@@ -454,6 +454,8 @@ pub fn clear_dragged_hwnd() {
 /// orphaned hook threads from lingering after the daemon exits.
 pub struct HookThreadHandle {
     os_thread_id: u32,
+    /// Names of the hooks the thread registered (see [`HOOK_NAMES`]).
+    registered: Vec<&'static str>,
 }
 
 impl HookThreadHandle {
@@ -465,6 +467,76 @@ impl HookThreadHandle {
             let _ = PostThreadMessageW(self.os_thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
         }
     }
+
+    /// OS thread id of the hook thread.
+    #[must_use]
+    pub fn os_thread_id(&self) -> u32 {
+        self.os_thread_id
+    }
+
+    /// Number of WinEvent hooks the thread registered successfully.
+    #[must_use]
+    pub fn registered_hooks(&self) -> usize {
+        self.registered.len()
+    }
+
+    /// Names of the hooks the thread registered successfully.
+    #[must_use]
+    pub fn registered_hook_names(&self) -> &[&'static str] {
+        &self.registered
+    }
+}
+
+/// Short names of every hook [`register_hooks`] attempts, in registration
+/// order. These are the names reported over the start channel and checked
+/// against [`MANDATORY_HOOKS`].
+pub const HOOK_NAMES: [&str; 8] = [
+    "CREATE/DESTROY",
+    "FOREGROUND",
+    "MOVESIZE",
+    "MINIMIZE",
+    "SHOW/HIDE",
+    "STATECHANGE",
+    "NAMECHANGE",
+    "LOCATIONCHANGE",
+];
+
+/// Hooks without which the daemon cannot track windows at all. If any of
+/// these fails to register, [`start_hook_thread`] returns an error instead of
+/// a silently deaf daemon. `MOVESIZE`, `STATECHANGE` and `NAMECHANGE` are
+/// recovery/drag niceties and are only logged when missing.
+pub const MANDATORY_HOOKS: [&str; 5] = [
+    "CREATE/DESTROY",
+    "FOREGROUND",
+    "SHOW/HIDE",
+    "LOCATIONCHANGE",
+    "MINIMIZE",
+];
+
+/// Check a set of registered hook names against [`MANDATORY_HOOKS`].
+///
+/// Pure: returns `Ok(())` when every mandatory hook is present, otherwise
+/// `Err(missing)` listing the mandatory hooks that are absent, in
+/// [`MANDATORY_HOOKS`] order.
+pub fn missing_mandatory_hooks(registered: &[&str]) -> Result<(), Vec<&'static str>> {
+    let missing: Vec<&'static str> = MANDATORY_HOOKS
+        .iter()
+        .copied()
+        .filter(|m| !registered.contains(m))
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(missing)
+    }
+}
+
+/// What the hook thread reports back once it has tried to register hooks.
+struct HookStartReport {
+    /// The hook thread's OS thread id (for `PostThreadMessageW`).
+    os_thread_id: u32,
+    /// Names of the hooks that registered successfully.
+    registered: Vec<&'static str>,
 }
 
 impl Drop for HookThreadHandle {
@@ -532,7 +604,10 @@ impl HookThreadHandle {
     /// `ERROR_INVALID_THREAD_ID` — the error is already discarded (`let _ =`),
     /// so drop is a silent no-op. Safe because no real thread is signaled.
     pub(crate) fn test_dummy() -> Self {
-        Self { os_thread_id: 0 }
+        Self {
+            os_thread_id: 0,
+            registered: Vec::new(),
+        }
     }
 }
 
@@ -558,8 +633,10 @@ impl HookSignal {
 ///
 /// The hook thread:
 /// 1. Optionally switches to the named desktop (for test isolation)
-/// 2. Reports its OS thread ID back to the caller
-/// 3. Registers WinEvent hooks via `SetWinEventHook`
+/// 2. Registers WinEvent hooks via `SetWinEventHook`
+/// 3. Reports its OS thread ID and the set of hooks that registered back to
+///    the caller, which refuses to continue if a [`MANDATORY_HOOKS`] entry
+///    is missing
 /// 4. Runs a `GetMessageW` message loop (required for `WINEVENT_OUTOFCONTEXT`)
 /// 5. The callback sends typed [`HookEvent`]s through the channel
 ///
@@ -579,7 +656,9 @@ impl HookSignal {
 /// # Errors
 ///
 /// Returns an error if the hook thread has already been started (double-init),
-/// the hook thread fails to start, or the desktop switch fails.
+/// the hook thread fails to start, the desktop switch fails, or any of the
+/// [`MANDATORY_HOOKS`] failed to register (the error names the missing
+/// hooks; the thread is told to stop and unhooks what it did register).
 pub fn start_hook_thread(
     desktop_name: Option<String>,
 ) -> Result<(Receiver<HookEvent>, HookThreadHandle, HookSignal), String> {
@@ -595,7 +674,7 @@ pub fn start_hook_thread(
     }
 
     let (sender, receiver) = mpsc::channel();
-    let (tid_tx, tid_rx) = mpsc::channel::<u32>();
+    let (report_tx, report_rx) = mpsc::channel::<HookStartReport>();
 
     // Store the sender in the global OnceLock so the callback can access it.
     HOOK_SENDER
@@ -638,21 +717,48 @@ pub fn start_hook_thread(
         #[cfg(not(debug_assertions))]
         let _ = desktop_name;
 
-        // Send our OS thread ID back to the caller before registering hooks.
-        let os_tid = unsafe { GetCurrentThreadId() };
-        let _ = tid_tx.send(os_tid);
-
-        run_hook_loop();
+        let os_thread_id = unsafe { GetCurrentThreadId() };
+        run_hook_loop(|registered| {
+            // Report back only after the hooks are registered, so the caller
+            // can verify the mandatory set rather than trusting a bare tid.
+            let _ = report_tx.send(HookStartReport {
+                os_thread_id,
+                registered,
+            });
+        });
     });
 
-    // Wait for the thread to report its OS thread ID.
-    let os_thread_id = tid_rx.recv().map_err(|_| {
-        "hook thread failed to start (exited before reporting thread ID)".to_owned()
-    })?;
+    // Wait for the thread to report which hooks registered.
+    let HookStartReport {
+        os_thread_id,
+        registered,
+    } = report_rx
+        .recv()
+        .map_err(|_| "hook thread failed to start (exited before registering hooks)".to_owned())?;
 
-    log::info!("hook thread started (OS tid={os_thread_id})");
+    let handle = HookThreadHandle {
+        os_thread_id,
+        registered,
+    };
 
-    Ok((receiver, HookThreadHandle { os_thread_id }, hook_signal))
+    if let Err(missing) = missing_mandatory_hooks(handle.registered_hook_names()) {
+        // The thread is parked in its message loop with a partial hook set;
+        // stop it (drop posts WM_QUIT -> it unhooks and exits) and fail.
+        drop(handle);
+        return Err(format!(
+            "mandatory WinEvent hook(s) failed to register: {} (SetWinEventHook returned NULL)",
+            missing.join(", ")
+        ));
+    }
+
+    log::info!(
+        "hook thread started (OS tid={}, {} of {} hooks registered)",
+        handle.os_thread_id(),
+        handle.registered_hooks(),
+        HOOK_NAMES.len()
+    );
+
+    Ok((receiver, handle, hook_signal))
 }
 
 // ── Hook thread internals ────────────────────────────────────────────
@@ -661,17 +767,24 @@ pub fn start_hook_thread(
 ///
 /// This function:
 /// 1. Registers WinEvent hooks
-/// 2. Enters a `GetMessageW` loop
-/// 3. Cleans up hooks on `WM_QUIT`
-fn run_hook_loop() {
+/// 2. Calls `report` with the names of the hooks that registered
+/// 3. Enters a `GetMessageW` loop (unless nothing registered)
+/// 4. Cleans up hooks on `WM_QUIT`
+fn run_hook_loop(report: impl FnOnce(Vec<&'static str>)) {
     let hooks = register_hooks();
+    let registered: Vec<&'static str> = hooks.iter().map(|(_, name)| *name).collect();
+    log::info!(
+        "hook thread: {} of {} hook(s) registered: {}",
+        hooks.len(),
+        HOOK_NAMES.len(),
+        registered.join(", ")
+    );
+    report(registered);
 
     if hooks.is_empty() {
         log::error!("hook thread: failed to register any hooks");
         return;
     }
-
-    log::info!("hook thread: {} hook(s) registered", hooks.len());
 
     // Standard Windows message loop — required for WINEVENT_OUTOFCONTEXT.
     let mut msg = MSG::default();
@@ -697,7 +810,7 @@ fn run_hook_loop() {
     }
 
     // Unregister all hooks.
-    for hook in &hooks {
+    for (hook, _) in &hooks {
         // SAFETY: UnhookWinEvent releases a previously registered hook.
         unsafe {
             let _ = windows::Win32::UI::Accessibility::UnhookWinEvent(*hook);
@@ -709,7 +822,8 @@ fn run_hook_loop() {
 
 /// Registers WinEvent hooks for all tracked event types.
 ///
-/// Returns a vector of hook handles. Each handle must be unregistered via
+/// Returns a vector of `(handle, name)` pairs — the names are the
+/// [`HOOK_NAMES`] entries. Each handle must be unregistered via
 /// `UnhookWinEvent` when the hook thread exits.
 ///
 /// Hooks are registered:
@@ -726,7 +840,7 @@ fn run_hook_loop() {
 /// **single-event** hooks rather than one `0x800A..=0x800C` range. `LOCATIONCHANGE`
 /// (`0x800B`) is callback-filtered to active-workspace floats only (see
 /// [`FLOAT_HWNS`]) so its per-pixel noisiness cannot flood the channel.
-fn register_hooks() -> Vec<HWINEVENTHOOK> {
+fn register_hooks() -> Vec<(HWINEVENTHOOK, &'static str)> {
     let mut hooks = Vec::new();
 
     // Hook: EVENT_OBJECT_CREATE + EVENT_OBJECT_DESTROY (range)
@@ -743,7 +857,7 @@ fn register_hooks() -> Vec<HWINEVENTHOOK> {
         )
     };
     if is_valid_hook(h) {
-        hooks.push(h);
+        hooks.push((h, HOOK_NAMES[0]));
         log::debug!("hook registered: CREATE/DESTROY");
     } else {
         log::error!("failed to hook CREATE/DESTROY");
@@ -762,7 +876,7 @@ fn register_hooks() -> Vec<HWINEVENTHOOK> {
         )
     };
     if is_valid_hook(h) {
-        hooks.push(h);
+        hooks.push((h, HOOK_NAMES[1]));
         log::debug!("hook registered: FOREGROUND");
     } else {
         log::error!("failed to hook FOREGROUND");
@@ -784,7 +898,7 @@ fn register_hooks() -> Vec<HWINEVENTHOOK> {
         )
     };
     if is_valid_hook(h) {
-        hooks.push(h);
+        hooks.push((h, HOOK_NAMES[2]));
         log::debug!("hook registered: MOVESIZE (drag detect)");
     } else {
         log::error!("failed to hook MOVESIZE");
@@ -803,7 +917,7 @@ fn register_hooks() -> Vec<HWINEVENTHOOK> {
         )
     };
     if is_valid_hook(h) {
-        hooks.push(h);
+        hooks.push((h, HOOK_NAMES[3]));
         log::debug!("hook registered: MINIMIZE events");
     } else {
         log::error!("failed to hook MINIMIZE events");
@@ -824,7 +938,7 @@ fn register_hooks() -> Vec<HWINEVENTHOOK> {
         )
     };
     if is_valid_hook(h) {
-        hooks.push(h);
+        hooks.push((h, HOOK_NAMES[4]));
         log::debug!("hook registered: SHOW/HIDE");
     } else {
         log::error!("failed to hook SHOW/HIDE");
@@ -848,7 +962,7 @@ fn register_hooks() -> Vec<HWINEVENTHOOK> {
         )
     };
     if is_valid_hook(h) {
-        hooks.push(h);
+        hooks.push((h, HOOK_NAMES[5]));
         log::debug!("hook registered: STATECHANGE");
     } else {
         log::error!("failed to hook STATECHANGE");
@@ -871,7 +985,7 @@ fn register_hooks() -> Vec<HWINEVENTHOOK> {
         )
     };
     if is_valid_hook(h) {
-        hooks.push(h);
+        hooks.push((h, HOOK_NAMES[6]));
         log::debug!("hook registered: NAMECHANGE");
     } else {
         log::error!("failed to hook NAMECHANGE");
@@ -897,7 +1011,7 @@ fn register_hooks() -> Vec<HWINEVENTHOOK> {
         )
     };
     if is_valid_hook(h) {
-        hooks.push(h);
+        hooks.push((h, HOOK_NAMES[7]));
         log::debug!("hook registered: LOCATIONCHANGE (float-filtered)");
     } else {
         log::error!("failed to hook LOCATIONCHANGE");
@@ -1055,6 +1169,52 @@ mod tests {
         // compile time (operands are const).
         const _: () = assert!(EVENT_OBJECT_STATECHANGE < EVENT_OBJECT_LOCATIONCHANGE);
         const _: () = assert!(EVENT_OBJECT_LOCATIONCHANGE < EVENT_OBJECT_NAMECHANGE);
+    }
+
+    #[test]
+    fn mandatory_hook_check_accepts_full_and_superset_registrations() {
+        // Every hook registered — the normal case.
+        assert_eq!(missing_mandatory_hooks(&HOOK_NAMES), Ok(()));
+        // Only the mandatory ones, in any order, is still acceptable.
+        let mut shuffled: Vec<&str> = MANDATORY_HOOKS.to_vec();
+        shuffled.reverse();
+        assert_eq!(missing_mandatory_hooks(&shuffled), Ok(()));
+        // Optional hooks missing (MOVESIZE/STATECHANGE/NAMECHANGE) is fine.
+        let without_optional: Vec<&str> = HOOK_NAMES
+            .iter()
+            .copied()
+            .filter(|n| !matches!(*n, "MOVESIZE" | "STATECHANGE" | "NAMECHANGE"))
+            .collect();
+        assert_eq!(missing_mandatory_hooks(&without_optional), Ok(()));
+        // Every mandatory name is a real hook name.
+        for m in MANDATORY_HOOKS {
+            assert!(HOOK_NAMES.contains(&m), "{m} is not in HOOK_NAMES");
+        }
+    }
+
+    #[test]
+    fn mandatory_hook_check_names_each_missing_hook() {
+        // Nothing registered: every mandatory hook is reported, in order.
+        assert_eq!(missing_mandatory_hooks(&[]), Err(MANDATORY_HOOKS.to_vec()));
+        // Partial registration: only the absent mandatory ones are named;
+        // absent optional ones are not.
+        let partial = ["CREATE/DESTROY", "MOVESIZE", "SHOW/HIDE", "MINIMIZE"];
+        assert_eq!(
+            missing_mandatory_hooks(&partial),
+            Err(vec!["FOREGROUND", "LOCATIONCHANGE"])
+        );
+        // Names are exact: a near-miss does not count.
+        let near_miss = [
+            "create/destroy",
+            "FOREGROUND",
+            "SHOW/HIDE",
+            "LOCATIONCHANGE",
+            "MINIMIZE",
+        ];
+        assert_eq!(
+            missing_mandatory_hooks(&near_miss),
+            Err(vec!["CREATE/DESTROY"])
+        );
     }
 
     #[test]

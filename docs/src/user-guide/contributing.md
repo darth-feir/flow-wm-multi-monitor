@@ -32,8 +32,17 @@ A good bug report is reproducible. Please include:
 
 ### Raising the log level
 
-To capture more detail, raise the log level by setting `RUST_LOG` before
-starting (default is `debug` in debug builds, `info` in release):
+To capture more detail, pass `--verbose` (debug level) or an explicit
+`--log-level` to `flow start` (default is `debug` in debug builds, `info` in
+release):
+
+```
+flow start --verbose --log-file <path>
+flow start --log-level trace --log-file <path>
+```
+
+Setting `RUST_LOG` before starting still works (the flags above take
+precedence when given):
 
 ```bat
 :: Windows cmd
@@ -44,6 +53,18 @@ set RUST_LOG=trace && flow start --log-file <path>
 # PowerShell
 $env:RUST_LOG='trace'; flow start --log-file <path>
 ```
+
+### If the daemon fails to start
+
+`flow start` waits for every startup step and tells you which one failed:
+
+```
+flow: FlowWM failed to start at step 'hooks': <reason> (log: <path>)
+```
+
+Include that line and the log it points at in your report. The step names
+(`config`, `monitors`, `scan`, `pipe`, `hooks`, …) and the daemon's exit codes
+are listed in the developer guide's IPC chapter.
 
 ### A note on config location
 

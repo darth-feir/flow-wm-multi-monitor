@@ -283,8 +283,9 @@ A few other top-level commands are worth knowing:
 
 | Command | What it does |
 |---|---|
-| `flow start [--ahk] [--config <dir>] [--log-file <path>]` | Launch the daemon in the background. `--ahk` also starts `flow.ahk` once the daemon is listening. |
+| `flow start [--ahk] [--config <dir>] [--log-file <path>] [--no-restore] [--verbose] [--log-level <lvl>]` | Launch the daemon in the background and wait until it is really ready (it must report every startup step and answer a ping). Prints `flow: daemon started (pid N, M monitor(s), log: <path>)`. If a step fails you get `flow: FlowWM failed to start at step '<step>': <reason> (log: <path>)` and a non-zero exit — nothing is left half-tiled, windows are put back. `--ahk` also starts `flow.ahk` once the daemon is listening. `--verbose` (`-v`) logs at `debug`; `--log-level trace` goes further. |
 | `flow stop [--ahk]` | Stop the running daemon (and the AHK script, with `--ahk`). |
+| `flow ping` | Check the daemon is alive: prints its version, pid, monitor count and registered-hook count. |
 | `flow config init [--ahk]` | Write default `flow.toml` (and `flow.ahk`) into your config dir. Never overwrites existing files. |
 | `flow config reload` | Tell the running daemon to re-read config from disk. |
 | `flow config edit` | Open the config directory in your editor. |

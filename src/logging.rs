@@ -41,6 +41,13 @@
 //!   `RUST_LOG=trace`, `RUST_LOG=flow_wm=debug`) before
 //!   starting the daemon. This takes precedence over the build-profile
 //!   default.
+//! - **CLI override**: `flowd --verbose` (debug) or `flowd --log-level <lvl>`
+//!   — forwarded by `flow start --verbose` / `--log-level` — takes
+//!   precedence over both `RUST_LOG` and the build default.
+//!
+//! The log directory honours the config directory resolved from `--config`
+//! / `FLOW_CONFIG_DIR` (the caller passes it in), and [`init`] returns the
+//! resolved log path so the daemon can publish it in its status file.
 //!
 //! ## Date rollover
 //!
@@ -58,7 +65,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::Local;
 use env_logger::{Builder, Target};
@@ -80,15 +87,25 @@ use env_logger::{Builder, Target};
 ///   debugging run, separate from the shared daily log. Stderr is still
 ///   echoed so a console-launched `flowd --log-file` stays visible.
 /// - **`log_file_override = None`** (default): the date-stamped daily log
-///   (`<config_dir>/logs/flowd-YYYY-MM-DD.log`) opened in append mode, so
-///   restarts on the same day accumulate into one file.
+///   (`<config_dir>/logs/flowd-YYYY-MM-DD.log`, see [`default_log_path`])
+///   opened in append mode, so restarts on the same day accumulate into one
+///   file. `config_dir` is the directory the daemon resolved from
+///   `--config` / `FLOW_CONFIG_DIR`.
 ///
 /// # Level resolution
 ///
-/// 1. If `RUST_LOG` is set, its directives are used (standard `env_logger`
-///    behavior — module-specific filters, etc.).
-/// 2. Otherwise, the build-profile default applies: `debug` in debug builds,
-///    `info` in release builds.
+/// 1. If `level_override` is `Some` (from `--verbose` → `"debug"`, or
+///    `--log-level <lvl>`), it is parsed as an `env_logger` filter string
+///    and wins outright.
+/// 2. Else if `RUST_LOG` is set, its directives are used (standard
+///    `env_logger` behavior — module-specific filters, etc.).
+/// 3. Otherwise, the build-profile default applies: `debug` in debug builds,
+///    `info` in release builds (see [`default_level`]).
+///
+/// # Return value
+///
+/// The resolved log file path when the file was opened, or `None` when
+/// logging fell back to stderr only.
 ///
 /// # File-open failure
 ///
@@ -96,26 +113,29 @@ use env_logger::{Builder, Target};
 /// with a stderr-only target and a warning is emitted. This ensures the
 /// daemon can still run and produce diagnostic output even when the log
 /// directory is inaccessible.
-pub fn init(log_file_override: Option<&Path>) {
-    let default_filter = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "info"
-    };
-    let env = env_logger::Env::default().default_filter_or(default_filter);
+pub fn init(
+    config_dir: &Path,
+    log_file_override: Option<&Path>,
+    level_override: Option<&str>,
+) -> Option<PathBuf> {
+    let env = env_logger::Env::default().default_filter_or(default_level());
 
     // Resolve the log file path and open mode from the override (if any).
     let (log_path, append) = match log_file_override {
         Some(path) => {
             // Explicit `--log-file`: a clean, isolated file for this run.
-            (std::path::PathBuf::from(path), false)
+            (PathBuf::from(path), false)
         }
         None => {
             // Default: date-stamped daily log, appended to across restarts.
-            let date = today_local_date();
-            let config_dir = crate::config::dirs::resolve_config_dir(None);
-            let path = crate::config::dirs::log_file_path_in(&config_dir, &date);
-            (path, true)
+            (default_log_path(config_dir), true)
+        }
+    };
+
+    let configure = |builder: &mut Builder| {
+        if let Some(level) = level_override {
+            // `--verbose` / `--log-level` beat RUST_LOG and the build default.
+            builder.parse_filters(level);
         }
     };
 
@@ -123,20 +143,49 @@ pub fn init(log_file_override: Option<&Path>) {
         Ok(file) => {
             // Primary path: tee to both file and stderr.
             let mut builder = Builder::from_env(env);
+            configure(&mut builder);
             builder.target(Target::Pipe(Box::new(TeeWriter::new(file))));
             builder.init();
-            log::info!("flowd: logging to {}", log_path.display());
+            log::info!(
+                "flowd: logging to {} (level: {})",
+                log_path.display(),
+                level_override.unwrap_or("RUST_LOG or build default")
+            );
+            Some(log_path)
         }
         Err(e) => {
             // Fallback: stderr-only. Initialize the logger BEFORE emitting the
             // warning so the warning is actually captured by the logger.
-            Builder::from_env(env).init();
+            let mut builder = Builder::from_env(env);
+            configure(&mut builder);
+            builder.init();
             log::warn!(
                 "flowd: could not open log file {}: {e}; falling back to stderr-only",
                 log_path.display()
             );
+            None
         }
     }
+}
+
+/// The build-profile default log level: `debug` in debug builds, `info` in
+/// release builds. Overridden by `RUST_LOG`, `--verbose` or `--log-level`.
+#[must_use]
+pub fn default_level() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "info"
+    }
+}
+
+/// The date-stamped daily log path the daemon uses when no `--log-file`
+/// override is given: `<config_dir>/logs/flowd-YYYY-MM-DD.log` for today's
+/// local date. The `flow` client uses this to tell the user where to look
+/// when the daemon fails to start.
+#[must_use]
+pub fn default_log_path(config_dir: &Path) -> PathBuf {
+    crate::config::dirs::log_file_path_in(config_dir, &today_local_date())
 }
 
 /// Return today's local date as a `YYYY-MM-DD` string.

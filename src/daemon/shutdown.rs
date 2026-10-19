@@ -13,8 +13,96 @@
 use windows::Win32::Foundation::HWND;
 
 use super::types::FlowWM;
-use crate::common::{InvisibleBounds, Rect};
+use crate::common::{InvisibleBounds, Rect, WindowId};
+use crate::registry::WindowRegistry;
 use crate::registry::win32;
+
+/// The per-monitor geometry the rescue pass needs.
+///
+/// A plain value type so the pass can run before a `FlowWM` (and its
+/// `Vec<Monitor>`) exists — i.e. from a failing `FlowWM::new` after the
+/// initial layout has already moved windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RescueMonitor {
+    /// Full physical display bounds.
+    pub screen_rect: Rect,
+    /// Taskbar-excluded work area windows are clamped into.
+    pub work_area: Rect,
+}
+
+/// Rescue windows stranded off-screen without a `FlowWM`.
+///
+/// This is the rescue pass itself (see
+/// [`FlowWM::rescue_stranded_windows`] for the rules). It is a free function
+/// so that a startup failure *after* the initial layout has moved windows can
+/// still bring them back — at that point no `FlowWM` exists yet.
+///
+/// * `registry` — supplies the controlled windows and their rescue anchors.
+/// * `virtual_screen` — union of all monitors; a window whose visible content
+///   overlaps it is left alone.
+/// * `monitors` — screen/work rects, in the same order as the daemon's
+///   monitor list; must be non-empty.
+/// * `active_monitor` — fallback owner when no monitor contains the anchor.
+/// * `owner_of` — monitor index owning a window by workspace membership, or
+///   `None` to fall back to the anchor's monitor. Before `FlowWM` exists no
+///   workspace bookkeeping is available, so pass `|_| None`.
+///
+/// Returns the number of windows moved.
+pub fn rescue_stranded_windows_with(
+    registry: &WindowRegistry,
+    virtual_screen: Rect,
+    monitors: &[RescueMonitor],
+    active_monitor: usize,
+    owner_of: impl Fn(WindowId) -> Option<usize>,
+) -> usize {
+    if monitors.is_empty() {
+        log::warn!("shutdown rescue: no monitors known, cannot rescue");
+        return 0;
+    }
+    let active_monitor = active_monitor.min(monitors.len() - 1);
+    let mut rescued = 0_usize;
+    for (hwnd_val, anchor, invisible_bounds) in registry.restorable_windows() {
+        let hwnd = HWND(hwnd_val as *mut _);
+        let Ok(current) = win32::get_window_rect(hwnd) else {
+            log::warn!("shutdown rescue: GetWindowRect failed for hwnd {hwnd_val}, skipping");
+            continue;
+        };
+        if content_overlaps_work_area(current, invisible_bounds, virtual_screen) {
+            continue;
+        }
+        // Bring it back onto the monitor that owns it (by workspace
+        // membership), else the one its pre-manage rect was on, else the
+        // active monitor.
+        let owner = owner_of(WindowId(hwnd_val))
+            .filter(|i| *i < monitors.len())
+            .unwrap_or_else(|| monitor_index_for_rect(monitors, anchor, active_monitor));
+        let work_area = monitors[owner].work_area;
+        let target = anchor.clamped_into(work_area);
+        if win32::set_window_rect(hwnd_val, target.x, target.y, target.width, target.height) {
+            rescued += 1;
+        }
+    }
+    log::info!("shutdown rescue: brought {rescued} stranded window(s) back on-screen");
+    rescued
+}
+
+/// Index of the monitor whose screen rect contains `rect`'s centre, else the
+/// first whose screen rect overlaps it, else `fallback`. Mirrors
+/// `FlowWM::monitor_index_for_rect` over plain geometry.
+fn monitor_index_for_rect(monitors: &[RescueMonitor], rect: Rect, fallback: usize) -> usize {
+    let cx = rect.x + rect.width / 2;
+    let cy = rect.y + rect.height / 2;
+    if let Some(i) = monitors.iter().position(|m| {
+        let s = m.screen_rect;
+        cx >= s.x && cx < s.right() && cy >= s.y && cy < s.bottom()
+    }) {
+        return i;
+    }
+    monitors
+        .iter()
+        .position(|m| m.screen_rect.overlaps(rect))
+        .unwrap_or(fallback)
+}
 
 impl FlowWM {
     /// Rescue windows stranded off-screen back into the active monitor's
@@ -42,29 +130,21 @@ impl FlowWM {
         // a window parked beyond the virtual screen must come back, a window
         // that lives on another monitor must be left alone.
         let virtual_screen = self.active_scrolling().monitor().virtual_screen;
-        let mut rescued = 0_usize;
-        for (hwnd_val, anchor, invisible_bounds) in self.registry.restorable_windows() {
-            let hwnd = HWND(hwnd_val as *mut _);
-            let Ok(current) = win32::get_window_rect(hwnd) else {
-                log::warn!("shutdown rescue: GetWindowRect failed for hwnd {hwnd_val}, skipping");
-                continue;
-            };
-            if content_overlaps_work_area(current, invisible_bounds, virtual_screen) {
-                continue;
-            }
-            // Bring it back onto the monitor that owns it (by workspace
-            // membership), else the one its pre-manage rect was on, else the
-            // active monitor.
-            let owner = self
-                .monitor_index_containing(crate::common::WindowId(hwnd_val))
-                .unwrap_or_else(|| self.monitor_index_for_rect(anchor));
-            let work_area = self.monitors[owner].work_area();
-            let target = anchor.clamped_into(work_area);
-            if win32::set_window_rect(hwnd_val, target.x, target.y, target.width, target.height) {
-                rescued += 1;
-            }
-        }
-        log::info!("shutdown rescue: brought {rescued} stranded window(s) back on-screen");
+        let monitors: Vec<RescueMonitor> = self
+            .monitors
+            .iter()
+            .map(|m| RescueMonitor {
+                screen_rect: m.screen_rect(),
+                work_area: m.work_area(),
+            })
+            .collect();
+        rescue_stranded_windows_with(
+            &self.registry,
+            virtual_screen,
+            &monitors,
+            self.active_monitor,
+            |wid| self.monitor_index_containing(wid),
+        );
     }
 }
 

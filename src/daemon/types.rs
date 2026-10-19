@@ -138,9 +138,10 @@ pub struct FlowWM {
     /// Receiver for hook events from the background WinEvent hook thread.
     pub(super) hook_receiver: Receiver<crate::registry::HookEvent>,
 
-    /// Handle to the background hook thread. Kept for its `Drop` impl
-    /// which posts `WM_QUIT` to the hook thread's message loop.
-    pub(super) _hook_handle: HookThreadHandle,
+    /// Handle to the background hook thread. Its `Drop` impl posts `WM_QUIT`
+    /// to the hook thread's message loop; `Ping` reports its registered-hook
+    /// count.
+    pub(super) hook_handle: HookThreadHandle,
 
     /// Win32 Event handle signaled by the hook callback thread.
     ///

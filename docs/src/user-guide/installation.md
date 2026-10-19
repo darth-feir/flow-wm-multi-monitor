@@ -143,7 +143,9 @@ flow start --log-file <path>
 ```
 
 The file is reset on each launch, so it contains only that run. To raise the
-verbosity, set `RUST_LOG=trace` first. See
+verbosity, add `--verbose` (or `--log-level trace`). `flow start` itself tells
+you which startup step failed (`flow: FlowWM failed to start at step '…'`) and
+where the log is; `flow ping` checks whether a daemon is answering. See
 [Contributing & Reporting Issues](./contributing.md) for how to file a useful
 bug report once you have a log.
 

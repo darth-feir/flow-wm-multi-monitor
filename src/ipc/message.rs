@@ -62,6 +62,10 @@ pub fn pipe_name() -> String {
 pub enum SocketMessage {
     /// Shut down the daemon gracefully.
     Stop,
+    /// Liveness probe. The daemon answers with [`SocketResponse::Pong`]
+    /// carrying its version, pid, monitor count and registered-hook count.
+    /// Never touches layout state, so it is also safe mid-drag.
+    Ping,
     /// Reload configuration from disk.
     ReloadConfig,
     /// Validate the current config file without applying it.
@@ -363,6 +367,18 @@ pub enum SocketResponse {
     /// The daemon is busy — a tile-window drag is in progress and layout-mutating
     /// commands are temporarily rejected. The client may retry shortly.
     Busy,
+    /// Reply to [`SocketMessage::Ping`]: identity and health of the daemon.
+    Pong {
+        /// Daemon crate version (`CARGO_PKG_VERSION`).
+        version: String,
+        /// Daemon process id — `flow start` compares it with the child it
+        /// spawned so a stale daemon can never be mistaken for the new one.
+        pid: u32,
+        /// Number of monitors the daemon is managing.
+        monitors: usize,
+        /// Number of WinEvent hooks the hook thread registered.
+        hooks_registered: usize,
+    },
 }
 
 /// Serialise a message as a single line of JSON terminated by `\\n`.
@@ -572,6 +588,7 @@ mod tests {
             SocketMessage::QueryLayoutActual,
             SocketMessage::QueryState,
             SocketMessage::ForgetAllApps,
+            SocketMessage::Ping,
         ];
 
         for msg in &variants {
@@ -579,6 +596,37 @@ mod tests {
             let parsed: Option<SocketMessage> = decode_message(&wire);
             assert_eq!(parsed.as_ref(), Some(msg), "roundtrip failed for: {msg:?}");
         }
+    }
+
+    // Positive: Ping is a plain `{"type":"ping"}` and never layout-mutating,
+    // so `flow start` can probe the daemon even while a drag is in progress.
+    #[test]
+    fn roundtrip_ping_is_not_layout_mutating() {
+        let msg = SocketMessage::Ping;
+        let wire = encode_message(&msg).unwrap();
+        assert_eq!(wire, "{\"type\":\"ping\"}\n");
+        let parsed: SocketMessage = decode_message(&wire).unwrap();
+        assert_eq!(parsed, msg);
+        assert!(!msg.is_layout_mutating());
+    }
+
+    // Positive: Pong round-trips with every field and a `"status":"pong"` tag.
+    #[test]
+    fn roundtrip_response_pong() {
+        let resp = SocketResponse::Pong {
+            version: "0.2.0".to_owned(),
+            pid: 1234,
+            monitors: 2,
+            hooks_registered: 8,
+        };
+        let wire = encode_message(&resp).unwrap();
+        assert!(wire.contains("\"status\":\"pong\""), "{wire}");
+        assert!(wire.contains("\"hooks_registered\":8"), "{wire}");
+        let parsed: SocketResponse = decode_message(&wire).unwrap();
+        assert_eq!(parsed, resp);
+        // A response never parses as a message.
+        let as_msg: Option<SocketMessage> = decode_message(&wire);
+        assert!(as_msg.is_none());
     }
 
     // Positive: round-trip ForgetApp variant (has string field)

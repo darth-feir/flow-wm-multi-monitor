@@ -1,20 +1,32 @@
 //! FlowWM constructor — performs all startup work.
 //!
-//! This module contains the [`FlowWM::new`] method which:
+//! This module contains the [`FlowWM::new`] method which runs the daemon's
+//! construction stages (see [`StartupStage`]) in this order:
 //!
-//! 1. Creates [`WindowRegistry`] from user and default rules.
-//! 2. Scans existing windows (populates registry before hooks start).
-//! 3. Queries monitor work area via Win32.
-//! 4. Derives layout parameters from the [`FlowConfig`].
-//! 5. Creates [`ScrollingSpace`] with those parameters.
-//! 6. Batch-initializes layout from existing tiling windows (sorted by x
-//!    coordinate for deterministic column assignment; viewport centered
-//!    on the focused column).
-//! 7. Creates [`WindowAnimator`] with Win32 backend and the user's
-//!    configured animation duration (instant if animation is disabled).
-//! 8. Animates the initial layout (windows animate to tiling positions).
-//! 9. Starts the WinEvent hook thread.
-//! 10. Creates the IPC named pipe server.
+//! 1. **`monitors`** — queries monitor geometry via Win32, derives layout
+//!    parameters from the [`FlowConfig`], and creates one [`ScrollingSpace`]
+//!    per monitor.
+//! 2. **`scan`** — creates the [`WindowRegistry`] from user and default
+//!    rules (plus learned history) and scans existing windows.
+//! 3. **`pipe`** — creates the IPC named pipe server (fails fast if another
+//!    daemon owns it).
+//! 4. **`hooks`** — starts the WinEvent hook thread and verifies the
+//!    mandatory hooks registered.
+//! 5. **`animator`** — creates [`WindowAnimator`] with the Win32 backend and
+//!    the user's configured animation duration.
+//! 6. **`initial_layout`** — batch-initializes each monitor's layout from
+//!    its existing tiling windows (sorted by x coordinate for deterministic
+//!    column assignment; viewport centered on the focused column) and
+//!    animates the windows to their tiling positions.
+//! 7. **`borders`** — adopts pre-existing floats and attaches border
+//!    overlays.
+//!
+//! The pipe and hooks come **before** the initial layout on purpose: those
+//! are the steps most likely to fail (another daemon, a deaf hook thread),
+//! and until the initial layout runs no window has been moved, so a failure
+//! there leaves the desktop exactly as it was. Once windows have moved,
+//! every later failure path rescues them (see
+//! [`rescue_stranded_windows_with`]) before returning the error.
 //!
 //! # Config Model
 //!
@@ -38,13 +50,15 @@ use windows::Win32::Foundation::HWND;
 
 use super::animation::animate_layout_raw;
 use super::config_derive;
+use super::shutdown::{RescueMonitor, rescue_stranded_windows_with};
+use super::startup::{AtStage, StartupError, StartupReporter, StartupStage};
 use super::types::FlowWM;
 
 impl FlowWM {
     /// Construct and initialize the daemon.
     ///
     /// Performs all startup work in sequence. See the [module documentation](self)
-    /// for the complete initialization flow.
+    /// for the complete initialization flow and stage order.
     ///
     /// # Arguments
     ///
@@ -53,21 +67,31 @@ impl FlowWM {
     /// * `default_rules` - Bundled default rules.
     /// * `config_dir` - Path to the configuration directory.
     /// * `desktop_name` - Optional test desktop name (debug builds only).
+    /// * `reporter` - Startup progress reporter; every stage is announced
+    ///   through it (log line + status file) and it is where `FLOW_FAIL_AT`
+    ///   injection takes effect.
     ///
     /// # Errors
     ///
-    /// Returns `Err(String)` if any startup step fails:
-    /// - Window scan failure (non-fatal — logged, returns `Ok`).
-    /// - Monitor work area query failure.
-    /// - Hook thread start failure.
-    /// - Named pipe creation failure (likely another daemon running).
+    /// Returns a [`StartupError`] naming the failing stage:
+    /// - `monitors` — monitor enumeration failure.
+    /// - `scan` — window scan failure.
+    /// - `pipe` — named pipe creation failure (likely another daemon running).
+    /// - `hooks` — hook thread start failure or a mandatory hook missing.
+    /// - `animator`, `initial_layout`, `borders` — only via injection today.
+    ///
+    /// If the failure happens after the initial layout has moved windows,
+    /// they are rescued back on-screen before the error is returned.
     pub fn new(
         app_config: FlowConfig,
         user_rules: WindowRulesConfig,
         default_rules: WindowRulesConfig,
         config_dir: std::path::PathBuf,
         desktop_name: Option<String>,
-    ) -> Result<Self, String> {
+        reporter: &StartupReporter,
+    ) -> Result<Self, StartupError> {
+        use StartupStage as S;
+
         log::debug!(
             "effective config: columns_per_screen={}, column_width={:?}, min_column_width_px={}, padding.window_gap={}, padding.up={}, padding.down={}, animation.duration_ms={}",
             app_config.columns_per_screen,
@@ -79,29 +103,17 @@ impl FlowWM {
             app_config.animation.duration_ms,
         );
 
-        // 1. Create registry from rules.
-        let mut registry = WindowRegistry::new(&user_rules, &default_rules);
-
-        // Load learned rules from `history-flow-rules.toml` and push them into
-        // the registry's classification pipeline BEFORE scanning existing
-        // windows, so previously-recorded decisions apply to windows that
-        // were already open when flowd started.
-        let history = HistoryStore::load(&history_rules_path_in(&config_dir));
-        if !history.is_empty() {
-            log::info!("loaded {} learned rules from history", history.len());
-            registry.set_learned_rules(history.rules().to_vec());
-        }
-
-        // 2. Scan existing windows before hooks start.
-        registry.scan_existing_windows()?;
-
-        // 3. Get monitor geometry via Win32 — both the full physical screen
-        //    rect (for parking workspaces off-screen) and the taskbar-excluded
-        //    work area (for in-workspace window placement). See
-        //    registry::win32::MonitorGeometry for why both are needed.
+        // ── 1. monitors ──────────────────────────────────────────────
+        // Get monitor geometry via Win32 — both the full physical screen
+        // rect (for parking workspaces off-screen) and the taskbar-excluded
+        // work area (for in-workspace window placement). See
+        // registry::win32::MonitorGeometry for why both are needed.
         // One scrolling space per monitor, each sized to its own work area.
-        // Windows are assigned to the monitor they are currently on.
-        let geometries = registry_win32::enumerate_monitors()?;
+        reporter.begin(S::Monitors)?;
+        let geometries = registry_win32::enumerate_monitors().at(S::Monitors)?;
+        if geometries.is_empty() {
+            return Err(StartupError::new(S::Monitors, "no monitors enumerated"));
+        }
         let virtual_screen = registry_win32::virtual_screen_rect();
         let screen_rects: Vec<Rect> = geometries.iter().map(|g| g.screen_rect).collect();
         log::info!(
@@ -157,6 +169,59 @@ impl FlowWM {
                 scrolling,
             });
         }
+        reporter.ok(S::Monitors);
+
+        // ── 2. scan ──────────────────────────────────────────────────
+        reporter.begin(S::Scan)?;
+        let mut registry = WindowRegistry::new(&user_rules, &default_rules);
+
+        // Load learned rules from `history-flow-rules.toml` and push them into
+        // the registry's classification pipeline BEFORE scanning existing
+        // windows, so previously-recorded decisions apply to windows that
+        // were already open when flowd started.
+        let history = HistoryStore::load(&history_rules_path_in(&config_dir));
+        if !history.is_empty() {
+            log::info!("loaded {} learned rules from history", history.len());
+            registry.set_learned_rules(history.rules().to_vec());
+        }
+
+        // Scan existing windows before hooks start.
+        registry.scan_existing_windows().at(S::Scan)?;
+        reporter.ok(S::Scan);
+
+        // ── 3. pipe ──────────────────────────────────────────────────
+        // Before any window moves: if another daemon owns the pipe we want
+        // to bail out with the desktop untouched.
+        reporter.begin(S::Pipe)?;
+        let server = PipeServer::create()
+            .map_err(|e| format!("failed to create pipe (is another daemon running?): {e}"))
+            .at(S::Pipe)?;
+        reporter.ok(S::Pipe);
+
+        // ── 4. hooks ─────────────────────────────────────────────────
+        // Also before any window moves. `start_hook_thread` fails if a
+        // mandatory hook did not register, so a deaf daemon never reaches
+        // the layout step. Events for our own upcoming moves simply queue
+        // in the channel until `run()` drains them.
+        reporter.begin(S::Hooks)?;
+        let (hook_receiver, hook_handle, hook_signal) =
+            hooks::start_hook_thread(desktop_name).at(S::Hooks)?;
+        reporter.ok(S::Hooks);
+
+        // ── 5. animator ──────────────────────────────────────────────
+        reporter.begin(S::Animator)?;
+        let backend = Win32Backend::new();
+        let init_config = config_derive::derive_animator_config(&app_config, Duration::ZERO);
+        log::debug!(
+            "init: animator config duration={:?}ms, animation.enabled={}",
+            init_config.duration,
+            app_config.animation.enabled,
+        );
+        let mut animator = WindowAnimator::new(backend, init_config);
+        reporter.ok(S::Animator);
+
+        // ── 6. initial_layout ────────────────────────────────────────
+        reporter.begin(S::InitialLayout)?;
 
         // Partition the pre-existing tiling windows by the monitor they sit on.
         let all_tiling = registry.tiling_window_ids_with_widths_sorted_by_x();
@@ -211,14 +276,6 @@ impl FlowWM {
             log::warn!("init: no tiling windows found - skipping initial layout");
         }
 
-        let backend = Win32Backend::new();
-        let init_config = config_derive::derive_animator_config(&app_config, Duration::ZERO);
-        log::debug!(
-            "init: animator config duration={:?}ms, animation.enabled={}",
-            init_config.duration,
-            app_config.animation.enabled,
-        );
-        let mut animator = WindowAnimator::new(backend, init_config);
         for diff in &initial_diffs {
             log::debug!(
                 "init: submitting {} targets to animator",
@@ -234,11 +291,32 @@ impl FlowWM {
             registry.update_tiling_slots_from_layout(&diff.virtual_layout);
             registry.update_tiled_rects(&diff.actual_layout);
         }
+        reporter.ok(S::InitialLayout);
 
-        let (hook_receiver, _hook_handle, hook_signal) = hooks::start_hook_thread(desktop_name)?;
-        let server = PipeServer::create()
-            .map_err(|e| format!("failed to create pipe (is another daemon running?): {e}"))?;
-        log::info!("flowd: daemon initialized successfully");
+        // ── windows have moved: every failure from here on must rescue ──
+        let rescue_monitors: Vec<RescueMonitor> = geometries
+            .iter()
+            .map(|g| RescueMonitor {
+                screen_rect: g.screen_rect,
+                work_area: g.work_area,
+            })
+            .collect();
+
+        // ── 7. borders ───────────────────────────────────────────────
+        // The injection check runs before `Self` exists so the rescue can go
+        // through the free function (no workspace bookkeeping yet: owners
+        // resolve by anchor rect).
+        if let Err(err) = reporter.begin(S::Borders) {
+            animator.cancel();
+            rescue_stranded_windows_with(
+                &registry,
+                virtual_screen,
+                &rescue_monitors,
+                active_monitor,
+                |_| None,
+            );
+            return Err(err);
+        }
 
         const WORKSPACE_COUNT: u32 = 10;
         let mut monitors: Vec<Monitor> = Vec::with_capacity(geometries.len());
@@ -277,7 +355,7 @@ impl FlowWM {
             config: app_config,
             config_dir,
             hook_receiver,
-            _hook_handle,
+            hook_handle,
             hook_signal,
             shutting_down: false,
             pending_creations: Vec::new(),
@@ -299,6 +377,7 @@ impl FlowWM {
         // Idempotent and O(N) where N = tracked windows. Runs after
         // populate_existing_floats so float overlays seat at the adopted rect.
         manager.refresh_all_border_styles();
+        reporter.ok(S::Borders);
         Ok(manager)
     }
 
@@ -379,7 +458,7 @@ impl FlowWM {
             config: FlowConfig::default(),
             config_dir: std::path::PathBuf::new(),
             hook_receiver,
-            _hook_handle: hooks::HookThreadHandle::test_dummy(),
+            hook_handle: hooks::HookThreadHandle::test_dummy(),
             hook_signal: hooks::HookSignal::test_dummy(),
             shutting_down: false,
             pending_creations: Vec::new(),

@@ -5,7 +5,7 @@
 //!
 //! | Group | Commands |
 //! |-------|----------|
-//! | Lifecycle | `start`, `stop`, `enable-autostart`, `disable-autostart` |
+//! | Lifecycle | `start`, `stop`, `ping`, `enable-autostart`, `disable-autostart` |
 //! | Loadout | `loadout save|load [path]` |
 //! | Config | `config init` / `reload` / `edit` / `path` / `check` |
 //! | Query | `query all` |
@@ -28,8 +28,8 @@
 //! Only `flow config reload` sends an IPC message to the running daemon.
 
 use std::os::windows::process::CommandExt;
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -38,13 +38,18 @@ use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 use flow_wm::autostart;
 use flow_wm::common::Direction;
 use flow_wm::config;
+use flow_wm::daemon::startup::{self, StartupState, StartupStatus};
 use flow_wm::ipc::message::SocketMessage;
 use flow_wm::ipc::message::SocketResponse;
 use flow_wm::ipc::message::WindowMode;
 use flow_wm::ipc::transport;
+use flow_wm::logging;
 
 /// Maximum time to wait for the daemon to become ready after spawning.
-const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Interval between readiness polls in [`wait_for_daemon`].
+const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Parser)]
 #[command(name = "flow", version, about = "FlowWM CLI")]
@@ -83,6 +88,16 @@ enum Commands {
         /// already on screen, untiled.
         #[arg(long)]
         no_restore: bool,
+        /// Run the daemon at `debug` log level (default is `info` in release
+        /// builds). Forwarded as `flowd --verbose`. Shorthand for
+        /// `--log-level debug`.
+        #[arg(long, short = 'v')]
+        verbose: bool,
+        /// Explicit daemon log level / filter (e.g. `trace`,
+        /// `flow_wm::registry=trace`). Forwarded as `flowd --log-level`;
+        /// overrides `--verbose` and `RUST_LOG`.
+        #[arg(long, value_name = "LEVEL")]
+        log_level: Option<String>,
     },
     /// Stop the running flowd daemon.
     Stop {
@@ -90,6 +105,9 @@ enum Commands {
         #[arg(long)]
         ahk: bool,
     },
+    /// Check that the daemon is alive: prints its version, pid, monitor
+    /// count and registered-hook count. Exits non-zero if it does not answer.
+    Ping,
     /// Save or restore a window arrangement (a "loadout").
     Loadout {
         #[command(subcommand)]
@@ -402,8 +420,27 @@ fn main() {
             log_file,
             ahk,
             no_restore,
-        } => cmd_start(config, log_file, ahk, no_restore),
+            verbose,
+            log_level,
+        } => {
+            let opts = StartOptions {
+                config_override: config,
+                log_file_override: log_file,
+                ahk,
+                no_restore,
+                verbose,
+                log_level,
+            };
+            match cmd_start(opts) {
+                Ok(()) => Ok(()),
+                Err(StartError { message, exit_code }) => {
+                    eprintln!("flow: {message}");
+                    std::process::exit(exit_code);
+                }
+            }
+        }
         Commands::Stop { ahk } => cmd_stop(ahk),
+        Commands::Ping => cmd_ping(),
         Commands::Loadout { command } => cmd_loadout(command),
         Commands::Config { command } => cmd_config(command),
         Commands::Query { command } => cmd_query(command),
@@ -419,17 +456,86 @@ fn main() {
     }
 }
 
+/// Options for `flow start`, mirroring the `Commands::Start` flags.
+#[derive(Debug, Default)]
+struct StartOptions {
+    /// `--config <dir>`: config directory override.
+    config_override: Option<String>,
+    /// `--log-file <path>`: forwarded to the daemon.
+    log_file_override: Option<String>,
+    /// `--ahk`: launch `flow.ahk` once the daemon is ready.
+    ahk: bool,
+    /// `--no-restore`: forwarded to the daemon.
+    no_restore: bool,
+    /// `--verbose`: forwarded to the daemon.
+    verbose: bool,
+    /// `--log-level <lvl>`: forwarded to the daemon.
+    log_level: Option<String>,
+}
+
+/// A `flow start` failure: the message to print (after `flow: `) and the
+/// process exit code — the daemon's own stage exit code when it failed at a
+/// known startup stage, else `1`.
+#[derive(Debug, PartialEq, Eq)]
+struct StartError {
+    /// Message printed to stderr, without the `flow: ` prefix.
+    message: String,
+    /// Exit code for the `flow` process.
+    exit_code: i32,
+}
+
+impl From<String> for StartError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            exit_code: 1,
+        }
+    }
+}
+
+impl StartError {
+    /// The user-facing failure line for a daemon that reported a failing
+    /// startup stage: `FlowWM failed to start at step '<stage>': <reason>
+    /// (log: <path>)`, exiting with that stage's code.
+    fn at_stage(stage: &str, reason: &str, log_path: &Path, exit_code: i32) -> Self {
+        Self {
+            message: format!(
+                "FlowWM failed to start at step '{stage}': {reason} (log: {})",
+                log_path.display()
+            ),
+            exit_code,
+        }
+    }
+}
+
+/// What a successful daemon start looks like, for the final status line.
+#[derive(Debug, PartialEq, Eq)]
+struct StartSummary {
+    /// Daemon pid (from the `Pong`, cross-checked against the spawned child).
+    pid: u32,
+    /// Monitor count reported by the daemon.
+    monitors: usize,
+    /// Registered WinEvent hook count reported by the daemon.
+    hooks_registered: usize,
+}
+
 /// Start the daemon and wait for it to become ready.
 ///
 /// If a `--config <dir>` override is provided, sets the `FLOW_CONFIG_DIR`
 /// environment variable before spawning the daemon process. The daemon reads
 /// this variable on startup to locate its config files, so the override is
-/// propagated transparently through process inheritance.
+/// propagated transparently through process inheritance. The rest of the
+/// current environment is inherited as well (`RUST_LOG`, `FLOW_PIPE_NAME`,
+/// and the test-only `FLOW_FAIL_AT` fault injector all reach the daemon).
 ///
-/// If a `--log-file <path>` override is provided, it is forwarded to the
-/// daemon as a `--log-file` CLI argument (see [`spawn_daemon`]). Unlike
-/// `--config`, this is passed explicitly on the command line rather than via
-/// an environment variable.
+/// `--log-file`, `--no-restore`, `--verbose` and `--log-level` are forwarded
+/// to the daemon as CLI arguments (see [`spawn_daemon`]).
+///
+/// Readiness is decided by [`wait_for_daemon`]: the spawned child is kept and
+/// polled, the daemon's `flowd.status` file is read (pid-checked), and a
+/// `Ping` round-trip must succeed. On failure the exact line
+/// `flow: FlowWM failed to start at step '<stage>': <reason> (log: <path>)`
+/// is printed and the process exits with the daemon's stage exit code.
 ///
 /// When `ahk` is true, the user's `flow.ahk` is launched via
 /// [`autostart::spawn_ahk_script`] after the daemon is ready, so the daemon
@@ -444,21 +550,17 @@ fn main() {
 ///
 /// # Errors
 ///
-/// Returns an error string if:
+/// Returns a [`StartError`] if:
 /// - The daemon is already running.
 /// - The user's `flow.toml` cannot be parsed (pre-flight config check fails).
 /// - The daemon binary cannot be found.
 /// - The daemon fails to spawn.
+/// - The daemon reports a failed startup stage or exits early.
 /// - The daemon does not become ready within [`DAEMON_START_TIMEOUT`].
 /// - `ahk` is true and `flow.ahk` cannot be launched.
-fn cmd_start(
-    config_override: Option<String>,
-    log_file_override: Option<String>,
-    ahk: bool,
-    no_restore: bool,
-) -> Result<(), String> {
+fn cmd_start(opts: StartOptions) -> Result<(), StartError> {
     // Set env var before any daemon interaction so the spawned child inherits it.
-    if let Some(ref dir) = config_override {
+    if let Some(ref dir) = opts.config_override {
         // SAFETY: This is called in the CLI process before spawning the daemon
         // child. There are no other threads reading this env var at this point,
         // and the CLI is a short-lived process with no concurrent Rust code.
@@ -466,25 +568,45 @@ fn cmd_start(
     }
 
     if transport::is_daemon_running() {
-        return Err("daemon is already running".into());
+        return Err("daemon is already running".to_owned().into());
     }
 
     // Pre-flight config check: surface `flow.toml`/`flow-rules.toml` errors on the
     // user's terminal before spawning, because the detached daemon's
     // stdout/stderr are discarded. Reuses the daemon's own loaders (same crate),
     // so the verdict matches — no desync between client and daemon.
-    let config_dir = config::dirs::resolve_config_dir(config_override.as_deref().map(Path::new));
+    let config_dir =
+        config::dirs::resolve_config_dir(opts.config_override.as_deref().map(Path::new));
     let config = preflight_config_check(&config_dir)?;
 
-    spawn_daemon(log_file_override.as_deref(), no_restore)?;
-    wait_for_daemon()?;
+    // Where the daemon will log, so a failure line can point at it even if
+    // the daemon died before writing its status file.
+    let expected_log_path = match opts.log_file_override.as_deref() {
+        Some(p) => PathBuf::from(p),
+        None => logging::default_log_path(&config_dir),
+    };
 
-    println!("flow: daemon started");
+    // A stale status file from a previous daemon must never be read as this
+    // one's. The pid check in `wait_for_daemon` is the real guard; removing
+    // the file first just avoids confusing a human looking at it.
+    startup::remove_status(&config_dir);
+
+    let mut child = spawn_daemon(&opts)?;
+    let summary = wait_for_daemon(&mut child, &config_dir, &expected_log_path)?;
+    // The daemon keeps running detached; dropping the handle does not kill it.
+    drop(child);
+
+    println!(
+        "flow: daemon started (pid {}, {} monitor(s), log: {})",
+        summary.pid,
+        summary.monitors,
+        expected_log_path.display()
+    );
     // The daemon auto-restores the last loadout during its own init (it is
     // passed `--no-restore` when the user opted out), so no IPC round-trip
     // happens here — this sidesteps the startup pipe race.
 
-    if ahk {
+    if opts.ahk {
         // Launch AHK after the daemon is listening so the first hotkey lands.
         let pid = autostart::spawn_ahk_script()?;
         println!("flow: launched flow.ahk (pid {pid})");
@@ -493,6 +615,32 @@ fn cmd_start(
     maybe_notify_update(&config);
 
     Ok(())
+}
+
+/// `flow ping`: one `Ping` round-trip, printing the daemon's identity.
+///
+/// # Errors
+///
+/// Returns an error string if the daemon is not running, does not answer,
+/// or answers with anything but `Pong`.
+fn cmd_ping() -> Result<(), String> {
+    let response = transport::send_message(&SocketMessage::Ping)
+        .map_err(|e| format!("daemon not reachable: {e}"))?;
+    match response {
+        SocketResponse::Pong {
+            version,
+            pid,
+            monitors,
+            hooks_registered,
+        } => {
+            println!(
+                "flow: pong from flowd {version} (pid {pid}, {monitors} monitor(s), {hooks_registered} hook(s) registered)"
+            );
+            Ok(())
+        }
+        SocketResponse::Error { message } => Err(format!("daemon error: {message}")),
+        other => Err(format!("unexpected reply to ping: {other:?}")),
+    }
 }
 
 /// Best-effort start-time update notification, gated by `check_for_updates`.
@@ -799,6 +947,7 @@ fn cmd_query_all() -> Result<(), String> {
             Ok(())
         }
         SocketResponse::Busy => Err("daemon is busy (drag in progress), retry shortly".to_string()),
+        SocketResponse::Pong { .. } => Err("unexpected pong reply to a query".to_string()),
     }
 }
 
@@ -999,6 +1148,7 @@ fn send_command(msg: SocketMessage, success_msg: &str) -> Result<(), String> {
             Ok(())
         }
         SocketResponse::Busy => Err("daemon is busy (drag in progress), retry shortly".to_string()),
+        SocketResponse::Pong { .. } => Err("unexpected pong reply to a command".to_string()),
     }
 }
 
@@ -1042,50 +1192,60 @@ fn resolve_editor() -> Result<String, String> {
 ///
 /// Falls back to a plain `spawn()` when the detached spawn fails (e.g., under
 /// WSL interop).
-fn spawn_daemon(log_file_override: Option<&str>, no_restore: bool) -> Result<(), String> {
+///
+/// The [`Child`] is returned (not dropped) so [`wait_for_daemon`] can notice
+/// an early exit via `try_wait`; dropping it later does not kill the daemon.
+fn spawn_daemon(opts: &StartOptions) -> Result<Child, String> {
     let exe = find_daemon_exe()?;
 
     // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
     const DETACHED: u32 = 0x00000200 | 0x08000000;
 
     // Try detached spawn first (native Windows), fall back to plain spawn (WSL).
-    // Both paths forward `--log-file` and `--no-restore` when provided.
-    let child = daemon_command(&exe, log_file_override, no_restore)
+    // Both paths forward the same daemon flags.
+    daemon_command(&exe, opts)
         .creation_flags(DETACHED)
         .spawn()
-        .or_else(|_| daemon_command(&exe, log_file_override, no_restore).spawn())
-        .map_err(|e| format!("failed to spawn daemon ({}): {e}", exe.display()))?;
-
-    // Explicitly drop the Child handle so we don't wait on the process.
-    // The daemon runs independently in the background.
-    drop(child);
-
-    Ok(())
+        .or_else(|_| daemon_command(&exe, opts).spawn())
+        .map_err(|e| format!("failed to spawn daemon ({}): {e}", exe.display()))
 }
 
-/// Build the daemon [`Command`] with any `--log-file` / `--no-restore` flags
-/// applied.
+/// Build the daemon [`Command`] with the forwarded flags applied
+/// (`--log-file`, `--no-restore`, `--verbose`, `--log-level`).
 ///
 /// Factored out so [`spawn_daemon`] can construct an identical command for
-/// both the native detached spawn and the WSL fallback spawn — the
-/// `--log-file` and `--no-restore` arguments must be present on both paths
-/// for the override to take effect regardless of which spawn path succeeds.
+/// both the native detached spawn and the WSL fallback spawn — the forwarded
+/// arguments must be present on both paths for the overrides to take effect
+/// regardless of which spawn path succeeds.
 ///
 /// The config directory is NOT passed here; it is propagated to the daemon
 /// via the inherited `FLOW_CONFIG_DIR` environment variable (see [`cmd_start`]).
-fn daemon_command(
-    exe: &std::path::Path,
-    log_file_override: Option<&str>,
-    no_restore: bool,
-) -> Command {
+/// The environment is inherited unchanged, so `FLOW_FAIL_AT` (test-only fault
+/// injection) and `RUST_LOG` reach the daemon too.
+fn daemon_command(exe: &Path, opts: &StartOptions) -> Command {
     let mut cmd = Command::new(exe);
-    if let Some(path) = log_file_override {
-        cmd.arg("--log-file").arg(path);
-    }
-    if no_restore {
-        cmd.arg("--no-restore");
-    }
+    cmd.args(daemon_args(opts));
     cmd
+}
+
+/// The daemon CLI arguments derived from [`StartOptions`], in a stable order.
+fn daemon_args(opts: &StartOptions) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(path) = &opts.log_file_override {
+        args.push("--log-file".to_owned());
+        args.push(path.clone());
+    }
+    if opts.no_restore {
+        args.push("--no-restore".to_owned());
+    }
+    if opts.verbose {
+        args.push("--verbose".to_owned());
+    }
+    if let Some(level) = &opts.log_level {
+        args.push("--log-level".to_owned());
+        args.push(level.clone());
+    }
+    args
 }
 
 /// Locate the `flowd.exe` binary next to the current executable.
@@ -1105,22 +1265,121 @@ fn find_daemon_exe() -> Result<std::path::PathBuf, String> {
     Err(format!("daemon binary not found at {}", daemon.display()))
 }
 
-/// Wait for the daemon to finish initialization by polling the named pipe.
+/// Wait for the spawned daemon to finish initialization, or explain why it
+/// did not.
 ///
-/// Polls [`transport::is_daemon_running`] (which connects and immediately
-/// drops the handle) until the daemon has created the pipe and entered its
-/// accept loop, or the timeout expires.
-fn wait_for_daemon() -> Result<(), String> {
+/// Every [`DAEMON_POLL_INTERVAL`] this checks, in order:
+///
+/// 1. `child.try_wait()` — the daemon exited. Its status file (if it got
+///    that far and the pid matches) names the stage; the exit code is
+///    reused for `flow`'s own exit.
+/// 2. `<config_dir>/flowd.status` with `pid == child.id()` — a stale file
+///    from an earlier daemon is ignored. `state: error` fails immediately
+///    with the reported stage; `state: ready` moves on to step 3.
+/// 3. A `Ping` round-trip whose `Pong.pid` matches the child — only then is
+///    the daemon considered started.
+///
+/// Times out after [`DAEMON_START_TIMEOUT`], naming the last stage seen.
+fn wait_for_daemon(
+    child: &mut Child,
+    config_dir: &Path,
+    expected_log_path: &Path,
+) -> Result<StartSummary, StartError> {
+    let child_pid = child.id();
     let deadline = std::time::Instant::now() + DAEMON_START_TIMEOUT;
+    let mut last_stage: Option<String> = None;
+
     loop {
-        if transport::is_daemon_running() {
-            return Ok(());
+        // 1. Did the daemon exit?
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("failed to poll daemon process: {e}"))?
+        {
+            let exit_code = status.code().unwrap_or(1);
+            return Err(match own_status(config_dir, child_pid) {
+                Some(st) if st.state == StartupState::Error => StartError::at_stage(
+                    st.stage.name(),
+                    &st.reason,
+                    log_path_of(&st, expected_log_path),
+                    if exit_code > 1 {
+                        exit_code
+                    } else {
+                        st.stage.exit_code()
+                    },
+                ),
+                Some(st) => StartError::at_stage(
+                    st.stage.name(),
+                    &format!("daemon exited with {status} after this step"),
+                    log_path_of(&st, expected_log_path),
+                    exit_code.max(1),
+                ),
+                None => StartError::at_stage(
+                    "unknown",
+                    &format!("daemon exited with {status} before reporting any step"),
+                    expected_log_path,
+                    exit_code.max(1),
+                ),
+            });
         }
+
+        // 2. What does the status file say (ours only)?
+        if let Some(st) = own_status(config_dir, child_pid) {
+            last_stage = Some(st.stage.name().to_owned());
+            match st.state {
+                StartupState::Error => {
+                    return Err(StartError::at_stage(
+                        st.stage.name(),
+                        &st.reason,
+                        log_path_of(&st, expected_log_path),
+                        st.stage.exit_code(),
+                    ));
+                }
+                StartupState::Ready => {
+                    // 3. Must actually answer on the pipe.
+                    if let Ok(SocketResponse::Pong {
+                        pid,
+                        monitors,
+                        hooks_registered,
+                        ..
+                    }) = transport::send_message(&SocketMessage::Ping)
+                        && pid == child_pid
+                    {
+                        return Ok(StartSummary {
+                            pid,
+                            monitors,
+                            hooks_registered,
+                        });
+                    }
+                }
+                StartupState::Starting => {}
+            }
+        }
+
         if std::time::Instant::now() >= deadline {
-            return Err("timed out waiting for daemon to start".into());
+            let stage = last_stage.unwrap_or_else(|| "unknown".to_owned());
+            return Err(StartError::at_stage(
+                &stage,
+                &format!(
+                    "timed out after {}s waiting for the daemon to become ready",
+                    DAEMON_START_TIMEOUT.as_secs()
+                ),
+                expected_log_path,
+                1,
+            ));
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(DAEMON_POLL_INTERVAL);
     }
+}
+
+/// Read the status file, keeping it only if it was written by `pid`.
+fn own_status(config_dir: &Path, pid: u32) -> Option<StartupStatus> {
+    startup::read_status(config_dir).filter(|st| st.pid == pid)
+}
+
+/// The log path to print for a status: the daemon's own if it recorded one,
+/// else the path the client expected it to use.
+fn log_path_of<'a>(status: &'a StartupStatus, fallback: &'a Path) -> &'a Path {
+    status.log_path.as_deref().unwrap_or(fallback)
 }
 
 #[cfg(test)]
@@ -1153,9 +1412,106 @@ mod tests {
                 config: None,
                 log_file: None,
                 ahk: false,
-                no_restore: false
+                no_restore: false,
+                verbose: false,
+                log_level: None,
             }
         ));
+    }
+
+    #[test]
+    fn parse_start_verbose_and_log_level() {
+        // Positive: both spellings of the verbose flag, and an explicit level.
+        for flag in ["--verbose", "-v"] {
+            let cli = Cli::try_parse_from(["flow", "start", flag]).unwrap();
+            assert!(
+                matches!(cli.command, Commands::Start { verbose: true, .. }),
+                "{flag} should set verbose"
+            );
+        }
+        let cli = Cli::try_parse_from(["flow", "start", "--log-level", "trace"]).unwrap();
+        match cli.command {
+            Commands::Start {
+                log_level: Some(ref l),
+                verbose: false,
+                ..
+            } => assert_eq!(l, "trace"),
+            other => panic!("expected Start with --log-level, got: {other:?}"),
+        }
+        // Negative: --log-level needs a value.
+        assert!(Cli::try_parse_from(["flow", "start", "--log-level"]).is_err());
+    }
+
+    #[test]
+    fn daemon_args_forward_every_start_flag() {
+        // Positive: each forwarded flag appears exactly as flowd expects it.
+        let opts = StartOptions {
+            config_override: Some("C:\\custom\\flow".to_owned()),
+            log_file_override: Some("C:\\tmp\\debug.log".to_owned()),
+            ahk: true,
+            no_restore: true,
+            verbose: true,
+            log_level: Some("trace".to_owned()),
+        };
+        assert_eq!(
+            daemon_args(&opts),
+            [
+                "--log-file",
+                "C:\\tmp\\debug.log",
+                "--no-restore",
+                "--verbose",
+                "--log-level",
+                "trace",
+            ]
+            .map(String::from)
+        );
+        // --config and --ahk are NOT daemon flags (env var / client-side).
+        assert_eq!(daemon_args(&StartOptions::default()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn start_error_message_format_is_exact() {
+        // Pin the failure line `flow start` prints (after the `flow: ` prefix).
+        let err = StartError::at_stage(
+            "hooks",
+            "mandatory WinEvent hook(s) failed to register: FOREGROUND",
+            Path::new("C:\\logs\\flowd-2026-10-19.log"),
+            15,
+        );
+        assert_eq!(
+            err.message,
+            "FlowWM failed to start at step 'hooks': mandatory WinEvent hook(s) failed to register: FOREGROUND (log: C:\\logs\\flowd-2026-10-19.log)"
+        );
+        assert_eq!(err.exit_code, 15);
+        // Plain string errors keep the generic exit code.
+        let generic: StartError = "daemon is already running".to_owned().into();
+        assert_eq!(generic.exit_code, 1);
+    }
+
+    #[test]
+    fn own_status_ignores_other_pids() {
+        // A stale status file from a previous daemon (different pid) must not
+        // be mistaken for the daemon we just spawned.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stale = StartupStatus {
+            pid: 1,
+            stage: flow_wm::daemon::StartupStage::Ready,
+            state: StartupState::Ready,
+            reason: String::new(),
+            log_path: None,
+        };
+        startup::write_status(dir.path(), &stale).unwrap();
+        assert!(own_status(dir.path(), 2).is_none());
+        assert_eq!(own_status(dir.path(), 1), Some(stale));
+        assert!(own_status(Path::new("C:\\does\\not\\exist"), 1).is_none());
+    }
+
+    #[test]
+    fn parse_ping() {
+        let cli = Cli::try_parse_from(["flow", "ping"]).unwrap();
+        assert!(matches!(cli.command, Commands::Ping));
+        // Negative: ping takes no arguments.
+        assert!(Cli::try_parse_from(["flow", "ping", "now"]).is_err());
     }
 
     #[test]
@@ -2226,14 +2582,60 @@ mod tests {
         );
     }
 
-    // Positive: wait_for_daemon() correctly wraps transport::wait_for_pipe errors.
-    // Verifies the error-formatting wrapper in wait_for_daemon().
-    // It cannot call wait_for_daemon() directly (would block on pipe),
-    // but we verify the function exists and is callable by confirming it
-    // compiles and its signature returns Result<(), String>.
+    // Positive: wait_for_daemon() reports an early daemon exit as a staged
+    // failure. A child that exits immediately (`cmd.exe /c exit 3`) and never
+    // writes a status file must yield the "before reporting any step" line
+    // with the expected log path and the child's exit code.
     #[test]
-    fn wait_for_daemon_maps_not_found_error() {
-        let _: fn() -> Result<(), String> = wait_for_daemon;
+    fn wait_for_daemon_reports_early_exit_without_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("flowd.log");
+        let mut child = Command::new("cmd.exe")
+            .args(["/c", "exit", "3"])
+            .spawn()
+            .expect("spawn cmd");
+        let err = wait_for_daemon(&mut child, dir.path(), &log).unwrap_err();
+        assert_eq!(err.exit_code, 3);
+        assert!(
+            err.message
+                .starts_with("FlowWM failed to start at step 'unknown': daemon exited with"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.ends_with(&format!("(log: {})", log.display())));
+    }
+
+    // Positive: a status file written by the spawned pid with `state: error`
+    // is reported with that stage's exit code, even though the child is
+    // still alive (the daemon writes the file just before exiting).
+    #[test]
+    fn wait_for_daemon_reports_error_status_for_own_pid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("flowd.log");
+        // A child that outlives the poll: wait long enough for one iteration.
+        let mut child = Command::new("cmd.exe")
+            .args(["/c", "ping -n 3 127.0.0.1 > nul"])
+            .spawn()
+            .expect("spawn cmd");
+        let status = StartupStatus {
+            pid: child.id(),
+            stage: flow_wm::daemon::StartupStage::Hooks,
+            state: StartupState::Error,
+            reason: "injected failure (FLOW_FAIL_AT)".to_owned(),
+            log_path: Some(dir.path().join("daemon-chosen.log")),
+        };
+        startup::write_status(dir.path(), &status).unwrap();
+        let err = wait_for_daemon(&mut child, dir.path(), &log).unwrap_err();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(err.exit_code, 15);
+        assert_eq!(
+            err.message,
+            format!(
+                "FlowWM failed to start at step 'hooks': injected failure (FLOW_FAIL_AT) (log: {})",
+                dir.path().join("daemon-chosen.log").display()
+            )
+        );
     }
 
     // --- resolve_editor tests ---

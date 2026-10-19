@@ -463,6 +463,7 @@ pub fn query_windows(pipe: &str) -> Result<serde_json::Value, String> {
         SocketResponse::Error { message } => Err(format!("daemon error: {message}")),
         SocketResponse::Ok => Err("unexpected Ok response".into()),
         SocketResponse::Busy => Err("daemon busy (tile drag in progress)".into()),
+        SocketResponse::Pong { .. } => Err("unexpected Pong response".into()),
     }
 }
 
@@ -484,6 +485,7 @@ pub fn query_layout_virtual(pipe: &str) -> Result<serde_json::Value, String> {
         SocketResponse::Error { message } => Err(format!("daemon error: {message}")),
         SocketResponse::Ok => Err("unexpected Ok response".into()),
         SocketResponse::Busy => Err("daemon busy (tile drag in progress)".into()),
+        SocketResponse::Pong { .. } => Err("unexpected Pong response".into()),
     }
 }
 
@@ -604,6 +606,7 @@ pub fn query_layout_actual(pipe: &str) -> Result<serde_json::Value, String> {
         SocketResponse::Error { message } => Err(format!("daemon error: {message}")),
         SocketResponse::Ok => Err("unexpected Ok response".into()),
         SocketResponse::Busy => Err("daemon busy (tile drag in progress)".into()),
+        SocketResponse::Pong { .. } => Err("unexpected Pong response".into()),
     }
 }
 

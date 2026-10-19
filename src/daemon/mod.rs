@@ -37,6 +37,8 @@
 //! - [`config_derive`] — configuration derivation helpers and tests
 //! - [`shutdown`] — graceful-shutdown window rescue
 //!   ([`FlowWM::rescue_stranded_windows`])
+//! - [`startup`] — staged startup reporting ([`StartupStage`],
+//!   [`StartupError`], the `flowd.status` file, `FLOW_FAIL_AT` injection)
 //!
 //! The threading model, the hook/IPC event pipelines, and per-event behavior
 //! tables are documented with sequence diagrams in the developer guide
@@ -54,7 +56,9 @@ mod loadout;
 mod new;
 mod query;
 mod run;
-mod shutdown;
+pub mod shutdown;
+pub mod startup;
 mod types;
 
+pub use startup::{StartupError, StartupReporter, StartupStage};
 pub use types::FlowWM;

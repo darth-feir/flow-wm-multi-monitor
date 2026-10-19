@@ -98,6 +98,15 @@ impl FlowWM {
                 SocketResponse::Ok
             }
 
+            // --- Liveness ---
+            // Read-only: reports identity and health, never touches layout.
+            SocketMessage::Ping => SocketResponse::Pong {
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                pid: std::process::id(),
+                monitors: self.monitors.len(),
+                hooks_registered: self.hook_handle.registered_hooks(),
+            },
+
             // --- Focus ---
             SocketMessage::FocusLeft => self.dispatch_focus(Direction::Left),
             SocketMessage::FocusRight => self.dispatch_focus(Direction::Right),
