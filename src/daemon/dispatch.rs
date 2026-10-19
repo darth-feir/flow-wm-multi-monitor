@@ -1213,8 +1213,11 @@ impl FlowWM {
     fn set_window_to_float(&mut self, focused: WindowId) -> SocketResponse {
         // a) Remove from scrolling. remove_window handles focus fallback
         //    (next_available_window) and ensure_column_visible internally.
-        let source_applied = self
-            .active_monitor_mut()
+        let idx = self
+            .monitor_index_containing(focused)
+            .unwrap_or(self.active_monitor);
+        self.set_active_monitor(idx);
+        let source_applied = self.monitors[idx]
             .active_scrolling_mut()
             .remove_window(focused);
         let source_virtual = source_applied.virtual_layout.clone();
@@ -1254,7 +1257,10 @@ impl FlowWM {
     /// [`FloatingSpace::centered_rect`]; this helper just resolves the
     /// preferred size. See (`docs/src/dev-guide/floating-space.md`).
     pub(super) fn centered_float_rect(&self, focused: WindowId) -> Rect {
-        let work_area = self.active_scrolling().monitor().work_area;
+        // Centre on the monitor the window is currently on, not blindly on
+        // the active one.
+        let idx = self.monitor_index_for_hwnd(focused.0);
+        let work_area = self.monitors[idx].active_scrolling().monitor().work_area;
         // Each dimension uses the user's explicit pixel value when set, else
         // the built-in fallback (fraction of work area, capped). The cap only
         // applies to the fallback path — explicit values are respected as-is.
@@ -1298,12 +1304,20 @@ impl FlowWM {
     /// the animator's float-suppression can detect the window as a tracked
     /// float and arm itself.
     pub(super) fn register_float(&mut self, focused: WindowId, rect: Rect) -> ActualLayout {
-        self.active_workspace_mut().floating.add(focused, rect);
+        // A float belongs to the monitor its rect is on.
+        let idx = self.monitor_index_for_rect(rect);
+        self.monitors[idx]
+            .active_workspace_mut()
+            .floating
+            .add(focused, rect);
         if let Some(window) = self.registry.get_window_mut(HWND(focused.0 as *mut _)) {
             window.state = WindowState::Floating(FloatingState::Active { rect });
         }
         add_float_hwnd(focused.0);
-        self.active_workspace_mut().floating.to_actual_layout()
+        self.monitors[idx]
+            .active_workspace_mut()
+            .floating
+            .to_actual_layout()
     }
 
     /// Transition a window from floating to tiling.
@@ -1317,7 +1331,11 @@ impl FlowWM {
     /// write, with `col`/`row` sourced from the destination virtual layout.
     fn set_window_to_tile(&mut self, focused: WindowId) -> SocketResponse {
         // a) Remove from floating space.
-        self.active_workspace_mut().floating.remove(focused);
+        // The float may be registered on any monitor's active workspace;
+        // drop it from wherever it is.
+        for m in &mut self.monitors {
+            m.active_workspace_mut().floating.remove(focused);
+        }
 
         // Drop from the float-tracking set so the LOCATIONCHANGE callback no
         // longer forwards this window (it is becoming a tiled window).
@@ -1326,8 +1344,11 @@ impl FlowWM {
         // b) Insert into scrolling. insert_window places after
         //    last_focused_window, shifts right, sets last_focused_window,
         //    and calls ensure_column_visible internally.
-        let dest_applied = self
-            .active_monitor_mut()
+        // Tile it on the monitor it is physically on (the user may have
+        // dragged the float there), and make that monitor active.
+        let idx = self.monitor_index_for_hwnd(focused.0);
+        self.set_active_monitor(idx);
+        let dest_applied = self.monitors[idx]
             .active_scrolling_mut()
             .insert_window(focused);
         let dest_virtual = dest_applied.virtual_layout.clone();
@@ -1338,7 +1359,10 @@ impl FlowWM {
         self.registry.update_tiled_rects(&dest_actual);
 
         // d) Get the floating layout (now without the removed window).
-        let float_actual = self.active_workspace_mut().floating.to_actual_layout();
+        let float_actual = self.monitors[idx]
+            .active_workspace_mut()
+            .floating
+            .to_actual_layout();
 
         // Registry state is already set to Tiling(Active { col, row }) by
         // update_tiling_slots_from_layout above — no manual write needed.
@@ -1777,14 +1801,12 @@ mod tests {
         }
         registry.set_focused(TEST_HWND);
 
-        let monitor_info = MonitorInfo {
-            work_area: Rect {
-                x: 0,
-                y: 0,
-                width: 1920,
-                height: 1080,
-            },
-        };
+        let monitor_info = MonitorInfo::single(Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        });
         let padding = Padding {
             window_gap: 4,
             up: 0,

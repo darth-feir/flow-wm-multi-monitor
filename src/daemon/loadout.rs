@@ -250,10 +250,7 @@ impl FlowWM {
     ///
     /// Thin wrapper over [`Self::apply_loadout`] that maps the `Result` to a
     /// [`SocketResponse`] for the IPC layer.
-    pub(super) fn dispatch_loadout_load(
-        &mut self,
-        path: Option<PathBuf>,
-    ) -> SocketResponse {
+    pub(super) fn dispatch_loadout_load(&mut self, path: Option<PathBuf>) -> SocketResponse {
         match self.apply_loadout(path) {
             Ok(()) => SocketResponse::Ok,
             Err(e) => {
@@ -334,6 +331,7 @@ impl FlowWM {
         }
 
         struct ResolvedWorkspace {
+            monitor: u32,
             workspace_id: u32,
             columns: Vec<(u32, Vec<WindowId>)>,
             focus: Option<WindowId>,
@@ -375,6 +373,7 @@ impl FlowWM {
             });
 
             resolved_workspaces.push(ResolvedWorkspace {
+                monitor: ws_snap.monitor,
                 workspace_id: ws_snap.workspace_id,
                 columns,
                 focus,
@@ -404,11 +403,20 @@ impl FlowWM {
             let ws_id = WorkspaceId(rw.workspace_id);
             // Find which monitor owns this workspace, and get its index.
             let (monitor_idx, ws_idx) = {
-                let mut found = None;
-                for (mi, monitor) in self.monitors.iter().enumerate() {
-                    if let Some(wsi) = monitor.find_workspace_index(ws_id) {
-                        found = Some((mi, wsi));
-                        break;
+                // Workspace ids repeat per monitor (1..=10 on each), so the
+                // snapshot's monitor index disambiguates. A file from a
+                // desktop with fewer monitors falls back to the first match.
+                let mut found = self
+                    .monitors
+                    .get(rw.monitor as usize)
+                    .and_then(|m| m.find_workspace_index(ws_id))
+                    .map(|wsi| (rw.monitor as usize, wsi));
+                if found.is_none() {
+                    for (mi, monitor) in self.monitors.iter().enumerate() {
+                        if let Some(wsi) = monitor.find_workspace_index(ws_id) {
+                            found = Some((mi, wsi));
+                            break;
+                        }
                     }
                 }
                 match found {
@@ -477,68 +485,47 @@ impl FlowWM {
         //    falling back to workspace 1) — used when the foreground is absent
         //    (desktop focus) or belongs to no managed workspace.
         let foreground = crate::registry::win32::get_foreground_window().map(WindowId);
-        let target_id = resolve_seating_target(
-            self.active_monitor().workspaces(),
-            foreground,
-            &file.workspaces,
-        );
-
-        // 8. Make the target workspace the visible one. The apply above set
-        //    every workspace's logical layout; this selects which one is on
-        //    screen — the first half of a workspace switch, without its
-        //    teleport step (see step 10 for why the teleport is wrong here).
-        //    The target is always present on the active monitor in the
-        //    single-monitor daemon; the guard keeps a missing target from
-        //    panicking and leaves the freshly-applied layout visible.
-        if self
-            .active_monitor_mut()
-            .set_active_workspace(target_id)
-            .is_none()
-        {
-            log::warn!(
-                "loadout load: seating target workspace {} not found on the active monitor; \
-                 leaving the freshly-tiled layout in place",
-                target_id.0
-            );
-            log::info!("loadout load: applied layout from {resolved:?} (seating skipped)");
-            return Ok(());
-        }
-
-        // 9. Rebuild the TARGET workspace's float-tracking set so
-        //     LOCATIONCHANGE forwarding and animator float-suppression reflect
-        //     the loaded layout (mirrors switch_workspace_layout). Parked
-        //     workspaces' floats are excluded — they are off-screen and must
-        //     not be draggable, and excluding them prevents a stray
-        //     LOCATIONCHANGE during the seating animation from corrupting a
-        //     parked workspace's rect.
-        let target_floats: Vec<isize> = self
-            .active_workspace()
-            .floating
-            .windows()
-            .iter()
-            .map(|entry| entry.window_id.0)
-            .collect();
-        set_float_hwnds(&target_floats);
-
-        // 10. Seat the full workspace stack in one animation: the target
-        //     workspace settles at offset 0 (visible) and every other
-        //     non-empty workspace animates to its parking offset. This is the
-        //     core fix — previously only the active workspace animated, so the
-        //     physical workspace stacking was never established at load time
-        //     and only appeared after a manual workspace switch. The pure
-        //     `build_seating_batches` helper builds the batch; see its docs for
-        //     why this path deliberately shares the switch path's merge+offset
-        //     math but not its bystander-teleport step.
-        let monitor_height = self.active_monitor().screen_rect().height;
+        // Seat every monitor: each picks its own target workspace (the one
+        // holding the foreground window if it lives there, else the one the
+        // file marks active) and parks its other workspaces vertically.
+        let mut all_target_floats: Vec<isize> = Vec::new();
         let window_gap = self.active_scrolling().padding().window_gap;
-        let batches = build_seating_batches(
-            self.active_monitor().workspaces(),
-            target_id,
-            monitor_height,
-            window_gap,
-        );
-        self.animate_workspaces(&batches);
-
+        for mi in 0..self.monitors.len() {
+            let fg_here = foreground
+                .filter(|&wid| self.monitors[mi].find_workspace_containing(wid).is_some());
+            let snaps_here: Vec<WorkspaceSnapshot> = file
+                .workspaces
+                .iter()
+                .filter(|ws| ws.monitor as usize == mi)
+                .cloned()
+                .collect();
+            let target_id =
+                resolve_seating_target(self.monitors[mi].workspaces(), fg_here, &snaps_here);
+            if self.monitors[mi].set_active_workspace(target_id).is_none() {
+                log::warn!(
+                    "loadout load: seating target workspace {} not found on monitor {mi};                      leaving its freshly-tiled layout in place",
+                    target_id.0
+                );
+                continue;
+            }
+            all_target_floats.extend(
+                self.monitors[mi]
+                    .active_workspace()
+                    .floating
+                    .windows()
+                    .iter()
+                    .map(|entry| entry.window_id.0),
+            );
+            let monitor_height = self.monitors[mi].screen_rect().height;
+            let batches = build_seating_batches(
+                self.monitors[mi].workspaces(),
+                target_id,
+                monitor_height,
+                window_gap,
+            );
+            self.animate_workspaces(&batches);
+        }
+        set_float_hwnds(&all_target_floats);
         log::info!("loadout load: restored layout from {resolved:?}");
         Ok(())
     }
@@ -563,12 +550,13 @@ impl FlowWM {
     /// workspace.
     fn snapshot_workspaces(&self) -> Vec<WorkspaceSnapshot> {
         let mut snapshots = Vec::new();
-        for monitor in &self.monitors {
+        for (mi, monitor) in self.monitors.iter().enumerate() {
             let active_ws_id = monitor.active_workspace_id();
             for ws in monitor.workspaces() {
                 let scrolling = self.snapshot_scrolling(ws);
                 let floating = self.snapshot_floating(ws);
                 snapshots.push(WorkspaceSnapshot {
+                    monitor: mi as u32,
                     workspace_id: ws.id.0,
                     active: ws.id == active_ws_id,
                     scrolling,
@@ -716,12 +704,14 @@ mod tests {
     fn saved_active_target_picks_the_marked_workspace() {
         let snaps = vec![
             WorkspaceSnapshot {
+                monitor: 0,
                 workspace_id: 1,
                 active: false,
                 scrolling: empty_scrolling_snap(),
                 floating: vec![],
             },
             WorkspaceSnapshot {
+                monitor: 0,
                 workspace_id: 2,
                 active: true,
                 scrolling: empty_scrolling_snap(),
@@ -735,6 +725,7 @@ mod tests {
     #[test]
     fn saved_active_target_falls_back_to_workspace_one_when_none_marked() {
         let snaps = vec![WorkspaceSnapshot {
+            monitor: 0,
             workspace_id: 3,
             active: false,
             scrolling: empty_scrolling_snap(),
@@ -945,6 +936,7 @@ mod tests {
         ];
         // Saved-active is workspace 1, but the foreground window lives on ws 2.
         let saved = vec![WorkspaceSnapshot {
+            monitor: 0,
             workspace_id: 1,
             active: true,
             scrolling: empty_scrolling_snap(),
@@ -965,6 +957,7 @@ mod tests {
         ];
         // Foreground window 999 is not on any workspace → saved-active ws 2.
         let saved = vec![WorkspaceSnapshot {
+            monitor: 0,
             workspace_id: 2,
             active: true,
             scrolling: empty_scrolling_snap(),
@@ -981,6 +974,7 @@ mod tests {
     fn seating_target_falls_back_to_saved_when_no_foreground() {
         let workspaces = vec![make_workspace_with_tile(1, WindowId(100))];
         let saved = vec![WorkspaceSnapshot {
+            monitor: 0,
             workspace_id: 1,
             active: true,
             scrolling: empty_scrolling_snap(),
@@ -1013,14 +1007,12 @@ mod tests {
     /// monitor, mirroring `workspace::monitor::tests::make_scrolling`.
     fn make_scrolling() -> ScrollingSpace {
         ScrollingSpace::new(
-            MonitorInfo {
-                work_area: Rect {
-                    x: 0,
-                    y: 0,
-                    width: 1920,
-                    height: 1080,
-                },
-            },
+            MonitorInfo::single(Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }),
             960,
             320,
             100,

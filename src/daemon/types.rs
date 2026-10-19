@@ -242,6 +242,56 @@ impl FlowWM {
         &mut self.monitors[self.active_monitor]
     }
 
+    /// Make `idx` the active monitor. Out-of-range indices are ignored.
+    pub(super) fn set_active_monitor(&mut self, idx: usize) {
+        if idx < self.monitors.len() && idx != self.active_monitor {
+            log::debug!("active monitor {} -> {}", self.active_monitor, idx);
+            self.active_monitor = idx;
+        }
+    }
+
+    /// Index of the monitor whose workspaces (tiling or floating) contain
+    /// `window`, if any.
+    #[must_use]
+    pub(super) fn monitor_index_containing(
+        &self,
+        window: crate::common::WindowId,
+    ) -> Option<usize> {
+        self.monitors
+            .iter()
+            .position(|m| m.find_workspace_containing(window).is_some())
+    }
+
+    /// Index of the monitor whose screen rect overlaps `rect`, preferring the
+    /// one containing the rect's centre. Falls back to the active monitor.
+    #[must_use]
+    pub(super) fn monitor_index_for_rect(&self, rect: crate::common::Rect) -> usize {
+        let cx = rect.x + rect.width / 2;
+        let cy = rect.y + rect.height / 2;
+        if let Some(i) = self.monitors.iter().position(|m| {
+            let s = m.screen_rect();
+            cx >= s.x && cx < s.right() && cy >= s.y && cy < s.bottom()
+        }) {
+            return i;
+        }
+        self.monitors
+            .iter()
+            .position(|m| m.screen_rect().overlaps(rect))
+            .unwrap_or(self.active_monitor)
+    }
+
+    /// Index of the monitor that currently displays `hwnd` (by its on-screen
+    /// rect), falling back to the active monitor when the rect is unknown.
+    #[must_use]
+    pub(super) fn monitor_index_for_hwnd(&self, hwnd: isize) -> usize {
+        match crate::registry::win32::get_window_rect(windows::Win32::Foundation::HWND(
+            hwnd as *mut _,
+        )) {
+            Ok(rect) => self.monitor_index_for_rect(rect),
+            Err(_) => self.active_monitor,
+        }
+    }
+
     /// Borrow the active workspace (the one currently on screen) of the
     /// active monitor.
     ///

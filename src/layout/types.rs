@@ -264,6 +264,67 @@ impl Default for ActualLayout {
 pub struct MonitorInfo {
     /// Monitor work area in screen coordinates.
     pub work_area: Rect,
+    /// Bounding box of every attached monitor (the Win32 "virtual screen").
+    /// Off-viewport columns are parked outside this box so they can never
+    /// land on a neighbouring monitor. For a single monitor this equals the
+    /// monitor's own screen rect.
+    pub virtual_screen: Rect,
+    /// Another monitor sits somewhere beyond this monitor's left edge.
+    /// A column that would overhang that edge is parked instead of being
+    /// allowed to spill onto the neighbour.
+    pub neighbour_left: bool,
+    /// Another monitor sits somewhere beyond this monitor's right edge.
+    pub neighbour_right: bool,
+}
+
+impl MonitorInfo {
+    /// Monitor info for a single-monitor desktop: the virtual screen is the
+    /// work area itself and there are no neighbours. Used by tests and by the
+    /// single-monitor code paths.
+    #[must_use]
+    pub fn single(work_area: Rect) -> Self {
+        Self {
+            work_area,
+            virtual_screen: work_area,
+            neighbour_left: false,
+            neighbour_right: false,
+        }
+    }
+
+    /// Monitor info for one monitor of a multi-monitor desktop.
+    ///
+    /// `screen_rect` is this monitor's full bounds, `virtual_screen` the
+    /// bounding box of all monitors, and `others` the screen rects of every
+    /// other monitor. A neighbour exists on a side when any other monitor
+    /// overlaps this monitor's vertical band beyond that edge.
+    #[must_use]
+    pub fn in_desktop(
+        work_area: Rect,
+        screen_rect: Rect,
+        virtual_screen: Rect,
+        others: &[Rect],
+    ) -> Self {
+        let shares_band = |o: &Rect| o.y < screen_rect.bottom() && o.bottom() > screen_rect.y;
+        let neighbour_left = others
+            .iter()
+            .any(|o| shares_band(o) && o.right() <= screen_rect.x);
+        let neighbour_right = others
+            .iter()
+            .any(|o| shares_band(o) && o.x >= screen_rect.right());
+        Self {
+            work_area,
+            virtual_screen,
+            neighbour_left,
+            neighbour_right,
+        }
+    }
+
+    /// Whether `rect` lies entirely outside the virtual screen, i.e. it is a
+    /// parked (hidden) window rather than a visible one.
+    #[must_use]
+    pub fn is_parked(&self, rect: Rect) -> bool {
+        !rect.overlaps(self.virtual_screen)
+    }
 }
 
 /// Gap and margin configuration for the layout engine.

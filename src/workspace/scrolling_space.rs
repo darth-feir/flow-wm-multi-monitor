@@ -58,9 +58,7 @@ use crate::layout::types::{ActualLayout, AppliedLayout, MonitorInfo, Padding, Vi
 /// use flow_wm::layout::types::{MonitorInfo, Padding};
 /// use flow_wm::common::{Rect, WindowId, Direction};
 ///
-/// let monitor = MonitorInfo {
-///     work_area: Rect { x: 0, y: 0, width: 1920, height: 1080 },
-/// };
+/// let monitor = MonitorInfo::single(Rect { x: 0, y: 0, width: 1920, height: 1080 });
 /// let mut engine = ScrollingSpace::new(monitor, 960, 320, 100, 100, Padding { window_gap: 4, up: 0, down: 0 }, 4);
 ///
 /// // Add windows (each becomes a new column, auto-focused)
@@ -561,9 +559,7 @@ impl ScrollingSpace {
     /// # use flow_wm::workspace::ScrollingSpace;
     /// # use flow_wm::layout::types::{MonitorInfo, Padding};
     /// # use flow_wm::common::WindowId;
-    /// # let monitor = MonitorInfo {
-    /// #     work_area: flow_wm::common::Rect { x: 0, y: 0, width: 1920, height: 1080 },
-    /// # };
+    /// # let monitor = MonitorInfo::single(flow_wm::common::Rect { x: 0, y: 0, width: 1920, height: 1080 });
     /// # let mut engine = ScrollingSpace::new(monitor, 960, 320, 100, 100, Padding { window_gap: 4, up: 0, down: 0 }, 4);
     /// engine.add_window(WindowId(1)); // col 0, focused
     /// engine.add_window(WindowId(2)); // col 1, focused
@@ -833,14 +829,12 @@ mod tests {
     use crate::common::Rect;
 
     fn test_monitor() -> MonitorInfo {
-        MonitorInfo {
-            work_area: Rect {
-                x: 0,
-                y: 0,
-                width: 1920,
-                height: 1080,
-            },
-        }
+        MonitorInfo::single(Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        })
     }
 
     fn test_padding() -> Padding {
@@ -1664,14 +1658,12 @@ mod tests {
         // Positive: focus within fully visible columns → diff is None (no viewport change).
         // The (WindowId, Option<AppliedLayout>) tuple must have None in the diff slot.
         // Use a wider monitor (3840px) so all 3 columns fit in the viewport without scroll.
-        let monitor = MonitorInfo {
-            work_area: Rect {
-                x: 0,
-                y: 0,
-                width: 3840,
-                height: 1080,
-            },
-        };
+        let monitor = MonitorInfo::single(Rect {
+            x: 0,
+            y: 0,
+            width: 3840,
+            height: 1080,
+        });
         let mut engine = ScrollingSpace::new(monitor, 960, 320, 100, 100, test_padding(), 4);
         engine.add_window(WindowId(1));
         engine.add_window(WindowId(2));

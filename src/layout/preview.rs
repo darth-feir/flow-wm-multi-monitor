@@ -373,14 +373,12 @@ mod tests {
     }
 
     fn test_monitor() -> MonitorInfo {
-        MonitorInfo {
-            work_area: Rect {
-                x: 0,
-                y: 0,
-                width: 1920,
-                height: 1080,
-            },
-        }
+        MonitorInfo::single(Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        })
     }
 
     /// Two-column layout: col 0 = [A], col 1 = [B, C].
@@ -873,14 +871,12 @@ mod tests {
     // =================================================================
 
     fn rdz_monitor() -> MonitorInfo {
-        MonitorInfo {
-            work_area: Rect {
-                x: 0,
-                y: 0,
-                width: 1000,
-                height: 1000,
-            },
-        }
+        MonitorInfo::single(Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 1000,
+        })
     }
 
     fn rdz_padding(gap: i32) -> Padding {

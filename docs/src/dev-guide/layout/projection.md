@@ -128,3 +128,13 @@ Padding is applied exclusively during projection and never stored on `Column`, `
 This separation has a practical benefit: the mutation layer operates on a padding-agnostic model. Swap, expand, shrink, and scroll never need to know about gaps or margins. Only the projection function — a single deterministic function with no side effects — handles the translation from the abstract to the physical.
 
 See [Overview](./overview.md) for the VirtualLayout/ActualLayout type relationship and [Mutations](./mutations.md) for the operations that produce the `VirtualLayout` inputs to projection.
+
+> **Multi-monitor note.** Parking zones are measured from the *virtual screen*
+> (the bounding box of every monitor, `MonitorInfo::virtual_screen`), not from
+> the monitor's own edge: left zone at `virtual_left - col_width - PARK_MARGIN`,
+> right zone at `virtual_right + PARK_MARGIN`. On a single monitor this is the
+> same as before. A partially visible column that would overhang an edge with a
+> neighbouring monitor beyond it (`MonitorInfo::neighbour_left/right`) is parked
+> instead, because Windows cannot clip a window at a monitor edge. The daemon
+> teleports (rather than tweens) windows whose slide would cross a neighbour
+> (`daemon/animation.rs`, `tween_crosses_neighbour`).

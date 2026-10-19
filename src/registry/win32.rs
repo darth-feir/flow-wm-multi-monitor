@@ -1166,6 +1166,11 @@ pub struct MonitorGeometry {
     pub screen_rect: Rect,
     /// Taskbar- and appbar-excluded work area (`rcWork`).
     pub work_area: Rect,
+    /// The `HMONITOR` handle, stored as an integer so the type stays `Copy`
+    /// and comparable. Used to match windows to monitors.
+    pub hmonitor: isize,
+    /// Whether Windows considers this the primary display.
+    pub is_primary: bool,
 }
 
 /// Get both the physical screen rect and the taskbar-excluded work area of
@@ -1214,9 +1219,19 @@ pub fn get_primary_monitor_info() -> Result<MonitorGeometry, String> {
         .ok()
         .map_err(|e| format!("GetMonitorInfoW failed: {e}"))?;
 
+    Ok(geometry_from_monitorinfo(hmonitor, &mi))
+}
+
+/// Convert a filled-in `MONITORINFO` into a [`MonitorGeometry`].
+fn geometry_from_monitorinfo(
+    hmonitor: windows::Win32::Graphics::Gdi::HMONITOR,
+    mi: &windows::Win32::Graphics::Gdi::MONITORINFO,
+) -> MonitorGeometry {
+    // MONITORINFOF_PRIMARY (winuser.h) is not exported by the windows crate.
+    const MONITORINFOF_PRIMARY: u32 = 1;
     let screen = mi.rcMonitor;
     let work = mi.rcWork;
-    Ok(MonitorGeometry {
+    MonitorGeometry {
         screen_rect: Rect {
             x: screen.left,
             y: screen.top,
@@ -1229,7 +1244,94 @@ pub fn get_primary_monitor_info() -> Result<MonitorGeometry, String> {
             width: work.right - work.left,
             height: work.bottom - work.top,
         },
-    })
+        hmonitor: hmonitor.0 as isize,
+        is_primary: (mi.dwFlags & MONITORINFOF_PRIMARY) != 0,
+    }
+}
+
+/// Enumerate every attached display monitor.
+///
+/// The primary monitor comes first; the rest follow in left-to-right,
+/// top-to-bottom order of their screen rects so the list is stable across
+/// runs. Fails only if `EnumDisplayMonitors` itself fails; a monitor whose
+/// `GetMonitorInfoW` fails is skipped with a warning.
+pub fn enumerate_monitors() -> Result<Vec<MonitorGeometry>, String> {
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    };
+    use windows::core::BOOL;
+
+    unsafe extern "system" fn collect(
+        hmonitor: HMONITOR,
+        _hdc: HDC,
+        _clip: *mut RECT,
+        lparam: LPARAM,
+    ) -> BOOL {
+        // SAFETY: lparam is the address of the `Vec<HMONITOR>` below, which
+        // outlives the synchronous EnumDisplayMonitors call.
+        let handles = unsafe { &mut *(lparam.0 as *mut Vec<HMONITOR>) };
+        handles.push(hmonitor);
+        BOOL(1)
+    }
+
+    let mut handles: Vec<HMONITOR> = Vec::new();
+    let ok = unsafe {
+        EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect),
+            LPARAM(&mut handles as *mut Vec<HMONITOR> as isize),
+        )
+    };
+    if !ok.as_bool() {
+        return Err("EnumDisplayMonitors failed".to_string());
+    }
+
+    let mut out = Vec::with_capacity(handles.len());
+    for hmonitor in handles {
+        let mut mi = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(hmonitor, &mut mi) }.as_bool() {
+            out.push(geometry_from_monitorinfo(hmonitor, &mi));
+        } else {
+            log::warn!(
+                "GetMonitorInfoW failed for monitor {:?}; skipping it",
+                hmonitor
+            );
+        }
+    }
+    if out.is_empty() {
+        return Err("no display monitors found".to_string());
+    }
+    out.sort_by_key(|m| (!m.is_primary, m.screen_rect.x, m.screen_rect.y));
+    Ok(out)
+}
+
+/// Bounding rectangle of all monitors (the Win32 "virtual screen").
+#[must_use]
+pub fn virtual_screen_rect() -> Rect {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
+    unsafe {
+        Rect {
+            x: GetSystemMetrics(SM_XVIRTUALSCREEN),
+            y: GetSystemMetrics(SM_YVIRTUALSCREEN),
+            width: GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            height: GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        }
+    }
+}
+
+/// `HMONITOR` (as an integer) of the monitor that has the largest overlap
+/// with `hwnd`, or the nearest one if the window is entirely off-screen.
+#[must_use]
+pub fn monitor_handle_for_window(hwnd: HWND) -> isize {
+    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+    unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }.0 as isize
 }
 
 #[cfg(test)]

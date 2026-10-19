@@ -23,7 +23,7 @@ features.
 | Remaining IPC stubs | 🜂 Near-term | `PlaceAbove`, `QueryState`, `CheckConfig`, `SetConfigValue`, `ForgetApp`/`ForgetAllApps` |
 | Floating enhancements | 🜂 Near-term | smart placement, size memory, z-order, gap mgmt |
 | Real cross-column `MoveWindow` | 🜂 Near-term | Left/Right aliased to swap-column; row-preserving move + floating nudge pending |
-| Multi-monitor support | ◷ Mid-term | `Vec<Monitor>` modeled; constructor hard-codes one |
+| Multi-monitor support | ✅ Baseline | one `Monitor` + scrolling space per display; windows tile on the monitor they appear on; parked columns stay off every monitor; cross-monitor focus/move commands pending |
 | Cloak parked windows (`DWMWA_CLOAK`) | ◷ Mid-term | read side exists; write side missing |
 | Watchdog + recovery snapshot | ◷ Mid-term | not started; gated on `flow`/`flowd` being complete |
 | Input hooks (DragSession etc.) | ◷ Aspirational | `src/input/` does not exist |

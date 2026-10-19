@@ -11,12 +11,17 @@
 //!    overlaps the monitor rectangle are **visible** and receive on-screen
 //!    coordinates.
 //!
-//! 2. **Parking**: columns fully outside the viewport are **parked** at a
-//!    deterministic position exactly one column-width beyond the nearest viewport
-//!    edge — left zone (`monitor_left - col_width`) or right zone
-//!    (`monitor_right + col_width`). Parking is necessary because Windows OS does
-//!    not gracefully handle windows at extreme off-screen coordinates; parking
-//!    just beyond the edge keeps scroll-in/out animations short and smooth.
+//! 2. **Parking**: columns fully outside the viewport are **parked** just
+//!    beyond the nearest edge of the *virtual screen* (the bounding box of all
+//!    monitors, [`MonitorInfo::virtual_screen`]) — left zone
+//!    (`virtual_left - col_width - PARK_MARGIN`) or right zone
+//!    (`virtual_right + PARK_MARGIN`). Parking relative to the virtual screen
+//!    rather than the monitor is what keeps a parked column off a neighbouring
+//!    monitor on multi-monitor desktops; on a single monitor the two are the
+//!    same. A partially visible column that would overhang an edge with a
+//!    neighbour beyond it ([`MonitorInfo::neighbour_left`] /
+//!    [`MonitorInfo::neighbour_right`]) is parked too, since Windows cannot
+//!    clip a window at a monitor edge.
 //!
 //! Columns are laid out in **slots** of width `col_width + window_gap`, so the
 //! visual gap between adjacent columns comes from the slot structure (the canvas
@@ -50,6 +55,10 @@ use crate::layout::types::{
     ActualEntry, ActualLayout, Column, MonitorInfo, Padding, VirtualLayout,
 };
 
+/// Margin between the virtual screen's edge and a parked column, in pixels.
+/// Small so scroll-in/out animations on a free edge stay short.
+pub const PARK_MARGIN: i32 = 16;
+
 /// Project a virtual layout onto a monitor viewport.
 ///
 /// This is the **camera-to-screen** conversion. For each column on the infinite
@@ -58,11 +67,15 @@ use crate::layout::types::{
 /// 1. **Visible columns**: Computes real screen coordinates by subtracting the
 ///    camera offset (`viewport_offset`) from the column's virtual x-position.
 ///
-/// 2. **Off-screen-left columns**: Parks at `monitor_left - col_width` (one
-///    column-width beyond the left viewport edge).
+/// 2. **Off-screen-left columns**: Parks at [`park_left_x`] (just beyond the
+///    virtual screen's left edge).
 ///
-/// 3. **Off-screen-right columns**: Parks at `monitor_right + col_width` (one
-///    column-width beyond the right viewport edge).
+/// 3. **Off-screen-right columns**: Parks at [`park_right_x`] (just beyond the
+///    virtual screen's right edge).
+///
+/// 4. **Overhanging columns**: A visible column that would extend past a
+///    monitor edge with another monitor beyond it is parked on that side
+///    instead of spilling onto the neighbour.
 ///
 /// Every window gets an [`ActualEntry`] — visible or parked. This ensures the
 /// diff engine can track smooth transitions when windows scroll in/out.
@@ -90,7 +103,6 @@ pub fn project(
     let slot_gap = padding.window_gap;
 
     let mut entries = Vec::new();
-    // Canvas starts at window_gap (left-edge gap in the slot model)
     let mut canvas_x: i32 = slot_gap;
 
     for column in &virtual_layout.columns {
@@ -100,44 +112,49 @@ pub fn project(
 
         let visible = canvas_col_right > viewport_left && canvas_col_left < viewport_right;
 
-        // Determine the screen x for this column's windows. Visible columns get
-        // their real screen position; off-screen columns get a deterministic
-        // parking position exactly one column-width beyond the nearest edge.
         let x = if visible {
-            monitor_rect.x + (canvas_col_left - viewport_left)
+            let on_screen_x = monitor_rect.x + (canvas_col_left - viewport_left);
+            // A column that overhangs an edge with a neighbouring monitor
+            // beyond it would spill onto that neighbour. Park it instead.
+            // Columns at least as wide as the viewport (monocle) are never
+            // parked: they are what the user is looking at.
+            let fits = col_width < monitor_rect.width;
+            let overhangs_left = on_screen_x < monitor_rect.x;
+            let overhangs_right = on_screen_x + col_width > monitor_rect.right();
+            if fits && overhangs_left && monitor.neighbour_left {
+                park_left_x(monitor, col_width)
+            } else if fits && overhangs_right && monitor.neighbour_right {
+                park_right_x(monitor)
+            } else {
+                on_screen_x
+            }
         } else if canvas_col_right <= viewport_left {
-            // Off-screen left: park one column-width beyond the left edge
-            monitor_rect.x - col_width
+            park_left_x(monitor, col_width)
         } else {
-            // Off-screen right: park one column-width beyond the right edge
-            monitor_rect.x + monitor_rect.width
+            park_right_x(monitor)
         };
 
         stack_column_rows(column, x, monitor_rect, col_width, padding, &mut entries);
-
-        // Advance by slot width (col_width + window_gap)
         canvas_x += col_width + slot_gap;
     }
 
     ActualLayout { entries }
 }
 
-/// Stack a column's rows into actual entries at the given screen x.
-///
-/// Each row's [`height`](crate::layout::types::Row::height) is consumed
-/// **verbatim** as the window's pixel height. Rows are stacked downward with
-/// one `padding.window_gap` between consecutive rows, plus a leading
-/// `padding.window_gap` after `padding.up`. The window fills the full
-/// `col_width` horizontally — inter-column gaps come from the slot model in
-/// [`project`].
-///
-/// The same stacking is used for **visible** and **parked** columns. Only the
-/// `x` argument differs (real screen position vs. parked offset). This keeps
-/// window dimensions identical across parked ↔ visible transitions so the
-/// animation engine can interpolate smoothly.
-///
-/// The resulting [`ActualEntry::rect`](crate::layout::ActualEntry::rect) is the
-/// final HWND rect.
+/// X coordinate of the left parking zone: just beyond the virtual screen's
+/// left edge, so the column is off every monitor, not merely off this one.
+#[must_use]
+pub fn park_left_x(monitor: &MonitorInfo, col_width: i32) -> i32 {
+    monitor.virtual_screen.x - col_width - PARK_MARGIN
+}
+
+/// X coordinate of the right parking zone: just beyond the virtual screen's
+/// right edge.
+#[must_use]
+pub fn park_right_x(monitor: &MonitorInfo) -> i32 {
+    monitor.virtual_screen.right() + PARK_MARGIN
+}
+
 fn stack_column_rows(
     column: &Column,
     x: i32,
@@ -203,14 +220,12 @@ mod tests {
     use crate::layout::types::Row;
 
     fn test_monitor() -> MonitorInfo {
-        MonitorInfo {
-            work_area: Rect {
-                x: 0,
-                y: 0,
-                width: 1920,
-                height: 1080,
-            },
-        }
+        MonitorInfo::single(Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        })
     }
 
     fn test_padding() -> Padding {
@@ -302,8 +317,8 @@ mod tests {
         );
         let actual = project(&layout, &monitor, &padding);
 
-        // First column parked at: monitor_left - col_width = -960
-        assert_eq!(actual.entries[0].rect.x, -960);
+        // First column parked just beyond the virtual screen's left edge
+        assert_eq!(actual.entries[0].rect.x, -960 - PARK_MARGIN);
         // Second column visible on screen
         assert!(actual.entries[1].rect.x >= 0);
     }
@@ -325,8 +340,8 @@ mod tests {
         );
         let actual = project(&layout, &monitor, &padding);
 
-        // Third column parked at: monitor_right = 1920
-        assert_eq!(actual.entries[2].rect.x, 1920);
+        // Third column parked just beyond the virtual screen's right edge
+        assert_eq!(actual.entries[2].rect.x, 1920 + PARK_MARGIN);
     }
 
     #[test]
@@ -420,10 +435,10 @@ mod tests {
         );
         let actual = project(&layout, &test_monitor(), &test_padding());
 
-        // Col 0 (canvas 4–964): 964 <= 1932 → parked left at -960
-        assert_eq!(actual.entries[0].rect.x, -960);
-        // Col 1 (canvas 968–1928): 1928 <= 1932 → parked left at -960
-        assert_eq!(actual.entries[1].rect.x, -960);
+        // Col 0 (canvas 4–964): 964 <= 1932 → parked left
+        assert_eq!(actual.entries[0].rect.x, -960 - PARK_MARGIN);
+        // Col 1 (canvas 968–1928): 1928 <= 1932 → parked left
+        assert_eq!(actual.entries[1].rect.x, -960 - PARK_MARGIN);
 
         // Col 2 (canvas 1932–2892): visible
         assert!(actual.entries[2].rect.x >= 0, "col 2 should be visible");
@@ -432,7 +447,7 @@ mod tests {
         assert!(actual.entries[3].rect.x >= 0, "col 3 should be visible");
 
         // Col 4 (canvas 3860–4820): 3860 >= 3852 → parked right at 1920
-        assert_eq!(actual.entries[4].rect.x, 1920);
+        assert_eq!(actual.entries[4].rect.x, 1920 + PARK_MARGIN);
     }
 
     #[test]
@@ -597,5 +612,170 @@ mod tests {
         // row 1: y = 4 + 200 + 4 = 208, height = 800 verbatim
         assert_eq!(actual.entries[1].rect.y, 208);
         assert_eq!(actual.entries[1].rect.height, 800);
+    }
+
+    // ---- multi-monitor parking ------------------------------------------
+
+    /// Primary at 0..1920 with a second monitor to its LEFT (-1920..0), as on
+    /// a side-by-side desktop whose secondary sits left of the primary.
+    fn primary_with_left_neighbour() -> MonitorInfo {
+        let primary = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let left = Rect {
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let virtual_screen = Rect {
+            x: -1920,
+            y: 0,
+            width: 3840,
+            height: 1080,
+        };
+        MonitorInfo::in_desktop(primary, primary, virtual_screen, &[left])
+    }
+
+    /// The left monitor of the same desktop: its free edge is the left one.
+    fn secondary_with_right_neighbour() -> MonitorInfo {
+        let primary = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let left = Rect {
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let virtual_screen = Rect {
+            x: -1920,
+            y: 0,
+            width: 3840,
+            height: 1080,
+        };
+        MonitorInfo::in_desktop(left, left, virtual_screen, &[primary])
+    }
+
+    #[test]
+    fn in_desktop_detects_neighbours_by_side() {
+        let m = primary_with_left_neighbour();
+        assert!(m.neighbour_left);
+        assert!(!m.neighbour_right);
+        let m = secondary_with_right_neighbour();
+        assert!(!m.neighbour_left);
+        assert!(m.neighbour_right);
+        let m = MonitorInfo::single(Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        });
+        assert!(!m.neighbour_left && !m.neighbour_right);
+    }
+
+    #[test]
+    fn parked_columns_never_land_on_the_neighbour_monitor() {
+        let padding = test_padding();
+        // 5 columns of 460px on a 4-per-screen primary, scrolled so that
+        // col 0 is off to the left and col 4 is off to the right.
+        let layout = VirtualLayout::with_columns(
+            (1..=5)
+                .map(|i| Column::with_row(460, Row::new(WindowId(i), 0)))
+                .collect(),
+            464, // start of col 1's slot
+        );
+        let m = primary_with_left_neighbour();
+        let actual = project(&layout, &m, &padding);
+        let left_monitor = Rect {
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        for e in &actual.entries {
+            assert!(
+                !e.rect.overlaps(left_monitor) || e.rect.overlaps(m.work_area),
+                "window {:?} at x={} spills onto the left monitor",
+                e.window_id,
+                e.rect.x
+            );
+        }
+        // col 0 is parked beyond the virtual screen's left edge, not the primary's
+        assert_eq!(actual.entries[0].rect.x, -1920 - 460 - PARK_MARGIN);
+        assert!(m.is_parked(actual.entries[0].rect));
+        // col 4 (canvas 1860..2320, viewport 464..2384) is partially visible
+        // on the free right edge, so it stays where it is (hangs off the edge)
+        assert_eq!(actual.entries[4].rect.x, 1860 - 464);
+        assert!(!m.is_parked(actual.entries[4].rect));
+    }
+
+    #[test]
+    fn overhang_toward_a_neighbour_is_parked_but_free_edge_overhang_is_kept() {
+        let padding = test_padding();
+        // Two 960px columns, viewport offset 500: col 0 (canvas 4..964) is
+        // partially visible, hanging off the LEFT edge.
+        let layout = VirtualLayout::with_columns(
+            vec![
+                Column::with_row(960, Row::new(WindowId(1), 0)),
+                Column::with_row(960, Row::new(WindowId(2), 0)),
+            ],
+            500,
+        );
+        // Primary: left neighbour → the overhanging column is parked left.
+        let m = primary_with_left_neighbour();
+        let actual = project(&layout, &m, &padding);
+        assert_eq!(actual.entries[0].rect.x, park_left_x(&m, 960));
+        assert!(m.is_parked(actual.entries[0].rect));
+        // Secondary: left edge is free → same column keeps its overhang.
+        let m2 = secondary_with_right_neighbour();
+        let actual2 = project(&layout, &m2, &padding);
+        assert_eq!(actual2.entries[0].rect.x, -1920 + (4 - 500));
+        assert!(!m2.is_parked(actual2.entries[0].rect));
+    }
+
+    #[test]
+    fn viewport_wide_column_is_never_parked_for_overhang() {
+        let padding = test_padding();
+        // A monocle-width column (1920 wide) with a slight negative offset
+        // overhangs both edges; it must stay on screen regardless of neighbours.
+        let layout =
+            VirtualLayout::with_columns(vec![Column::with_row(1920, Row::new(WindowId(1), 0))], 10);
+        let m = primary_with_left_neighbour();
+        let actual = project(&layout, &m, &padding);
+        assert!(!m.is_parked(actual.entries[0].rect));
+        assert!(actual.entries[0].rect.overlaps(m.work_area));
+    }
+
+    #[test]
+    fn secondary_monitor_parks_beyond_the_far_edge_of_the_desktop() {
+        let padding = test_padding();
+        let layout = VirtualLayout::with_columns(
+            vec![
+                Column::with_row(960, Row::new(WindowId(1), 0)),
+                Column::with_row(960, Row::new(WindowId(2), 0)),
+                Column::with_row(960, Row::new(WindowId(3), 0)),
+            ],
+            0,
+        );
+        let m = secondary_with_right_neighbour();
+        let actual = project(&layout, &m, &padding);
+        // col 2 is off the right of the secondary; the primary sits there,
+        // so it is parked beyond the primary's far edge.
+        assert_eq!(actual.entries[2].rect.x, 1920 + PARK_MARGIN);
+        assert!(m.is_parked(actual.entries[2].rect));
+        let primary = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        assert!(!actual.entries[2].rect.overlaps(primary));
     }
 }

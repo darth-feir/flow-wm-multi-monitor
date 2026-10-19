@@ -99,60 +99,102 @@ impl FlowWM {
         //    rect (for parking workspaces off-screen) and the taskbar-excluded
         //    work area (for in-workspace window placement). See
         //    registry::win32::MonitorGeometry for why both are needed.
-        let geometry = registry_win32::get_primary_monitor_info()?;
-        let monitor = MonitorInfo {
-            work_area: geometry.work_area,
-        };
-
-        // 4. Derive layout parameters from the app config.
-        let layout_config = config_derive::derive_layout_config(&app_config, &monitor);
-
-        // 5. Create scrolling space (the tiling half of the workspace).
-        let mut scrolling = ScrollingSpace::new(
-            monitor,
-            layout_config.column_width,
-            layout_config.min_column_width_px,
-            layout_config.min_window_height_px,
-            layout_config.min_row_height_px,
-            layout_config.padding,
-            app_config.columns_per_screen,
+        // One scrolling space per monitor, each sized to its own work area.
+        // Windows are assigned to the monitor they are currently on.
+        let geometries = registry_win32::enumerate_monitors()?;
+        let virtual_screen = registry_win32::virtual_screen_rect();
+        let screen_rects: Vec<Rect> = geometries.iter().map(|g| g.screen_rect).collect();
+        log::info!(
+            "init: {} monitor(s), virtual screen ({},{},{},{})",
+            geometries.len(),
+            virtual_screen.x,
+            virtual_screen.y,
+            virtual_screen.width,
+            virtual_screen.height,
         );
 
-        // 6. Batch-initialize layout from existing tiling windows.
-        //    Sort by x-coordinate so column assignment is deterministic and
-        //    windows travel the shortest distance to their tiling positions.
-        //    Collect each window's pre-flow width for width-aware init.
-        let (tiling_ids, widths): (Vec<WindowId>, Vec<u32>) = registry
-            .tiling_window_ids_with_widths_sorted_by_x()
-            .into_iter()
-            .unzip();
-        log::debug!(
-            "init: {} tiling windows (sorted by x), widths: {:?}",
-            tiling_ids.len(),
-            widths
-        );
-        let initial_diff = if !tiling_ids.is_empty() {
-            // Query the actual foreground window so init focuses the column
-            // the user was last interacting with, rather than blindly picking
-            // the rightmost window.
-            let fg_hwnd = registry_win32::get_foreground_window();
-            // Sync the registry's OS-focus tracker from the live foreground
-            // window. Without this, `registry.focused()` stays `None` until
-            // the first EVENT_SYSTEM_FOREGROUND arrives, so the initial
-            // `refresh_all_border_styles` pass resolves the Unfocused color
-            // for every border — including the real foreground window's.
-            // `set_focused` no-ops for HWNDs not in the registry, so this is
-            // safe even when the foreground is a non-managed window (taskbar,
-            // dialog). See `docs/src/dev-guide/borders.md`.
-            if let Some(hwnd) = fg_hwnd {
-                registry.set_focused(hwnd);
+        struct PerMonitor {
+            info: MonitorInfo,
+            layout_config: super::types::LayoutConfig,
+            scrolling: ScrollingSpace,
+        }
+        let mut per_monitor: Vec<PerMonitor> = Vec::with_capacity(geometries.len());
+        for (i, g) in geometries.iter().enumerate() {
+            let others: Vec<Rect> = screen_rects
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, r)| *r)
+                .collect();
+            let info = MonitorInfo::in_desktop(g.work_area, g.screen_rect, virtual_screen, &others);
+            log::info!(
+                "init: monitor {i}: screen ({},{},{},{}) work ({},{},{},{}) primary={} neighbours L={} R={}",
+                g.screen_rect.x,
+                g.screen_rect.y,
+                g.screen_rect.width,
+                g.screen_rect.height,
+                g.work_area.x,
+                g.work_area.y,
+                g.work_area.width,
+                g.work_area.height,
+                g.is_primary,
+                info.neighbour_left,
+                info.neighbour_right,
+            );
+            let layout_config = config_derive::derive_layout_config(&app_config, &info);
+            let scrolling = ScrollingSpace::new(
+                info,
+                layout_config.column_width,
+                layout_config.min_column_width_px,
+                layout_config.min_window_height_px,
+                layout_config.min_row_height_px,
+                layout_config.padding,
+                app_config.columns_per_screen,
+            );
+            per_monitor.push(PerMonitor {
+                info,
+                layout_config,
+                scrolling,
+            });
+        }
+
+        // Partition the pre-existing tiling windows by the monitor they sit on.
+        let all_tiling = registry.tiling_window_ids_with_widths_sorted_by_x();
+        let mut per_monitor_windows: Vec<(Vec<WindowId>, Vec<u32>)> =
+            vec![(Vec::new(), Vec::new()); geometries.len()];
+        for (wid, width) in all_tiling {
+            let h = registry_win32::monitor_handle_for_window(HWND(wid.0 as *mut _));
+            let idx = geometries.iter().position(|g| g.hmonitor == h).unwrap_or(0);
+            per_monitor_windows[idx].0.push(wid);
+            per_monitor_windows[idx].1.push(width);
+        }
+
+        let fg_hwnd = registry_win32::get_foreground_window();
+        if let Some(hwnd) = fg_hwnd {
+            registry.set_focused(hwnd);
+        }
+        let mut active_monitor = 0;
+        let mut initial_diffs = Vec::with_capacity(geometries.len());
+        for (idx, pm) in per_monitor.iter_mut().enumerate() {
+            let (tiling_ids, widths) = std::mem::take(&mut per_monitor_windows[idx]);
+            log::debug!(
+                "init: monitor {idx}: {} tiling windows (sorted by x), widths: {:?}",
+                tiling_ids.len(),
+                widths
+            );
+            if tiling_ids.is_empty() {
+                continue;
             }
             let focus_col = fg_hwnd.and_then(|hwnd| {
                 let wid = WindowId(hwnd);
                 tiling_ids.iter().position(|&id| id == wid)
             });
-            log::debug!("init: focus_col = {focus_col:?} (foreground window lookup)");
-            let diff = scrolling.initialize_windows(tiling_ids, focus_col, Some(&widths));
+            if focus_col.is_some() {
+                active_monitor = idx;
+            }
+            let diff = pm
+                .scrolling
+                .initialize_windows(tiling_ids, focus_col, Some(&widths));
             for entry in &diff.actual_layout.entries {
                 log::trace!(
                     "init target: {:?} rect ({},{},{},{})",
@@ -163,16 +205,12 @@ impl FlowWM {
                     entry.rect.height,
                 );
             }
-            Some(diff)
-        } else {
-            log::warn!("init: no tiling windows found — skipping initial layout");
-            None
-        };
+            initial_diffs.push(diff);
+        }
+        if initial_diffs.is_empty() {
+            log::warn!("init: no tiling windows found - skipping initial layout");
+        }
 
-        // 7. Create animator with the user's configured animation duration.
-        //    On startup, windows animate from their current positions to tiling
-        //    positions using the user's configured speed. If animation is disabled
-        //    in config, duration will be zero (instant snap).
         let backend = Win32Backend::new();
         let init_config = config_derive::derive_animator_config(&app_config, Duration::ZERO);
         log::debug!(
@@ -181,11 +219,7 @@ impl FlowWM {
             app_config.animation.enabled,
         );
         let mut animator = WindowAnimator::new(backend, init_config);
-
-        // 8. Animate initial layout with user-configured duration.
-        if let Some(ref diff) = initial_diff {
-            // Use a standalone function to avoid borrow checker issues
-            // — animate_layout takes &mut self, but we don't have Self yet.
+        for diff in &initial_diffs {
             log::debug!(
                 "init: submitting {} targets to animator",
                 diff.actual_layout.entries.len()
@@ -197,72 +231,47 @@ impl FlowWM {
                 app_config.borders.thickness as i32,
                 app_config.borders.overlap as i32,
             );
-
-            // Sync registry tiling state from the initial layout so that
-            // queries return correct col/row and tiled_rect immediately.
             registry.update_tiling_slots_from_layout(&diff.virtual_layout);
             registry.update_tiled_rects(&diff.actual_layout);
         }
 
-        // 9. Start hook thread.
-        //    Returns the mpsc receiver, thread handle (RAII cleanup via Drop),
-        //    and a Win32 manual-reset Event (HookSignal) that the hook callback
-        //    signals to wake the main thread's WaitForMultipleObjects loop.
         let (hook_receiver, _hook_handle, hook_signal) = hooks::start_hook_thread(desktop_name)?;
-
-        // 10. Create IPC server.
         let server = PipeServer::create()
             .map_err(|e| format!("failed to create pipe (is another daemon running?): {e}"))?;
-
         log::info!("flowd: daemon initialized successfully");
 
-        // ---- Build the workspace stack -------------------------------------
-        //
-        // The daemon ships with a fixed set of 10 workspaces (per the user
-        // spec: 1-indexed, default active = workspace 1). Workspace 1
-        // inherits the scrolling space that was just initialised with the
-        // existing tiling windows; workspaces 2..=10 start empty. All
-        // workspaces share the same layout parameters so columns size
-        // consistently when the user later switches between them or moves
-        // windows across.
-        //
-        // The count is hard-coded rather than read from config because the
-        // spec fixes it at 10 for now. If this ever becomes configurable,
-        // the natural home is a `[workspaces]` table in `flow.toml` with a
-        // default of 10 (and `default-config.toml` must then be updated in
-        // lockstep — see AGENTS.md).
         const WORKSPACE_COUNT: u32 = 10;
-        let mut workspaces: Vec<Workspace> = Vec::with_capacity(WORKSPACE_COUNT as usize);
-        // Workspace 1 takes the already-initialised scrolling space — it owns
-        // every tiling window the registry knew about at startup.
-        workspaces.push(Workspace::new(WorkspaceId(1), scrolling));
-        // Workspaces 2..=10 each get a fresh empty scrolling space built from
-        // the same layout parameters. MonitorInfo and Padding are Copy, so
-        // passing `monitor` and `layout_config.padding` by value into each
-        // ScrollingSpace::new call is cheap and idiomatic.
-        for id in 2..=WORKSPACE_COUNT {
-            let empty_scrolling = ScrollingSpace::new(
-                monitor,
-                layout_config.column_width,
-                layout_config.min_column_width_px,
-                layout_config.min_window_height_px,
-                layout_config.min_row_height_px,
-                layout_config.padding,
-                app_config.columns_per_screen,
+        let mut monitors: Vec<Monitor> = Vec::with_capacity(geometries.len());
+        for (g, pm) in geometries.iter().zip(per_monitor) {
+            let PerMonitor {
+                info,
+                layout_config,
+                scrolling,
+            } = pm;
+            let mut workspaces: Vec<Workspace> = Vec::with_capacity(WORKSPACE_COUNT as usize);
+            workspaces.push(Workspace::new(WorkspaceId(1), scrolling));
+            for id in 2..=WORKSPACE_COUNT {
+                let empty_scrolling = ScrollingSpace::new(
+                    info,
+                    layout_config.column_width,
+                    layout_config.min_column_width_px,
+                    layout_config.min_window_height_px,
+                    layout_config.min_row_height_px,
+                    layout_config.padding,
+                    app_config.columns_per_screen,
+                );
+                workspaces.push(Workspace::new(WorkspaceId(id), empty_scrolling));
+            }
+            monitors.push(
+                Monitor::new(g.screen_rect, g.work_area, workspaces, 0).with_hmonitor(g.hmonitor),
             );
-            workspaces.push(Workspace::new(WorkspaceId(id), empty_scrolling));
         }
 
         let mut manager = Self {
             registry,
             history,
-            monitors: vec![Monitor::new(
-                geometry.screen_rect,
-                monitor.work_area,
-                workspaces,
-                0,
-            )],
-            active_monitor: 0,
+            monitors,
+            active_monitor,
             animator,
             server,
             config: app_config,

@@ -31,6 +31,10 @@ impl LoadoutFile {
 /// Snapshot of a single workspace's tiling and floating state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
+    /// Index of the monitor this workspace belongs to (primary = 0).
+    /// Absent in files written by single-monitor builds, which maps to 0.
+    #[serde(default)]
+    pub monitor: u32,
     /// 0-based workspace index.
     pub workspace_id: u32,
     /// Whether this workspace was active (visible) when saved.
@@ -138,6 +142,7 @@ mod tests {
         let file = LoadoutFile {
             version: LoadoutFile::CURRENT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                monitor: 0,
                 workspace_id: 0,
                 active: true,
                 scrolling: ScrollingSnapshot {

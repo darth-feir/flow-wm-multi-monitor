@@ -18,7 +18,7 @@ use windows::Win32::Foundation::HWND;
 
 use crate::animation::{IVec2, WindowAnimator, WindowRef, WindowTarget};
 use crate::common::Rect;
-use crate::layout::types::{ActualLayout, AppliedLayout};
+use crate::layout::types::{ActualLayout, AppliedLayout, MonitorInfo};
 use crate::registry::WindowRegistry;
 
 use super::types::FlowWM;
@@ -74,12 +74,21 @@ impl FlowWM {
     /// mismatched coordinate spaces would cause visual distortion during
     /// the animation.
     pub(super) fn animate_layout(&mut self, layout: &AppliedLayout) {
-        // Always sync registry state from the new layout, even if no windows
-        // physically moved (col/row indices may have changed).
+        self.animate_layout_on(self.active_monitor, layout);
+    }
+
+    /// Animate a layout produced by `monitor_idx`'s scrolling space.
+    ///
+    /// Registry bookkeeping (tiling slots + tiled rects) is refreshed so the
+    /// registry knows where every window is after the layout change. The
+    /// submission happens *before* the tiled rects are updated so the
+    /// teleport decision can compare each window's previous rect with its
+    /// new one.
+    pub(super) fn animate_layout_on(&mut self, monitor_idx: usize, layout: &AppliedLayout) {
+        self.submit_animation(layout, monitor_idx);
         self.registry
             .update_tiling_slots_from_layout(&layout.virtual_layout);
         self.registry.update_tiled_rects(&layout.actual_layout);
-        self.submit_animation(layout);
     }
 
     /// Submit animation targets for `layout` WITHOUT syncing registry state or
@@ -95,10 +104,11 @@ impl FlowWM {
     /// calls [`animate_layout`], `drag_state` has already been `take()`n so the
     /// filter does not trigger — the dragged window animates to its final
     /// position as intended.
-    fn submit_animation(&mut self, layout: &AppliedLayout) {
+    fn submit_animation(&mut self, layout: &AppliedLayout, monitor_idx: usize) {
         if layout.actual_layout.entries.is_empty() {
             return;
         }
+        let monitor_info = *self.monitors[monitor_idx].active_scrolling().monitor();
 
         // Safety net: during a tile drag, exclude the dragged window and its
         // border overlay from animation targets so the animator doesn't fight
@@ -154,6 +164,33 @@ impl FlowWM {
             let window_rect = invisible_bounds
                 .visible_to_window(entry.rect)
                 .inset(border_thickness - border_overlap);
+
+            // A tween that would carry the window across a neighbouring
+            // monitor (parking toward it, or arriving from a parking slot
+            // on its side) is replaced by an instant move. The window is
+            // still submitted as a zero-length tween so any in-flight tween
+            // for it is retargeted rather than left running.
+            let prev_rect = window.and_then(|w| w.tiled_rect);
+            if tween_crosses_neighbour(&monitor_info, prev_rect, entry.rect) {
+                log::debug!(
+                    "animate: hwnd={} teleport to ({},{},{},{}) (neighbour monitor in the way)",
+                    entry.window_id.0,
+                    window_rect.x,
+                    window_rect.y,
+                    window_rect.width,
+                    window_rect.height,
+                );
+                let _ = crate::registry::win32::set_window_rect(
+                    entry.window_id.0,
+                    window_rect.x,
+                    window_rect.y,
+                    window_rect.width,
+                    window_rect.height,
+                );
+                if let Some(border) = window.and_then(|w| w.border.as_ref()) {
+                    border.set_geometry(entry.rect);
+                }
+            }
 
             log::debug!(
                 "animate: hwnd={} target ({},{},{},{}) [visible] \
@@ -215,7 +252,8 @@ impl FlowWM {
     /// direct `border.set_geometry` calls in `on_drag_move`.
     /// (`docs/src/dev-guide/tile-drag.md`)
     pub(super) fn animate_preview(&mut self, preview: &AppliedLayout) {
-        self.submit_animation(preview);
+        let idx = self.active_monitor;
+        self.submit_animation(preview, idx);
     }
 
     /// Submit a single combined animation batch spanning multiple workspaces.
@@ -498,6 +536,33 @@ impl FlowWM {
 /// from the config and forwards them. The effective per-edge shrink is
 /// `(thickness - overlap)`, same as
 /// [`FlowWM::animate_layout`].
+/// Would tweening a window from `prev` to `next` sweep it across a monitor
+/// that neighbours this one?
+///
+/// True when `next` is a parking slot on a side that has a neighbour (the
+/// window would slide out over the neighbour), or when `prev` was a parking
+/// slot on such a side and `next` is on-screen (it would slide in over the
+/// neighbour). Parking on a free side keeps the usual slide animation.
+fn tween_crosses_neighbour(monitor: &MonitorInfo, prev: Option<Rect>, next: Rect) -> bool {
+    let parked_side = |r: Rect| -> Option<bool> {
+        monitor
+            .is_parked(r)
+            .then(|| r.right() <= monitor.virtual_screen.x)
+    };
+    let blocked = |left: bool| {
+        if left {
+            monitor.neighbour_left
+        } else {
+            monitor.neighbour_right
+        }
+    };
+    match (prev.and_then(parked_side), parked_side(next)) {
+        (_, Some(left)) => blocked(left),
+        (Some(left), None) => blocked(left),
+        (None, None) => false,
+    }
+}
+
 pub(super) fn animate_layout_raw(
     animator: &mut WindowAnimator,
     layout: &AppliedLayout,
@@ -546,5 +611,86 @@ pub(super) fn animate_layout_raw(
 
     if let Err(e) = animator.animate(targets) {
         log::warn!("animation error (initial snap): {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tween_crosses_neighbour;
+    use crate::common::Rect;
+    use crate::layout::types::MonitorInfo;
+
+    fn primary_with_left_neighbour() -> MonitorInfo {
+        let primary = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let left = Rect {
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let vs = Rect {
+            x: -1920,
+            y: 0,
+            width: 3840,
+            height: 1080,
+        };
+        MonitorInfo::in_desktop(primary, primary, vs, &[left])
+    }
+
+    fn col(x: i32) -> Rect {
+        Rect {
+            x,
+            y: 16,
+            width: 460,
+            height: 1000,
+        }
+    }
+
+    #[test]
+    fn parking_toward_a_neighbour_teleports() {
+        let m = primary_with_left_neighbour();
+        // on-screen -> parked left (DISPLAY2 is there): teleport
+        assert!(tween_crosses_neighbour(&m, Some(col(11)), col(-2401)));
+        // unknown previous rect -> parked left: still teleport
+        assert!(tween_crosses_neighbour(&m, None, col(-2401)));
+    }
+
+    #[test]
+    fn arriving_from_a_neighbour_side_parking_slot_teleports() {
+        let m = primary_with_left_neighbour();
+        assert!(tween_crosses_neighbour(&m, Some(col(-2401)), col(11)));
+    }
+
+    #[test]
+    fn free_edge_parking_keeps_the_slide_animation() {
+        let m = primary_with_left_neighbour();
+        // parked right (no neighbour there): slide out as usual
+        assert!(!tween_crosses_neighbour(&m, Some(col(1439)), col(1936)));
+        // ... and slide back in
+        assert!(!tween_crosses_neighbour(&m, Some(col(1936)), col(1439)));
+    }
+
+    #[test]
+    fn on_screen_moves_never_teleport() {
+        let m = primary_with_left_neighbour();
+        assert!(!tween_crosses_neighbour(&m, Some(col(11)), col(487)));
+        assert!(!tween_crosses_neighbour(&m, None, col(487)));
+    }
+
+    #[test]
+    fn single_monitor_never_teleports() {
+        let m = MonitorInfo::single(Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        });
+        assert!(!tween_crosses_neighbour(&m, Some(col(11)), col(-476)));
+        assert!(!tween_crosses_neighbour(&m, Some(col(-476)), col(11)));
     }
 }

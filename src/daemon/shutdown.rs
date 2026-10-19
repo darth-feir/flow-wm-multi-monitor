@@ -38,36 +38,36 @@ impl FlowWM {
     /// Failures (window vanished mid-loop, `SetWindowPos` rejected) are logged
     /// at `warn` and skipped: one bad window must not abort the rescue pass.
     pub fn rescue_stranded_windows(&self) {
-        let work_area = self.active_monitor().work_area();
+        // "Stranded" means off every monitor, not merely off the active one:
+        // a window parked beyond the virtual screen must come back, a window
+        // that lives on another monitor must be left alone.
+        let virtual_screen = self.active_scrolling().monitor().virtual_screen;
         let mut rescued = 0_usize;
-
         for (hwnd_val, anchor, invisible_bounds) in self.registry.restorable_windows() {
             let hwnd = HWND(hwnd_val as *mut _);
-            // Ground truth: where does Win32 say the window is right now?
             let Ok(current) = win32::get_window_rect(hwnd) else {
                 log::warn!("shutdown rescue: GetWindowRect failed for hwnd {hwnd_val}, skipping");
                 continue;
             };
-            // Visible on the active monitor → leave it where the user put it.
-            if content_overlaps_work_area(current, invisible_bounds, work_area) {
+            if content_overlaps_work_area(current, invisible_bounds, virtual_screen) {
                 continue;
             }
-            // Stranded — bring it back to its pre-flow anchor, clamped on-screen.
+            // Bring it back onto the monitor that owns it (by workspace
+            // membership), else the one its pre-manage rect was on, else the
+            // active monitor.
+            let owner = self
+                .monitor_index_containing(crate::common::WindowId(hwnd_val))
+                .unwrap_or_else(|| self.monitor_index_for_rect(anchor));
+            let work_area = self.monitors[owner].work_area();
             let target = anchor.clamped_into(work_area);
             if win32::set_window_rect(hwnd_val, target.x, target.y, target.width, target.height) {
                 rescued += 1;
             }
         }
-
         log::info!("shutdown rescue: brought {rescued} stranded window(s) back on-screen");
     }
 }
 
-/// True if the window's **visible content** overlaps `work_area`.
-///
-/// Returns `false` (never panics) even for degenerate inputs. See
-/// `docs/src/dev-guide/ipc-and-watchdog.md` for why the visible-content rect —
-/// not the raw `GetWindowRect` rect — is the visibility test.
 fn content_overlaps_work_area(window_rect: Rect, bounds: InvisibleBounds, work_area: Rect) -> bool {
     // GetWindowRect includes invisible borders, so a window parked flush at the
     // work-area edge bleeds a few pixels into it. Stripping the borders first

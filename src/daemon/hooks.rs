@@ -86,8 +86,13 @@ impl FlowWM {
         // Tiling: handle_created returns Some only for a freshly-registered
         // tiling window.
         if let Some(window_id) = self.registry.handle_created(hwnd) {
-            let applied = self.active_scrolling_mut().insert_window(window_id);
-            self.animate_layout(&applied);
+            // Tile on the monitor the OS placed the window on, not blindly
+            // on the active one.
+            let idx = self.monitor_index_for_hwnd(hwnd);
+            let applied = self.monitors[idx]
+                .active_scrolling_mut()
+                .insert_window(window_id);
+            self.animate_layout_on(idx, &applied);
             self.reconcile_new_window_focus(hwnd);
             return true;
         }
@@ -263,9 +268,14 @@ impl FlowWM {
     /// already correct and we avoid a redundant (and potentially disruptive)
     /// `SetForegroundWindow` call.
     fn remove_from_layout_and_refocus(&mut self, window: WindowId) {
-        let prev_focus = self.active_scrolling().last_focused_window();
-        let applied = self.active_scrolling_mut().remove_window(window);
-        let new_focus = self.active_scrolling().last_focused_window();
+        let idx = self
+            .monitor_index_containing(window)
+            .unwrap_or(self.active_monitor);
+        let prev_focus = self.monitors[idx].active_scrolling().last_focused_window();
+        let applied = self.monitors[idx]
+            .active_scrolling_mut()
+            .remove_window(window);
+        let new_focus = self.monitors[idx].active_scrolling().last_focused_window();
 
         if new_focus != prev_focus
             && let Some(id) = new_focus
@@ -279,7 +289,7 @@ impl FlowWM {
             self.registry.set_focused(target);
         }
 
-        self.animate_layout(&applied);
+        self.animate_layout_on(idx, &applied);
     }
 
     /// Handle a window restore (un-minimize) event.
@@ -294,8 +304,11 @@ impl FlowWM {
 
         // After restore, check if the window is now tiling-active.
         if self.registry.is_tiling(hwnd) {
-            let applied = self.active_scrolling_mut().add_window(WindowId(hwnd));
-            self.animate_layout(&applied);
+            let idx = self.monitor_index_for_hwnd(hwnd);
+            let applied = self.monitors[idx]
+                .active_scrolling_mut()
+                .add_window(WindowId(hwnd));
+            self.animate_layout_on(idx, &applied);
         }
         // Border overlay: registry now records Active ⇒ refresh re-attaches.
         self.refresh_border_for(hwnd);
@@ -376,8 +389,11 @@ impl FlowWM {
         // Re-show path: a tracked window returning from hidden (Hidden → Active).
         let change = self.registry.reconcile_visibility(hwnd);
         if change == VisibilityChange::Shown && self.registry.is_tiling_active(hwnd) {
-            let applied = self.active_scrolling_mut().add_window(WindowId(hwnd));
-            self.animate_layout(&applied);
+            let idx = self.monitor_index_for_hwnd(hwnd);
+            let applied = self.monitors[idx]
+                .active_scrolling_mut()
+                .add_window(WindowId(hwnd));
+            self.animate_layout_on(idx, &applied);
         }
         // Border overlay: registry now records Active ⇒ refresh re-attaches.
         // (The untracked-recovery branch above early-returns after
@@ -403,6 +419,12 @@ impl FlowWM {
         self.registry.set_focused(hwnd);
 
         let target = WindowId(hwnd);
+
+        // Focus moved to a window on another monitor: that monitor becomes
+        // the active one so subsequent commands act where the user is.
+        if let Some(idx) = self.monitor_index_containing(target) {
+            self.set_active_monitor(idx);
+        }
 
         // Bail for untracked/ignored windows (taskbar, tray, off-monitor).
         let Some(home_ws) = self.active_monitor().find_workspace_containing(target) else {
@@ -476,12 +498,13 @@ impl FlowWM {
         // Restrict to the active workspace: a background poll should not switch
         // workspaces. A genuine cross-workspace focus change still arrives via
         // EVENT_SYSTEM_FOREGROUND, which is the intended driver for switches.
-        let active_id = self.active_monitor().active_workspace_id();
-        if self
-            .active_monitor()
-            .find_workspace_containing(WindowId(true_fg))
-            != Some(active_id)
-        {
+        // The window may live on any monitor; only correct drift when it is
+        // on that monitor's visible workspace.
+        let Some(idx) = self.monitor_index_containing(WindowId(true_fg)) else {
+            return;
+        };
+        let active_id = self.monitors[idx].active_workspace_id();
+        if self.monitors[idx].find_workspace_containing(WindowId(true_fg)) != Some(active_id) {
             return;
         }
 
@@ -513,8 +536,11 @@ impl FlowWM {
     pub(super) fn on_window_state_change(&mut self, hwnd: isize) {
         let outcome = self.registry.reclassify_os_state(hwnd);
         if let ReclassifyResult::Recovered { now_tiling: true } = outcome {
-            let applied = self.active_scrolling_mut().add_window(WindowId(hwnd));
-            self.animate_layout(&applied);
+            let idx = self.monitor_index_for_hwnd(hwnd);
+            let applied = self.monitors[idx]
+                .active_scrolling_mut()
+                .add_window(WindowId(hwnd));
+            self.animate_layout_on(idx, &applied);
         }
         // Border overlay: covers all transitions — Ignored→Tiling (attach),
         // Tiling→Ignored (detach), and no-op cases.

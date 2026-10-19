@@ -15,9 +15,37 @@ impl FlowWM {
     /// can determine which windows are currently visible on screen.
     pub(super) fn query_windows_all(&self) -> SocketResponse {
         let viewport_offset = self.active_scrolling().virtual_layout().viewport_offset;
-        SocketResponse::Data {
-            payload: self.registry.to_json_value(viewport_offset),
+        let mut payload = self.registry.to_json_value(viewport_offset);
+        if let serde_json::Value::Object(map) = &mut payload {
+            let monitors: Vec<serde_json::Value> = self
+                .monitors
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let info = m.active_scrolling().monitor();
+                    let sr = m.screen_rect();
+                    let wa = m.work_area();
+                    serde_json::json!({
+                        "index": i,
+                        "active": i == self.active_monitor,
+                        "hmonitor": m.hmonitor(),
+                        "screen_rect": { "x": sr.x, "y": sr.y, "width": sr.width, "height": sr.height },
+                        "work_area": { "x": wa.x, "y": wa.y, "width": wa.width, "height": wa.height },
+                        "neighbour_left": info.neighbour_left,
+                        "neighbour_right": info.neighbour_right,
+                        "active_workspace": m.active_workspace_id().0,
+                        "viewport_offset": m.active_scrolling().virtual_layout().viewport_offset,
+                        "tiled_windows": m.active_scrolling().virtual_layout().window_count(),
+                    })
+                })
+                .collect();
+            map.insert(
+                "active_monitor".into(),
+                serde_json::json!(self.active_monitor),
+            );
+            map.insert("monitors".into(), serde_json::Value::Array(monitors));
         }
+        SocketResponse::Data { payload }
     }
 
     /// Return the virtual layout structure as JSON.

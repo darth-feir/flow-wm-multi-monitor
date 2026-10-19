@@ -45,6 +45,8 @@ pub struct Monitor {
     /// Index into [`workspaces`](Self::workspaces) of the currently visible
     /// workspace. Always a valid index while `workspaces` is non-empty.
     active_workspace: usize,
+    /// Win32 `HMONITOR` as an integer; `0` when unknown (tests).
+    hmonitor: isize,
 }
 
 impl Monitor {
@@ -76,7 +78,21 @@ impl Monitor {
             work_area,
             workspaces,
             active_workspace,
+            hmonitor: 0,
         }
+    }
+
+    /// Attach the Win32 monitor handle this `Monitor` represents.
+    #[must_use]
+    pub fn with_hmonitor(mut self, hmonitor: isize) -> Self {
+        self.hmonitor = hmonitor;
+        self
+    }
+
+    /// Win32 `HMONITOR` (as an integer) of this monitor; `0` if unknown.
+    #[must_use]
+    pub fn hmonitor(&self) -> isize {
+        self.hmonitor
     }
 
     /// The full physical [`Rect`] for this monitor (taskbar included).
@@ -316,14 +332,12 @@ mod tests {
     /// it exists only to satisfy [`Workspace::new`]'s signature.
     fn make_scrolling() -> ScrollingSpace {
         ScrollingSpace::new(
-            MonitorInfo {
-                work_area: Rect {
-                    x: 0,
-                    y: 0,
-                    width: 1920,
-                    height: 1080,
-                },
-            },
+            MonitorInfo::single(Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }),
             960,
             320,
             100,

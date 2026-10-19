@@ -109,7 +109,7 @@ impl Workspace {
     /// # use flow_wm::workspace::{Workspace, WorkspaceId, ScrollingSpace};
     /// # use flow_wm::layout::types::MonitorInfo;
     /// # use flow_wm::common::Rect;
-    /// # let monitor = MonitorInfo { work_area: Rect { x: 0, y: 0, width: 1920, height: 1080 } };
+    /// # let monitor = MonitorInfo::single(Rect { x: 0, y: 0, width: 1920, height: 1080 });
     /// # let scrolling = ScrollingSpace::new(monitor, 960, 320, 100, 100,
     /// #     flow_wm::layout::types::Padding { window_gap: 4, up: 0, down: 0 }, 4);
     /// let ws = Workspace::new(WorkspaceId(1), scrolling);
