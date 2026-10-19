@@ -1147,6 +1147,25 @@ pub fn insert_window_after_focused(
     ensure_column_visible(&new_layout, insert_idx, config)
 }
 
+/// Insert `window` as a new single-row column at column index `col_idx`
+/// (clamped to the column count) and bring it into view. Used to attach a
+/// window arriving from another monitor at the strip's near edge.
+#[must_use]
+pub fn insert_window_at(
+    layout: &VirtualLayout,
+    col_idx: usize,
+    window: WindowId,
+    config: &MutationConfig,
+) -> VirtualLayout {
+    let mut new_layout = layout.clone();
+    let idx = col_idx.min(new_layout.columns.len());
+    new_layout.columns.insert(
+        idx,
+        single_row_column(window, config.column_width as i32, config),
+    );
+    ensure_column_visible(&new_layout, idx, config)
+}
+
 /// Insert a new window as a column after the focused window, at an explicit
 /// (already quantized) width.
 ///

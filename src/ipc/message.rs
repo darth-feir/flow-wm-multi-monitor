@@ -242,6 +242,20 @@ pub enum SocketMessage {
         workspace_id: u32,
     },
 
+    // --- Monitors ---
+    /// Make the monitor in `direction` (by screen geometry) the active one
+    /// and focus its last-focused window.
+    FocusMonitor {
+        /// Which neighbouring monitor to focus.
+        direction: Direction,
+    },
+    /// Move the focused window to the active workspace of the monitor in
+    /// `direction`, making that monitor active and keeping the window focused.
+    MoveWindowToMonitor {
+        /// Which neighbouring monitor to move the window to.
+        direction: Direction,
+    },
+
     // --- Queries ---
     /// Query all managed windows.
     QueryWindowsAll,
@@ -322,6 +336,8 @@ impl SocketMessage {
                 | Self::SwitchWorkspace { .. }
                 | Self::SwapWorkspace { .. }
                 | Self::MoveWindowToWorkspace { .. }
+                | Self::FocusMonitor { .. }
+                | Self::MoveWindowToMonitor { .. }
                 | Self::ReloadConfig
                 | Self::CloseWindow
         )
@@ -580,6 +596,33 @@ mod tests {
     }
 
     // Positive: round-trip SwitchWorkspace (struct variant carrying workspace_id)
+    #[test]
+    fn roundtrip_focus_monitor() {
+        let msg = SocketMessage::FocusMonitor {
+            direction: Direction::Right,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(json, r#"{"type":"focus_monitor","direction":"Right"}"#);
+        let parsed: SocketMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, msg);
+        assert!(msg.is_layout_mutating());
+    }
+
+    #[test]
+    fn roundtrip_move_window_to_monitor() {
+        let msg = SocketMessage::MoveWindowToMonitor {
+            direction: Direction::Left,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"move_window_to_monitor","direction":"Left"}"#
+        );
+        let parsed: SocketMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, msg);
+        assert!(msg.is_layout_mutating());
+    }
+
     #[test]
     fn roundtrip_switch_workspace() {
         let msg = SocketMessage::SwitchWorkspace { workspace_id: 3 };

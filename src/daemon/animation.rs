@@ -85,10 +85,34 @@ impl FlowWM {
     /// teleport decision can compare each window's previous rect with its
     /// new one.
     pub(super) fn animate_layout_on(&mut self, monitor_idx: usize, layout: &AppliedLayout) {
-        self.submit_animation(layout, monitor_idx);
-        self.registry
-            .update_tiling_slots_from_layout(&layout.virtual_layout);
-        self.registry.update_tiled_rects(&layout.actual_layout);
+        self.animate_layouts_on(&[(monitor_idx, layout)]);
+    }
+
+    /// Animate several layouts (one per monitor) as a **single** animator
+    /// batch. The animator supersedes an in-flight batch when a new one is
+    /// submitted, so two monitors changed by one command (a window moving
+    /// between them) must be submitted together or the first monitor's
+    /// windows stop wherever the second submission caught them.
+    pub(super) fn animate_layouts_on(&mut self, layouts: &[(usize, &AppliedLayout)]) {
+        let mut targets: Vec<WindowTarget> = Vec::new();
+        for (idx, layout) in layouts {
+            self.collect_targets(layout, *idx, &mut targets);
+        }
+        if !targets.is_empty() {
+            log::debug!(
+                "animate_layouts_on: submitting {} targets across {} layout(s)",
+                targets.len(),
+                layouts.len()
+            );
+            if let Err(e) = self.animator.animate(targets) {
+                log::warn!("animation error: {e}");
+            }
+        }
+        for (_, layout) in layouts {
+            self.registry
+                .update_tiling_slots_from_layout(&layout.virtual_layout);
+            self.registry.update_tiled_rects(&layout.actual_layout);
+        }
     }
 
     /// Submit animation targets for `layout` WITHOUT syncing registry state or
@@ -105,6 +129,29 @@ impl FlowWM {
     /// filter does not trigger — the dragged window animates to its final
     /// position as intended.
     fn submit_animation(&mut self, layout: &AppliedLayout, monitor_idx: usize) {
+        let mut targets: Vec<WindowTarget> = Vec::new();
+        self.collect_targets(layout, monitor_idx, &mut targets);
+        if targets.is_empty() {
+            return;
+        }
+        log::debug!(
+            "animate_layout: submitting {} targets to animator",
+            targets.len()
+        );
+        if let Err(e) = self.animator.animate(targets) {
+            log::warn!("animation error: {e}");
+        }
+    }
+
+    /// Append the animator targets for `layout` (produced by `monitor_idx`'s
+    /// scrolling space) to `targets`, teleporting the windows whose tween
+    /// would cross a neighbouring monitor.
+    fn collect_targets(
+        &self,
+        layout: &AppliedLayout,
+        monitor_idx: usize,
+        targets: &mut Vec<WindowTarget>,
+    ) {
         if layout.actual_layout.entries.is_empty() {
             return;
         }
@@ -133,7 +180,6 @@ impl FlowWM {
         let border_thickness = self.config.borders.thickness as i32;
         let border_overlap = self.config.borders.overlap as i32;
 
-        let mut targets: Vec<WindowTarget> = Vec::new();
         for entry in &layout.actual_layout.entries {
             // Skip the dragged window during an active drag.
             if Some(entry.window_id) == excluded_id {
@@ -226,15 +272,6 @@ impl FlowWM {
                     IVec2::new(entry.rect.width, entry.rect.height),
                 ));
             }
-        }
-
-        log::debug!(
-            "animate_layout: submitting {} targets to animator",
-            targets.len()
-        );
-
-        if let Err(e) = self.animator.animate(targets) {
-            log::warn!("animation error: {e}");
         }
     }
 

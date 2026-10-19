@@ -280,6 +280,20 @@ impl FlowWM {
             .unwrap_or(self.active_monitor)
     }
 
+    /// Index of the nearest monitor lying beyond `from`'s edge in `dir`, or
+    /// `None` when no monitor lies in that direction. See the free function
+    /// [`monitor_in_direction`] for the rule.
+    #[must_use]
+    pub(super) fn monitor_in_direction(
+        &self,
+        from: usize,
+        dir: crate::common::Direction,
+    ) -> Option<usize> {
+        let rects: Vec<crate::common::Rect> =
+            self.monitors.iter().map(|m| m.screen_rect()).collect();
+        monitor_in_direction(&rects, from, dir)
+    }
+
     /// Index of the monitor that currently displays `hwnd` (by its on-screen
     /// rect), falling back to the active monitor when the rect is unknown.
     #[must_use]
@@ -338,5 +352,127 @@ impl FlowWM {
     #[allow(dead_code)] // API surface for upcoming floating-window management.
     pub(super) fn active_floating_mut(&mut self) -> &mut FloatingSpace {
         self.active_monitor_mut().active_floating_mut()
+    }
+}
+
+/// Pure geometry behind [`FlowWM::monitor_in_direction`].
+///
+/// Candidates must start past `from`'s edge in `dir` (allowing a few pixels
+/// of overlap or gap). Among them the one sharing the most of `from`'s
+/// perpendicular extent wins, with distance from the edge as the tie-breaker.
+#[must_use]
+pub(super) fn monitor_in_direction(
+    rects: &[crate::common::Rect],
+    from: usize,
+    dir: crate::common::Direction,
+) -> Option<usize> {
+    use crate::common::Direction;
+    const SLACK: i32 = 8;
+    let f = *rects.get(from)?;
+    // (index, negated band overlap, distance) - smaller tuple wins
+    let mut best: Option<(usize, i32, i32)> = None;
+    for (i, r) in rects.iter().enumerate() {
+        if i == from {
+            continue;
+        }
+        let (beyond, distance, overlap) = match dir {
+            Direction::Left => (
+                r.right() <= f.x + SLACK,
+                f.x - r.right(),
+                band_overlap(f.y, f.bottom(), r.y, r.bottom()),
+            ),
+            Direction::Right => (
+                r.x >= f.right() - SLACK,
+                r.x - f.right(),
+                band_overlap(f.y, f.bottom(), r.y, r.bottom()),
+            ),
+            Direction::Up => (
+                r.bottom() <= f.y + SLACK,
+                f.y - r.bottom(),
+                band_overlap(f.x, f.right(), r.x, r.right()),
+            ),
+            Direction::Down => (
+                r.y >= f.bottom() - SLACK,
+                r.y - f.bottom(),
+                band_overlap(f.x, f.right(), r.x, r.right()),
+            ),
+        };
+        if !beyond {
+            continue;
+        }
+        let key = (i, -overlap, distance.max(0));
+        if best.is_none_or(|b| (key.1, key.2) < (b.1, b.2)) {
+            best = Some(key);
+        }
+    }
+    best.map(|b| b.0)
+}
+
+/// Length of the overlap between the intervals `[a0, a1)` and `[b0, b1)`.
+fn band_overlap(a0: i32, a1: i32, b0: i32, b1: i32) -> i32 {
+    (a1.min(b1) - a0.max(b0)).max(0)
+}
+
+#[cfg(test)]
+mod monitor_direction_tests {
+    use super::monitor_in_direction;
+    use crate::common::{Direction, Rect};
+
+    fn r(x: i32, y: i32, w: i32, h: i32) -> Rect {
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn side_by_side_pair() {
+        // primary at 0, secondary to its left (the user's real layout)
+        let rects = [r(0, 0, 1920, 1080), r(-1920, 0, 1920, 1080)];
+        assert_eq!(monitor_in_direction(&rects, 0, Direction::Left), Some(1));
+        assert_eq!(monitor_in_direction(&rects, 0, Direction::Right), None);
+        assert_eq!(monitor_in_direction(&rects, 1, Direction::Right), Some(0));
+        assert_eq!(monitor_in_direction(&rects, 1, Direction::Left), None);
+        assert_eq!(monitor_in_direction(&rects, 0, Direction::Up), None);
+        assert_eq!(monitor_in_direction(&rects, 0, Direction::Down), None);
+    }
+
+    #[test]
+    fn three_in_a_row_picks_the_adjacent_one() {
+        let rects = [
+            r(0, 0, 1920, 1080),
+            r(1920, 0, 1920, 1080),
+            r(3840, 0, 1920, 1080),
+        ];
+        assert_eq!(monitor_in_direction(&rects, 0, Direction::Right), Some(1));
+        assert_eq!(monitor_in_direction(&rects, 2, Direction::Left), Some(1));
+        assert_eq!(monitor_in_direction(&rects, 1, Direction::Left), Some(0));
+    }
+
+    #[test]
+    fn stacked_pair_uses_up_and_down() {
+        let rects = [r(0, 0, 1920, 1080), r(0, -1080, 1920, 1080)];
+        assert_eq!(monitor_in_direction(&rects, 0, Direction::Up), Some(1));
+        assert_eq!(monitor_in_direction(&rects, 1, Direction::Down), Some(0));
+        assert_eq!(monitor_in_direction(&rects, 0, Direction::Left), None);
+    }
+
+    #[test]
+    fn prefers_the_monitor_sharing_the_most_band() {
+        // Two monitors to the right: one mostly above us, one level with us.
+        let rects = [
+            r(0, 0, 1920, 1080),
+            r(1920, -900, 1920, 1080),
+            r(1920, 100, 1920, 1080),
+        ];
+        assert_eq!(monitor_in_direction(&rects, 0, Direction::Right), Some(2));
+    }
+
+    #[test]
+    fn out_of_range_from_is_none() {
+        let rects = [r(0, 0, 1920, 1080)];
+        assert_eq!(monitor_in_direction(&rects, 5, Direction::Left), None);
     }
 }

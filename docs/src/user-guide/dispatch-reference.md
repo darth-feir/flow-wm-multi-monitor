@@ -41,6 +41,8 @@ flowchart LR
 | `Alt + q` | `close-window` |
 | `Alt + 1`…`9`, `0` | `switch-workspace 1`…`10` |
 | `Alt + Shift + 1`…`9`, `0` | `move-to-workspace 1`…`10` |
+| `Alt + [` / `]` | `focus-monitor left` / `right` |
+| `Alt + Shift + [` / `]` | `move-to-monitor left` / `right` |
 | `Alt + p` | `flow stop` (shuts the daemon down) |
 
 Commands with **no default hotkey** (run them from the terminal, or bind them
@@ -223,6 +225,38 @@ flow dispatch move-to-workspace 4
 ```
 
 Default hotkey: `Alt + Shift + 1`…`9`, `0` (0 = workspace 10).
+
+## Monitors
+
+Every monitor has its own scrolling strip and its own set of workspaces. The
+*active* monitor is the one holding the focused window; commands act there.
+
+### `focus-monitor <left|right|up|down>`
+
+Make the monitor in that direction (by screen geometry) the active one and
+focus the window you last used there. `focus left` / `focus right` at the edge
+of a strip does the same hop, so you can walk across monitors with the plain
+focus keys.
+
+```powershell
+flow dispatch focus-monitor left
+```
+
+Default hotkey: `Alt + [` / `Alt + ]`.
+
+### `move-to-monitor <left|right|up|down>`
+
+Move the focused window to the active workspace of the monitor in that
+direction. A tiled window joins that strip at the near edge (moving right puts
+it at the left end of the right-hand monitor); a float keeps its position
+relative to the work area. Focus follows the window. `move-window left` /
+`move-window right` at the edge of a strip does the same hop.
+
+```powershell
+flow dispatch move-to-monitor right
+```
+
+Default hotkey: `Alt + Shift + [` / `Alt + Shift + ]`.
 
 ## Window & daemon lifecycle
 

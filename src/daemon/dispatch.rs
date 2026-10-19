@@ -165,6 +165,10 @@ impl FlowWM {
                 self.dispatch_switch_workspace(*workspace_id)
             }
             SocketMessage::SwapWorkspace { .. } => unimplemented_command("swap_workspace"),
+            SocketMessage::FocusMonitor { direction } => self.dispatch_focus_monitor(*direction),
+            SocketMessage::MoveWindowToMonitor { direction } => {
+                self.dispatch_move_window_to_monitor(*direction)
+            }
             SocketMessage::MoveWindowToWorkspace { workspace_id } => {
                 self.dispatch_move_window_to_workspace(*workspace_id)
             }
@@ -236,9 +240,17 @@ impl FlowWM {
 
                 SocketResponse::Ok
             }
-            None => SocketResponse::Error {
-                message: "no window to focus in that direction".into(),
-            },
+            None => {
+                // At the edge of this strip: hop to the monitor in that
+                // direction, if there is one (niri behaviour).
+                if let Some(target) = self.monitor_in_direction(self.active_monitor, dir) {
+                    self.focus_monitor(target);
+                    return SocketResponse::Ok;
+                }
+                SocketResponse::Error {
+                    message: "no window to focus in that direction".into(),
+                }
+            }
         }
     }
 
@@ -312,9 +324,19 @@ impl FlowWM {
                 self.animate_layout(&diff);
                 SocketResponse::Ok
             }
-            None => SocketResponse::Error {
-                message: "cannot swap column in that direction".into(),
-            },
+            None => {
+                // At the edge of this strip: carry the window over to the
+                // monitor in that direction, if there is one.
+                let from = self
+                    .monitor_index_containing(id)
+                    .unwrap_or(self.active_monitor);
+                if let Some(target) = self.monitor_in_direction(from, dir) {
+                    return self.move_tiled_to_monitor(id, from, target, dir);
+                }
+                SocketResponse::Error {
+                    message: "cannot swap column in that direction".into(),
+                }
+            }
         }
     }
 
@@ -440,6 +462,185 @@ impl FlowWM {
             Direction::Up | Direction::Down => self.dispatch_swap_window(dir),
             Direction::Left | Direction::Right => self.dispatch_swap_column(dir),
         }
+    }
+
+    // ── Monitors ────────────────────────────────────────────────────────
+
+    /// `flow dispatch focus-monitor <dir>`: make the monitor in `dir` active
+    /// and focus its last-focused window.
+    fn dispatch_focus_monitor(&mut self, dir: Direction) -> SocketResponse {
+        let Some(target) = self.monitor_in_direction(self.active_monitor, dir) else {
+            return SocketResponse::Error {
+                message: format!("no monitor {}", direction_word(dir)),
+            };
+        };
+        self.focus_monitor(target);
+        SocketResponse::Ok
+    }
+
+    /// Make `target` the active monitor and push OS focus to the window the
+    /// user last used there (tiled first, else the top float). With nothing
+    /// to focus the monitor still becomes active, and OS focus is handed to
+    /// the shell so a later command cannot act on the window we came from.
+    pub(super) fn focus_monitor(&mut self, target: usize) {
+        if target >= self.monitors.len() {
+            return;
+        }
+        self.set_active_monitor(target);
+        let candidate = self.monitors[target]
+            .active_scrolling()
+            .last_focused_window()
+            .or_else(|| {
+                self.monitors[target]
+                    .active_workspace()
+                    .floating
+                    .windows()
+                    .last()
+                    .map(|e| e.window_id)
+            });
+        match candidate {
+            Some(id) => {
+                if !registry_win32::set_foreground_window(id.0) {
+                    log::warn!(
+                        "focus_monitor: SetForegroundWindow failed for hwnd {}",
+                        id.0
+                    );
+                }
+                let prev = self.registry.focused().map(|w| w.0);
+                self.registry.set_focused(id.0);
+                self.refresh_border_for(id.0);
+                if let Some(p) = prev
+                    && p != id.0
+                {
+                    self.refresh_border_for(p);
+                }
+            }
+            None => {
+                let _ = registry_win32::clear_foreground_window();
+            }
+        }
+    }
+
+    /// `flow dispatch move-to-monitor <dir>`: move the focused window to the
+    /// active workspace of the monitor in `dir`.
+    fn dispatch_move_window_to_monitor(&mut self, dir: Direction) -> SocketResponse {
+        let Some(id) = self.registry.focused() else {
+            log::debug!("dispatch_move_window_to_monitor: no-op (no OS-foreground window)");
+            return SocketResponse::Ok;
+        };
+        let Some(win) = self.registry.get_window(HWND(id.0 as *mut _)) else {
+            log::debug!("dispatch_move_window_to_monitor: no-op (foreground id not in registry)");
+            return SocketResponse::Ok;
+        };
+        let state = win.state.clone();
+        let from = self
+            .monitor_index_containing(id)
+            .unwrap_or(self.active_monitor);
+        let Some(target) = self.monitor_in_direction(from, dir) else {
+            return SocketResponse::Error {
+                message: format!("no monitor {}", direction_word(dir)),
+            };
+        };
+        match state {
+            WindowState::Tiling(TilingState::Active { .. }) => {
+                self.move_tiled_to_monitor(id, from, target, dir)
+            }
+            WindowState::Floating(FloatingState::Active { rect }) => {
+                self.move_float_to_monitor(id, from, target, rect)
+            }
+            _ => {
+                log::debug!("dispatch_move_window_to_monitor: no-op (window is not active)");
+                SocketResponse::Ok
+            }
+        }
+    }
+
+    /// Detach a tiled window from `from`'s strip and attach it to `target`'s
+    /// at the near edge: a window moving right enters the target strip at
+    /// its left end, a window moving left enters at its right end. Focus
+    /// follows the window.
+    fn move_tiled_to_monitor(
+        &mut self,
+        id: WindowId,
+        from: usize,
+        target: usize,
+        dir: Direction,
+    ) -> SocketResponse {
+        if from == target {
+            return SocketResponse::Ok;
+        }
+        let src = self.monitors[from].active_scrolling_mut().remove_window(id);
+
+        self.set_active_monitor(target);
+        let mut dst = match dir {
+            Direction::Right | Direction::Down => self.monitors[target]
+                .active_scrolling_mut()
+                .prepend_window(id),
+            Direction::Left | Direction::Up => {
+                self.monitors[target].active_scrolling_mut().add_window(id)
+            }
+        };
+        if let Some(diff) = self.monitors[target]
+            .active_scrolling_mut()
+            .ensure_focused_visible()
+        {
+            dst = diff;
+        }
+        // Both monitors change in one command: submit them as one batch so
+        // the source strip's columns resettle instead of being cut off by
+        // the destination's submission.
+        self.animate_layouts_on(&[(from, &src), (target, &dst)]);
+
+        if !registry_win32::set_foreground_window(id.0) {
+            log::warn!(
+                "move_tiled_to_monitor: SetForegroundWindow failed for hwnd {}",
+                id.0
+            );
+        }
+        self.registry.set_focused(id.0);
+        self.refresh_border_for(id.0);
+        SocketResponse::Ok
+    }
+
+    /// Move a float to `target`, keeping its offset relative to the work
+    /// area (clamped so it stays fully on the new monitor).
+    fn move_float_to_monitor(
+        &mut self,
+        id: WindowId,
+        from: usize,
+        target: usize,
+        rect: Rect,
+    ) -> SocketResponse {
+        if from == target {
+            return SocketResponse::Ok;
+        }
+        let from_wa = self.monitors[from].work_area();
+        let to_wa = self.monitors[target].work_area();
+        let moved = Rect {
+            x: rect.x - from_wa.x + to_wa.x,
+            y: rect.y - from_wa.y + to_wa.y,
+            width: rect.width,
+            height: rect.height,
+        }
+        .clamped_into(to_wa);
+
+        for m in &mut self.monitors {
+            m.active_workspace_mut().floating.remove(id);
+        }
+        remove_float_hwnd(id.0);
+        self.set_active_monitor(target);
+        let float_actual = self.register_float(id, moved);
+        self.animate_workspaces(&[(float_actual, 0)]);
+
+        if !registry_win32::set_foreground_window(id.0) {
+            log::warn!(
+                "move_float_to_monitor: SetForegroundWindow failed for hwnd {}",
+                id.0
+            );
+        }
+        self.registry.set_focused(id.0);
+        self.refresh_border_for(id.0);
+        SocketResponse::Ok
     }
 
     /// Dispatch a scroll-left command.
@@ -1480,6 +1681,16 @@ impl FlowWM {
 fn unimplemented_command(name: &str) -> SocketResponse {
     SocketResponse::Error {
         message: format!("command '{name}' is not yet implemented"),
+    }
+}
+
+/// Human word for a direction, for error messages ("no monitor to the left").
+fn direction_word(dir: Direction) -> &'static str {
+    match dir {
+        Direction::Left => "to the left",
+        Direction::Right => "to the right",
+        Direction::Up => "above",
+        Direction::Down => "below",
     }
 }
 

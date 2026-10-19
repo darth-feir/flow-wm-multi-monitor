@@ -315,6 +315,23 @@ enum DispatchCommands {
         /// Identifier of the destination workspace.
         workspace_id: u32,
     },
+    /// Focus the monitor in the given direction (by screen geometry) and
+    /// its last-focused window.
+    #[command(name = "focus-monitor")]
+    FocusMonitor {
+        #[command(subcommand)]
+        direction: FocusDirection,
+    },
+    /// Move the focused window to the monitor in the given direction. A
+    /// tiled window joins that monitor's strip at the near edge; a float
+    /// keeps its position relative to the work area. Focus follows.
+    ///
+    /// `move-window left/right` at the edge of a strip does the same hop.
+    #[command(name = "move-to-monitor")]
+    MoveWindowToMonitor {
+        #[command(subcommand)]
+        direction: FocusDirection,
+    },
 }
 
 /// Cardinal direction for `flow dispatch focus <dir>`.
@@ -813,10 +830,32 @@ fn cmd_dispatch(command: DispatchCommands) -> Result<(), String> {
             SocketMessage::SwapWorkspace { workspace_id },
             "workspace swapped",
         ),
+        DispatchCommands::FocusMonitor { direction } => send_command(
+            SocketMessage::FocusMonitor {
+                direction: focus_direction_to_direction(direction),
+            },
+            "monitor focused",
+        ),
+        DispatchCommands::MoveWindowToMonitor { direction } => send_command(
+            SocketMessage::MoveWindowToMonitor {
+                direction: focus_direction_to_direction(direction),
+            },
+            "window moved to monitor",
+        ),
         DispatchCommands::MoveWindowToWorkspace { workspace_id } => send_command(
             SocketMessage::MoveWindowToWorkspace { workspace_id },
             "window moved to workspace",
         ),
+    }
+}
+
+/// Map the CLI's `FocusDirection` subcommand onto the IPC [`Direction`].
+fn focus_direction_to_direction(direction: FocusDirection) -> Direction {
+    match direction {
+        FocusDirection::Left => Direction::Left,
+        FocusDirection::Right => Direction::Right,
+        FocusDirection::Up => Direction::Up,
+        FocusDirection::Down => Direction::Down,
     }
 }
 

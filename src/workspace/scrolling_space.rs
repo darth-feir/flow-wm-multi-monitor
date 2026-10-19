@@ -532,6 +532,16 @@ impl ScrollingSpace {
         self.apply_mutation(new_layout)
     }
 
+    /// Insert `window` as a new column at the **left end** of the strip and
+    /// focus it. The counterpart of [`add_window`](Self::add_window) (which
+    /// appends at the right end); used when a window arrives from the
+    /// monitor to the left so it lands at the near edge.
+    pub fn prepend_window(&mut self, window: WindowId) -> AppliedLayout {
+        let new_layout = mutations::insert_window_at(&self.virtual_layout, 0, window, &self.config);
+        self.last_focused_window = Some(window);
+        self.apply_mutation(new_layout)
+    }
+
     /// Insert a new window as a column immediately after the focused window.
     ///
     /// This is the **window-creation placement strategy**: when a new tiling

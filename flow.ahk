@@ -45,6 +45,8 @@
 ;   q        close focused window
 ;   p        stop the daemon (then this script exits too)
 ;   1..9,0   switch to workspace 1..10        (+Shift = send window there)
+;   [ ]      focus monitor left / right        (+Shift = send window there)
+;            (focus / move-window left/right also hop monitors at a strip edge)
 ;
 ; ════════════════════════════════════════════════════════════════════════════
 
@@ -108,6 +110,20 @@ Act_Up(*) {       ; k
         FlowDispatch("focus up")
 }
 
+Act_MonitorLeft(*) {   ; [
+    if GetKeyState("Shift")
+        FlowDispatch("move-to-monitor left")
+    else
+        FlowDispatch("focus-monitor left")
+}
+
+Act_MonitorRight(*) {  ; ]
+    if GetKeyState("Shift")
+        FlowDispatch("move-to-monitor right")
+    else
+        FlowDispatch("focus-monitor right")
+}
+
 WorkspaceAction(n) {
     if GetKeyState("Shift")
         FlowDispatch("move-to-workspace " n)
@@ -139,3 +155,5 @@ Hotkey(ModKey " & 7", (*) => WorkspaceAction(7))
 Hotkey(ModKey " & 8", (*) => WorkspaceAction(8))
 Hotkey(ModKey " & 9", (*) => WorkspaceAction(9))
 Hotkey(ModKey " & 0", (*) => WorkspaceAction(10))
+Hotkey(ModKey " & [", Act_MonitorLeft)
+Hotkey(ModKey " & ]", Act_MonitorRight)

@@ -204,6 +204,8 @@ daemon. The config directory resolution chain is documented in
 | `flow dispatch switch-workspace <id>` | `SwitchWorkspace` |
 | `flow dispatch swap-workspace <id>` | `SwapWorkspace` (stub) |
 | `flow dispatch move-to-workspace <id>` | `MoveWindowToWorkspace` |
+| `flow dispatch focus-monitor left/right/up/down` | `FocusMonitor` |
+| `flow dispatch move-to-monitor left/right/up/down` | `MoveWindowToMonitor` |
 
 The dispatch commands that change layout flow through the daemon's 3-stage
 pipeline (mutate, project, animate) as described in
