@@ -21,9 +21,10 @@
 ;   Mod+Comma                     consume: merge the window into the column to the left
 ;   Mod+Period                    expel: promote the window out into its own column
 ;   Mod+Space, Mod+D              application launcher (launcher.ahk: apps, open windows, settings)
-;   Mod+T                         terminal (Windows Terminal, else PowerShell)
+;   Mod+T / Mod+Shift+T           Alacritty / Alacritty as admin (UAC)
+;   Mod+Alt+T / Mod+Alt+Shift+T   Windows Terminal / Windows Terminal as admin (UAC)
 ;   Mod+Shift+/                   key-binding overlay (help.ahk); Esc or the same chord hides it
-;   Mod+Shift+T                   tiling toggle: `flow dispatch tiling toggle`
+;   Mod+Ctrl+T                    tiling toggle: `flow dispatch tiling toggle`
 ;   Mod+Shift+E                   stop FlowWM (and this script)
 ;
 ; Tiling toggle: while tiling is off every window-management chord above
@@ -53,7 +54,7 @@
 ; desktops), Win+Shift+Left/Right (Windows' own move-to-monitor), Win+Space
 ; (Windows' input-language switcher; Win+Ctrl+Space, which cycles the other
 ; way, still works). With tiling off only Win+Space, Win+D, Win+Shift+/,
-; Win+Shift+T and Win+Shift+E remain shadowed.
+; Win+Ctrl+T and Win+Shift+E remain shadowed.
 ; ════════════════════════════════════════════════════════════════════════════
 
 flowExe := "flow"      ; path to flow.exe (PATH by default); quote-safe below
@@ -224,13 +225,42 @@ ShowCentered(gui) {
     AhkLog("ShowCentered: could not activate " gui.Title)
 }
 
-; Mod+T: terminal (niri's default), Windows Terminal when installed.
-Terminal() {
-    try Run("wt.exe")
-    catch
-        try Run("powershell.exe")
-        catch as e
-            TrayTip("could not start a terminal: " e.Message, "flow.ahk")
+; Terminals. Mod+T Alacritty, Mod+Shift+T Alacritty as admin, Mod+Alt+T
+; Windows Terminal, Mod+Alt+Shift+T Windows Terminal as admin. Admin uses the
+; shell's RunAs verb, so UAC prompts as usual. Alacritty is looked up in its
+; usual install folders and then on PATH.
+Alacritty(admin := false) {
+    static exe := ""
+    if (exe = "") {
+        for p in [A_AppData "\..\Local\Programs\Alacritty\alacritty.exe", A_ProgramFiles "\Alacritty\alacritty.exe"]
+            if FileExist(p) {
+                exe := p
+                break
+            }
+        if (exe = "") {
+            try {
+                out := ComObject("WScript.Shell").Exec("where.exe alacritty.exe").StdOut.ReadAll()
+                if (Trim(out, " `t`r`n") != "")
+                    exe := Trim(StrSplit(out, "`n")[1], " `t`r")
+            }
+        }
+    }
+    if (exe = "") {
+        AhkLog("alacritty not found")
+        TrayTip("Alacritty not found (%LOCALAPPDATA%\Programs\Alacritty, Program Files, PATH).", "flow.ahk")
+        return
+    }
+    Launch(exe, admin)
+}
+WindowsTerminal(admin := false) {
+    Launch("wt.exe", admin)
+}
+Launch(exe, admin) {
+    AhkLog("launch " (admin ? "(admin) " : "") exe)
+    try Run((admin ? "*RunAs " : "") '"' exe '"')
+    catch as e
+        if !InStr(e.Message, "cancel")       ; a declined UAC prompt is not worth a popup
+            TrayTip("could not start " exe ": " e.Message, "flow.ahk")
 }
 
 ; Startup gate: refuse to hook the Win key unless the daemon answers within 10 s.
@@ -293,13 +323,18 @@ Loop 9 {
 #=::D("expand-column")
 #,::D("merge-column left")
 #.::D("promote right")
-#t::Terminal()
+
+; --- Terminals -------------------------------------------------------------
+#t::Alacritty()
+#+t::Alacritty(true)
+#!t::WindowsTerminal()
+#!+t::WindowsTerminal(true)
 
 ; --- Always bound while the daemon runs (tiling on or off) -----------------
 #HotIf DaemonUp
 
 ; --- Tiling toggle ----------------------------------------------------------
-#+t::D("tiling toggle", TilingToggled)
+#^t::D("tiling toggle", TilingToggled)
 
 ; --- Daemon ----------------------------------------------------------------
 #+e:: {

@@ -22,9 +22,10 @@ Bindings := [
     ["Mod+Comma",                   "consume: merge window into the column to the left"],
     ["Mod+Period",                  "expel: promote window out into its own column"],
     ["Mod+Space, Mod+D",            "application launcher (apps, open windows, settings)"],
-    ["Mod+T",                       "terminal"],
+    ["Mod+T / Mod+Shift+T",         "Alacritty / Alacritty as admin"],
+    ["Mod+Alt+T / Mod+Alt+Shift+T", "Windows Terminal / Windows Terminal as admin"],
     ["Mod+Shift+/",                 "this help (Esc or the same chord hides it)"],
-    ["Mod+Shift+T",                 "toggle tiling (off: Windows manages windows, chords fall through)"],
+    ["Mod+Ctrl+T",                  "toggle tiling (off: Windows manages windows, chords fall through)"],
     ["Mod+Shift+E",                 "stop FlowWM and this script"]
 ]
 
@@ -47,7 +48,7 @@ HelpGui.AddText(, "FlowWM key bindings   (Mod = Win)")
 HelpGui.SetFont("s12 norm cE0E0E0", "Consolas")
 HelpGui.AddText("xm y+12", HelpText())
 HelpGui.SetFont("s9 norm c9A9A9A", "Segoe UI")
-HelpGui.AddText("xm y+14", "Esc or Mod+Shift+/ closes this overlay. Win+L is the Windows lock. Tiling off releases every chord above except Mod+Space, Mod+D, Mod+Shift+/, Mod+Shift+T and Mod+Shift+E to Windows.")
+HelpGui.AddText("xm y+14", "Esc or Mod+Shift+/ closes this overlay. Win+L is the Windows lock. Tiling off releases every chord above except Mod+Space, Mod+D, Mod+Shift+/, Mod+Ctrl+T and Mod+Shift+E to Windows.")
 HelpGui.OnEvent("Escape", HelpHide)
 
 HelpToggle(*) {
