@@ -398,6 +398,25 @@ Full decision table:
 | Cycle | false | true | MakeTiling |
 | *any* | false | false | Err (ignored / minimized / hidden) |
 
+## Fullscreen windows
+
+`set-window fullscreen` (`src/daemon/fullscreen.rs`) reuses the floating
+space as its home: the window is removed from the layout like a float and
+added to its workspace's `FloatingSpace` at the monitor's **screen rect**
+(taskbar included), recorded in the registry as `Floating(Active)`, and kept
+above the tiles with `HWND_TOPMOST`. A daemon-side map
+(`FlowWM::fullscreen`, HWND → `FullscreenOrigin`) is what distinguishes it
+from a float: no border (`border_style_for`), no float-location tracking
+(`rebuild_float_hwnds` skips it), no ring inset in the animation bridge, and
+`mode: "fullscreen"` in `flow query all`. The origin remembers the monitor,
+workspace, column, row, width and whether the window had the column to
+itself (or the float rect); the second toggle restores it through
+`ScrollingSpace::restore_window_at` (same column/row when the column still
+exists, else appended) or `register_float`. Minimize / hide keep the origin
+and the restore hook re-asserts the screen rect and the topmost flag; destroy
+drops it; `tiling off` and the shutdown rescue demote every fullscreen window
+to a float inside its work area and clear the topmost flag.
+
 ## Future Work
 
 Several enhancements are planned but not yet implemented:

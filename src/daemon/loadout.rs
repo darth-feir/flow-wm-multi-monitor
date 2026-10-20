@@ -863,19 +863,36 @@ impl FlowWM {
     }
 
     /// Snapshot the floating area of a single workspace.
+    ///
+    /// A fullscreen window (`set-window fullscreen`) is written as the
+    /// float it comes back as after a restart: at the rect it was floating
+    /// at before, else its screen rect clamped into the work area — never
+    /// the taskbar-covering screen rect itself.
     fn snapshot_floating(&self, ws: &crate::workspace::Workspace) -> Vec<FloatingEntry> {
         ws.floating
             .windows()
             .iter()
             .filter_map(|entry| {
+                let rect = match self.fullscreen.get(&entry.window_id.0) {
+                    Some(super::fullscreen::FullscreenOrigin::Float { rect, .. }) => *rect,
+                    Some(super::fullscreen::FullscreenOrigin::Tile { monitor, .. }) => {
+                        let wa = self
+                            .monitors
+                            .get(*monitor)
+                            .map(|m| m.work_area())
+                            .unwrap_or(entry.rect);
+                        entry.rect.clamped_into(wa)
+                    }
+                    None => entry.rect,
+                };
                 self.window_ref_for(entry.window_id)
                     .map(|wr| FloatingEntry {
                         window: wr,
                         rect: RectJson {
-                            x: entry.rect.x,
-                            y: entry.rect.y,
-                            w: entry.rect.width,
-                            h: entry.rect.height,
+                            x: rect.x,
+                            y: rect.y,
+                            w: rect.width,
+                            h: rect.height,
                         },
                     })
             })

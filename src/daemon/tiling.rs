@@ -324,15 +324,29 @@ impl FlowWM {
         // 1. No tween may land after the windows have been put back.
         self.animator.cancel_and_wait();
 
+        // 1b. Fullscreen windows become plain floats inside their work area
+        //     (origin forgotten, topmost cleared): the resume sees floats.
+        let demoted = self.demote_all_fullscreen_to_floats();
+
         // 2. Every tile on-screen, off-screen floats clamped, in one
         //    instant batch.
         let PauseTargets {
-            targets,
-            submitted,
+            mut targets,
+            mut submitted,
             tiles,
             restored,
-            floats_clamped,
+            mut floats_clamped,
         } = self.pause_targets();
+        for (hwnd, rect) in demoted {
+            let bounds = self
+                .registry
+                .get_window(HWND(hwnd as *mut _))
+                .map(|w| w.invisible_bounds)
+                .unwrap_or_default();
+            push_instant(&mut targets, hwnd, bounds.visible_to_window(rect));
+            submitted.push((hwnd, rect));
+            floats_clamped += 1;
+        }
         if !targets.is_empty() {
             log::debug!(
                 "tiling: submitting {} instant target(s) to put windows back",
@@ -1095,6 +1109,51 @@ mod tests {
         assert!(again.already_paused);
         assert_eq!(again.tiles, 0);
         assert_eq!(probe.placements.borrow().len(), 1);
+    }
+
+    /// A fullscreen window is handed back as a plain float inside its work
+    /// area when tiling goes off, and stays a float when it comes back on.
+    #[test]
+    fn pause_demotes_fullscreen_windows_to_floats_and_resume_keeps_them_floating() {
+        let mut flow = fixture();
+        flow.config.borders.enabled = false;
+        assert_eq!(
+            flow.set_window_to_fullscreen(WindowId(C)),
+            SocketResponse::Ok
+        );
+        assert!(flow.is_fullscreen(C));
+        assert_eq!(column_order(&flow, 0, 1), vec![WindowId(A)]);
+
+        let summary = flow.pause_tiling_with(&desktop());
+        assert!(!summary.already_paused);
+        assert!(!flow.is_fullscreen(C));
+        let seat = flow.monitors[0]
+            .active_workspace()
+            .floating
+            .windows()
+            .iter()
+            .find(|e| e.window_id == WindowId(C))
+            .map(|e| e.rect);
+        assert_eq!(seat, Some(PRIMARY));
+        assert!(matches!(
+            flow.registry.get_window(HWND(C as *mut _)).map(|w| &w.state),
+            Some(WindowState::Floating(FloatingState::Active { rect })) if *rect == PRIMARY
+        ));
+
+        let mut d = desktop();
+        d.rects.insert(C, PRIMARY);
+        let resumed = flow.resume_tiling_with(&d);
+        assert!(!resumed.already_tiling);
+        assert!(!flow.is_fullscreen(C));
+        assert_eq!(column_order(&flow, 0, 1), vec![WindowId(A)]);
+        assert!(
+            flow.monitors[0]
+                .active_workspace()
+                .floating
+                .windows()
+                .iter()
+                .any(|e| e.window_id == WindowId(C))
+        );
     }
 
     #[test]

@@ -192,6 +192,7 @@ impl FlowWM {
             self.purge_windows_from_all_spaces(&[WindowId(hwnd)]);
             remove_float_hwnd(hwnd);
             self.forget_submitted(hwnd);
+            self.forget_fullscreen(hwnd, false);
             self.registry.remove_window(hwnd);
             return;
         }
@@ -209,6 +210,8 @@ impl FlowWM {
         remove_float_hwnd(hwnd);
         self.remove_float_from_all_spaces(WindowId(hwnd));
         self.forget_submitted(hwnd);
+        // A fullscreen window that closed takes its origin with it.
+        self.forget_fullscreen(hwnd, false);
 
         self.registry.remove_window(hwnd);
         // Border overlay: cleaned up automatically — `remove_window` drops the
@@ -447,6 +450,9 @@ impl FlowWM {
         if self.registry.is_tiling(hwnd) {
             self.readd_tile_to_home_monitor(hwnd);
         }
+        // A fullscreen window comes back fullscreen (the registry restored
+        // it as a float at its pre-manage rect).
+        self.reassert_fullscreen(hwnd);
         // Border overlay: registry now records Active ⇒ refresh re-attaches.
         self.refresh_border_for(hwnd);
     }
@@ -531,6 +537,9 @@ impl FlowWM {
         }
         if change == VisibilityChange::Shown && self.registry.is_tiling_active(hwnd) {
             self.readd_tile_to_home_monitor(hwnd);
+        }
+        if change == VisibilityChange::Shown {
+            self.reassert_fullscreen(hwnd);
         }
         // Border overlay: registry now records Active ⇒ refresh re-attaches.
         // (The untracked-recovery branch above early-returns after

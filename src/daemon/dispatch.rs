@@ -24,6 +24,7 @@ use windows::Win32::Foundation::HWND;
 
 use super::animation::PrevRects;
 use super::config_derive;
+use super::fullscreen::FullscreenExit;
 use super::types::FlowWM;
 
 // Built-in fallback policy for a floating window's default size when the user
@@ -755,6 +756,7 @@ impl FlowWM {
             .floating
             .remove(window);
         remove_float_hwnd(window.0);
+        self.forget_fullscreen(window.0, false);
     }
 
     /// Forget the tracked focus and recolour the previously focused window's
@@ -789,6 +791,9 @@ impl FlowWM {
         match state {
             WindowState::Tiling(TilingState::Active { .. }) => {
                 self.move_tiled_to_monitor(id, from, target, dir)
+            }
+            WindowState::Floating(FloatingState::Active { .. }) if self.is_fullscreen(id.0) => {
+                self.move_fullscreen_to_monitor(id, from, target)
             }
             WindowState::Floating(FloatingState::Active { rect }) => {
                 self.move_float_to_monitor(id, from, target, rect)
@@ -1574,6 +1579,9 @@ impl FlowWM {
             win.state,
             WindowState::Floating(FloatingState::Active { .. })
         );
+        // A fullscreen window is recorded as a float; the daemon's map is
+        // what tells it apart.
+        let currently_fullscreen = currently_floating && self.is_fullscreen(focused.0);
 
         // Capture the window's identity for history recording before the
         // immutable borrow of `self.registry` (via `win`) ends — the
@@ -1586,7 +1594,12 @@ impl FlowWM {
         //    the only non-trivial branching in the handler — extracting it
         //    makes the full mode × state table unit-testable without
         //    constructing the daemon (see `resolve_set_window_action`).
-        let action = match resolve_set_window_action(mode, currently_tiling, currently_floating) {
+        let action = match resolve_set_window_action(
+            mode,
+            currently_tiling,
+            currently_floating,
+            currently_fullscreen,
+        ) {
             Ok(a) => a,
             Err(()) => {
                 return SocketResponse::Error {
@@ -1604,6 +1617,8 @@ impl FlowWM {
             SetWindowAction::NoOp => SocketResponse::Ok,
             SetWindowAction::MakeFloating => self.set_window_to_float(focused),
             SetWindowAction::MakeTiling => self.set_window_to_tile(focused),
+            SetWindowAction::MakeFullscreen => self.set_window_to_fullscreen(focused),
+            SetWindowAction::LeaveFullscreen(exit) => self.restore_from_fullscreen(focused, exit),
         };
 
         // 5. Record the user's explicit decision so the next window of the
@@ -2013,6 +2028,10 @@ enum SetWindowAction {
     MakeFloating,
     /// Transition the window into tiling mode.
     MakeTiling,
+    /// Put the window fullscreen (see `daemon::fullscreen`).
+    MakeFullscreen,
+    /// Take a fullscreen window back: to its origin, the strip or a float.
+    LeaveFullscreen(FullscreenExit),
     /// The window already satisfies the requested mode — no transition needed.
     NoOp,
 }
@@ -2026,20 +2045,38 @@ enum SetWindowAction {
 ///
 /// # Decision table
 ///
-/// | mode  | currently tiling | currently floating | result        |
-/// |-------|------------------|--------------------|---------------|
-/// | Float | true             | false              | MakeFloating  |
-/// | Float | false            | true               | NoOp          |
-/// | Tile  | true             | false              | NoOp          |
-/// | Tile  | false            | true               | MakeTiling    |
-/// | Cycle | true             | false              | MakeFloating  |
-/// | Cycle | false            | true               | MakeTiling    |
-/// | any   | false            | false              | Err (ignored) |
+/// | mode       | currently tiling | currently floating | fullscreen | result                     |
+/// |------------|------------------|--------------------|------------|----------------------------|
+/// | Float      | true             | false              | false      | MakeFloating               |
+/// | Float      | false            | true               | false      | NoOp                       |
+/// | Tile       | true             | false              | false      | NoOp                       |
+/// | Tile       | false            | true               | false      | MakeTiling                 |
+/// | Cycle      | true             | false              | false      | MakeFloating               |
+/// | Cycle      | false            | true               | false      | MakeTiling                 |
+/// | Fullscreen | either           |                    | false      | MakeFullscreen             |
+/// | Fullscreen | (floating)       |                    | true       | LeaveFullscreen(Origin)    |
+/// | Tile       | (floating)       |                    | true       | LeaveFullscreen(Tile)      |
+/// | Cycle      | (floating)       |                    | true       | LeaveFullscreen(Tile)      |
+/// | Float      | (floating)       |                    | true       | LeaveFullscreen(Float)     |
+/// | any        | false            | false              | false      | Err (ignored)              |
+///
+/// A fullscreen window is recorded as a float, so `currently_fullscreen`
+/// implies `currently_floating`; it is checked first. `cycle` keeps its
+/// float/tile meaning for everything else — on a fullscreen window it only
+/// ever leads back to tiled.
 const fn resolve_set_window_action(
     mode: WindowMode,
     currently_tiling: bool,
     currently_floating: bool,
+    currently_fullscreen: bool,
 ) -> Result<SetWindowAction, ()> {
+    if currently_fullscreen {
+        return Ok(SetWindowAction::LeaveFullscreen(match mode {
+            WindowMode::Fullscreen => FullscreenExit::Origin,
+            WindowMode::Tile | WindowMode::Cycle => FullscreenExit::Tile,
+            WindowMode::Float => FullscreenExit::Float,
+        }));
+    }
     // Ignored / minimized / hidden windows cannot transition.
     if !currently_tiling && !currently_floating {
         return Err(());
@@ -2049,6 +2086,7 @@ const fn resolve_set_window_action(
         WindowMode::Float => true,
         WindowMode::Tile => false,
         WindowMode::Cycle => currently_tiling,
+        WindowMode::Fullscreen => return Ok(SetWindowAction::MakeFullscreen),
     };
     // No-op when the window already satisfies the requested mode.
     let already_satisfied = (make_float && currently_floating) || (!make_float && currently_tiling);
@@ -2073,7 +2111,10 @@ const fn action_to_learned(action: SetWindowAction) -> Option<WindowAction> {
     match action {
         SetWindowAction::MakeFloating => Some(WindowAction::Float),
         SetWindowAction::MakeTiling => Some(WindowAction::Tile),
-        SetWindowAction::NoOp => None,
+        // Fullscreen is a view, not a classification: never learned.
+        SetWindowAction::MakeFullscreen
+        | SetWindowAction::LeaveFullscreen(_)
+        | SetWindowAction::NoOp => None,
     }
 }
 
@@ -2091,64 +2132,104 @@ mod tests {
     #[test]
     fn float_mode_on_tiling_makes_floating() {
         // Positive: Float requested, currently tiling → must transition.
-        let action = resolve_set_window_action(WindowMode::Float, true, false);
+        let action = resolve_set_window_action(WindowMode::Float, true, false, false);
         assert_eq!(action, Ok(SetWindowAction::MakeFloating));
     }
 
     #[test]
     fn float_mode_on_floating_is_noop() {
         // Positive no-op: already floating, asking to float → nothing to do.
-        let action = resolve_set_window_action(WindowMode::Float, false, true);
+        let action = resolve_set_window_action(WindowMode::Float, false, true, false);
         assert_eq!(action, Ok(SetWindowAction::NoOp));
     }
 
     #[test]
     fn tile_mode_on_tiling_is_noop() {
         // Positive no-op: already tiling, asking to tile → nothing to do.
-        let action = resolve_set_window_action(WindowMode::Tile, true, false);
+        let action = resolve_set_window_action(WindowMode::Tile, true, false, false);
         assert_eq!(action, Ok(SetWindowAction::NoOp));
     }
 
     #[test]
     fn tile_mode_on_floating_makes_tiling() {
         // Positive: Tile requested, currently floating → must transition.
-        let action = resolve_set_window_action(WindowMode::Tile, false, true);
+        let action = resolve_set_window_action(WindowMode::Tile, false, true, false);
         assert_eq!(action, Ok(SetWindowAction::MakeTiling));
     }
 
     #[test]
     fn cycle_mode_on_tiling_makes_floating() {
         // Positive: Cycle toggles tiling → floating.
-        let action = resolve_set_window_action(WindowMode::Cycle, true, false);
+        let action = resolve_set_window_action(WindowMode::Cycle, true, false, false);
         assert_eq!(action, Ok(SetWindowAction::MakeFloating));
     }
 
     #[test]
     fn cycle_mode_on_floating_makes_tiling() {
         // Positive: Cycle toggles floating → tiling.
-        let action = resolve_set_window_action(WindowMode::Cycle, false, true);
+        let action = resolve_set_window_action(WindowMode::Cycle, false, true, false);
         assert_eq!(action, Ok(SetWindowAction::MakeTiling));
     }
 
     #[test]
     fn float_mode_on_ignored_is_err() {
         // Negative: an ignored / minimized / hidden window cannot transition.
-        let action = resolve_set_window_action(WindowMode::Float, false, false);
+        let action = resolve_set_window_action(WindowMode::Float, false, false, false);
         assert_eq!(action, Err(()));
     }
 
     #[test]
     fn tile_mode_on_ignored_is_err() {
         // Negative: Tile on a non-active window is also rejected.
-        let action = resolve_set_window_action(WindowMode::Tile, false, false);
+        let action = resolve_set_window_action(WindowMode::Tile, false, false, false);
         assert_eq!(action, Err(()));
     }
 
     #[test]
     fn cycle_mode_on_ignored_is_err() {
         // Negative: Cycle has nothing to toggle for a non-active window.
-        let action = resolve_set_window_action(WindowMode::Cycle, false, false);
+        let action = resolve_set_window_action(WindowMode::Cycle, false, false, false);
         assert_eq!(action, Err(()));
+    }
+
+    #[test]
+    fn fullscreen_mode_and_fullscreen_state_resolve_as_documented() {
+        // Entering: a tile or a float goes fullscreen.
+        assert_eq!(
+            resolve_set_window_action(WindowMode::Fullscreen, true, false, false),
+            Ok(SetWindowAction::MakeFullscreen)
+        );
+        assert_eq!(
+            resolve_set_window_action(WindowMode::Fullscreen, false, true, false),
+            Ok(SetWindowAction::MakeFullscreen)
+        );
+        assert_eq!(
+            resolve_set_window_action(WindowMode::Fullscreen, false, false, false),
+            Err(())
+        );
+        // Leaving: the mode decides where to.
+        assert_eq!(
+            resolve_set_window_action(WindowMode::Fullscreen, false, true, true),
+            Ok(SetWindowAction::LeaveFullscreen(FullscreenExit::Origin))
+        );
+        assert_eq!(
+            resolve_set_window_action(WindowMode::Cycle, false, true, true),
+            Ok(SetWindowAction::LeaveFullscreen(FullscreenExit::Tile))
+        );
+        assert_eq!(
+            resolve_set_window_action(WindowMode::Tile, false, true, true),
+            Ok(SetWindowAction::LeaveFullscreen(FullscreenExit::Tile))
+        );
+        assert_eq!(
+            resolve_set_window_action(WindowMode::Float, false, true, true),
+            Ok(SetWindowAction::LeaveFullscreen(FullscreenExit::Float))
+        );
+        // Never learned.
+        assert_eq!(action_to_learned(SetWindowAction::MakeFullscreen), None);
+        assert_eq!(
+            action_to_learned(SetWindowAction::LeaveFullscreen(FullscreenExit::Tile)),
+            None
+        );
     }
 
     #[test]
@@ -2160,14 +2241,19 @@ mod tests {
         // The (true, true) cell is treated as already-floating for no-op
         // purposes because the floating check wins the `already_satisfied`
         // short-circuit for Float/Cycle, and the tiling check wins for Tile.
-        for mode in [WindowMode::Float, WindowMode::Tile, WindowMode::Cycle] {
+        for mode in [
+            WindowMode::Float,
+            WindowMode::Tile,
+            WindowMode::Cycle,
+            WindowMode::Fullscreen,
+        ] {
             // tiling=true, floating=false
-            let _ = resolve_set_window_action(mode, true, false);
+            let _ = resolve_set_window_action(mode, true, false, false);
             // tiling=false, floating=true
-            let _ = resolve_set_window_action(mode, false, true);
+            let _ = resolve_set_window_action(mode, false, true, false);
             // tiling=false, floating=false (ignored)
             assert_eq!(
-                resolve_set_window_action(mode, false, false),
+                resolve_set_window_action(mode, false, false, false),
                 Err(()),
                 "ignored window must always be Err for {mode:?}"
             );

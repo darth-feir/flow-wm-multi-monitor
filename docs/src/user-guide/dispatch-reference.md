@@ -227,7 +227,9 @@ Change the focused window's tiling mode. `mode` is one of:
 
 - `float` — detach the window from the layout and let it float freely.
 - `tile` — insert the window into the scrolling column layout.
-- `cycle` — toggle between float and tile (the most common choice).
+- `cycle` — toggle between float and tile (the most common choice). On a
+  fullscreen window it goes back to tiled.
+- `fullscreen` — toggle fullscreen (see below).
 
 FlowWM **remembers** your decision: it writes the app's tile/float choice to
 `history-flow-rules.toml`, and the next time you open that app it tiles (or
@@ -240,6 +242,35 @@ flow dispatch set-window cycle
 ```
 
 Default hotkey: `Alt + t` (cycle).
+
+#### `set-window fullscreen`
+
+Put the focused tiled or floating window over its monitor's **whole screen**
+— the full screen rect, not the work area, so it covers the taskbar — kept
+above the tiles and without a border. FlowWM remembers where it came from:
+the monitor, workspace, column, row and column width of a tile, or the rect
+of a float. Issuing `set-window fullscreen` again puts it back there — into
+the same column and row when that column still exists (else appended at the
+end of the strip; with `[columns]` presets the column takes the monitor's
+current preset width), or back to its float rect.
+
+While fullscreen the window still belongs to its workspace: switching
+workspaces parks and unparks it with the workspace like a float, and
+`move-to-monitor` carries it fullscreen to the other monitor (leaving
+fullscreen there appends it to that strip). The tiled-only commands (`focus`,
+`move-window`, `expand-column`, …) ignore it. `set-window tile` or `cycle`
+on a fullscreen window tiles it; `set-window float` floats it (at its old
+rect if it was a float, else centred). Closing it forgets it; minimizing and
+restoring brings it back fullscreen. `flow dispatch tiling off` hands it back
+as a plain float inside the work area, and `tiling on` keeps it a float.
+`flow query all` lists it with `"mode": "fullscreen"`. The choice is not
+learned (it never changes an app's tile/float rule).
+
+```powershell
+flow dispatch set-window fullscreen    # and again to come back
+```
+
+No default hotkey in `flow.ahk` — bind it yourself.
 
 ## Workspaces
 
@@ -352,8 +383,9 @@ known; otherwise it is brought into its monitor's work area), the border
 overlays disappear, and FlowWM stops moving windows altogether. Windows you
 open, close, minimize or drag meanwhile are plain Windows windows; a
 minimized window whose restore position was off-screen is fixed so it comes
-back on-screen. The daemon and the hotkey script keep running, so the same
-chord turns tiling back on.
+back on-screen. A fullscreen window (`set-window fullscreen`) is handed back
+as a plain float inside its work area. The daemon and the hotkey script keep
+running, so the same chord turns tiling back on.
 
 `tiling on` rebuilds the layout from what is on the desktop now: windows that
 were tiled before go back to the same monitor, workspace, column and row
@@ -414,7 +446,7 @@ A few other top-level commands are worth knowing:
 | `flow config edit` | Open the config directory in your editor. |
 | `flow config path` | Print the resolved config directory path. |
 | `flow config check` | Validate `flow.toml` / `flow-rules.toml` without loading them. |
-| `flow query all` | Dump every tracked window (state, rect, column/row, …) as JSON, plus the monitors and whether tiling is on (`tiling_enabled`). |
+| `flow query all` | Dump every tracked window (state, `mode` — `tiled` / `floating` / `fullscreen` / `minimized` / `hidden` / `ignored` —, rect, column/row, …) as JSON, plus the monitors (each with its `width_preset`) and whether tiling is on (`tiling_enabled`). |
 | `flow enable-autostart [--ahk]` | Create the login shortcut in `shell:startup` (idempotent). |
 | `flow disable-autostart` | Remove the login shortcut (idempotent). |
 

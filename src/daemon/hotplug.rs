@@ -845,6 +845,7 @@ impl FlowWM {
             .unwrap_or(primary_new)
             .min(self.monitors.len() - 1);
 
+        self.reseat_fullscreen_after_hotplug();
         self.seat_all_monitors_instantly();
         self.rebuild_float_hwnds();
 

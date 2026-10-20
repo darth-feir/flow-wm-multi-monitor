@@ -16,7 +16,9 @@ impl FlowWM {
     /// window entry carries a `monitor` field: the index of the monitor
     /// whose workspace holds it (else the remembered owning monitor), or
     /// `null` for a window seated nowhere (ignored, minimized, hidden and
-    /// never seated).
+    /// never seated) — and a `mode` field: `"tiled"`, `"floating"`,
+    /// `"fullscreen"` (a `set-window fullscreen` window, which the `state`
+    /// records as a float), `"minimized"`, `"hidden"` or `"ignored"`.
     pub(super) fn query_windows_all(&self) -> SocketResponse {
         let viewport_offset = self.active_scrolling().virtual_layout().viewport_offset;
         let mut payload = self.registry.to_json_value(viewport_offset);
@@ -25,6 +27,7 @@ impl FlowWM {
             self.monitor_index_containing(wid)
                 .or_else(|| self.remembered_monitor(wid))
         });
+        annotate_windows_with_mode(&mut payload, |hwnd| self.window_mode(hwnd));
         if let serde_json::Value::Object(map) = &mut payload {
             let monitors: Vec<serde_json::Value> = self
                 .monitors
@@ -131,6 +134,28 @@ impl FlowWM {
     }
 }
 
+/// Add a `mode` field to every entry of `payload["windows"]` from
+/// `mode_of(hwnd)`. Entries without a numeric `hwnd` are left untouched.
+pub(super) fn annotate_windows_with_mode(
+    payload: &mut serde_json::Value,
+    mode_of: impl Fn(isize) -> &'static str,
+) {
+    let Some(windows) = payload
+        .get_mut("windows")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for entry in windows {
+        let Some(hwnd) = entry.get("hwnd").and_then(serde_json::Value::as_i64) else {
+            continue;
+        };
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("mode".into(), serde_json::json!(mode_of(hwnd as isize)));
+        }
+    }
+}
+
 /// Add a `monitor` field to every entry of `payload["windows"]`, using
 /// `monitor_of(hwnd)` — `None` serialises as `null`. Entries without a
 /// numeric `hwnd` are left untouched; a payload without a `windows` array is
@@ -185,6 +210,20 @@ mod tests {
         // Other fields are untouched.
         assert_eq!(payload["windows"][0]["exe"], "a.exe");
         assert_eq!(payload["count"], 3);
+    }
+
+    /// Every window entry gains a `mode` from the lookup.
+    #[test]
+    fn windows_payload_is_annotated_with_mode() {
+        let mut payload = serde_json::json!({
+            "windows": [ { "hwnd": 10 }, { "hwnd": 20 }, { "title": "no hwnd" } ],
+        });
+        annotate_windows_with_mode(&mut payload, |hwnd| {
+            if hwnd == 10 { "fullscreen" } else { "tiled" }
+        });
+        assert_eq!(payload["windows"][0]["mode"], "fullscreen");
+        assert_eq!(payload["windows"][1]["mode"], "tiled");
+        assert!(payload["windows"][2].get("mode").is_none());
     }
 
     /// A payload without a `windows` array is left as it is.

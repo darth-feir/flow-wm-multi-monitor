@@ -534,11 +534,15 @@ impl FlowWM {
                     y: r.y + y_offset,
                     ..r
                 };
-                let window_rect = shift(
-                    invisible_bounds
-                        .visible_to_window(entry.rect)
-                        .inset(border_thickness - border_overlap),
-                );
+                // A fullscreen window has no ring to make room for: it
+                // covers the screen rect exactly.
+                let inset = if self.is_fullscreen(entry.window_id.0) {
+                    0
+                } else {
+                    border_thickness - border_overlap
+                };
+                let window_rect =
+                    shift(invisible_bounds.visible_to_window(entry.rect).inset(inset));
                 // The border overlay sits at the visible rect (same y_offset)
                 // so it moves in lockstep with the window across the switch.
                 let next = shift(entry.rect);

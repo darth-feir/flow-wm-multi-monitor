@@ -97,7 +97,7 @@ format with a `"type"` field and snake_case variant names.
 | Semantic move | `MoveWindow { direction }` | Daemon resolves concrete action by state |
 | Scroll | `ScrollLeft`, `ScrollRight` | Slide the viewport |
 | Column resize | `ExpandColumn`, `ShrinkColumn`, `SetColumnWidth { width_px }`, `SetWidthPreset { preset }` | Adjust column widths; `SetWidthPreset` (`next`/`prev`/`cycle`/`{"preset": "1/2"}`) moves the focused monitor to a `[columns]` preset and answers `Data { "width_preset", "monitor" }` |
-| Window state | `ToggleFloat`, `ToggleMonocle`, `PlaceAbove`, `Promote`, `MergeColumn`, `ConsumeOrExpel`, `CloseWindow` | Per-window operations; `ConsumeOrExpel { direction }` is `Promote` for a window that shares its column, `MergeColumn` for one alone in it |
+| Window state | `SetWindow { mode }`, `ToggleFloat`, `ToggleMonocle`, `PlaceAbove`, `Promote`, `MergeColumn`, `ConsumeOrExpel`, `CloseWindow` | Per-window operations; `SetWindow` takes `float`, `tile`, `cycle` or `fullscreen` (a toggle — see `daemon::fullscreen`); `ConsumeOrExpel { direction }` is `Promote` for a window that shares its column, `MergeColumn` for one alone in it |
 | Workspace | `SwitchWorkspace { workspace_id }`, `SwapWorkspace { workspace_id }`, `MoveWindowToWorkspace { workspace_id }` | niri-style virtual desktops (`Switch`/`Move` implemented; `Swap` stub) |
 | Query | `QueryWindowsAll`, `QueryLayoutVirtual`, `QueryLayoutActual`, `QueryState` | Read-only introspection |
 | Config mutation | `SetConfigValue { key, value }` | Runtime config change |
@@ -354,6 +354,7 @@ owning monitor the registry remembers for a minimized or hidden window), or
 | `flow dispatch expand-column` | `ExpandColumn` |
 | `flow dispatch shrink-column` | `ShrinkColumn` |
 | `flow dispatch width next/prev/cycle/<preset>` | `SetWidthPreset` — prints `flow: column width <preset>` |
+| `flow dispatch set-window float/tile/cycle/fullscreen` | `SetWindow { mode }` |
 | `flow dispatch close-window` | `CloseWindow` |
 | `flow dispatch switch-workspace <id>` | `SwitchWorkspace` |
 | `flow dispatch swap-workspace <id>` | `SwapWorkspace` (stub) |

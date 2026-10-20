@@ -290,6 +290,13 @@ pub struct FlowWM {
     /// The startup reporter, kept so runtime changes reach the status file
     /// (`tiling: on|off`). `None` in unit tests.
     pub(super) status_reporter: Option<super::startup::StartupReporter>,
+
+    /// Windows the daemon put fullscreen (`set-window fullscreen`), keyed
+    /// by HWND value, with where each came from so it can be put back. A
+    /// fullscreen window sits in its workspace's floating space at the
+    /// monitor's screen rect; this map is what tells it apart from a float.
+    /// See `daemon::fullscreen`.
+    pub(super) fullscreen: std::collections::HashMap<isize, super::fullscreen::FullscreenOrigin>,
 }
 
 impl FlowWM {

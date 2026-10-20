@@ -753,6 +753,62 @@ impl ScrollingSpace {
         self.apply_mutation(new_layout)
     }
 
+    /// Put `window` back into the seat it left — the fullscreen restore
+    /// primitive. `alone` says it had column `col` to itself: then a new
+    /// single-row column is inserted at `col` (clamped, so a vanished
+    /// column index appends). Otherwise it becomes row `row` (clamped) of
+    /// column `col` when that column still exists and has room for one
+    /// more row above `min_window_height_px`, else a new column at `col`.
+    /// `width_px` is the new column's width (`None` = the base
+    /// `column_width`), clamped to the strip's bounds. The window becomes
+    /// the strip's focus cursor and is brought into view. A window already
+    /// seated is left where it is.
+    pub fn restore_window_at(
+        &mut self,
+        col: usize,
+        row: usize,
+        alone: bool,
+        window: WindowId,
+        width_px: Option<i32>,
+    ) -> AppliedLayout {
+        if let Some(seated) = self.already_seated(window) {
+            return seated;
+        }
+        let mut new_layout = self.virtual_layout.clone();
+        let width = width_px.unwrap_or(self.config.column_width as i32).clamp(
+            (self.config.min_column_width_px as i32).min(self.config.abs_max_width),
+            self.config.abs_max_width,
+        );
+        let into_existing = !alone && col < new_layout.columns.len() && {
+            let n = new_layout.columns[col].rows.len() + 1;
+            let heights = mutations::distribute_heights(
+                n,
+                self.config.available_height(),
+                self.config.padding.window_gap,
+            );
+            heights
+                .iter()
+                .all(|h| *h >= self.config.min_window_height_px as i32)
+        };
+        let seat_col = if into_existing {
+            new_layout = mutations::add_window_to_column(&new_layout, col, window, &self.config);
+            let rows = &mut new_layout.columns[col].rows;
+            let last = rows.len() - 1;
+            let at = row.min(last);
+            let moved = rows.remove(last);
+            rows.insert(at, moved);
+            col
+        } else {
+            let idx = col.min(new_layout.columns.len());
+            new_layout = mutations::seat_window_at(&new_layout, idx, window, &self.config);
+            new_layout.columns[idx].width_px = width;
+            idx
+        };
+        new_layout = mutations::ensure_column_visible(&new_layout, seat_col, &self.config);
+        self.last_focused_window = Some(window);
+        self.apply_mutation(new_layout)
+    }
+
     /// Add a window as a new row in the focused column.
     pub fn add_window_to_focused_column(&mut self, window: WindowId) -> Option<AppliedLayout> {
         let focused = self.last_focused_window?;
@@ -1033,6 +1089,70 @@ mod tests {
         assert_eq!(engine.last_focused_window(), Some(WindowId(1)));
         assert_eq!(engine.virtual_layout().columns.len(), 3);
         assert_eq!(engine.virtual_layout().window_count(), 3);
+    }
+
+    #[test]
+    fn restore_window_at_puts_a_window_back_into_its_seat_or_appends() {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        engine.add_window(WindowId(1));
+        engine.add_window(WindowId(2));
+        engine.add_window(WindowId(3));
+
+        // Alone at column 1, 1200 wide: a new column at index 1.
+        let applied = engine.restore_window_at(1, 0, true, WindowId(9), Some(1200));
+        assert_eq!(
+            applied.virtual_layout.find_window(WindowId(9)),
+            Some((1, 0))
+        );
+        assert_eq!(applied.virtual_layout.columns[1].width_px, 1200);
+        assert_eq!(applied.virtual_layout.columns.len(), 4);
+        assert_eq!(engine.last_focused_window(), Some(WindowId(9)));
+
+        // Shared column 0, row 0: back on top of window 1.
+        let applied = engine.restore_window_at(0, 0, false, WindowId(8), None);
+        assert_eq!(
+            applied.virtual_layout.find_window(WindowId(8)),
+            Some((0, 0))
+        );
+        assert_eq!(
+            applied.virtual_layout.find_window(WindowId(1)),
+            Some((0, 1))
+        );
+        assert_eq!(applied.virtual_layout.columns[0].rows.len(), 2);
+        let heights: Vec<i32> = applied.virtual_layout.columns[0]
+            .rows
+            .iter()
+            .map(|r| r.height)
+            .collect();
+        assert_eq!(
+            heights.iter().sum::<i32>(),
+            1080 - 3 * test_padding().window_gap
+        );
+
+        // A column index past the end appends; `None` takes the base width.
+        let applied = engine.restore_window_at(99, 5, true, WindowId(7), None);
+        let last = applied.virtual_layout.columns.len() - 1;
+        assert_eq!(
+            applied.virtual_layout.find_window(WindowId(7)),
+            Some((last, 0))
+        );
+        assert_eq!(applied.virtual_layout.columns[last].width_px, 960);
+
+        // A column that cannot take another row (min height) gets a new
+        // column at that index instead.
+        let mut tight = ScrollingSpace::new(test_monitor(), 960, 320, 600, 100, test_padding(), 4);
+        tight.add_window(WindowId(1));
+        let applied = tight.restore_window_at(0, 1, false, WindowId(2), None);
+        assert_eq!(applied.virtual_layout.columns.len(), 2);
+        assert_eq!(
+            applied.virtual_layout.find_window(WindowId(2)),
+            Some((0, 0))
+        );
+
+        // Already seated: nothing changes.
+        let before = engine.virtual_layout().clone();
+        let applied = engine.restore_window_at(0, 0, true, WindowId(7), None);
+        assert_eq!(applied.virtual_layout, before);
     }
 
     #[test]

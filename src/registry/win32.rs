@@ -45,11 +45,12 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetCursorPos, GetDesktopWindow,
     GetForegroundWindow, GetShellWindow, GetSystemMetrics, GetWindowLongW, GetWindowPlacement,
-    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow, SetWindowPlacement, SetWindowPos,
-    ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT, WM_CLOSE, WS_CAPTION,
-    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_THICKFRAME,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HWND_NOTOPMOST,
+    HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SM_CXSCREEN,
+    SM_CYSCREEN, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SetForegroundWindow, SetWindowPlacement, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WINDOWPLACEMENT, WM_CLOSE, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    WS_THICKFRAME,
 };
 use windows::core::PWSTR;
 
@@ -851,6 +852,42 @@ pub fn close_window(hwnd_val: isize) -> bool {
     // queue); we always target a specific window, hence `Some(...)`.
     let queued = unsafe { PostMessageW(Some(target_hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
     queued.is_ok()
+}
+
+/// Put `hwnd_val` in (or take it out of) the topmost band of the z-order
+/// (`HWND_TOPMOST` / `HWND_NOTOPMOST`), without moving, resizing or
+/// activating it. Used for `set-window fullscreen`, whose window must stay
+/// above the tiles it covers.
+///
+/// Returns `false` (logged at `debug`) when `SetWindowPos` fails — a window
+/// that vanished, or a handle from a unit test.
+#[must_use]
+pub fn set_topmost(hwnd_val: isize, topmost: bool) -> bool {
+    let target_hwnd = HWND(hwnd_val as *mut _);
+    let after = if topmost {
+        HWND_TOPMOST
+    } else {
+        HWND_NOTOPMOST
+    };
+    // SAFETY: SetWindowPos with a possibly-stale HWND fails cleanly.
+    let result = unsafe {
+        SetWindowPos(
+            target_hwnd,
+            Some(after),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    };
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            log::debug!("set_topmost({topmost}) failed for hwnd {hwnd_val}: {e}");
+            false
+        }
+    }
 }
 
 /// Directly reposition a single window via `SetWindowPos`, bypassing the animator.

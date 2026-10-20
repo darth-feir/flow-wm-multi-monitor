@@ -40,6 +40,7 @@ impl FlowWM {
     /// Returns `None` when the window should NOT currently have a visible
     /// overlay:
     /// - `[borders] enabled = false` turns every overlay off.
+    /// - **Fullscreen** windows (`set-window fullscreen`) have none.
     /// - **Ignored** windows never get an overlay.
     /// - **Minimized / Hidden** windows are detached — the overlay is
     ///   destroyed and recreated on the next restore/show. This avoids
@@ -54,6 +55,10 @@ impl FlowWM {
         // `[borders] enabled = false`: the master switch — no overlay is
         // ever created, and an existing one is dropped on the next refresh.
         if !self.config.borders.enabled {
+            return None;
+        }
+        // A fullscreen window covers the whole screen: nothing to ring.
+        if self.is_fullscreen(hwnd) {
             return None;
         }
         let window = self.registry.get_window(HWND(hwnd as *mut _))?;

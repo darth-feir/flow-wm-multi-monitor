@@ -327,8 +327,10 @@ enum DispatchCommands {
     /// Set the focused window's tiling mode.
     ///
     /// Maps to [`SocketMessage::SetWindow`]. Sends
-    /// `flow dispatch set-window float|tile|cycle` to the daemon, which
-    /// transitions the focused window between floating and tiling modes.
+    /// `flow dispatch set-window float|tile|cycle|fullscreen` to the daemon,
+    /// which transitions the focused window between floating, tiling and
+    /// fullscreen modes (`fullscreen` toggles: a fullscreen window goes
+    /// back where it came from).
     SetWindow {
         #[command(subcommand)]
         mode: WindowMode,
@@ -1430,6 +1432,7 @@ fn cmd_dispatch_set_window(mode: WindowMode) -> Result<(), String> {
         WindowMode::Float => "float",
         WindowMode::Tile => "tile",
         WindowMode::Cycle => "cycle",
+        WindowMode::Fullscreen => "fullscreen",
     };
     send_command(msg, &format!("window set to {label}"))
 }
@@ -2788,6 +2791,20 @@ mod tests {
                     },
             } => {}
             other => panic!("expected Dispatch::SetWindow::Cycle, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_dispatch_set_window_fullscreen() {
+        let cli = Cli::try_parse_from(["flow", "dispatch", "set-window", "fullscreen"]).unwrap();
+        match cli.command {
+            Commands::Dispatch {
+                command:
+                    DispatchCommands::SetWindow {
+                        mode: WindowMode::Fullscreen,
+                    },
+            } => {}
+            other => panic!("expected Dispatch::SetWindow::Fullscreen, got: {other:?}"),
         }
     }
 

@@ -209,6 +209,17 @@ impl FlowWM {
 
     /// One rescue pass over the current registry and monitor geometry.
     fn rescue_stranded_windows_pass(&mut self) -> usize {
+        // Fullscreen windows: the topmost flag is the daemon's and must not
+        // outlive it; the window itself goes back inside its work area.
+        for (hwnd, rect) in self.demote_all_fullscreen_to_floats() {
+            let bounds = self
+                .registry
+                .get_window(HWND(hwnd as *mut _))
+                .map(|w| w.invisible_bounds)
+                .unwrap_or_default();
+            let target = bounds.visible_to_window(rect);
+            let _ = win32::set_window_rect(hwnd, target.x, target.y, target.width, target.height);
+        }
         // "Stranded" means off every monitor, not merely off the active one:
         // a window parked beyond the virtual screen must come back, a window
         // that lives on another monitor must be left alone.

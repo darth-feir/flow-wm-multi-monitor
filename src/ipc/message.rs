@@ -30,8 +30,13 @@ pub enum WindowMode {
     Float,
     /// Place the focused window in tiling mode.
     Tile,
-    /// Toggle between float and tile based on current state.
+    /// Toggle between float and tile based on current state. A fullscreen
+    /// window goes back to tiled.
     Cycle,
+    /// Toggle fullscreen: a tiled or floating window covers its monitor's
+    /// whole screen (taskbar included), stays above the tiles and loses its
+    /// border; a fullscreen window goes back where it came from.
+    Fullscreen,
 }
 
 /// Which column width preset [`SocketMessage::SetWidthPreset`] asks for.
