@@ -668,9 +668,12 @@ mod tests {
         let m = primary_with_left_neighbour();
         assert!(m.neighbour_left);
         assert!(!m.neighbour_right);
+        // Side by side: nothing above or below.
+        assert!(!m.neighbour_up && !m.neighbour_down);
         let m = secondary_with_right_neighbour();
         assert!(!m.neighbour_left);
         assert!(m.neighbour_right);
+        assert!(!m.neighbour_up && !m.neighbour_down);
         let m = MonitorInfo::single(Rect {
             x: 0,
             y: 0,
@@ -678,6 +681,152 @@ mod tests {
             height: 1080,
         });
         assert!(!m.neighbour_left && !m.neighbour_right);
+        assert!(!m.neighbour_up && !m.neighbour_down);
+    }
+
+    /// Bounding box of a set of rects (the Win32 virtual screen).
+    fn union(rects: &[Rect]) -> Rect {
+        let x0 = rects.iter().map(|r| r.x).min().unwrap_or(0);
+        let y0 = rects.iter().map(|r| r.y).min().unwrap_or(0);
+        let x1 = rects.iter().map(|r| r.right()).max().unwrap_or(0);
+        let y1 = rects.iter().map(|r| r.bottom()).max().unwrap_or(0);
+        Rect {
+            x: x0,
+            y: y0,
+            width: x1 - x0,
+            height: y1 - y0,
+        }
+    }
+
+    #[test]
+    fn in_desktop_stacked_pair_has_vertical_neighbours_only() {
+        // Laptop at (0,0) 1920x1080 with a wider 2560x1440 external above it.
+        let laptop = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let external = Rect {
+            x: 0,
+            y: -1440,
+            width: 2560,
+            height: 1440,
+        };
+        let vs = union(&[laptop, external]);
+        let m = MonitorInfo::in_desktop(laptop, laptop, vs, &[external]);
+        assert!(m.neighbour_up && !m.neighbour_down);
+        assert!(!m.neighbour_left && !m.neighbour_right);
+        let m = MonitorInfo::in_desktop(external, external, vs, &[laptop]);
+        assert!(!m.neighbour_up && m.neighbour_down);
+        assert!(!m.neighbour_left && !m.neighbour_right);
+    }
+
+    #[test]
+    fn in_desktop_diagonal_offset_has_no_neighbours() {
+        // Corner to corner: no band overlap on either axis, so nothing
+        // parked straight out from any edge can land on the other.
+        let a = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let b = Rect {
+            x: 1920,
+            y: -1440,
+            width: 2560,
+            height: 1440,
+        };
+        let vs = union(&[a, b]);
+        let m = MonitorInfo::in_desktop(a, a, vs, &[b]);
+        assert!(!m.neighbour_left && !m.neighbour_right);
+        assert!(!m.neighbour_up && !m.neighbour_down);
+        let m = MonitorInfo::in_desktop(b, b, vs, &[a]);
+        assert!(!m.neighbour_left && !m.neighbour_right);
+        assert!(!m.neighbour_up && !m.neighbour_down);
+    }
+
+    #[test]
+    fn in_desktop_two_by_two_grid_has_one_neighbour_per_touching_edge() {
+        let w = 1920;
+        let h = 1080;
+        let tl = Rect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        };
+        let tr = Rect {
+            x: w,
+            y: 0,
+            width: w,
+            height: h,
+        };
+        let bl = Rect {
+            x: 0,
+            y: h,
+            width: w,
+            height: h,
+        };
+        let br = Rect {
+            x: w,
+            y: h,
+            width: w,
+            height: h,
+        };
+        let vs = union(&[tl, tr, bl, br]);
+        let m = MonitorInfo::in_desktop(tl, tl, vs, &[tr, bl, br]);
+        assert!(!m.neighbour_left && m.neighbour_right);
+        assert!(!m.neighbour_up && m.neighbour_down);
+        let m = MonitorInfo::in_desktop(tr, tr, vs, &[tl, bl, br]);
+        assert!(m.neighbour_left && !m.neighbour_right);
+        assert!(!m.neighbour_up && m.neighbour_down);
+        let m = MonitorInfo::in_desktop(bl, bl, vs, &[tl, tr, br]);
+        assert!(!m.neighbour_left && m.neighbour_right);
+        assert!(m.neighbour_up && !m.neighbour_down);
+        let m = MonitorInfo::in_desktop(br, br, vs, &[tl, tr, bl]);
+        assert!(m.neighbour_left && !m.neighbour_right);
+        assert!(m.neighbour_up && !m.neighbour_down);
+    }
+
+    #[test]
+    fn stacked_pair_projection_parks_columns_like_a_lone_monitor() {
+        // Regression: vertical neighbours must not change horizontal column
+        // parking. The laptop under an external parks off-viewport columns
+        // beyond the virtual screen's left/right edges, which for a stacked
+        // pair whose x-range the laptop shares are x = 0 and x = 2560.
+        let padding = test_padding();
+        let laptop = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let external = Rect {
+            x: 0,
+            y: -1440,
+            width: 2560,
+            height: 1440,
+        };
+        let vs = union(&[laptop, external]);
+        let m = MonitorInfo::in_desktop(laptop, laptop, vs, &[external]);
+        let layout = VirtualLayout::with_columns(
+            (1..=3)
+                .map(|i| Column::with_row(960, Row::new(WindowId(i), 0)))
+                .collect(),
+            968, // col 1 fills the viewport; col 0 off-left, col 2 overhangs right
+        );
+        let actual = project(&layout, &m, &padding);
+        assert_eq!(actual.entries[0].rect.x, park_left_x(&m, 960));
+        assert_eq!(actual.entries[0].rect.x, vs.x - 960 - PARK_MARGIN);
+        assert_eq!(actual.entries[1].rect.x, 0);
+        // The right side is free, so the overhanging column is NOT parked.
+        assert_eq!(actual.entries[2].rect.x, 964);
+        // Every rect keeps the laptop's own y band: nothing moves vertically.
+        for e in &actual.entries {
+            assert!(e.rect.y >= laptop.y && e.rect.bottom() <= laptop.bottom());
+        }
     }
 
     #[test]

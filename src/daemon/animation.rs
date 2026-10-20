@@ -23,6 +23,7 @@ use crate::common::Rect;
 use crate::layout::types::{ActualLayout, AppliedLayout, MonitorInfo};
 use crate::registry::WindowRegistry;
 use crate::registry::types::{FloatingState, Window, WindowState};
+use crate::workspace::WorkspaceParking;
 
 use super::types::FlowWM;
 
@@ -34,8 +35,17 @@ use super::types::FlowWM;
 /// it, so the "now" rect must predate the mutation being animated. Callers
 /// that sync the registry *after* submitting use [`Registry`](Self::Registry);
 /// callers that have already synced it (the loadout apply path) capture the
-/// rects first with [`FlowWM::snapshot_prev_rects`] and pass
-/// [`Snapshot`](Self::Snapshot).
+/// rects first and pass [`Snapshot`](Self::Snapshot).
+///
+/// The registry's rects are **workspace-local**: a window in a parked
+/// workspace is recorded at its on-screen layout rect, while it really sits
+/// one parking offset above or below. [`Registry`](Self::Registry) is
+/// therefore only right for windows of the *active* workspace (offset 0 —
+/// the float toggles). Anything that moves a parked workspace (a switch,
+/// the loadout seating) must pass a
+/// [`FlowWM::snapshot_stacked_prev_rects`] snapshot, which applies the
+/// current parking offsets; otherwise a window coming back from behind a
+/// stacked neighbour reads as on-screen → on-screen and tweens across it.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum PrevRects<'a> {
     /// The registry's tiled / float rects still describe the pre-batch
@@ -280,6 +290,47 @@ impl FlowWM {
             .collect()
     }
 
+    /// Where every tracked window **really** is right now, keyed by HWND
+    /// value, for [`PrevRects::Snapshot`].
+    ///
+    /// Starts from [`snapshot_prev_rects`](Self::snapshot_prev_rects) and
+    /// shifts every window seated in a parked workspace by that workspace's
+    /// current parking offset ([`WorkspaceParking::offset`] against the
+    /// monitor's active workspace), because the registry only keeps
+    /// workspace-local rects. Capture it **before** changing any monitor's
+    /// active workspace and before syncing the registry to a new layout.
+    ///
+    /// This is the prev-rect source for every submit that moves a parked
+    /// workspace: without the shift, a workspace returning from behind a
+    /// stacked neighbour would look like an on-screen → on-screen move and
+    /// [`plan_move`] would tween it down through that neighbour.
+    pub(super) fn snapshot_stacked_prev_rects(&self) -> HashMap<isize, Rect> {
+        let mut rects = self.snapshot_prev_rects();
+        for monitor in &self.monitors {
+            let window_gap = monitor.active_scrolling().padding().window_gap;
+            let parking = WorkspaceParking::new(
+                monitor.active_scrolling().monitor(),
+                monitor.screen_rect(),
+                window_gap,
+            );
+            let active_id = monitor.active_workspace_id();
+            for ws in monitor.workspaces() {
+                let offset = parking.offset(ws.id, active_id);
+                if offset == 0 {
+                    continue;
+                }
+                let tiles = ws.scrolling.actual_layout().entries.iter();
+                let floats = ws.floating.windows().iter();
+                for entry in tiles.chain(floats) {
+                    if let Some(r) = rects.get_mut(&entry.window_id.0) {
+                        r.y += offset;
+                    }
+                }
+            }
+        }
+        rects
+    }
+
     /// Non-committing preview animation for a tile drag.
     ///
     /// During a tile drag, `on_drag_move` calls this to reflow the *other*
@@ -361,6 +412,46 @@ impl FlowWM {
             return;
         }
 
+        let (targets, has_float_target) = self.workspace_targets(monitor_idx, batches, prev);
+
+        if targets.is_empty() {
+            return;
+        }
+
+        // Suppress LOCATIONCHANGE capture for the animation's duration so the
+        // animator's intermediate rects don't reach FloatingSpace. Only armed
+        // when animation is enabled: an instant (0 ms) snap lands at the final
+        // rect, so its LOCATIONCHANGE is already correct.
+        if has_float_target && self.config.animation.enabled {
+            self.arm_float_tracking_suppression();
+        }
+
+        log::debug!(
+            "animate_workspaces: submitting {} targets across {} workspace batch(es)",
+            targets.len(),
+            batches.len()
+        );
+
+        if let Err(e) = self.animator.animate(targets) {
+            log::warn!("animate_workspaces error: {e}");
+        }
+    }
+
+    /// The animator targets for a workspace batch on `monitor_idx`, and
+    /// whether any of them is a tracked float window.
+    ///
+    /// This is the pure half of
+    /// [`animate_workspaces_on`](Self::animate_workspaces_on): every window of
+    /// every `(layout, y_offset)` pair is shifted by its offset and run
+    /// through [`push_targets`] with its pre-batch rect from `prev`, so the
+    /// neighbour-teleport decision is made here. Split out so tests can
+    /// inspect the decisions without an animator.
+    pub(super) fn workspace_targets(
+        &self,
+        monitor_idx: usize,
+        batches: &[(ActualLayout, i32)],
+        prev: PrevRects<'_>,
+    ) -> (Vec<WindowTarget>, bool) {
         let border_thickness = self.config.borders.thickness as i32;
         let border_overlap = self.config.borders.overlap as i32;
         let monitor_info = *self.monitors[monitor_idx].active_scrolling().monitor();
@@ -413,28 +504,7 @@ impl FlowWM {
                 );
             }
         }
-
-        if targets.is_empty() {
-            return;
-        }
-
-        // Suppress LOCATIONCHANGE capture for the animation's duration so the
-        // animator's intermediate rects don't reach FloatingSpace. Only armed
-        // when animation is enabled: an instant (0 ms) snap lands at the final
-        // rect, so its LOCATIONCHANGE is already correct.
-        if has_float_target && self.config.animation.enabled {
-            self.arm_float_tracking_suppression();
-        }
-
-        log::debug!(
-            "animate_workspaces: submitting {} targets across {} workspace batch(es)",
-            targets.len(),
-            batches.len()
-        );
-
-        if let Err(e) = self.animator.animate(targets) {
-            log::warn!("animate_workspaces error: {e}");
-        }
+        (targets, has_float_target)
     }
 
     /// Silently teleport windows across multiple workspaces, bypassing the animator.
@@ -669,39 +739,55 @@ enum ParkSide {
     Below,
 }
 
-/// Which parking zone `rect` lies in, or `None` when it touches the virtual
-/// screen (an on-screen rect).
-fn park_side(monitor: &MonitorInfo, rect: Rect) -> Option<ParkSide> {
+/// The parking zones `rect` lies in, one per axis: `(horizontal, vertical)`.
+///
+/// Both are `None` when the rect touches the virtual screen (an on-screen
+/// rect). A parked rect has at least one; a column parked left or right of
+/// the virtual screen *inside an inactive workspace* has both, since the
+/// workspace offset shifts it above or below as well.
+fn park_sides(monitor: &MonitorInfo, rect: Rect) -> (Option<ParkSide>, Option<ParkSide>) {
     if !monitor.is_parked(rect) {
-        return None;
+        return (None, None);
     }
     let vs = monitor.virtual_screen;
-    Some(if rect.right() <= vs.x {
-        ParkSide::Left
+    let horizontal = if rect.right() <= vs.x {
+        Some(ParkSide::Left)
     } else if rect.x >= vs.right() {
-        ParkSide::Right
-    } else if rect.bottom() <= vs.y {
-        ParkSide::Above
+        Some(ParkSide::Right)
     } else {
-        ParkSide::Below
-    })
+        None
+    };
+    let vertical = if rect.bottom() <= vs.y {
+        Some(ParkSide::Above)
+    } else if rect.y >= vs.bottom() {
+        Some(ParkSide::Below)
+    } else {
+        None
+    };
+    (horizontal, vertical)
 }
 
 /// Whether a window sliding between this monitor and the `side` parking
-/// zone would pass over another monitor.
-///
-/// Only horizontal neighbours are modelled today
-/// ([`MonitorInfo::neighbour_left`] / [`MonitorInfo::neighbour_right`]).
-/// Vertical workspace parking still uses the monitor's own height and does
-/// not know about stacked monitors; once `MonitorInfo` grows
-/// `neighbour_up` / `neighbour_down`, wire them in here and every submit
-/// path picks the rule up.
+/// zone would pass over another monitor: the monitor's neighbour flag for
+/// that side ([`MonitorInfo::neighbour_left`] / `neighbour_right` /
+/// `neighbour_up` / `neighbour_down`). This is the one place the rule reads
+/// the flags; every submit path goes through it via [`plan_move`].
 fn side_blocked(monitor: &MonitorInfo, side: ParkSide) -> bool {
     match side {
         ParkSide::Left => monitor.neighbour_left,
         ParkSide::Right => monitor.neighbour_right,
-        ParkSide::Above | ParkSide::Below => false,
+        ParkSide::Above => monitor.neighbour_up,
+        ParkSide::Below => monitor.neighbour_down,
     }
+}
+
+/// Whether `rect` is parked on **any** side that has a neighbour. A window
+/// parked both horizontally (column) and vertically (workspace) is blocked
+/// when either axis is: a tween to or from it would cross that neighbour.
+fn parked_on_blocked_side(monitor: &MonitorInfo, rect: Rect) -> bool {
+    let (horizontal, vertical) = park_sides(monitor, rect);
+    horizontal.is_some_and(|s| side_blocked(monitor, s))
+        || vertical.is_some_and(|s| side_blocked(monitor, s))
 }
 
 /// How the bridge moves one window from where it is to where the layout
@@ -726,8 +812,10 @@ pub(super) enum Move {
 /// a parking slot on a side that has a neighbour (`prev` parked there and
 /// sliding in over the neighbour, `next` parked there and sliding out over
 /// it, or both parked on blocked sides and sliding from one across to the
-/// other). Parking on a free side keeps the usual slide, and an on-screen
-/// to on-screen move is always a tween.
+/// other). Horizontal sides come from column parking, vertical ones from
+/// workspace parking, and a rect parked on both axes counts as blocked when
+/// **any** of its sides is. Parking on a free side keeps the usual slide,
+/// and an on-screen to on-screen move is always a tween.
 ///
 /// When `prev == Some(next)` and that slot is on a blocked side the window
 /// is already there — its last move was instant, so no tween can be in
@@ -736,10 +824,8 @@ pub(super) enum Move {
 /// never get `Stay`: they slid there, may still be mid-flight, and must be
 /// resubmitted so a superseding batch does not strand them.
 pub(super) fn plan_move(monitor: &MonitorInfo, prev: Option<Rect>, next: Rect) -> Move {
-    let next_blocked = park_side(monitor, next).is_some_and(|s| side_blocked(monitor, s));
-    let prev_blocked = prev
-        .and_then(|p| park_side(monitor, p))
-        .is_some_and(|s| side_blocked(monitor, s));
+    let next_blocked = parked_on_blocked_side(monitor, next);
+    let prev_blocked = prev.is_some_and(|p| parked_on_blocked_side(monitor, p));
     if next_blocked && prev == Some(next) {
         Move::Stay
     } else if next_blocked || prev_blocked {
@@ -822,9 +908,13 @@ fn push_targets(
 
 #[cfg(test)]
 mod tests {
-    use super::{Move, plan_move, push_targets, tween_crosses_neighbour};
-    use crate::common::Rect;
+    use super::{
+        FlowWM, Move, PrevRects, WindowTarget, WorkspaceParking, plan_move, push_targets,
+        tween_crosses_neighbour,
+    };
+    use crate::common::{Rect, WindowId};
     use crate::layout::types::MonitorInfo;
+    use windows::Win32::Foundation::HWND;
 
     fn primary_with_left_neighbour() -> MonitorInfo {
         let primary = Rect {
@@ -974,10 +1064,11 @@ mod tests {
     }
 
     #[test]
-    fn vertical_workspace_parking_is_not_a_blocked_side() {
-        // A workspace parked above/below the virtual screen is off-screen but
-        // no vertical neighbour is modelled, so it keeps the slide.
+    fn vertical_workspace_parking_on_a_free_side_keeps_the_slide() {
+        // A workspace parked above/below the virtual screen is off-screen,
+        // but with no monitor stacked there it slides like before.
         let m = primary_with_left_neighbour();
+        assert!(!m.neighbour_up && !m.neighbour_down);
         let above = Rect {
             x: 11,
             y: -1080 + 16,
@@ -996,5 +1087,303 @@ mod tests {
             plan_move(&m, Some(col(-2401)), parked_left_shifted),
             Move::Instant
         );
+    }
+
+    /// Laptop panel at the origin with a 2560x1440 display stacked above it.
+    /// Up is blocked, down is free.
+    fn laptop_under_external() -> MonitorInfo {
+        let laptop = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let external = Rect {
+            x: 0,
+            y: -1440,
+            width: 2560,
+            height: 1440,
+        };
+        let vs = Rect {
+            x: 0,
+            y: -1440,
+            width: 2560,
+            height: 2520,
+        };
+        MonitorInfo::in_desktop(laptop, laptop, vs, &[external])
+    }
+
+    /// The far "above" slot on `laptop_under_external`: a 1000px-tall window
+    /// at y=16 on the laptop, shifted by the blocked-side workspace offset
+    /// (-1440 - 16 - 1080).
+    fn far_above(x: i32) -> Rect {
+        Rect {
+            y: 16 - 1440 - 16 - 1080,
+            ..col(x)
+        }
+    }
+
+    #[test]
+    fn workspace_parking_toward_a_stacked_neighbour_teleports() {
+        let m = laptop_under_external();
+        assert!(m.neighbour_up && !m.neighbour_down);
+        // on-screen -> far above (behind the external): instant
+        assert_eq!(plan_move(&m, Some(col(11)), far_above(11)), Move::Instant);
+        // unknown previous rect: still instant
+        assert_eq!(plan_move(&m, None, far_above(11)), Move::Instant);
+        // arriving from behind the external: instant
+        assert_eq!(plan_move(&m, Some(far_above(11)), col(11)), Move::Instant);
+        // already there: Stay, no target emitted
+        assert_eq!(
+            plan_move(&m, Some(far_above(11)), far_above(11)),
+            Move::Stay
+        );
+    }
+
+    #[test]
+    fn returning_from_the_far_slot_behind_a_stacked_neighbour_is_instant() {
+        // VM regression: DISPLAY2 above DISPLAY1, switch 2 -> 1 on DISPLAY1.
+        // The incoming window sits exactly at the far "above" slot (its
+        // bottom PARK_MARGIN above the virtual screen) and must not tween
+        // down through DISPLAY2 on its way back on-screen.
+        let m = laptop_under_external();
+        let height = 1000;
+        let parked = Rect {
+            x: 11,
+            y: m.virtual_screen.y - crate::layout::projection::PARK_MARGIN - height,
+            width: 460,
+            height,
+        };
+        let on_screen = col(11);
+        assert_eq!(plan_move(&m, Some(parked), on_screen), Move::Instant);
+        let mut targets = Vec::new();
+        let decision = push_targets(
+            &mut targets,
+            &m,
+            7,
+            Some(parked),
+            on_screen,
+            on_screen.inset(2),
+            Some(8),
+        );
+        assert_eq!(decision, Move::Instant);
+        assert!(targets.iter().all(|t| t.instant));
+    }
+
+    #[test]
+    fn workspace_parking_toward_the_free_side_still_slides() {
+        let m = laptop_under_external();
+        // The free-side slot: one monitor height (+gap) below the laptop,
+        // which is also beyond the virtual screen's bottom (2520).
+        let below = Rect {
+            y: 16 + 1080 + 4,
+            ..col(11)
+        };
+        assert_eq!(plan_move(&m, Some(col(11)), below), Move::Tween);
+        assert_eq!(plan_move(&m, Some(below), col(11)), Move::Tween);
+        // A free-side parked window is always resubmitted.
+        assert_eq!(plan_move(&m, Some(below), below), Move::Tween);
+    }
+
+    #[test]
+    fn window_parked_on_both_axes_is_instant_when_either_side_is_blocked() {
+        let m = laptop_under_external();
+        // Column parked right of the virtual screen (free side) inside a
+        // workspace parked above (blocked side): the vertical axis blocks.
+        let right_and_above = far_above(2560 + 16);
+        assert_eq!(
+            plan_move(&m, Some(col(2560 + 16)), right_and_above),
+            Move::Instant
+        );
+        assert_eq!(
+            plan_move(&m, Some(right_and_above), col(2560 + 16)),
+            Move::Instant
+        );
+        // Free on both axes (parked right, workspace below): slide.
+        let right_and_below = Rect {
+            y: 16 + 1080 + 4,
+            ..col(2560 + 16)
+        };
+        assert_eq!(
+            plan_move(&m, Some(col(2560 + 16)), right_and_below),
+            Move::Tween
+        );
+        // The mirror case: a left-blocked column inside a workspace parked
+        // on a free vertical side is still instant (horizontal axis blocks).
+        let m = primary_with_left_neighbour();
+        let left_and_below = Rect {
+            y: 16 + 1080 + 4,
+            ..col(-2401)
+        };
+        assert_eq!(plan_move(&m, Some(col(11)), left_and_below), Move::Instant);
+    }
+
+    /// Fake HWND values for the stacked-pair daemon fixture.
+    const WS1_HWND: isize = 0x20001;
+    const WS2_HWND: isize = 0x20002;
+
+    /// A daemon on the laptop of `laptop_under_external` with two
+    /// workspaces of one tile each and workspace 2 active, so workspace 1 is
+    /// parked above — behind the external. The registry holds each tile's
+    /// workspace-local rect, as it does in the daemon.
+    fn stacked_flow_with_ws1_parked_above() -> FlowWM {
+        use crate::config::types::WindowRulesConfig;
+        use crate::layout::types::Padding;
+        use crate::registry::WindowRegistry;
+        use crate::registry::win32::WindowInfo;
+        use crate::workspace::{Monitor, ScrollingSpace, Workspace, WorkspaceId};
+        use windows::Win32::Foundation::HWND;
+
+        let rules = WindowRulesConfig::default();
+        let mut registry = WindowRegistry::new(&rules, &rules);
+        for hwnd in [WS1_HWND, WS2_HWND] {
+            registry.register_window_from_info(&WindowInfo {
+                hwnd: HWND(hwnd as *mut _),
+                title: "TestWindow".into(),
+                class: "TestClass".into(),
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 800,
+                    height: 600,
+                },
+                exe: "test.exe".into(),
+                process_path: "C:\\test.exe".into(),
+                is_visible: true,
+                is_maximized: false,
+                is_fullscreen: false,
+            });
+        }
+        let info = laptop_under_external();
+        let padding = Padding {
+            window_gap: 4,
+            up: 0,
+            down: 0,
+        };
+        let mut workspaces = Vec::new();
+        for (id, hwnd) in [(1, WS1_HWND), (2, WS2_HWND)] {
+            let mut scrolling = ScrollingSpace::new(info, 960, 320, 100, 100, padding, 4);
+            scrolling.add_window(WindowId(hwnd));
+            registry.update_tiling_slots_from_layout(scrolling.virtual_layout());
+            registry.update_tiled_rects(scrolling.actual_layout());
+            workspaces.push(Workspace::new(WorkspaceId(id), scrolling));
+        }
+        let laptop = info.work_area;
+        let monitor = Monitor::new(laptop, laptop, workspaces, 1);
+        FlowWM::new_for_test(registry, vec![monitor])
+    }
+
+    #[test]
+    fn stacked_snapshot_reports_parked_workspace_windows_at_their_far_slot() {
+        use crate::workspace::WorkspaceId;
+        let flow = stacked_flow_with_ws1_parked_above();
+        let monitor = &flow.monitors[0];
+        let parking = WorkspaceParking::new(
+            monitor.active_scrolling().monitor(),
+            monitor.screen_rect(),
+            4,
+        );
+        let far_above = parking.offset(WorkspaceId(1), WorkspaceId(2));
+        assert!(far_above < -1440, "ws 1 parks beyond the external");
+        let local1 = flow
+            .registry
+            .get_window(HWND(WS1_HWND as *mut _))
+            .and_then(|w| w.tiled_rect);
+        let local2 = flow
+            .registry
+            .get_window(HWND(WS2_HWND as *mut _))
+            .and_then(|w| w.tiled_rect);
+        let (Some(local1), Some(local2)) = (local1, local2) else {
+            panic!("both tiles have registry rects");
+        };
+        // The plain registry snapshot is workspace-local: both tiles on-screen.
+        let plain = flow.snapshot_prev_rects();
+        assert_eq!(plain.get(&WS1_HWND), Some(&local1));
+        // The stacked snapshot shifts the parked workspace's tile up to where
+        // it really is, and leaves the active workspace's tile alone.
+        let stacked = flow.snapshot_stacked_prev_rects();
+        assert_eq!(
+            stacked.get(&WS1_HWND),
+            Some(&Rect {
+                y: local1.y + far_above,
+                ..local1
+            })
+        );
+        assert_eq!(stacked.get(&WS2_HWND), Some(&local2));
+    }
+
+    #[test]
+    fn switching_back_from_behind_the_external_targets_the_incoming_window_instantly() {
+        use crate::workspace::WorkspaceId;
+        let flow = stacked_flow_with_ws1_parked_above();
+        let monitor = &flow.monitors[0];
+        let parking = WorkspaceParking::new(
+            monitor.active_scrolling().monitor(),
+            monitor.screen_rect(),
+            4,
+        );
+        let (Some(ws1), Some(ws2)) = (
+            monitor.workspace(WorkspaceId(1)),
+            monitor.workspace(WorkspaceId(2)),
+        ) else {
+            panic!("fixture has workspaces 1 and 2");
+        };
+        // The batch a 2 -> 1 switch builds: ws 1 comes on-screen (offset 0),
+        // ws 2 parks below on the free side (+height+gap).
+        let batches = [
+            (ws1.scrolling.actual_layout().clone(), 0),
+            (
+                ws2.scrolling.actual_layout().clone(),
+                parking.offset(WorkspaceId(2), WorkspaceId(1)),
+            ),
+        ];
+        let find = |targets: &[WindowTarget], hwnd: isize| {
+            targets
+                .iter()
+                .find(|t| t.window_ref.0 == hwnd)
+                .map(|t| t.instant)
+        };
+
+        // With the stacked snapshot (what the switch uses) the incoming
+        // window is instant and the outgoing one still slides.
+        let snap = flow.snapshot_stacked_prev_rects();
+        let (targets, _) = flow.workspace_targets(0, &batches, PrevRects::Snapshot(&snap));
+        assert_eq!(
+            find(&targets, WS1_HWND),
+            Some(true),
+            "incoming window must not tween down through the external"
+        );
+        assert_eq!(
+            find(&targets, WS2_HWND),
+            Some(false),
+            "outgoing window slides to the free side below"
+        );
+
+        // The workspace-local registry rects would have hidden the parked
+        // position (on-screen -> on-screen reads as a tween): this is the
+        // VM failure and why the switch must not use `PrevRects::Registry`.
+        let (targets, _) = flow.workspace_targets(0, &batches, PrevRects::Registry);
+        assert_eq!(find(&targets, WS1_HWND), Some(false));
+    }
+
+    #[test]
+    fn switch_workspace_layout_on_a_stacked_pair_flips_the_active_workspace() {
+        // End to end through the dispatch path with the mock animator: the
+        // switch must build its batches, teleport nothing (both workspaces
+        // are participants) and leave ws 1 active.
+        use crate::workspace::WorkspaceId;
+        let mut flow = stacked_flow_with_ws1_parked_above();
+        assert!(flow.switch_workspace_layout(WorkspaceId(1), WorkspaceId(2)));
+        assert_eq!(flow.monitors[0].active_workspace_id(), WorkspaceId(1));
+    }
+
+    #[test]
+    fn stacked_pair_with_free_sides_never_teleports_horizontally() {
+        // Regression: a vertical neighbour must not make horizontal column
+        // parking instant — the laptop's left and right sides are free.
+        let m = laptop_under_external();
+        assert!(!m.neighbour_left && !m.neighbour_right);
+        assert_eq!(plan_move(&m, Some(col(11)), col(-476)), Move::Tween);
+        assert_eq!(plan_move(&m, Some(col(11)), col(2560 + 16)), Move::Tween);
     }
 }

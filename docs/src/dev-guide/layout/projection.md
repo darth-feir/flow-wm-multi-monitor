@@ -140,3 +140,36 @@ See [Overview](./overview.md) for the VirtualLayout/ActualLayout type relationsh
 > taskbar counts as overhanging. The daemon moves windows whose slide would
 > cross a neighbour instantly instead of tweening them — see
 > [Instant targets and the teleport rule](../animation.md#instant-targets-and-the-neighbour-teleport-rule).
+
+### Neighbours on four sides
+
+`MonitorInfo::in_desktop` derives one flag per edge from the other monitors'
+screen rects. A monitor is a **left/right** neighbour when it lies beyond that
+edge and its y-range overlaps ours; an **up/down** neighbour
+(`MonitorInfo::neighbour_up/down`) when it lies beyond the top/bottom edge and
+its *x-range* overlaps ours. A display that is only diagonally offset
+(overlapping neither band) is no neighbour on any side: nothing parked
+straight out from an edge can land on it. For a laptop at `(0,0) 1920×1080`
+with an external `2560×1440` at `(0,-1440)` the laptop has `neighbour_up`
+only, the external `neighbour_down` only, and neither has a left/right
+neighbour — so column parking on a stacked pair is exactly the single-monitor
+rule, measured from the virtual screen.
+
+The vertical flags are not read by `project` at all: columns only ever park
+horizontally. They drive **workspace parking**, which lives in the daemon
+(`workspace::y_offset::WorkspaceParking`) because projection is
+workspace-local. The rule mirrors the horizontal one:
+
+| side        | free (no neighbour)                        | blocked (neighbour there)                                  |
+|-------------|--------------------------------------------|------------------------------------------------------------|
+| above (`id < active`) | one monitor height up: `-(screen_height + window_gap)` | strip bottom at `virtual_screen.y - PARK_MARGIN`     |
+| below (`id > active`) | one monitor height down: `+(screen_height + window_gap)` | strip top at `virtual_screen.bottom() + PARK_MARGIN` |
+
+The offset is measured from the monitor's full physical screen rect, never
+the work area, and every workspace on one side shares that side's slot (the
+±1-unit model of [Workspace](../workspace.md)). A free side keeps the short
+slot so a switch still reads as the workspace strip sliding up or down; a
+blocked side uses the far slot, and the animation bridge then moves the
+windows instantly (same decision as for columns, see the animation chapter).
+A monitor with a display above and nothing below therefore slides workspaces
+in from below and teleports them out above.

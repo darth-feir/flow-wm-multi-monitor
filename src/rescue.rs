@@ -291,6 +291,46 @@ mod tests {
         assert_eq!(rescue_target(below, &m), Some(r(2500, 620, 800, 600)));
     }
 
+    /// Laptop at (0,0) 1920x1080 under a 2560x1440 external display.
+    fn stacked_pair() -> Vec<RescueMonitor> {
+        vec![mon(0, 0, 1920, 1080), mon(0, -1440, 2560, 1440)]
+    }
+
+    #[test]
+    fn stacked_pair_workspace_parked_beyond_the_virtual_screen_is_rescued() {
+        let m = stacked_pair();
+        assert_eq!(virtual_screen_of(&m), Some(r(0, -1440, 2560, 2520)));
+        // A laptop window (y 16..1016) in a workspace parked above the pair:
+        // the far slot puts its bottom at -1440 - 16 (PARK_MARGIN). It is
+        // off the virtual screen, so it is rescued. The laptop's x range is
+        // inside the external's, so both monitors tie on band overlap and
+        // the nearest one wins — the external, which lies between the slot
+        // and the laptop. Without workspace bookkeeping (the daemon's own
+        // shutdown path has it, this CLI path does not) that is the best
+        // guess; what matters is that the window lands on a monitor.
+        let above = r(300, 16 - 1440 - 16 - 1080, 800, 1000);
+        assert!(above.bottom() <= -1440);
+        assert_eq!(home_monitor_index(above, &m), Some(1));
+        let target = rescue_target(above, &m).expect("far-parked window is rescued");
+        assert_eq!(target, r(300, -1440, 800, 1000));
+        assert!(target.overlaps(m[1].work_area));
+        // An external window in a workspace parked below the pair.
+        let below = r(2000, 1080 + 16 + 100, 500, 400);
+        assert_eq!(home_monitor_index(below, &m), Some(1));
+        // Clamped into the external's work area (bottom 1440-40 = -40).
+        assert_eq!(rescue_target(below, &m), Some(r(2000, -40 - 400, 500, 400)));
+    }
+
+    #[test]
+    fn stacked_pair_window_one_height_up_is_on_the_external_and_left_alone() {
+        // Why the far slot exists: the old one-height slot for a laptop
+        // workspace overlaps the external display, so the rescue (rightly)
+        // sees it as visible and does nothing.
+        let m = stacked_pair();
+        let old_slot = r(300, 16 - 1084, 800, 1000);
+        assert_eq!(rescue_target(old_slot, &m), None);
+    }
+
     #[test]
     fn diagonal_window_goes_to_nearest_monitor() {
         let m = two_monitors();

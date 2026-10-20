@@ -23,7 +23,7 @@ features.
 | Remaining IPC stubs | 🜂 Near-term | `PlaceAbove`, `QueryState`, `CheckConfig`, `SetConfigValue`, `ForgetApp`/`ForgetAllApps` |
 | Floating enhancements | 🜂 Near-term | smart placement, size memory, z-order, gap mgmt |
 | Real cross-column `MoveWindow` | 🜂 Near-term | Left/Right aliased to swap-column; row-preserving move + floating nudge pending |
-| Multi-monitor support | ✅ Baseline | one `Monitor` + scrolling space per display; windows tile on the monitor they appear on; parked columns stay off every monitor; cross-monitor focus/move commands pending |
+| Multi-monitor support | ✅ Baseline | one `Monitor` + scrolling space per display; windows tile on the monitor they appear on; parked columns and parked workspaces stay off every monitor (neighbours modelled on all four sides); cross-monitor focus/move commands pending |
 | Cloak parked windows (`DWMWA_CLOAK`) | ◷ Mid-term | read side exists; write side missing |
 | Watchdog + recovery snapshot | ◷ Mid-term | not started; gated on `flow`/`flowd` being complete |
 | Input hooks (DragSession etc.) | ◷ Aspirational | `src/input/` does not exist |
@@ -133,6 +133,15 @@ keybindings.
 ## Mid-term
 
 ### Multi-Monitor Support
+
+**Vertical arrangements (done).** `MonitorInfo` carries `neighbour_up/down`
+next to `neighbour_left/right`, inactive workspaces on a monitor with a
+display stacked above or below park beyond the virtual screen on that side
+(`WorkspaceParking`), and the neighbour-teleport rule in the animation bridge
+reads all four flags. Still open: a free vertical side on a *diagonal*
+arrangement parks a workspace one height away, which is off every monitor but
+inside the virtual-screen bounding box, so the shutdown rescue (which tests
+overlap against that box) leaves such a window where it is.
 
 The workspace hierarchy already models `Vec<Monitor>` with
 `active_monitor: usize`, and every IPC command routes through

@@ -42,6 +42,8 @@ impl FlowWM {
                         "work_area": { "x": wa.x, "y": wa.y, "width": wa.width, "height": wa.height },
                         "neighbour_left": info.neighbour_left,
                         "neighbour_right": info.neighbour_right,
+                        "neighbour_up": info.neighbour_up,
+                        "neighbour_down": info.neighbour_down,
                         "active_workspace": m.active_workspace_id().0,
                         "viewport_offset": m.active_scrolling().virtual_layout().viewport_offset,
                         "tiled_windows": m.active_scrolling().virtual_layout().window_count(),

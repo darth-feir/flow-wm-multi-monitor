@@ -8,6 +8,24 @@
 //! **physical** screen height (taskbar included), never the work area — see
 //! the `monitor_height` parameter docs for why.
 //!
+//! # Vertical neighbours: the far parking slot
+//!
+//! `±y_unit` keeps a parked workspace off its *own* monitor. On a desktop
+//! where another monitor sits directly above or below this one (a laptop
+//! under an external display, say), one monitor height up is squarely *on*
+//! that neighbour. [`WorkspaceParking`] therefore mirrors the horizontal
+//! column rule ([`layout::projection`](crate::layout::projection)): a side
+//! with a neighbour ([`MonitorInfo::neighbour_up`] /
+//! [`MonitorInfo::neighbour_down`]) parks the workspace **beyond the Win32
+//! virtual screen** — the strip's bottom at `virtual_screen.y - PARK_MARGIN`
+//! above, its top at `virtual_screen.bottom() + PARK_MARGIN` below — while a
+//! free side keeps the `±y_unit` slot so the switch still reads as the
+//! workspace strip sliding up or down. Every workspace on the same side
+//! shares one slot either way (see the ±1-unit model below). The animation
+//! bridge turns a move to or from a blocked side into an instant one, exactly
+//! as it does for columns parked behind a left/right neighbour; see
+//! `daemon::animation::plan_move`.
+//!
 //! # The ±1-Unit Model
 //!
 //! The offset is **always exactly one unit**, regardless of how far apart the
@@ -44,19 +62,29 @@
 //!
 //! # Where this lives
 //!
-//! This function is pure math — no Win32, no IPC. It is applied in the daemon
-//! animation bridge ([`crate::daemon::animation`]) when building
+//! This module is pure math — no Win32, no IPC. Its offsets are applied in
+//! the daemon animation bridge ([`crate::daemon::animation`]) when building
 //! `WindowTarget` batches, **not** in the layout projection layer. The
 //! projection layer (`layout::projection`) stays horizontal-only and
 //! workspace-local; the daemon decides where each workspace sits vertically.
 
+use crate::common::Rect;
+use crate::layout::projection::PARK_MARGIN;
+use crate::layout::types::MonitorInfo;
 use crate::workspace::WorkspaceId;
 
-/// Compute the vertical parking offset for a workspace relative to the active one.
+/// Compute the **free-side** vertical parking offset for a workspace relative
+/// to the active one.
 ///
 /// Returns `±(monitor_height + window_gap)` based on whether `target_id` sits
 /// below (`+`) or above (`-`) the `active_id`. Returns `0` when the two ids
 /// are equal (i.e. the active workspace itself).
+///
+/// This is the one-monitor-height slot that keeps a parked workspace off its
+/// own monitor. It is correct only when no other monitor sits on that side;
+/// the daemon goes through [`WorkspaceParking::offset`], which falls back to
+/// this function on a free side and parks beyond the virtual screen on a
+/// side with a neighbour.
 ///
 /// # Arguments
 ///
@@ -103,6 +131,132 @@ pub fn workspace_y_offset(
     // without scaling by the (arbitrary) numeric distance between ids.
     let direction = id_diff.signum() as i32;
     direction * (monitor_height + window_gap)
+}
+
+/// The geometry the vertical workspace-parking rule needs for one monitor.
+///
+/// Built once per switch or seating pass from the monitor's
+/// [`MonitorInfo`] (virtual screen and vertical neighbours), its full
+/// physical screen rect and the configured gap, then asked for each
+/// workspace's offset via [`offset`](Self::offset).
+///
+/// # The rule
+///
+/// For a workspace parked **above** the active one (`id < active`):
+///
+/// | `neighbour_up` | strip position                                     | offset                                                  |
+/// |----------------|----------------------------------------------------|---------------------------------------------------------|
+/// | `false`        | one monitor height up (free side, keeps the slide) | `-(screen_rect.height + window_gap)`                    |
+/// | `true`         | bottom flush with `virtual_screen.y - PARK_MARGIN` | `virtual_screen.y - PARK_MARGIN - screen_rect.bottom()` |
+///
+/// and symmetrically for one parked **below** (`id > active`):
+///
+/// | `neighbour_down` | strip position                                         | offset                                                  |
+/// |------------------|--------------------------------------------------------|---------------------------------------------------------|
+/// | `false`          | one monitor height down                                | `+(screen_rect.height + window_gap)`                    |
+/// | `true`           | top flush with `virtual_screen.bottom() + PARK_MARGIN` | `virtual_screen.bottom() + PARK_MARGIN - screen_rect.y` |
+///
+/// The active workspace is always at `0`. Every workspace on one side shares
+/// that side's single slot (the ±1-unit model), so the blocked-side slot is
+/// simply further out than the free-side one — never closer, because a
+/// neighbour above implies `virtual_screen.y < screen_rect.y` by at least
+/// that neighbour's height. Which slot a side uses is decided per side, so a
+/// monitor with a display above it and nothing below slides workspaces in
+/// from below and teleports them out above.
+///
+/// The offset is relative to each window's projected rect, which lies inside
+/// `screen_rect`; a window inside the monitor therefore ends up wholly beyond
+/// the virtual screen on a blocked side. (A floating window that already
+/// overhangs the monitor edge by more than `PARK_MARGIN` is the one case
+/// that can still peek, exactly as with the free-side slot and the gap.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceParking {
+    /// Full physical screen rect of the monitor (taskbar included).
+    pub screen_rect: Rect,
+    /// Bounding box of every monitor (the Win32 virtual screen).
+    pub virtual_screen: Rect,
+    /// Another monitor sits above this one (see [`MonitorInfo::neighbour_up`]).
+    pub neighbour_up: bool,
+    /// Another monitor sits below this one (see [`MonitorInfo::neighbour_down`]).
+    pub neighbour_down: bool,
+    /// The configured window gap, used as the free-side stacking gap.
+    pub window_gap: i32,
+}
+
+impl WorkspaceParking {
+    /// Parking geometry for a monitor described by `monitor` (virtual screen
+    /// and neighbours), whose full physical bounds are `screen_rect`.
+    ///
+    /// `screen_rect` is taken separately because [`MonitorInfo`] carries the
+    /// taskbar-excluded work area, and parked workspaces must travel the full
+    /// physical height (see [`workspace_y_offset`]).
+    #[must_use]
+    pub fn new(monitor: &MonitorInfo, screen_rect: Rect, window_gap: i32) -> Self {
+        Self {
+            screen_rect,
+            virtual_screen: monitor.virtual_screen,
+            neighbour_up: monitor.neighbour_up,
+            neighbour_down: monitor.neighbour_down,
+            window_gap,
+        }
+    }
+
+    /// Parking geometry for a lone monitor with no neighbours: both sides
+    /// are free, so this reproduces [`workspace_y_offset`] exactly.
+    #[must_use]
+    pub fn single(screen_rect: Rect, window_gap: i32) -> Self {
+        Self {
+            screen_rect,
+            virtual_screen: screen_rect,
+            neighbour_up: false,
+            neighbour_down: false,
+            window_gap,
+        }
+    }
+
+    /// The vertical offset at which workspace `target_id` parks while
+    /// `active_id` is the active workspace. See the type-level docs for the
+    /// rule.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use flow_wm::common::Rect;
+    /// # use flow_wm::layout::projection::PARK_MARGIN;
+    /// # use flow_wm::layout::types::MonitorInfo;
+    /// # use flow_wm::workspace::{WorkspaceId, WorkspaceParking};
+    /// // A laptop panel at (0,0) with a 1440p display stacked above it.
+    /// let laptop = Rect { x: 0, y: 0, width: 1920, height: 1080 };
+    /// let external = Rect { x: 0, y: -1440, width: 2560, height: 1440 };
+    /// let vs = Rect { x: 0, y: -1440, width: 2560, height: 2520 };
+    /// let info = MonitorInfo::in_desktop(laptop, laptop, vs, &[external]);
+    /// let parking = WorkspaceParking::new(&info, laptop, 4);
+    ///
+    /// // Above is blocked: the strip's bottom sits PARK_MARGIN above the
+    /// // virtual screen, i.e. above the external display.
+    /// let above = parking.offset(WorkspaceId(1), WorkspaceId(2));
+    /// assert_eq!(above, -1440 - PARK_MARGIN - 1080);
+    ///
+    /// // Below is free: the usual one-height slide.
+    /// let below = parking.offset(WorkspaceId(3), WorkspaceId(2));
+    /// assert_eq!(below, 1080 + 4);
+    /// ```
+    #[must_use]
+    pub fn offset(&self, target_id: WorkspaceId, active_id: WorkspaceId) -> i32 {
+        let free = workspace_y_offset(
+            target_id,
+            active_id,
+            self.screen_rect.height,
+            self.window_gap,
+        );
+        if free < 0 && self.neighbour_up {
+            self.virtual_screen.y - PARK_MARGIN - self.screen_rect.bottom()
+        } else if free > 0 && self.neighbour_down {
+            self.virtual_screen.bottom() + PARK_MARGIN - self.screen_rect.y
+        } else {
+            free
+        }
+    }
 }
 
 #[cfg(test)]
@@ -213,6 +367,195 @@ mod tests {
         // Symmetric to the underflow test: target much larger than active.
         let off = workspace_y_offset(WorkspaceId(10), WorkspaceId(1), MONITOR_H, GAP);
         assert_eq!(off, Y_UNIT);
+    }
+
+    // ---------------------------------------------------------------------
+    // WorkspaceParking: free side vs blocked side
+    // ---------------------------------------------------------------------
+
+    /// Laptop panel at the origin; the external display (if any) is placed
+    /// by the caller.
+    const LAPTOP: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 1920,
+        height: MONITOR_H,
+    };
+
+    fn parking_with(others: &[Rect]) -> WorkspaceParking {
+        let mut vs = LAPTOP;
+        for o in others {
+            let x0 = vs.x.min(o.x);
+            let y0 = vs.y.min(o.y);
+            let x1 = vs.right().max(o.right());
+            let y1 = vs.bottom().max(o.bottom());
+            vs = Rect {
+                x: x0,
+                y: y0,
+                width: x1 - x0,
+                height: y1 - y0,
+            };
+        }
+        let info = MonitorInfo::in_desktop(LAPTOP, LAPTOP, vs, others);
+        WorkspaceParking::new(&info, LAPTOP, GAP)
+    }
+
+    #[test]
+    fn single_monitor_parking_matches_the_free_side_function() {
+        let p = WorkspaceParking::single(LAPTOP, GAP);
+        assert_eq!(p.offset(WorkspaceId(1), WorkspaceId(2)), -Y_UNIT);
+        assert_eq!(p.offset(WorkspaceId(2), WorkspaceId(2)), 0);
+        assert_eq!(p.offset(WorkspaceId(3), WorkspaceId(2)), Y_UNIT);
+        assert_eq!(p, parking_with(&[]));
+    }
+
+    #[test]
+    fn side_by_side_neighbour_leaves_vertical_parking_alone() {
+        // A monitor to the right blocks nothing vertically: the strip still
+        // slides one height up or down.
+        let right = Rect {
+            x: 1920,
+            y: 0,
+            width: 2560,
+            height: 1440,
+        };
+        let p = parking_with(&[right]);
+        assert!(!p.neighbour_up && !p.neighbour_down);
+        assert_eq!(p.offset(WorkspaceId(1), WorkspaceId(2)), -Y_UNIT);
+        assert_eq!(p.offset(WorkspaceId(3), WorkspaceId(2)), Y_UNIT);
+    }
+
+    #[test]
+    fn neighbour_above_parks_beyond_the_virtual_screen_but_below_still_slides() {
+        // External 2560x1440 stacked above the laptop: virtual screen spans
+        // y = -1440 .. 1080.
+        let external = Rect {
+            x: 0,
+            y: -1440,
+            width: 2560,
+            height: 1440,
+        };
+        let p = parking_with(&[external]);
+        assert!(p.neighbour_up && !p.neighbour_down);
+        // Above: the strip's bottom edge lands at -1440 - PARK_MARGIN, so a
+        // window spanning the laptop's full height (0..1080) ends at
+        // (-1440 - 16 - 1080) .. (-1440 - 16): entirely above the external.
+        let above = p.offset(WorkspaceId(1), WorkspaceId(2));
+        assert_eq!(above, -1440 - PARK_MARGIN - MONITOR_H);
+        assert!(LAPTOP.bottom() + above <= external.y);
+        // The old one-height slot would have sat fully on the external.
+        assert!(LAPTOP.y - Y_UNIT >= external.y);
+        // Below is free: unchanged.
+        assert_eq!(p.offset(WorkspaceId(3), WorkspaceId(2)), Y_UNIT);
+        // Active stays put.
+        assert_eq!(p.offset(WorkspaceId(2), WorkspaceId(2)), 0);
+    }
+
+    #[test]
+    fn neighbour_below_parks_beyond_the_virtual_screen_but_above_still_slides() {
+        let external = Rect {
+            x: -320,
+            y: MONITOR_H,
+            width: 2560,
+            height: 1440,
+        };
+        let p = parking_with(&[external]);
+        assert!(!p.neighbour_up && p.neighbour_down);
+        let below = p.offset(WorkspaceId(3), WorkspaceId(2));
+        // Virtual screen bottom is 1080 + 1440 = 2520; the strip's top goes
+        // PARK_MARGIN past it.
+        assert_eq!(below, 2520 + PARK_MARGIN);
+        assert!(LAPTOP.y + below >= external.bottom());
+        assert_eq!(p.offset(WorkspaceId(1), WorkspaceId(2)), -Y_UNIT);
+    }
+
+    #[test]
+    fn neighbours_on_both_sides_park_both_directions_far() {
+        let up = Rect {
+            x: 0,
+            y: -1440,
+            width: 2560,
+            height: 1440,
+        };
+        let down = Rect {
+            x: 0,
+            y: MONITOR_H,
+            width: 1920,
+            height: 1080,
+        };
+        let p = parking_with(&[up, down]);
+        assert!(p.neighbour_up && p.neighbour_down);
+        assert_eq!(
+            p.offset(WorkspaceId(1), WorkspaceId(5)),
+            -1440 - PARK_MARGIN - MONITOR_H
+        );
+        assert_eq!(
+            p.offset(WorkspaceId(9), WorkspaceId(5)),
+            MONITOR_H + 1080 + PARK_MARGIN
+        );
+        // The ±1-unit model survives: every workspace on a side shares its slot.
+        assert_eq!(
+            p.offset(WorkspaceId(1), WorkspaceId(5)),
+            p.offset(WorkspaceId(4), WorkspaceId(5))
+        );
+    }
+
+    #[test]
+    fn blocked_slot_is_never_closer_than_the_free_slot() {
+        let up = Rect {
+            x: 0,
+            y: -1440,
+            width: 2560,
+            height: 1440,
+        };
+        let p = parking_with(&[up]);
+        let blocked = p.offset(WorkspaceId(1), WorkspaceId(2));
+        assert!(blocked.abs() > Y_UNIT);
+    }
+
+    #[test]
+    fn diagonal_monitor_is_not_a_vertical_neighbour() {
+        // A display above-right that shares no x-range: nothing parked one
+        // height up can land on it, so the free-side slot is kept.
+        let diag = Rect {
+            x: 1920,
+            y: -1440,
+            width: 2560,
+            height: 1440,
+        };
+        let p = parking_with(&[diag]);
+        assert!(!p.neighbour_up && !p.neighbour_down);
+        assert_eq!(p.offset(WorkspaceId(1), WorkspaceId(2)), -Y_UNIT);
+    }
+
+    #[test]
+    fn blocked_offset_uses_the_physical_screen_rect_not_the_work_area() {
+        // Work area is 40px shorter than the screen (bottom taskbar). The
+        // blocked-side offset must shift the strip by the physical bottom,
+        // otherwise the taskbar strip of the workspace would peek onto the
+        // display above.
+        let work_area = Rect {
+            height: MONITOR_H - 40,
+            ..LAPTOP
+        };
+        let external = Rect {
+            x: 0,
+            y: -1440,
+            width: 2560,
+            height: 1440,
+        };
+        let vs = Rect {
+            x: 0,
+            y: -1440,
+            width: 2560,
+            height: 2520,
+        };
+        let info = MonitorInfo::in_desktop(work_area, LAPTOP, vs, &[external]);
+        let p = WorkspaceParking::new(&info, LAPTOP, GAP);
+        assert_eq!(
+            p.offset(WorkspaceId(1), WorkspaceId(2)),
+            external.y - PARK_MARGIN - LAPTOP.bottom()
+        );
     }
 
     #[test]

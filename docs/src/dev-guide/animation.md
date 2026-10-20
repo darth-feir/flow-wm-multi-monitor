@@ -224,28 +224,46 @@ with an instant move.
 
 **The rule** (`daemon/animation.rs`, `plan_move`): a move is **instant** when
 *either* endpoint is a parking slot on a side that has a neighbour
-(`MonitorInfo::neighbour_left/right`) — sliding out toward the neighbour,
-sliding in from behind it, or sliding from one blocked slot across to the
-other. Parking on a free side keeps the ordinary slide, as does any on-screen
-to on-screen move. When the previous rect equals the new one *and* that slot
-is on a blocked side, the window is already there (its last move was instant,
-so no tween can be in flight) and **no target is emitted** at all, so a layout
-does not re-`SetWindowPos` every parked window. Free-side parked windows are
-always resubmitted because their slide may still be mid-flight and a
-superseding batch would otherwise strand them. Vertical parking (workspaces
-above/below) is recognised as a parking zone but has no neighbour modelled
-yet; `side_blocked` is the one place to extend when `MonitorInfo` learns
-`neighbour_up/down`.
+(`MonitorInfo::neighbour_left/right/up/down`) — sliding out toward the
+neighbour, sliding in from behind it, or sliding from one blocked slot across
+to the other. Parking on a free side keeps the ordinary slide, as does any
+on-screen to on-screen move. When the previous rect equals the new one *and*
+that slot is on a blocked side, the window is already there (its last move was
+instant, so no tween can be in flight) and **no target is emitted** at all, so
+a layout does not re-`SetWindowPos` every parked window. Free-side parked
+windows are always resubmitted because their slide may still be mid-flight and
+a superseding batch would otherwise strand them.
+
+The rule covers both axes. Columns park **left/right** of the virtual screen;
+inactive workspaces park **above/below** it when the monitor has a display
+stacked on that side (`WorkspaceParking`, see
+[Projection](./layout/projection.md#neighbours-on-four-sides)), and one
+monitor height away — which may or may not leave the virtual screen — when the
+side is free. `park_sides` classifies a rect on each axis independently and a
+rect is blocked when **any** of its parked sides has a neighbour: a column
+parked right (free) inside a workspace parked above a stacked display (blocked)
+teleports, and so does a column parked behind a left neighbour inside a
+workspace parked on a free vertical side. `side_blocked` is the one place that
+reads the four flags, so a workspace switch, a loadout seating pass and a
+column scroll all make the same decision through `push_targets`. On a stacked
+pair with both vertical sides blocked every workspace switch is instant; with
+one side free the strip still slides in from (or out to) that side.
 
 Every submit path builds its targets through one helper (`push_targets`):
 `animate_layout`'s `collect_targets`, `animate_workspaces[_on]` (workspace
 switches, float toggles, the loadout apply) and the construction-time
 `animate_layout_raw`. The decision needs each window's **pre-batch** rect, so
 callers submit before syncing the registry's tiled rects
-(`PrevRects::Registry`), or capture the rects first with
-`snapshot_prev_rects` and pass `PrevRects::Snapshot` (the loadout path, which
-syncs per workspace long before it seats the monitors). A window's border
-overlay always follows the window's decision so both move in lockstep.
+(`PrevRects::Registry`), or capture the rects first and pass
+`PrevRects::Snapshot`. The registry's rects are *workspace-local* — a window
+in a parked workspace is recorded at its on-screen layout rect — so
+`PrevRects::Registry` is only right for the active workspace's windows (the
+float toggles). Anything that moves a parked workspace (a switch, the loadout
+seating) captures `snapshot_stacked_prev_rects`, which shifts each window by
+its workspace's current parking offset; without that, a workspace returning
+from behind a stacked neighbour reads as an on-screen → on-screen move and
+tweens down through it. A window's border overlay always follows the window's
+decision so both move in lockstep.
 
 **Inside the animator** an instant move is a `WindowTarget` with
 `instant: true` (`WindowTarget::instant` / `with_instant`). When the worker

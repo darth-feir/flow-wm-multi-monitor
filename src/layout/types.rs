@@ -275,6 +275,13 @@ pub struct MonitorInfo {
     pub neighbour_left: bool,
     /// Another monitor sits somewhere beyond this monitor's right edge.
     pub neighbour_right: bool,
+    /// Another monitor sits somewhere above this monitor's top edge (its
+    /// x-range overlaps ours). Inactive workspaces, which park vertically,
+    /// are parked beyond the virtual screen on that side instead of one
+    /// monitor height up, where they would be visible on the neighbour.
+    pub neighbour_up: bool,
+    /// Another monitor sits somewhere below this monitor's bottom edge.
+    pub neighbour_down: bool,
 }
 
 impl MonitorInfo {
@@ -293,6 +300,8 @@ impl MonitorInfo {
             virtual_screen: work_area,
             neighbour_left: false,
             neighbour_right: false,
+            neighbour_up: false,
+            neighbour_down: false,
         }
     }
 
@@ -301,7 +310,11 @@ impl MonitorInfo {
     /// `screen_rect` is this monitor's full bounds, `virtual_screen` the
     /// bounding box of all monitors, and `others` the screen rects of every
     /// other monitor. A neighbour exists on a side when any other monitor
-    /// overlaps this monitor's vertical band beyond that edge.
+    /// lies beyond that edge **and** overlaps this monitor's band across it:
+    /// the vertical band (y-range) for left/right, the horizontal band
+    /// (x-range) for up/down. A monitor that is only diagonally offset
+    /// (overlapping neither band) is no neighbour on any side: nothing
+    /// parked straight out from an edge can land on it.
     #[must_use]
     pub fn in_desktop(
         work_area: Rect,
@@ -316,11 +329,20 @@ impl MonitorInfo {
         let neighbour_right = others
             .iter()
             .any(|o| shares_band(o) && o.x >= screen_rect.right());
+        let shares_column = |o: &Rect| o.x < screen_rect.right() && o.right() > screen_rect.x;
+        let neighbour_up = others
+            .iter()
+            .any(|o| shares_column(o) && o.bottom() <= screen_rect.y);
+        let neighbour_down = others
+            .iter()
+            .any(|o| shares_column(o) && o.y >= screen_rect.bottom());
         Self {
             work_area,
             virtual_screen,
             neighbour_left,
             neighbour_right,
+            neighbour_up,
+            neighbour_down,
         }
     }
 

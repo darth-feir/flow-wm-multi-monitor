@@ -37,7 +37,7 @@ pub mod y_offset;
 pub use floating_space::FloatingSpace;
 pub use monitor::Monitor;
 pub use scrolling_space::ScrollingSpace;
-pub use y_offset::workspace_y_offset;
+pub use y_offset::{WorkspaceParking, workspace_y_offset};
 
 /// Stable, IPC-friendly identifier for a workspace.
 ///

@@ -19,9 +19,10 @@ use crate::layout::types::{ActualLayout, AppliedLayout};
 use crate::registry::hooks::{add_float_hwnd, remove_float_hwnd};
 use crate::registry::types::{FloatingState, TilingState, WindowState};
 use crate::registry::win32 as registry_win32;
-use crate::workspace::{FloatingSpace, WorkspaceId, workspace_y_offset};
+use crate::workspace::{FloatingSpace, WorkspaceId, WorkspaceParking};
 use windows::Win32::Foundation::HWND;
 
+use super::animation::PrevRects;
 use super::config_derive;
 use super::types::FlowWM;
 
@@ -1010,6 +1011,13 @@ impl FlowWM {
     /// y-offsets, not workspace-local positions. (A window *move* caller syncs
     /// the registry's tiled rects for both workspaces before calling this.)
     ///
+    /// Because the registry's rects are workspace-local, the animator's
+    /// neighbour-teleport decision is fed a
+    /// [`snapshot_stacked_prev_rects`](Self::snapshot_stacked_prev_rects)
+    /// taken before the active index changes — the windows' *real* positions,
+    /// parking offsets applied — so a workspace coming back from behind a
+    /// stacked monitor is moved instantly instead of tweened across it.
+    ///
     /// # Returns
     ///
     /// `false` only if `target_id` could not be set active (impossible after
@@ -1024,9 +1032,20 @@ impl FlowWM {
         // travel the FULL physical monitor height to stay completely
         // off-screen — the taskbar-excluded work area would leave a slice
         // peeking past the taskbar strip. The window_gap is the same value
-        // used intra-workspace, so stacking looks consistent with tiling.
-        let monitor_height = self.active_monitor().screen_rect().height;
+        // used intra-workspace, so stacking looks consistent with tiling. A
+        // side with a stacked neighbour parks beyond the virtual screen
+        // instead (see `WorkspaceParking`), and `animate_workspaces` moves
+        // windows to or from such a slot instantly.
         let window_gap = self.active_scrolling().padding().window_gap;
+        let parking = WorkspaceParking::new(
+            self.active_scrolling().monitor(),
+            self.active_monitor().screen_rect(),
+            window_gap,
+        );
+        // Where every window really is before the switch (parking offsets
+        // applied), captured while `prev_active_id` is still the active
+        // workspace. See the method docs.
+        let prev_rects = self.snapshot_stacked_prev_rects();
 
         // Update the active index synchronously. The caller validated the id,
         // so failure is impossible in practice — but the explicit guard keeps
@@ -1063,8 +1082,8 @@ impl FlowWM {
                 continue;
             }
 
-            let prev_offset = workspace_y_offset(ws.id, prev_active_id, monitor_height, window_gap);
-            let new_offset = workspace_y_offset(ws.id, target_id, monitor_height, window_gap);
+            let prev_offset = parking.offset(ws.id, prev_active_id);
+            let new_offset = parking.offset(ws.id, target_id);
 
             let is_participant = ws.id == target_id || ws.id == prev_active_id;
             let side_changed = prev_offset != new_offset;
@@ -1099,7 +1118,11 @@ impl FlowWM {
         // no-ops, animates the participants, and retargets any window still
         // mid-flight from a prior switch.
         self.teleport_workspaces(&teleport_batches);
-        self.animate_workspaces(&animate_batches);
+        self.animate_workspaces_on(
+            self.active_monitor,
+            &animate_batches,
+            PrevRects::Snapshot(&prev_rects),
+        );
 
         true
     }

@@ -124,9 +124,14 @@ one of three buckets during a switch:
 
 Parked workspaces sit one full physical monitor height (plus one
 `window_gap`) above or below the active workspace — the full height keeps
-them completely off-screen past the taskbar strip. Teleport runs before
-animate so the bystander "backdrop" snaps into place before the participant
-transition begins. Floating windows merge with tiles per workspace and ride
+them completely off-screen past the taskbar strip. When another monitor is
+stacked on that side (`MonitorInfo::neighbour_up/down`) one height away would
+be *on* that monitor, so the workspace is parked beyond the Win32 virtual
+screen instead (`WorkspaceParking` in `src/workspace/y_offset.rs`; rule table
+in [Projection](./layout/projection.md#neighbours-on-four-sides)) and the
+animation bridge moves it instantly rather than sliding it across the
+neighbour. Teleport runs before animate so the bystander "backdrop" snaps
+into place before the participant transition begins. Floating windows merge with tiles per workspace and ride
 along in the same batch. See `switch_active_workspace` in
 [`src/daemon/dispatch.rs`](../../src/daemon/dispatch.rs) for the full
 algorithm, and [roadmap](./roadmap.md) for the remaining `SwapWorkspace`

@@ -298,6 +298,57 @@ mod tests {
     }
 
     #[test]
+    fn stacked_pair_far_parked_workspace_window_is_not_visible() {
+        // Laptop (0,0,1920,1080) under a 2560x1440 external: the virtual
+        // screen is (0,-1440,2560,2520). A laptop window in a workspace
+        // parked above the pair sits with its visible bottom at -1456.
+        let virtual_screen = Rect {
+            x: 0,
+            y: -1440,
+            width: 2560,
+            height: 2520,
+        };
+        let visible = Rect {
+            x: 300,
+            y: -1456 - 1000,
+            width: 800,
+            height: 1000,
+        };
+        let window_rect = BOUNDS.visible_to_window(visible);
+        assert!(!content_overlaps_work_area(
+            window_rect,
+            BOUNDS,
+            virtual_screen
+        ));
+        // Below the pair, flush with the virtual screen's bottom + margin.
+        let visible = Rect {
+            x: 300,
+            y: 1080 + 1440 + 16,
+            width: 800,
+            height: 1000,
+        };
+        let window_rect = BOUNDS.visible_to_window(visible);
+        assert!(!content_overlaps_work_area(
+            window_rect,
+            BOUNDS,
+            virtual_screen
+        ));
+        // The old one-height slot is on the external: visible, not rescued.
+        let visible = Rect {
+            x: 300,
+            y: -1084,
+            width: 800,
+            height: 1000,
+        };
+        let window_rect = BOUNDS.visible_to_window(visible);
+        assert!(content_overlaps_work_area(
+            window_rect,
+            BOUNDS,
+            virtual_screen
+        ));
+    }
+
+    #[test]
     fn genuinely_on_screen_window_is_visible() {
         // A window squarely inside the work area stays visible → no rescue.
         let visible = Rect {

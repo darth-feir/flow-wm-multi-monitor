@@ -142,7 +142,7 @@ impl FlowWM {
                 .collect();
             let info = MonitorInfo::in_desktop(g.work_area, g.screen_rect, virtual_screen, &others);
             log::info!(
-                "init: monitor {i}: screen ({},{},{},{}) work ({},{},{},{}) primary={} neighbours L={} R={}",
+                "init: monitor {i}: screen ({},{},{},{}) work ({},{},{},{}) primary={} neighbours L={} R={} U={} D={}",
                 g.screen_rect.x,
                 g.screen_rect.y,
                 g.screen_rect.width,
@@ -154,6 +154,8 @@ impl FlowWM {
                 g.is_primary,
                 info.neighbour_left,
                 info.neighbour_right,
+                info.neighbour_up,
+                info.neighbour_down,
             );
             let layout_config = config_derive::derive_layout_config(&app_config, &info);
             let scrolling = ScrollingSpace::new(

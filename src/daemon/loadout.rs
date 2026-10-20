@@ -50,7 +50,7 @@ use crate::loadout::{
     WindowRef, WorkspaceSnapshot,
 };
 use crate::registry::types::{FloatingState, WindowState};
-use crate::workspace::{Workspace, WorkspaceId, workspace_y_offset};
+use crate::workspace::{Workspace, WorkspaceId, WorkspaceParking};
 use windows::Win32::Foundation::HWND;
 
 use super::animation::PrevRects;
@@ -243,9 +243,11 @@ fn resolve_seating_target(
 /// For each non-empty workspace on the monitor, merges its scrolling and
 /// floating actual layouts into one batch entry and computes that workspace's
 /// vertical parking offset relative to `target_id` via
-/// [`workspace_y_offset`]: the target sits at offset `0` (visible), every other
-/// workspace parks off-screen above (`-`) or below (`+`). Workspaces with no
-/// windows in either space are skipped — there is nothing to seat.
+/// [`WorkspaceParking::offset`]: the target sits at offset `0` (visible),
+/// every other workspace parks off-screen above (`-`) or below (`+`) — one
+/// monitor height away on a free side, beyond the virtual screen on a side
+/// with a stacked neighbour. Workspaces with no windows in either space are
+/// skipped — there is nothing to seat.
 ///
 /// Pure: no Win32, no animator, no daemon state. The caller submits the
 /// returned `&[(ActualLayout, i32)]` through
@@ -267,8 +269,7 @@ fn resolve_seating_target(
 fn build_seating_batches(
     workspaces: &[Workspace],
     target_id: WorkspaceId,
-    monitor_height: i32,
-    window_gap: i32,
+    parking: &WorkspaceParking,
 ) -> Vec<(ActualLayout, i32)> {
     let mut batches = Vec::new();
     for ws in workspaces {
@@ -280,7 +281,7 @@ fn build_seating_batches(
         if scroll_actual.entries.is_empty() && float_actual.entries.is_empty() {
             continue;
         }
-        let y_offset = workspace_y_offset(ws.id, target_id, monitor_height, window_gap);
+        let y_offset = parking.offset(ws.id, target_id);
         // Merge scrolling + floating into one entry so a single workspace's
         // tiles and floats animate together at the same parking offset.
         let mut entries = scroll_actual.entries.clone();
@@ -471,11 +472,13 @@ impl FlowWM {
             }
         }
 
-        // Where every window is right now, captured before phase D rewrites
-        // the registry's tiled rects: the seating submit below compares these
-        // with the new positions to decide which moves must be instant
-        // (a slide across a neighbouring monitor).
-        let prev_rects = self.snapshot_prev_rects();
+        // Where every window really is right now (parking offsets of its
+        // current workspace applied), captured before phase D rewrites the
+        // registry's tiled rects and before the seating pass changes any
+        // active workspace: the seating submit below compares these with the
+        // new positions to decide which moves must be instant (a slide
+        // across a neighbouring monitor, horizontal or stacked).
+        let prev_rects = self.snapshot_stacked_prev_rects();
 
         // 4b. Purge: every window the file references leaves every workspace
         //     on every monitor before any snapshot is applied, so a window
@@ -638,13 +641,13 @@ impl FlowWM {
                 );
                 continue;
             }
-            let monitor_height = self.monitors[mi].screen_rect().height;
-            let batches = build_seating_batches(
-                self.monitors[mi].workspaces(),
-                target_id,
-                monitor_height,
+            let parking = WorkspaceParking::new(
+                self.monitors[mi].active_scrolling().monitor(),
+                self.monitors[mi].screen_rect(),
                 window_gap,
             );
+            let batches =
+                build_seating_batches(self.monitors[mi].workspaces(), target_id, &parking);
             self.animate_workspaces_on(mi, &batches, PrevRects::Snapshot(&prev_rects));
         }
         self.rebuild_float_hwnds();
@@ -895,7 +898,7 @@ mod tests {
             make_empty_workspace(2),
             make_workspace_with_tile(3, WindowId(200)),
         ];
-        let batches = build_seating_batches(&workspaces, WorkspaceId(1), MONITOR_H, GAP);
+        let batches = build_seating_batches(&workspaces, WorkspaceId(1), &single_parking());
 
         // Two non-empty workspaces; the empty middle one is skipped.
         assert_eq!(batches.len(), 2, "empty workspace must be skipped");
@@ -930,7 +933,7 @@ mod tests {
             make_workspace_with_tile(2, WindowId(200)),
             make_workspace_with_tile(3, WindowId(300)),
         ];
-        let batches = build_seating_batches(&workspaces, WorkspaceId(2), MONITOR_H, GAP);
+        let batches = build_seating_batches(&workspaces, WorkspaceId(2), &single_parking());
 
         // Offsets in workspace-id order: ws1 above (-Y_UNIT), ws2 target (0),
         // ws3 below (+Y_UNIT).
@@ -955,7 +958,7 @@ mod tests {
                 height: 100,
             },
         );
-        let batches = build_seating_batches(&[ws], WorkspaceId(2), MONITOR_H, GAP);
+        let batches = build_seating_batches(&[ws], WorkspaceId(2), &single_parking());
 
         assert_eq!(
             batches.len(),
@@ -987,7 +990,7 @@ mod tests {
                 height: 80,
             },
         );
-        let batches = build_seating_batches(&[ws], WorkspaceId(1), MONITOR_H, GAP);
+        let batches = build_seating_batches(&[ws], WorkspaceId(1), &single_parking());
 
         assert_eq!(batches.len(), 1);
         let ids: Vec<isize> = batches[0].0.entries.iter().map(|e| e.window_id.0).collect();
@@ -999,8 +1002,50 @@ mod tests {
     #[test]
     fn seating_batches_empty_when_all_workspaces_empty() {
         let workspaces = vec![make_empty_workspace(1), make_empty_workspace(2)];
-        let batches = build_seating_batches(&workspaces, WorkspaceId(1), MONITOR_H, GAP);
+        let batches = build_seating_batches(&workspaces, WorkspaceId(1), &single_parking());
         assert!(batches.is_empty());
+    }
+
+    /// Positive: on a monitor with a display stacked above it, the seating
+    /// pass parks "above" workspaces beyond the virtual screen (the far slot)
+    /// while "below" ones keep the one-height slot — the same split the
+    /// workspace switch uses, so a loadout restore never seats a workspace
+    /// on the neighbour.
+    #[test]
+    fn seating_batches_use_the_far_slot_toward_a_stacked_neighbour() {
+        let workspaces = vec![
+            make_workspace_with_tile(1, WindowId(100)),
+            make_workspace_with_tile(2, WindowId(200)),
+            make_workspace_with_tile(3, WindowId(300)),
+        ];
+        let laptop = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: MONITOR_H,
+        };
+        let external = Rect {
+            x: 0,
+            y: -1440,
+            width: 2560,
+            height: 1440,
+        };
+        let vs = Rect {
+            x: 0,
+            y: -1440,
+            width: 2560,
+            height: 1440 + MONITOR_H,
+        };
+        let info = MonitorInfo::in_desktop(laptop, laptop, vs, &[external]);
+        let parking = WorkspaceParking::new(&info, laptop, GAP);
+        let batches = build_seating_batches(&workspaces, WorkspaceId(2), &parking);
+        let offsets: Vec<i32> = batches.iter().map(|(_, off)| *off).collect();
+        let far_above = external.y - crate::layout::projection::PARK_MARGIN - laptop.bottom();
+        assert_eq!(offsets, vec![far_above, 0, Y_UNIT]);
+        // ws 1's tile, shifted by its offset, lies entirely above the
+        // external display rather than on it.
+        let tile = &batches[0].0.entries[0].rect;
+        assert!(tile.bottom() + far_above <= external.y);
     }
 
     // ── workspace_containing_window: workspace lookup by window ──────────
@@ -1140,6 +1185,20 @@ mod tests {
     const MONITOR_H: i32 = 1080;
     const GAP: i32 = 4;
     const Y_UNIT: i32 = MONITOR_H + GAP; // 1084
+
+    /// Parking geometry for a lone `1920×MONITOR_H` monitor: both sides free,
+    /// so every offset is `±Y_UNIT` or `0`.
+    fn single_parking() -> WorkspaceParking {
+        WorkspaceParking::single(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: MONITOR_H,
+            },
+            GAP,
+        )
+    }
 
     /// Build a [`ScrollingSpace`] sized like the canonical 1920×1080 test
     /// monitor, mirroring `workspace::monitor::tests::make_scrolling`.
