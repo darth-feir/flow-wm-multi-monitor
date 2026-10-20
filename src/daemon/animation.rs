@@ -14,14 +14,57 @@
 //! - [`animate_layout_raw`] — standalone version used during construction when
 //!   `FlowWM` doesn't exist yet.
 
+use std::collections::HashMap;
+
 use windows::Win32::Foundation::HWND;
 
 use crate::animation::{IVec2, WindowAnimator, WindowRef, WindowTarget};
 use crate::common::Rect;
 use crate::layout::types::{ActualLayout, AppliedLayout, MonitorInfo};
 use crate::registry::WindowRegistry;
+use crate::registry::types::{FloatingState, Window, WindowState};
 
 use super::types::FlowWM;
+
+/// Where the bridge reads each window's **pre-batch** rect from when it
+/// decides whether a tween would cross a neighbouring monitor
+/// ([`plan_move`]).
+///
+/// The decision compares where the window is now with where the layout puts
+/// it, so the "now" rect must predate the mutation being animated. Callers
+/// that sync the registry *after* submitting use [`Registry`](Self::Registry);
+/// callers that have already synced it (the loadout apply path) capture the
+/// rects first with [`FlowWM::snapshot_prev_rects`] and pass
+/// [`Snapshot`](Self::Snapshot).
+#[derive(Debug, Clone, Copy)]
+pub(super) enum PrevRects<'a> {
+    /// The registry's tiled / float rects still describe the pre-batch
+    /// positions.
+    Registry,
+    /// Pre-batch rects captured by the caller, keyed by HWND value.
+    Snapshot(&'a HashMap<isize, Rect>),
+}
+
+impl PrevRects<'_> {
+    /// The pre-batch rect of `hwnd`, if known.
+    fn rect_for(self, hwnd: isize, window: Option<&Window>) -> Option<Rect> {
+        match self {
+            PrevRects::Registry => registry_prev_rect(window),
+            PrevRects::Snapshot(map) => map.get(&hwnd).copied(),
+        }
+    }
+}
+
+/// The rect the registry says `window` currently occupies: its tiled rect
+/// while tiled, its float rect while floating, nothing otherwise.
+fn registry_prev_rect(window: Option<&Window>) -> Option<Rect> {
+    let w = window?;
+    match w.state {
+        WindowState::Tiling(_) => w.tiled_rect,
+        WindowState::Floating(FloatingState::Active { rect }) => Some(rect),
+        _ => None,
+    }
+}
 
 impl FlowWM {
     /// Convert an [`AppliedLayout`] into animation targets and submit to the animator.
@@ -211,68 +254,30 @@ impl FlowWM {
                 .visible_to_window(entry.rect)
                 .inset(border_thickness - border_overlap);
 
-            // A tween that would carry the window across a neighbouring
-            // monitor (parking toward it, or arriving from a parking slot
-            // on its side) is replaced by an instant move. The window is
-            // still submitted as a zero-length tween so any in-flight tween
-            // for it is retargeted rather than left running.
-            let prev_rect = window.and_then(|w| w.tiled_rect);
-            if tween_crosses_neighbour(&monitor_info, prev_rect, entry.rect) {
-                log::debug!(
-                    "animate: hwnd={} teleport to ({},{},{},{}) (neighbour monitor in the way)",
-                    entry.window_id.0,
-                    window_rect.x,
-                    window_rect.y,
-                    window_rect.width,
-                    window_rect.height,
-                );
-                let _ = crate::registry::win32::set_window_rect(
-                    entry.window_id.0,
-                    window_rect.x,
-                    window_rect.y,
-                    window_rect.width,
-                    window_rect.height,
-                );
-                if let Some(border) = window.and_then(|w| w.border.as_ref()) {
-                    border.set_geometry(entry.rect);
-                }
-            }
-
-            log::debug!(
-                "animate: hwnd={} target ({},{},{},{}) [visible] \
-                 → ({},{},{},{}) [window]",
+            // The registry's tiled rect is still the pre-mutation one here:
+            // animate_layouts_on syncs the registry after submitting.
+            let prev_rect = registry_prev_rect(window);
+            push_targets(
+                targets,
+                &monitor_info,
                 entry.window_id.0,
-                entry.rect.x,
-                entry.rect.y,
-                entry.rect.width,
-                entry.rect.height,
-                window_rect.x,
-                window_rect.y,
-                window_rect.width,
-                window_rect.height,
+                prev_rect,
+                entry.rect,
+                window_rect,
+                border_hwnd,
             );
-
-            targets.push(WindowTarget::new(
-                WindowRef(entry.window_id.0),
-                IVec2::new(window_rect.x, window_rect.y),
-                IVec2::new(window_rect.width, window_rect.height),
-            ));
-
-            // Flatten the border overlay into the same target list so
-            // the animator moves it in lockstep with the window. Border
-            // overlays sit at the layout engine's visible rect — no
-            // invisible-bounds translation, no thickness inset — because
-            // the ring occupies the gap between entry.rect and the
-            // inset window_rect. The animator's SetWindowPos-based
-            // backend treats the overlay HWND like any other window.
-            if let Some(b_hwnd) = border_hwnd {
-                targets.push(WindowTarget::new(
-                    WindowRef(b_hwnd),
-                    IVec2::new(entry.rect.x, entry.rect.y),
-                    IVec2::new(entry.rect.width, entry.rect.height),
-                ));
-            }
         }
+    }
+
+    /// Pre-batch rects of every tracked window (tiled rect while tiled, float
+    /// rect while floating), keyed by HWND value, for
+    /// [`PrevRects::Snapshot`]. Capture it **before** syncing the registry to
+    /// a new layout.
+    pub(super) fn snapshot_prev_rects(&self) -> HashMap<isize, Rect> {
+        self.registry
+            .windows()
+            .filter_map(|w| registry_prev_rect(Some(w)).map(|r| (w.hwnd.0 as isize, r)))
+            .collect()
     }
 
     /// Non-committing preview animation for a tile drag.
@@ -327,20 +332,38 @@ impl FlowWM {
     /// **not** call [`registry.update_tiling_slots_from_layout`] or
     /// [`registry.update_tiled_rects`] — those operate on a single virtual
     /// layout at a time, and the caller must invoke them per-workspace
-    /// before constructing the `(ActualLayout, y_offset)` pairs. This method
-    /// only submits animation targets.
+    /// **after** this call (see [`PrevRects::Registry`]). This method only
+    /// submits animation targets.
+    ///
+    /// The batches are taken to belong to the active monitor; use
+    /// [`animate_workspaces_on`](Self::animate_workspaces_on) for another
+    /// monitor or for a pre-captured set of previous rects.
     ///
     /// [`registry.update_tiling_slots_from_layout`]:
     ///     crate::registry::WindowRegistry::update_tiling_slots_from_layout
     /// [`registry.update_tiled_rects`]:
     ///     crate::registry::WindowRegistry::update_tiled_rects
     pub(super) fn animate_workspaces(&mut self, batches: &[(ActualLayout, i32)]) {
+        self.animate_workspaces_on(self.active_monitor, batches, PrevRects::Registry);
+    }
+
+    /// [`animate_workspaces`](Self::animate_workspaces) for the workspaces of
+    /// `monitor_idx`, reading each window's pre-batch rect from `prev` so a
+    /// move that would cross a neighbouring monitor becomes an instant one
+    /// ([`plan_move`]).
+    pub(super) fn animate_workspaces_on(
+        &mut self,
+        monitor_idx: usize,
+        batches: &[(ActualLayout, i32)],
+        prev: PrevRects<'_>,
+    ) {
         if batches.is_empty() {
             return;
         }
 
         let border_thickness = self.config.borders.thickness as i32;
         let border_overlap = self.config.borders.overlap as i32;
+        let monitor_info = *self.monitors[monitor_idx].active_scrolling().monitor();
 
         // Build the combined target list. Iterating with explicit loops
         // (rather than `flat_map`) lets us hold one `&self.registry` borrow
@@ -366,26 +389,28 @@ impl FlowWM {
                 // fixed `-top`, inset is uniform), but the chosen order keeps
                 // the "workspace-local rect first, workspace stack second"
                 // mental model clear.
-                let window_rect = invisible_bounds
-                    .visible_to_window(entry.rect)
-                    .inset(border_thickness - border_overlap);
-                targets.push(WindowTarget::new(
-                    WindowRef(entry.window_id.0),
-                    IVec2::new(window_rect.x, window_rect.y + y_offset),
-                    IVec2::new(window_rect.width, window_rect.height),
-                ));
-
-                // Flatten the border overlay at the visible rect (same
-                // y_offset) so it moves in lockstep with the window across
-                // the workspace switch. See animate_layout for the rationale
-                // on why border targets use entry.rect directly.
-                if let Some(b_hwnd) = border_hwnd {
-                    targets.push(WindowTarget::new(
-                        WindowRef(b_hwnd),
-                        IVec2::new(entry.rect.x, entry.rect.y + y_offset),
-                        IVec2::new(entry.rect.width, entry.rect.height),
-                    ));
-                }
+                let shift = |r: Rect| Rect {
+                    y: r.y + y_offset,
+                    ..r
+                };
+                let window_rect = shift(
+                    invisible_bounds
+                        .visible_to_window(entry.rect)
+                        .inset(border_thickness - border_overlap),
+                );
+                // The border overlay sits at the visible rect (same y_offset)
+                // so it moves in lockstep with the window across the switch.
+                let next = shift(entry.rect);
+                let prev_rect = prev.rect_for(entry.window_id.0, window);
+                push_targets(
+                    &mut targets,
+                    &monitor_info,
+                    entry.window_id.0,
+                    prev_rect,
+                    next,
+                    window_rect,
+                    border_hwnd,
+                );
             }
         }
 
@@ -573,36 +598,14 @@ impl FlowWM {
 /// from the config and forwards them. The effective per-edge shrink is
 /// `(thickness - overlap)`, same as
 /// [`FlowWM::animate_layout`].
-/// Would tweening a window from `prev` to `next` sweep it across a monitor
-/// that neighbours this one?
 ///
-/// True when `next` is a parking slot on a side that has a neighbour (the
-/// window would slide out over the neighbour), or when `prev` was a parking
-/// slot on such a side and `next` is on-screen (it would slide in over the
-/// neighbour). Parking on a free side keeps the usual slide animation.
-fn tween_crosses_neighbour(monitor: &MonitorInfo, prev: Option<Rect>, next: Rect) -> bool {
-    let parked_side = |r: Rect| -> Option<bool> {
-        monitor
-            .is_parked(r)
-            .then(|| r.right() <= monitor.virtual_screen.x)
-    };
-    let blocked = |left: bool| {
-        if left {
-            monitor.neighbour_left
-        } else {
-            monitor.neighbour_right
-        }
-    };
-    match (prev.and_then(parked_side), parked_side(next)) {
-        (_, Some(left)) => blocked(left),
-        (Some(left), None) => blocked(left),
-        (None, None) => false,
-    }
-}
-
+/// `monitor` is the monitor the layout was projected for; it drives the
+/// neighbour-teleport decision ([`plan_move`]) like every other submit path,
+/// although at `Duration::ZERO` a tween never sweeps anyway.
 pub(super) fn animate_layout_raw(
     animator: &mut WindowAnimator,
     layout: &AppliedLayout,
+    monitor: &MonitorInfo,
     registry: &WindowRegistry,
     border_thickness: i32,
     border_overlap: i32,
@@ -611,49 +614,215 @@ pub(super) fn animate_layout_raw(
         return;
     }
 
-    let targets: Vec<WindowTarget> = layout
-        .actual_layout
-        .entries
-        .iter()
-        .flat_map(|entry| {
-            let window = registry.get_window(HWND(entry.window_id.0 as *mut _));
-            let invisible_bounds = window.map(|w| w.invisible_bounds).unwrap_or_default();
-            let border_hwnd = window.and_then(|w| w.border.as_ref()).map(|b| b.hwnd());
+    let mut targets: Vec<WindowTarget> = Vec::new();
+    for entry in &layout.actual_layout.entries {
+        let window = registry.get_window(HWND(entry.window_id.0 as *mut _));
+        let invisible_bounds = window.map(|w| w.invisible_bounds).unwrap_or_default();
+        // During initial construction borders are still None (they're
+        // created afterwards in refresh_all_border_styles), so this yields
+        // zero border targets on the first snap. Subsequent calls (if any)
+        // would include them. See animate_layout.
+        let border_hwnd = window.and_then(|w| w.border.as_ref()).map(|b| b.hwnd());
 
-            let window_rect = invisible_bounds
-                .visible_to_window(entry.rect)
-                .inset(border_thickness - border_overlap);
+        let window_rect = invisible_bounds
+            .visible_to_window(entry.rect)
+            .inset(border_thickness - border_overlap);
+        // Nothing has been laid out yet, so there is no previous rect.
+        push_targets(
+            &mut targets,
+            monitor,
+            entry.window_id.0,
+            None,
+            entry.rect,
+            window_rect,
+            border_hwnd,
+        );
+    }
 
-            let window_target = WindowTarget::new(
-                WindowRef(entry.window_id.0),
-                IVec2::new(window_rect.x, window_rect.y),
-                IVec2::new(window_rect.width, window_rect.height),
-            );
-
-            // During initial construction borders are still None (they're
-            // created afterwards in refresh_all_border_styles), so this
-            // yields zero border targets on the first snap. Subsequent
-            // calls (if any) would include them. See animate_layout.
-            let border_target = border_hwnd.map(|b_hwnd| {
-                WindowTarget::new(
-                    WindowRef(b_hwnd),
-                    IVec2::new(entry.rect.x, entry.rect.y),
-                    IVec2::new(entry.rect.width, entry.rect.height),
-                )
-            });
-
-            std::iter::once(window_target).chain(border_target)
-        })
-        .collect();
-
+    if targets.is_empty() {
+        return;
+    }
     if let Err(e) = animator.animate(targets) {
         log::warn!("animation error (initial snap): {e}");
     }
 }
 
+// ---------------------------------------------------------------------------
+// Neighbour-teleport rule
+// ---------------------------------------------------------------------------
+
+/// The off-virtual-screen zone a parked rect sits in.
+///
+/// Horizontal zones come from the layout projection
+/// ([`park_left_x`](crate::layout::projection::park_left_x) /
+/// [`park_right_x`](crate::layout::projection::park_right_x)); vertical ones
+/// from workspace parking ([`workspace_y_offset`](crate::workspace::workspace_y_offset)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkSide {
+    /// Entirely left of the virtual screen.
+    Left,
+    /// Entirely right of the virtual screen.
+    Right,
+    /// Entirely above the virtual screen (vertical workspace parking).
+    Above,
+    /// Entirely below the virtual screen.
+    Below,
+}
+
+/// Which parking zone `rect` lies in, or `None` when it touches the virtual
+/// screen (an on-screen rect).
+fn park_side(monitor: &MonitorInfo, rect: Rect) -> Option<ParkSide> {
+    if !monitor.is_parked(rect) {
+        return None;
+    }
+    let vs = monitor.virtual_screen;
+    Some(if rect.right() <= vs.x {
+        ParkSide::Left
+    } else if rect.x >= vs.right() {
+        ParkSide::Right
+    } else if rect.bottom() <= vs.y {
+        ParkSide::Above
+    } else {
+        ParkSide::Below
+    })
+}
+
+/// Whether a window sliding between this monitor and the `side` parking
+/// zone would pass over another monitor.
+///
+/// Only horizontal neighbours are modelled today
+/// ([`MonitorInfo::neighbour_left`] / [`MonitorInfo::neighbour_right`]).
+/// Vertical workspace parking still uses the monitor's own height and does
+/// not know about stacked monitors; once `MonitorInfo` grows
+/// `neighbour_up` / `neighbour_down`, wire them in here and every submit
+/// path picks the rule up.
+fn side_blocked(monitor: &MonitorInfo, side: ParkSide) -> bool {
+    match side {
+        ParkSide::Left => monitor.neighbour_left,
+        ParkSide::Right => monitor.neighbour_right,
+        ParkSide::Above | ParkSide::Below => false,
+    }
+}
+
+/// How the bridge moves one window from where it is to where the layout
+/// puts it. Decided by [`plan_move`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Move {
+    /// Ordinary tween through the animator.
+    Tween,
+    /// Instant move ([`WindowTarget::instant`]): the tween would sweep the
+    /// window across a neighbouring monitor.
+    Instant,
+    /// No target at all: the window already sits in this blocked-side
+    /// parking slot and an instant move put it there, so there is nothing
+    /// to retarget.
+    Stay,
+}
+
+/// Decide how to move a window from `prev` (its rect before this batch,
+/// `None` when unknown) to `next` on `monitor`.
+///
+/// The teleport rule: a move is [`Move::Instant`] when **either** endpoint is
+/// a parking slot on a side that has a neighbour (`prev` parked there and
+/// sliding in over the neighbour, `next` parked there and sliding out over
+/// it, or both parked on blocked sides and sliding from one across to the
+/// other). Parking on a free side keeps the usual slide, and an on-screen
+/// to on-screen move is always a tween.
+///
+/// When `prev == Some(next)` and that slot is on a blocked side the window
+/// is already there — its last move was instant, so no tween can be in
+/// flight for it — and the answer is [`Move::Stay`], which saves a
+/// `SetWindowPos` per parked window per layout. Free-side parked windows
+/// never get `Stay`: they slid there, may still be mid-flight, and must be
+/// resubmitted so a superseding batch does not strand them.
+pub(super) fn plan_move(monitor: &MonitorInfo, prev: Option<Rect>, next: Rect) -> Move {
+    let next_blocked = park_side(monitor, next).is_some_and(|s| side_blocked(monitor, s));
+    let prev_blocked = prev
+        .and_then(|p| park_side(monitor, p))
+        .is_some_and(|s| side_blocked(monitor, s));
+    if next_blocked && prev == Some(next) {
+        Move::Stay
+    } else if next_blocked || prev_blocked {
+        Move::Instant
+    } else {
+        Move::Tween
+    }
+}
+
+/// Would tweening a window from `prev` to `next` sweep it across a monitor
+/// that neighbours this one? `true` exactly when [`plan_move`] answers
+/// [`Move::Instant`]. Kept as the boolean view of the rule for the tests;
+/// production code reads the full [`Move`] decision.
+#[cfg(test)]
+fn tween_crosses_neighbour(monitor: &MonitorInfo, prev: Option<Rect>, next: Rect) -> bool {
+    plan_move(monitor, prev, next) == Move::Instant
+}
+
+/// Append the animator target(s) for one window — the window itself and,
+/// when it has one, its border overlay — to `targets`, choosing tween,
+/// instant move or no target per [`plan_move`]. Every submit path builds its
+/// targets through here so the teleport rule is applied uniformly.
+///
+/// `next` is the layout's visible rect (any workspace `y_offset` already
+/// applied): it drives the decision and seats the border overlay, which sits
+/// at the visible rect with no invisible-bounds translation and no thickness
+/// inset because the ring occupies the gap between `next` and the inset
+/// `window_rect`. `window_rect` is the translated Win32 rect the window
+/// itself is moved to. The border follows the window's decision so the
+/// animator moves both in lockstep (its `SetWindowPos`-based backend treats
+/// the overlay HWND like any other window).
+///
+/// Returns the decision so callers can log or count it.
+fn push_targets(
+    targets: &mut Vec<WindowTarget>,
+    monitor: &MonitorInfo,
+    hwnd: isize,
+    prev: Option<Rect>,
+    next: Rect,
+    window_rect: Rect,
+    border_hwnd: Option<isize>,
+) -> Move {
+    let decision = plan_move(monitor, prev, next);
+    log::debug!(
+        "animate: hwnd={hwnd} {decision:?} ({},{},{},{}) [visible] → ({},{},{},{}) [window]",
+        next.x,
+        next.y,
+        next.width,
+        next.height,
+        window_rect.x,
+        window_rect.y,
+        window_rect.width,
+        window_rect.height,
+    );
+    let instant = match decision {
+        Move::Stay => return decision,
+        Move::Instant => true,
+        Move::Tween => false,
+    };
+    targets.push(
+        WindowTarget::new(
+            WindowRef(hwnd),
+            IVec2::new(window_rect.x, window_rect.y),
+            IVec2::new(window_rect.width, window_rect.height),
+        )
+        .with_instant(instant),
+    );
+    if let Some(b_hwnd) = border_hwnd {
+        targets.push(
+            WindowTarget::new(
+                WindowRef(b_hwnd),
+                IVec2::new(next.x, next.y),
+                IVec2::new(next.width, next.height),
+            )
+            .with_instant(instant),
+        );
+    }
+    decision
+}
+
 #[cfg(test)]
 mod tests {
-    use super::tween_crosses_neighbour;
+    use super::{Move, plan_move, push_targets, tween_crosses_neighbour};
     use crate::common::Rect;
     use crate::layout::types::MonitorInfo;
 
@@ -729,5 +898,103 @@ mod tests {
         });
         assert!(!tween_crosses_neighbour(&m, Some(col(11)), col(-476)));
         assert!(!tween_crosses_neighbour(&m, Some(col(-476)), col(11)));
+    }
+
+    #[test]
+    fn parked_left_to_parked_right_teleports_when_the_left_side_is_blocked() {
+        // 6 columns, viewport at the end, focus col 0: col 5 goes from the
+        // free right slot to the left slot behind DISPLAY2 (and vice versa).
+        let m = primary_with_left_neighbour();
+        let parked_left = col(-2401);
+        let parked_right = col(1936);
+        assert!(tween_crosses_neighbour(&m, Some(parked_left), parked_right));
+        assert!(tween_crosses_neighbour(&m, Some(parked_right), parked_left));
+        assert_eq!(
+            plan_move(&m, Some(parked_left), parked_right),
+            Move::Instant
+        );
+    }
+
+    #[test]
+    fn already_parked_on_a_blocked_side_stays_put() {
+        let m = primary_with_left_neighbour();
+        let parked_left = col(-2401);
+        assert_eq!(plan_move(&m, Some(parked_left), parked_left), Move::Stay);
+        assert!(!tween_crosses_neighbour(&m, Some(parked_left), parked_left));
+        let mut targets = Vec::new();
+        let decision = push_targets(
+            &mut targets,
+            &m,
+            7,
+            Some(parked_left),
+            parked_left,
+            parked_left.inset(2),
+            Some(8),
+        );
+        assert_eq!(decision, Move::Stay);
+        assert!(targets.is_empty(), "no target is emitted for a Stay");
+    }
+
+    #[test]
+    fn already_parked_on_a_free_side_is_still_resubmitted() {
+        // The slide to a free-side slot may be mid-flight; dropping the
+        // target would strand it when the new batch supersedes the old.
+        let m = primary_with_left_neighbour();
+        let parked_right = col(1936);
+        assert_eq!(plan_move(&m, Some(parked_right), parked_right), Move::Tween);
+    }
+
+    #[test]
+    fn push_targets_marks_window_and_border_instant_together() {
+        let m = primary_with_left_neighbour();
+        let mut targets = Vec::new();
+        let next = col(-2401);
+        let decision = push_targets(
+            &mut targets,
+            &m,
+            7,
+            Some(col(11)),
+            next,
+            next.inset(2),
+            Some(8),
+        );
+        assert_eq!(decision, Move::Instant);
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().all(|t| t.instant));
+        assert_eq!(targets[0].window_ref.0, 7);
+        assert_eq!(targets[0].as_rect().x, next.inset(2).x);
+        assert_eq!(targets[1].window_ref.0, 8);
+        assert_eq!(targets[1].as_rect().x, next.x);
+
+        let mut targets = Vec::new();
+        let decision = push_targets(&mut targets, &m, 7, Some(col(11)), col(487), col(487), None);
+        assert_eq!(decision, Move::Tween);
+        assert_eq!(targets.len(), 1);
+        assert!(!targets[0].instant);
+    }
+
+    #[test]
+    fn vertical_workspace_parking_is_not_a_blocked_side() {
+        // A workspace parked above/below the virtual screen is off-screen but
+        // no vertical neighbour is modelled, so it keeps the slide.
+        let m = primary_with_left_neighbour();
+        let above = Rect {
+            x: 11,
+            y: -1080 + 16,
+            width: 460,
+            height: 1000,
+        };
+        assert_eq!(plan_move(&m, Some(col(11)), above), Move::Tween);
+        assert_eq!(plan_move(&m, Some(above), col(11)), Move::Tween);
+        // ... but a column parked left of the virtual screen AND shifted
+        // vertically is still behind the left neighbour: instant.
+        let parked_left_shifted = Rect {
+            y: -1080 + 16,
+            ..col(-2401)
+        };
+        assert_eq!(
+            plan_move(&m, Some(col(-2401)), parked_left_shifted),
+            Move::Instant
+        );
     }
 }

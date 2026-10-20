@@ -426,8 +426,50 @@ fn handle_animate(
 // start_batch — build tweens and activate
 // ---------------------------------------------------------------------------
 
+/// Write every instant target of `targets` through the backend in one
+/// `apply_batch` call and evict those windows from the active batch so no
+/// later frame of it moves them again.
+///
+/// Runs before the batch's tweens are built: a window that was mid-tween
+/// jumps straight to its instant rect instead of being retargeted from its
+/// interpolated position (which would carry a parked window across a
+/// neighbouring monitor). If evicting leaves the active batch with no
+/// tweens, it is cleared so the worker does not keep ticking an empty batch.
+fn apply_instant_targets(
+    state: &mut WorkerState,
+    backend: &dyn WindowBackend,
+    targets: &[WindowTarget],
+    animating: &Arc<AtomicBool>,
+) {
+    let updates: Vec<(WindowRef, Rect)> = targets
+        .iter()
+        .filter(|t| t.instant)
+        .map(|t| (t.window_ref, t.as_rect()))
+        .collect();
+    if updates.is_empty() {
+        return;
+    }
+    log::debug!("start_batch: applying {} instant target(s)", updates.len());
+    if let Err(e) = backend.apply_batch(&updates) {
+        log::warn!("apply_batch error for instant targets: {e}");
+    }
+    if let Some(active) = &mut state.active {
+        active
+            .batch
+            .tweens
+            .retain(|tw| !updates.iter().any(|(w, _)| *w == tw.window_ref));
+        if active.batch.tweens.is_empty() {
+            state.active = None;
+            animating.store(false, Ordering::Release);
+        }
+    }
+}
+
 /// Build an [`AnimationBatch`] from the current window geometry and make it
 /// the active animation.
+///
+/// Instant targets ([`WindowTarget::instant`]) are applied first, in one
+/// backend call, and never tweened (see [`apply_instant_targets`]).
 ///
 /// For windows that are mid-animation, the current interpolated position is
 /// used as the starting rect so the transition appears continuous. For all
@@ -441,15 +483,21 @@ fn start_batch(
     pending: PendingBatch,
     animating: &Arc<AtomicBool>,
 ) {
+    apply_instant_targets(state, backend, &pending.targets, animating);
+
     // Sample current progress of the active batch, if any.
     // `progress()` already clamps to [0.0, 1.0] internally.
     let current_t = state.active.as_ref().map(|a| a.batch.progress());
 
-    // Resolve the current rect for each target window.
+    // Resolve the current rect for each target window. An instant target
+    // starts from its own rect so `build_tweens` drops it as a no-op.
     let from_rects: Vec<(WindowRef, Rect)> = pending
         .targets
         .iter()
         .map(|target| {
+            if target.instant {
+                return (target.window_ref, target.as_rect());
+            }
             let rect = if let (Some(t), Some(active)) = (current_t, &state.active) {
                 // Prefer the interpolated position from the active batch when
                 // this window is part of it (RetargetFromCurrent case).
@@ -968,6 +1016,147 @@ mod tests {
         assert!(
             animator.is_animating(),
             "animation should still be running under DropNew policy"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Instant targets: a window mid-tween jumps straight to the instant rect
+    // and is never touched by the superseded batch again.
+    // -----------------------------------------------------------------------
+
+    /// Every rect applied for `window`, in application order.
+    fn applied_rects(state: &Arc<Mutex<MockState>>, window: WindowRef) -> Vec<Rect> {
+        state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter_map(|c| match c {
+                MockCall::ApplyBatch(updates) => Some(updates),
+                _ => None,
+            })
+            .flat_map(|updates| {
+                updates
+                    .iter()
+                    .filter(|(w, _)| *w == window)
+                    .map(|(_, r)| *r)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn instant_target_preempts_inflight_tween_without_sweeping() {
+        // Arrange: batch A slides W1 from x=0 to x=1000 (and W2 alongside)
+        // over a long duration, paced by a slow mock DwmFlush.
+        let w1 = WindowRef(1);
+        let w2 = WindowRef(2);
+        let state = Arc::new(Mutex::new(MockState {
+            rects: [
+                (w1, Rect::new(0, 0, 100, 100)),
+                (w2, Rect::new(0, 200, 100, 100)),
+            ]
+            .into(),
+            dwm_flush_delay_ms: 5,
+            ..MockState::default()
+        }));
+        let backend = MockBackend::with_state(Arc::clone(&state));
+        let config = AnimatorConfig {
+            duration: Duration::from_millis(2_000),
+            ..AnimatorConfig::default()
+        };
+        let mut animator = WindowAnimator::new(backend, config);
+        animator
+            .animate(vec![
+                WindowTarget::new(w1, IVec2::new(1000, 0), IVec2::new(100, 100)),
+                WindowTarget::new(w2, IVec2::new(1000, 200), IVec2::new(100, 100)),
+            ])
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(animator.is_animating(), "batch A should be in flight");
+        assert!(
+            applied_rects(&state, w1).len() > 1,
+            "A should have applied several frames for W1"
+        );
+
+        // Act: batch B parks W1 at x=-2400 instantly.
+        let parked = Rect::new(-2400, 0, 100, 100);
+        animator
+            .animate(vec![WindowTarget::instant(
+                w1,
+                IVec2::new(-2400, 0),
+                IVec2::new(100, 100),
+            )])
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+
+        // Assert: W1's history is a run of A frames (monotonic, within
+        // [0, 1000]) followed by exactly one jump to the parked rect, with
+        // nothing in between and nothing after.
+        let history = applied_rects(&state, w1);
+        let jump = history
+            .iter()
+            .position(|r| *r == parked)
+            .expect("instant rect must have been applied");
+        let before = &history[..jump];
+        assert!(
+            before.windows(2).all(|p| p[0].x <= p[1].x),
+            "A frames must be monotonic: {before:?}"
+        );
+        assert!(
+            before.iter().all(|r| (0..=1000).contains(&r.x)),
+            "A frames must stay between the A endpoints: {before:?}"
+        );
+        let last_a = before.last().map_or(0, |r| r.x);
+        assert!(
+            !history
+                .iter()
+                .any(|r| r.x > -2400 && r.x < last_a && r.x < 0),
+            "no rect may be applied between the parked slot and the last A frame: {history:?}"
+        );
+        assert_eq!(
+            &history[jump..],
+            &[parked],
+            "nothing may touch W1 after the instant apply: {history:?}"
+        );
+        assert_eq!(history.last(), Some(&parked), "W1 ends at the parked rect");
+
+        // W2 was not in batch B: its A tween keeps running after the jump.
+        let w2_after = applied_rects(&state, w2).len();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            applied_rects(&state, w2).len() > w2_after,
+            "W2's tween must survive the instant batch for W1"
+        );
+        assert!(animator.is_animating());
+        animator.cancel();
+    }
+
+    #[test]
+    fn instant_only_batch_on_idle_animator_applies_once_and_stays_idle() {
+        let (mut animator, state) = make_animator_with_mock();
+        let to = Rect::new(-2400, 0, 100, 100);
+        animator
+            .animate(vec![WindowTarget::instant(
+                WindowRef(1),
+                IVec2::new(-2400, 0),
+                IVec2::new(100, 100),
+            )])
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(applied_rects(&state, WindowRef(1)), vec![to]);
+        assert!(
+            !animator.is_animating(),
+            "an instant-only batch leaves no tween running"
+        );
+        // Nothing is tweened, so the backend is never asked for the rect.
+        assert!(
+            !state
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .any(|c| matches!(c, MockCall::GetWindowRect(_))),
+            "instant targets do not query the backend"
         );
     }
 }

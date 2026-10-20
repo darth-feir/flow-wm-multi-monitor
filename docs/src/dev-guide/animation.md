@@ -214,6 +214,51 @@ batch's frozen config for consistency) and starts a new batch from those
 positions toward the new targets. This means rapid-fire operations like
 scrolling or swapping produce continuous motion with no visible restarts.
 
+## Instant targets and the neighbour-teleport rule
+
+On a multi-monitor desktop a column that leaves the viewport is *parked*
+beyond the Win32 virtual screen (see [Projection](./layout/projection.md)). A
+tween from the viewport to a parking slot that lies behind a neighbouring
+monitor would sweep the window across that monitor, so the bridge replaces it
+with an instant move.
+
+**The rule** (`daemon/animation.rs`, `plan_move`): a move is **instant** when
+*either* endpoint is a parking slot on a side that has a neighbour
+(`MonitorInfo::neighbour_left/right`) — sliding out toward the neighbour,
+sliding in from behind it, or sliding from one blocked slot across to the
+other. Parking on a free side keeps the ordinary slide, as does any on-screen
+to on-screen move. When the previous rect equals the new one *and* that slot
+is on a blocked side, the window is already there (its last move was instant,
+so no tween can be in flight) and **no target is emitted** at all, so a layout
+does not re-`SetWindowPos` every parked window. Free-side parked windows are
+always resubmitted because their slide may still be mid-flight and a
+superseding batch would otherwise strand them. Vertical parking (workspaces
+above/below) is recognised as a parking zone but has no neighbour modelled
+yet; `side_blocked` is the one place to extend when `MonitorInfo` learns
+`neighbour_up/down`.
+
+Every submit path builds its targets through one helper (`push_targets`):
+`animate_layout`'s `collect_targets`, `animate_workspaces[_on]` (workspace
+switches, float toggles, the loadout apply) and the construction-time
+`animate_layout_raw`. The decision needs each window's **pre-batch** rect, so
+callers submit before syncing the registry's tiled rects
+(`PrevRects::Registry`), or capture the rects first with
+`snapshot_prev_rects` and pass `PrevRects::Snapshot` (the loadout path, which
+syncs per workspace long before it seats the monitors). A window's border
+overlay always follows the window's decision so both move in lockstep.
+
+**Inside the animator** an instant move is a `WindowTarget` with
+`instant: true` (`WindowTarget::instant` / `with_instant`). When the worker
+starts a batch it first writes every instant target through the backend in a
+single `apply_batch`, evicts those windows from any batch still in flight
+(so no later frame of the superseded tween moves them again — under
+`RetargetFromCurrent` the old tween's interpolated position would otherwise
+become the new tween's start and the window would slide across the
+neighbour anyway), and then uses the instant rect as the window's *from*
+rect so `build_tweens` drops it as a no-op. Instant targets never query
+`GetWindowRect`. A batch that contains only instant targets leaves the
+animator idle.
+
 ## Cross-References
 
 - [Layout pipeline](./layout/pipeline.md) — how `AppliedLayout` is produced by

@@ -276,13 +276,13 @@ impl FlowWM {
                     entry.rect.height,
                 );
             }
-            initial_diffs.push(diff);
+            initial_diffs.push((*pm.scrolling.monitor(), diff));
         }
         if initial_diffs.is_empty() {
             log::warn!("init: no tiling windows found - skipping initial layout");
         }
 
-        for diff in &initial_diffs {
+        for (monitor, diff) in &initial_diffs {
             log::debug!(
                 "init: submitting {} targets to animator",
                 diff.actual_layout.entries.len()
@@ -290,6 +290,7 @@ impl FlowWM {
             animate_layout_raw(
                 &mut animator,
                 diff,
+                monitor,
                 &registry,
                 app_config.borders.thickness as i32,
                 app_config.borders.overlap as i32,

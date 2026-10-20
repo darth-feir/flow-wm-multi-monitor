@@ -135,6 +135,8 @@ See [Overview](./overview.md) for the VirtualLayout/ActualLayout type relationsh
 > right zone at `virtual_right + PARK_MARGIN`. On a single monitor this is the
 > same as before. A partially visible column that would overhang an edge with a
 > neighbouring monitor beyond it (`MonitorInfo::neighbour_left/right`) is parked
-> instead, because Windows cannot clip a window at a monitor edge. The daemon
-> teleports (rather than tweens) windows whose slide would cross a neighbour
-> (`daemon/animation.rs`, `tween_crosses_neighbour`).
+> instead, because Windows cannot clip a window at a monitor edge. Overhang is
+> judged against the *work area*, so a column tucked under a left-docked
+> taskbar counts as overhanging. The daemon moves windows whose slide would
+> cross a neighbour instantly instead of tweening them — see
+> [Instant targets and the teleport rule](../animation.md#instant-targets-and-the-neighbour-teleport-rule).

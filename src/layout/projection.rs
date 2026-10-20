@@ -778,4 +778,183 @@ mod tests {
         };
         assert!(!actual.entries[2].rect.overlaps(primary));
     }
+
+    /// The middle monitor of a three-wide desktop: neighbours on both sides.
+    fn middle_of_three() -> MonitorInfo {
+        let left = Rect {
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let middle = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let right = Rect {
+            x: 1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let virtual_screen = Rect {
+            x: -1920,
+            y: 0,
+            width: 5760,
+            height: 1080,
+        };
+        MonitorInfo::in_desktop(middle, middle, virtual_screen, &[left, right])
+    }
+
+    #[test]
+    fn middle_monitor_parks_beyond_both_far_edges() {
+        let m = middle_of_three();
+        assert!(m.neighbour_left && m.neighbour_right);
+        let padding = test_padding();
+        // 4 × 960 columns, viewport at the start of col 1's slot (968):
+        // col 0 is off-left, col 1 fills 0..960, col 2 (964..1924) overhangs
+        // the right edge, col 3 is off-right.
+        let layout = VirtualLayout::with_columns(
+            (1..=4)
+                .map(|i| Column::with_row(960, Row::new(WindowId(i), 0)))
+                .collect(),
+            968,
+        );
+        let actual = project(&layout, &m, &padding);
+        assert_eq!(actual.entries[0].rect.x, -1920 - 960 - PARK_MARGIN);
+        assert_eq!(actual.entries[1].rect.x, 0);
+        // Overhang toward the right neighbour: parked beyond ITS far edge.
+        assert_eq!(actual.entries[2].rect.x, 3840 + PARK_MARGIN);
+        assert_eq!(actual.entries[3].rect.x, 3840 + PARK_MARGIN);
+        let left = Rect {
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let right = Rect {
+            x: 1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        for e in &actual.entries {
+            assert!(
+                !e.rect.overlaps(left) && !e.rect.overlaps(right),
+                "{:?} at x={} lands on a neighbour",
+                e.window_id,
+                e.rect.x
+            );
+        }
+
+        // Overhang toward the left neighbour is parked left of everything.
+        let layout = VirtualLayout::with_columns(
+            vec![
+                Column::with_row(960, Row::new(WindowId(1), 0)),
+                Column::with_row(960, Row::new(WindowId(2), 0)),
+            ],
+            500,
+        );
+        let actual = project(&layout, &m, &padding);
+        assert_eq!(actual.entries[0].rect.x, park_left_x(&m, 960));
+        assert_eq!(actual.entries[0].rect.x, -1920 - 960 - PARK_MARGIN);
+        assert_eq!(actual.entries[1].rect.x, 968 - 500);
+    }
+
+    #[test]
+    fn negative_origin_monitor_projects_relative_to_its_own_corner() {
+        // A monitor above-left of the primary: both x and y are negative.
+        let m = MonitorInfo::single(Rect {
+            x: -1920,
+            y: -1080,
+            width: 1920,
+            height: 1080,
+        });
+        let padding = Padding {
+            window_gap: 4,
+            up: 10,
+            down: 0,
+        };
+        let layout = VirtualLayout::with_columns(
+            vec![
+                Column::with_row(960, Row::new(WindowId(1), 0)),
+                Column::with_row(960, Row::new(WindowId(2), 0)),
+                Column::with_row(960, Row::new(WindowId(3), 0)),
+            ],
+            0,
+        );
+        let actual = project(&layout, &m, &padding);
+        assert_eq!(actual.entries[0].rect.x, -1920 + 4);
+        assert_eq!(actual.entries[0].rect.y, -1080 + 10 + 4);
+        assert_eq!(actual.entries[1].rect.x, -1920 + 968);
+        // Off-right: parked beyond the monitor's right edge, which is x=0.
+        assert_eq!(actual.entries[2].rect.x, PARK_MARGIN);
+        assert_eq!(actual.entries[2].rect.y, -1080 + 10 + 4, "parking keeps y");
+        assert!(m.is_parked(actual.entries[2].rect));
+
+        // Scrolled past col 0: parked beyond the monitor's left edge.
+        let layout = VirtualLayout::with_columns(layout.columns.clone(), 968);
+        let actual = project(&layout, &m, &padding);
+        assert_eq!(actual.entries[0].rect.x, -1920 - 960 - PARK_MARGIN);
+        assert_eq!(actual.entries[1].rect.x, -1920);
+    }
+
+    #[test]
+    fn work_area_offset_from_screen_edge_drives_overhang_and_origin() {
+        // Taskbar docked on the left: the work area starts 60 px into the
+        // screen. A second monitor sits to the left.
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let work_area = Rect {
+            x: 60,
+            y: 0,
+            width: 1860,
+            height: 1080,
+        };
+        let left = Rect {
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let virtual_screen = Rect {
+            x: -1920,
+            y: 0,
+            width: 3840,
+            height: 1080,
+        };
+        let m = MonitorInfo::in_desktop(work_area, screen, virtual_screen, &[left]);
+        assert!(m.neighbour_left && !m.neighbour_right);
+        let padding = test_padding();
+        let columns = vec![
+            Column::with_row(960, Row::new(WindowId(1), 0)),
+            Column::with_row(960, Row::new(WindowId(2), 0)),
+            Column::with_row(960, Row::new(WindowId(3), 0)),
+        ];
+
+        // Viewport at 0: columns are placed from the WORK AREA's left edge.
+        let layout = VirtualLayout::with_columns(columns.clone(), 0);
+        let actual = project(&layout, &m, &padding);
+        assert_eq!(actual.entries[0].rect.x, 60 + 4);
+        // Col 1 (1028..1988) overhangs the free right edge: kept.
+        assert_eq!(actual.entries[1].rect.x, 60 + 968);
+        // Col 2 (canvas 1932) is past the viewport (0..1860): parked right of
+        // the virtual screen.
+        assert_eq!(actual.entries[2].rect.x, 1920 + PARK_MARGIN);
+
+        // Viewport at 30: col 0 would sit at x=34 — on the screen, but under
+        // the taskbar strip left of the work area, with a neighbour beyond.
+        // Overhang is judged against the work area, so it is parked.
+        let layout = VirtualLayout::with_columns(columns, 30);
+        let actual = project(&layout, &m, &padding);
+        assert_eq!(actual.entries[0].rect.x, park_left_x(&m, 960));
+        assert_eq!(actual.entries[0].rect.x, -1920 - 960 - PARK_MARGIN);
+        assert_eq!(actual.entries[1].rect.x, 60 + 968 - 30);
+    }
 }

@@ -1434,20 +1434,22 @@ impl FlowWM {
         let source_virtual = source_applied.virtual_layout.clone();
         let source_actual = source_applied.actual_layout.clone();
 
-        // b) Sync registry tiling state for the scrolling side.
-        self.registry
-            .update_tiling_slots_from_layout(&source_virtual);
-        self.registry.update_tiled_rects(&source_actual);
-
-        // c) Compute the centered float rect and place the window into the
+        // b) Compute the centered float rect and place the window into the
         //    floating space. register_float also mirrors the rect into the
         //    registry state and arms float-location tracking.
         let float_rect = self.centered_float_rect(focused);
         let float_actual = self.register_float(focused, float_rect);
 
-        // d) Animate: single batch, both at y_offset 0 (same workspace).
-        let batches = [(source_actual, 0), (float_actual, 0)];
+        // c) Animate: single batch, both at y_offset 0 (same workspace).
+        //    Submitted BEFORE the tiled-rect sync so the neighbour-teleport
+        //    decision sees where each remaining tile is now.
+        let batches = [(source_actual.clone(), 0), (float_actual, 0)];
         self.animate_workspaces(&batches);
+
+        // d) Sync registry tiling state for the scrolling side.
+        self.registry
+            .update_tiling_slots_from_layout(&source_virtual);
+        self.registry.update_tiled_rects(&source_actual);
 
         // Re-sync the toggled window's border: the registry state just flipped
         // Tiling→Floating, so refresh_border_for re-resolves color (a focused
@@ -1565,22 +1567,23 @@ impl FlowWM {
         let dest_virtual = dest_applied.virtual_layout.clone();
         let dest_actual = dest_applied.actual_layout.clone();
 
-        // c) Sync registry tiling state.
-        self.registry.update_tiling_slots_from_layout(&dest_virtual);
-        self.registry.update_tiled_rects(&dest_actual);
-
-        // d) Get the floating layout (now without the removed window).
+        // c) Get the floating layout (now without the removed window).
         let float_actual = self.monitors[idx]
             .active_workspace_mut()
             .floating
             .to_actual_layout();
 
-        // Registry state is already set to Tiling(Active { col, row }) by
-        // update_tiling_slots_from_layout above — no manual write needed.
-
-        // f) Animate: single batch, both at y_offset 0.
-        let batches = [(dest_actual, 0), (float_actual, 0)];
+        // d) Animate: single batch, both at y_offset 0. Submitted BEFORE
+        //    the tiled-rect sync so the neighbour-teleport decision sees
+        //    where each tile is now (the toggled window still reads as a
+        //    float at its float rect, which is where it is).
+        let batches = [(dest_actual.clone(), 0), (float_actual, 0)];
         self.animate_workspaces(&batches);
+
+        // e) Sync registry tiling state. This sets the toggled window to
+        //    Tiling(Active { col, row }) — no manual write needed.
+        self.registry.update_tiling_slots_from_layout(&dest_virtual);
+        self.registry.update_tiled_rects(&dest_actual);
 
         // Re-sync the toggled window's border: the registry state just flipped
         // Floating→Tiling, so refresh_border_for re-resolves color. Tiled

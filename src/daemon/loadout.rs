@@ -47,6 +47,7 @@ use crate::registry::types::{FloatingState, WindowState};
 use crate::workspace::{Workspace, WorkspaceId, workspace_y_offset};
 use windows::Win32::Foundation::HWND;
 
+use super::animation::PrevRects;
 use super::types::FlowWM;
 
 // ── Pure helpers (unit-testable without FlowWM) ────────────────────
@@ -398,6 +399,12 @@ impl FlowWM {
             }
         }
 
+        // Where every window is right now, captured before phase D rewrites
+        // the registry's tiled rects: the seating submit below compares these
+        // with the new positions to decide which moves must be instant
+        // (a slide across a neighbouring monitor).
+        let prev_rects = self.snapshot_prev_rects();
+
         // 5. Phase D: apply per-workspace
         for rw in resolved_workspaces {
             let ws_id = WorkspaceId(rw.workspace_id);
@@ -523,7 +530,7 @@ impl FlowWM {
                 monitor_height,
                 window_gap,
             );
-            self.animate_workspaces(&batches);
+            self.animate_workspaces_on(mi, &batches, PrevRects::Snapshot(&prev_rects));
         }
         set_float_hwnds(&all_target_floats);
         log::info!("loadout load: restored layout from {resolved:?}");

@@ -76,7 +76,9 @@ pub struct WindowRef(pub isize);
 /// Desired final geometry for one window in an animation batch.
 ///
 /// The animator reads the window's current geometry from the backend and
-/// interpolates from that to the target.
+/// interpolates from that to the target — unless the target is
+/// [`instant`](Self::instant), in which case the worker applies the final
+/// rect in one step before any tween of the batch starts.
 #[derive(Debug, Clone)]
 pub struct WindowTarget {
     /// The window to animate.
@@ -85,16 +87,41 @@ pub struct WindowTarget {
     pub final_position: IVec2,
     /// Desired size (width × height) after animation.
     pub final_size: IVec2,
+    /// Apply the final geometry immediately instead of tweening to it.
+    ///
+    /// An instant target is written through the backend as soon as its batch
+    /// starts, and the window is dropped from any tween still in flight so no
+    /// later frame moves it again. The daemon uses this for windows whose
+    /// slide would sweep across a neighbouring monitor.
+    pub instant: bool,
 }
 
 impl WindowTarget {
-    /// Construct a new [`WindowTarget`].
+    /// Construct a new tweened [`WindowTarget`].
     pub fn new(window_ref: WindowRef, final_position: IVec2, final_size: IVec2) -> Self {
         Self {
             window_ref,
             final_position,
             final_size,
+            instant: false,
         }
+    }
+
+    /// Construct a [`WindowTarget`] that is applied in one step rather than
+    /// tweened (see the [`instant`](Self::instant) field).
+    pub fn instant(window_ref: WindowRef, final_position: IVec2, final_size: IVec2) -> Self {
+        Self {
+            instant: true,
+            ..Self::new(window_ref, final_position, final_size)
+        }
+    }
+
+    /// Return this target with its [`instant`](Self::instant) flag set to
+    /// `instant`.
+    #[must_use]
+    pub fn with_instant(mut self, instant: bool) -> Self {
+        self.instant = instant;
+        self
     }
 
     /// Convert the target fields into a [`Rect`].
@@ -162,5 +189,15 @@ mod tests {
     fn window_target_as_rect() {
         let t = WindowTarget::new(WindowRef(42), IVec2::new(50, 60), IVec2::new(400, 300));
         assert_eq!(t.as_rect(), Rect::new(50, 60, 400, 300));
+    }
+
+    #[test]
+    fn window_target_instant_flag() {
+        let t = WindowTarget::new(WindowRef(1), IVec2::ZERO, IVec2::new(1, 1));
+        assert!(!t.instant, "new() builds a tweened target");
+        let i = WindowTarget::instant(WindowRef(1), IVec2::ZERO, IVec2::new(1, 1));
+        assert!(i.instant);
+        assert_eq!(i.as_rect(), t.as_rect());
+        assert!(!i.with_instant(false).instant);
     }
 }

@@ -4633,4 +4633,53 @@ mod tests {
             "bottom row gets base"
         );
     }
+
+    // --- insert_window_at tests ---
+
+    #[test]
+    fn insert_window_at_zero_prepends_and_shows_the_strip_start() {
+        let config = test_config();
+        // Start scrolled to the end so the viewport has to move back.
+        let layout = VirtualLayout::with_columns(three_column_layout().columns, 1000);
+        let out = insert_window_at(&layout, 0, WindowId(4), &config);
+        assert_eq!(out.columns.len(), 4);
+        assert_eq!(out.columns[0].rows[0].window_id, WindowId(4));
+        assert_eq!(out.columns[0].width_px, config.column_width as i32);
+        assert_eq!(out.columns[1].rows[0].window_id, WindowId(1));
+        assert_eq!(
+            out.viewport_offset, 0,
+            "the new first column is brought into view"
+        );
+    }
+
+    #[test]
+    fn insert_window_at_middle_index_keeps_order() {
+        let out = insert_window_at(&three_column_layout(), 1, WindowId(4), &test_config());
+        let ids: Vec<WindowId> = out.columns.iter().map(|c| c.rows[0].window_id).collect();
+        assert_eq!(
+            ids,
+            vec![WindowId(1), WindowId(4), WindowId(2), WindowId(3)]
+        );
+    }
+
+    #[test]
+    fn insert_window_at_clamps_past_the_end_to_append() {
+        let layout = three_column_layout();
+        let out = insert_window_at(&layout, 99, WindowId(4), &test_config());
+        assert_eq!(out.columns.len(), 4);
+        assert_eq!(out.columns[3].rows[0].window_id, WindowId(4));
+        // Identical to inserting at exactly len().
+        let at_len = insert_window_at(&layout, 3, WindowId(4), &test_config());
+        assert_eq!(at_len.viewport_offset, out.viewport_offset);
+        // The appended column (canvas 2896..3856) is scrolled into view.
+        assert!(out.viewport_offset <= 2896);
+        assert!(out.viewport_offset + 1920 >= 3856);
+    }
+
+    #[test]
+    fn insert_window_at_into_empty_layout() {
+        let out = insert_window_at(&VirtualLayout::new(), 5, WindowId(4), &test_config());
+        assert_eq!(out.columns.len(), 1);
+        assert_eq!(out.columns[0].rows[0].window_id, WindowId(4));
+    }
 }

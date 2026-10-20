@@ -2754,4 +2754,46 @@ mod tests {
         assert_eq!(engine.last_focused_window(), Some(WindowId(10)));
         assert_eq!(result.virtual_layout.viewport_offset, -200);
     }
+
+    // --- prepend_window tests ---
+
+    #[test]
+    fn prepend_window_lands_at_the_left_end_focused_and_visible() {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        // Enough columns to overflow the viewport, then scroll to the last
+        // one so the strip start is off-screen.
+        for i in 1..=6 {
+            engine.add_window(WindowId(i));
+        }
+        engine.set_focus(WindowId(6));
+        let _ = engine.ensure_focused_visible();
+        assert!(engine.virtual_layout().viewport_offset > 0);
+
+        let applied = engine.prepend_window(WindowId(7));
+
+        assert_eq!(
+            applied.virtual_layout.columns[0].rows[0].window_id,
+            WindowId(7)
+        );
+        assert_eq!(applied.virtual_layout.columns.len(), 7);
+        assert_eq!(engine.last_focused_window(), Some(WindowId(7)));
+        assert_eq!(
+            engine.virtual_layout().viewport_offset,
+            0,
+            "viewport scrolls back to the strip start"
+        );
+        let entry = &applied.actual_layout.entries[0];
+        assert_eq!(entry.window_id, WindowId(7));
+        assert_eq!(entry.rect.x, test_padding().window_gap);
+        assert!(!test_monitor().is_parked(entry.rect));
+    }
+
+    #[test]
+    fn prepend_window_into_empty_space_behaves_like_add() {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        let applied = engine.prepend_window(WindowId(1));
+        assert_eq!(applied.virtual_layout.columns.len(), 1);
+        assert_eq!(engine.last_focused_window(), Some(WindowId(1)));
+        assert_eq!(applied.actual_layout.entries.len(), 1);
+    }
 }
