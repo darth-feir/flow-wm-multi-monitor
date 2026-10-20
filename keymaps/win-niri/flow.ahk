@@ -8,18 +8,20 @@
 ; (together with launcher.ahk and help.ahk, which it #Includes) and start with
 ; `flow start --ahk`.
 ;
-;   Mod+Left/Down/Up/Right        focus                (hops monitors at a strip edge)
-;   Mod+Ctrl+Arrows               move window          (hops monitors at a strip edge)
-;   Mod+Shift+Arrows              focus monitor
-;   Mod+Shift+Ctrl+Arrows         move window to monitor
+;   Mod+Left/Down/Up/Right        focus the next window on this screen
+;   Mod+Shift+Arrows              move the window along the strip (up/down inside a stacked column)
+;   Mod+Ctrl+Arrows               focus the other screen
+;   Mod+Alt+Arrows                move the window to the other screen (it takes that screen's width)
 ;   Mod+1..9, Mod+0               switch workspace 1..10
 ;   Mod+Ctrl+1..9, Mod+Ctrl+0     move window to workspace 1..10
 ;   Mod+Q                         close window
 ;   Mod+C                         center the focused column
 ;   Mod+V                         toggle floating (shadows Windows clipboard history)
-;   Mod+Minus / Mod+Equal         shrink / expand column
-;   Mod+Comma                     consume: merge the window into the column to the left
-;   Mod+Period                    expel: promote the window out into its own column
+;   Mod+R                         cycle this screen's column width: 1/3 -> 1/2 -> 1/1 (flow.toml [columns])
+;   Mod+F                         fullscreen toggle
+;   Mod+Minus / Mod+Equal         shrink / expand this column one step
+;   Mod+[ / Mod+]                 alone in its column: merge into the column on that side;
+;                                 in a stacked column: pop out into its own column on that side
 ;   Mod+Space, Mod+D              application launcher (launcher.ahk: apps, open windows, settings)
 ;   Mod+T / Mod+Shift+T           Alacritty / Alacritty as admin (UAC)
 ;   Mod+Alt+T / Mod+Alt+Shift+T   Windows Terminal / Windows Terminal as admin (UAC)
@@ -33,7 +35,7 @@
 ; taskbar, and so on. Only the toggle itself, the launcher, the help overlay
 ; and Mod+Shift+E stay bound. The state is read from `flow ping` at startup
 ; ("tiling off" in its output) and flipped locally whenever the toggle
-; dispatch exits 0; a TrayTip reports each flip.
+; dispatch exits 0; an on-screen message reports each flip.
 ;
 ; Fail-back: every binding above is only active while the flowd daemon's named
 ; pipe exists. If the daemon dies, the Win key and all chords revert to stock
@@ -46,15 +48,17 @@
 ; Win+L (lock) is handled by Windows below the hook layer and is untouched;
 ; the only ways around that are a keyboard-firmware or registry remap of the
 ; left Win key (the FlowWM README's "sacrificial key" setup), neither of which
-; is used here. Not bound here, so still Windows: Win+Tab, Win+E, Win+R,
-; Win+Shift+S, Win+A/I/X/S/N/W/P, Win+Ctrl+Space. Shadowed while the daemon
-; runs: Win+1..9/0 (taskbar launch), Win+C, Win+Q, Win+V, Win+D (show
-; desktop), Win+T (taskbar cycle), Win+Minus/Equal (Magnifier), Win+Comma
-; (peek), Win+Period (emoji), Win+Arrows (Snap), Win+Ctrl+Left/Right (virtual
-; desktops), Win+Shift+Left/Right (Windows' own move-to-monitor), Win+Space
-; (Windows' input-language switcher; Win+Ctrl+Space, which cycles the other
-; way, still works). With tiling off only Win+Space, Win+D, Win+Shift+/,
-; Win+Ctrl+T and Win+Shift+E remain shadowed.
+; is used here. Not bound here, so still Windows: Win+Tab, Win+E, Win+Shift+S,
+; Win+A/I/X/S/N/W/P, Win+Comma (peek), Win+Period (emoji), Win+Ctrl+Space.
+; Shadowed while the daemon runs: Win+1..9/0 (taskbar launch), Win+C, Win+Q,
+; Win+V, Win+R (Run: use the right Win key or the launcher), Win+F (Feedback
+; Hub), Win+D (show desktop), Win+T (taskbar cycle), Win+Minus/Equal
+; (Magnifier), Win+Arrows (Snap), Win+Ctrl+Left/Right (virtual desktops),
+; Win+Shift+Left/Right (Windows' own move-to-monitor), Win+Space (Windows'
+; input-language switcher; Win+Ctrl+Space, which cycles the other way, still
+; works). With tiling off only Win+Space, Win+D, Win+Shift+/, Win+Ctrl+T and
+; Win+Shift+E remain shadowed. The daemon side of this map (width presets,
+; edge_hop = false) is in flow.toml.example next to this file.
 ; ════════════════════════════════════════════════════════════════════════════
 
 flowExe := "flow"      ; path to flow.exe (PATH by default); quote-safe below
@@ -69,7 +73,7 @@ Flow(cmd) {
     global flowExe
     try Run('"' flowExe '" ' cmd, , 'Hide')
     catch as e
-        TrayTip("could not run flow: " e.Message, "flow.ahk")
+        Osd("could not run flow: " e.Message)
 }
 
 ; Dispatch without blocking the hotkey thread (Run returns at once); the exit
@@ -82,6 +86,30 @@ AhkLog(msg) {
         try FileAppend(FormatTime(, "HH:mm:ss") " " msg "`n", path)
 }
 
+; Short on-screen message in the bottom-right corner of the primary screen,
+; gone after `ms`. Never TrayTip: Windows 11 turns it into a toast that stays
+; until dismissed and holds the foreground lock, so neither this script's
+; windows nor the daemon's focus pushes can take the foreground meanwhile.
+Osd(msg, ms := 2500) {
+    static gui := 0
+    AhkLog("osd: " msg)
+    if gui
+        try gui.Destroy()
+    gui := Gui("+AlwaysOnTop -Caption +ToolWindow +Owner +E0x20", "FlowWM")   ; E0x20: click-through
+    gui.BackColor := 0x1E1E1E
+    gui.MarginX := 16, gui.MarginY := 10
+    gui.SetFont("s11 cE8E8E8", "Segoe UI")
+    gui.AddText("w520", msg)
+    MonitorGetWorkArea(MonitorGetPrimary(), &l, &t, &r, &b)
+    gui.Show("NoActivate Hide")
+    gui.GetPos(, , &w, &h)
+    gui.Show("NoActivate x" (r - w - 24) " y" (b - h - 24))
+    SetTimer(OsdHide.Bind(gui), -ms)
+}
+OsdHide(gui) {
+    try gui.Hide()
+}
+
 ; onExit (optional): a function object called as onExit(exitCode) once the
 ; dispatch has finished (not called if the process could not be opened or is
 ; still running after ~5 s).
@@ -90,7 +118,7 @@ D(cmd, onExit := 0) {
     AhkLog("dispatch " cmd)
     try Run('"' flowExe '" dispatch ' cmd, , 'Hide', &pid)
     catch as e {
-        TrayTip("could not run flow: " e.Message, "flow.ahk")
+        Osd("could not run flow: " e.Message)
         return
     }
     ; PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE: enough to read the exit code.
@@ -149,12 +177,12 @@ QueryTiling() {
 TilingToggled(code) {
     global TilingOn
     if (code != 0) {
-        TrayTip("tiling toggle failed (flow exit " code ")", "flow.ahk")
+        Osd("tiling toggle failed (flow exit " code ")")
         return
     }
     TilingOn := !TilingOn
     AhkLog("tiling " (TilingOn ? "on" : "off"))
-    TrayTip(TilingOn ? "FlowWM tiling on" : "FlowWM tiling off: Windows is managing windows", "flow.ahk")
+    Osd(TilingOn ? "FlowWM tiling on" : "FlowWM tiling off: Windows is managing windows")
 }
 
 ; --- Daemon liveness --------------------------------------------------------
@@ -185,7 +213,7 @@ CheckDaemon() {
     }
     DaemonUp := false            ; chords fall through to Windows immediately
     if (++DownTicks >= 5) {      ; ~10 s on the 2 s timer: release the hook
-        TrayTip("FlowWM daemon is gone; Win key released.", "flow.ahk")
+        Osd("FlowWM daemon is gone; Win key released.")
         Sleep 1500
         ExitApp()
     }
@@ -247,7 +275,7 @@ Alacritty(admin := false) {
     }
     if (exe = "") {
         AhkLog("alacritty not found")
-        TrayTip("Alacritty not found (%LOCALAPPDATA%\Programs\Alacritty, Program Files, PATH).", "flow.ahk")
+        Osd("Alacritty not found (%LOCALAPPDATA%\Programs\Alacritty, Program Files, PATH).")
         return
     }
     Launch(exe, admin)
@@ -260,7 +288,7 @@ Launch(exe, admin) {
     try Run((admin ? "*RunAs " : "") '"' exe '"')
     catch as e
         if !InStr(e.Message, "cancel")       ; a declined UAC prompt is not worth a popup
-            TrayTip("could not start " exe ": " e.Message, "flow.ahk")
+            Osd("could not start " exe ": " e.Message)
 }
 
 ; Startup gate: refuse to hook the Win key unless the daemon answers within 10 s.
@@ -285,25 +313,25 @@ HotIf((*) => DaemonUp && TilingOn)   ; criterion for the Hotkey() registrations 
 ; roughly one chord in eight in testing (its own key send lands between the
 ; Win press and the arrow). A bare Win tap therefore still opens Start.
 
-; --- Focus / move (Mod, Mod+Ctrl) ------------------------------------------
+; --- Focus / move on this screen (Mod, Mod+Shift) --------------------------
 #Left::D("focus left")
 #Down::D("focus down")
 #Up::D("focus up")
 #Right::D("focus right")
-#^Left::D("move-window left")
-#^Down::D("move-window down")
-#^Up::D("move-window up")
-#^Right::D("move-window right")
+#+Left::D("move-window left")
+#+Down::D("move-window down")
+#+Up::D("move-window up")
+#+Right::D("move-window right")
 
-; --- Monitors (Mod+Shift, Mod+Shift+Ctrl) ----------------------------------
-#+Left::D("focus-monitor left")
-#+Right::D("focus-monitor right")
-#+Down::D("focus-monitor down")
-#+Up::D("focus-monitor up")
-#+^Left::D("move-to-monitor left")
-#+^Right::D("move-to-monitor right")
-#+^Down::D("move-to-monitor down")
-#+^Up::D("move-to-monitor up")
+; --- Screens (Mod+Ctrl focus, Mod+Alt move) ---------------------------------
+#^Left::D("focus-monitor left")
+#^Right::D("focus-monitor right")
+#^Down::D("focus-monitor down")
+#^Up::D("focus-monitor up")
+#!Left::D("move-to-monitor left")
+#!Right::D("move-to-monitor right")
+#!Down::D("move-to-monitor down")
+#!Up::D("move-to-monitor up")
 
 ; --- Workspaces (Mod+n, Mod+Ctrl+n) ----------------------------------------
 SwitchWs(n, *) => D("switch-workspace " n)
@@ -321,8 +349,10 @@ Loop 9 {
 #v::D("set-window cycle")
 #-::D("shrink-column")
 #=::D("expand-column")
-#,::D("merge-column left")
-#.::D("promote right")
+#r::D("width cycle")                  ; 1/3 -> 1/2 -> 1/1 for every column on this screen
+#f::D("set-window fullscreen")        ; toggle
+#[::D("consume-or-expel left")        ; alone: merge into the column to the left; in a stack: pop out to the left
+#]::D("consume-or-expel right")
 
 ; --- Terminals -------------------------------------------------------------
 #t::Alacritty()

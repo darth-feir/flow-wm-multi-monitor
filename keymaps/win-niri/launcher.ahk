@@ -348,7 +348,7 @@ LauncherRun(*) {
         return
     try Run(text)
     catch as err
-        TrayTip("could not run " text ": " err.Message, "FlowWM launcher")
+        Osd("could not run " text ": " err.Message)
 }
 
 LauncherActivate(e) {
@@ -358,7 +358,7 @@ LauncherActivate(e) {
         else
             Run(e.run)
     } catch as err
-        TrayTip("could not open " e.name ": " err.Message, "FlowWM launcher")
+        Osd("could not open " e.name ": " err.Message)
 }
 
 ; --- Hotkeys ---------------------------------------------------------------
