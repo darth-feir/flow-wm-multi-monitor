@@ -165,6 +165,9 @@ impl FlowWM {
             SocketMessage::PlaceAbove => unimplemented_command("place_above"),
             SocketMessage::Promote { direction } => self.dispatch_promote_window(*direction),
             SocketMessage::MergeColumn { direction } => self.dispatch_merge_column(*direction),
+            SocketMessage::ConsumeOrExpel { direction } => {
+                self.dispatch_consume_or_expel(*direction)
+            }
             SocketMessage::CloseWindow => self.dispatch_close_window(),
 
             // --- Queries ---
@@ -472,6 +475,60 @@ impl FlowWM {
             }
             None => SocketResponse::Error {
                 message: "cannot promote window in that direction".into(),
+            },
+        }
+    }
+
+    /// Dispatch `consume-or-expel <left|right>`.
+    ///
+    /// The focused window's column decides which of the two column
+    /// operations runs: with more than one window in it this is
+    /// [`dispatch_promote_window`](Self::dispatch_promote_window) (expel the
+    /// window into a column of its own on that side); alone in its column
+    /// it is [`dispatch_merge_column`](Self::dispatch_merge_column) (consume
+    /// it into the neighbouring column). Errors name the operation that
+    /// could not run — no neighbour to consume into, or an expel the layout
+    /// refused.
+    fn dispatch_consume_or_expel(&mut self, dir: Direction) -> SocketResponse {
+        // Resolve from OS foreground; silent no-op when not an active tile.
+        let Some(id) = self.registry.focused() else {
+            log::debug!("dispatch_consume_or_expel: no-op (no OS-foreground window)");
+            return SocketResponse::Ok;
+        };
+        let Some(win) = self.registry.get_window(HWND(id.0 as *mut _)) else {
+            log::debug!("dispatch_consume_or_expel: no-op (foreground id not in registry)");
+            return SocketResponse::Ok;
+        };
+        if !matches!(win.state, WindowState::Tiling(TilingState::Active { .. })) {
+            log::debug!("dispatch_consume_or_expel: no-op (focused window is not an active tile)");
+            return SocketResponse::Ok;
+        }
+        let strip = self.active_scrolling().virtual_layout();
+        let Some((col, _)) = strip.find_window(id) else {
+            log::debug!(
+                "dispatch_consume_or_expel: no-op (focused tile is not in the active strip)"
+            );
+            return SocketResponse::Ok;
+        };
+        let shares_column = strip.columns[col].rows.len() > 1;
+        match consume_or_expel_action(shares_column) {
+            ColumnAction::Expel => match self.active_scrolling_mut().promote_window(id, dir) {
+                Some(diff) => {
+                    self.animate_layout(&diff);
+                    SocketResponse::Ok
+                }
+                None => SocketResponse::Error {
+                    message: format!("cannot expel window {}", direction_word(dir)),
+                },
+            },
+            ColumnAction::Consume => match self.active_scrolling_mut().merge_column(id, dir) {
+                Some(diff) => {
+                    self.animate_layout(&diff);
+                    SocketResponse::Ok
+                }
+                None => SocketResponse::Error {
+                    message: format!("no column {} to consume into", direction_word(dir)),
+                },
             },
         }
     }
@@ -1897,6 +1954,29 @@ pub(super) fn focus_candidate(
     focus_candidates(scrolling, floating).into_iter().next()
 }
 
+/// Which column operation `consume-or-expel` runs — see
+/// [`consume_or_expel_action`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnAction {
+    /// The window shares its column: expel it into a column of its own
+    /// (`promote`).
+    Expel,
+    /// The window is alone in its column: consume it into the neighbouring
+    /// column (`merge-column`).
+    Consume,
+}
+
+/// Pure rule behind `dispatch_consume_or_expel`: a window that shares its
+/// column is expelled, one alone in its column is consumed.
+#[must_use]
+const fn consume_or_expel_action(shares_column: bool) -> ColumnAction {
+    if shares_column {
+        ColumnAction::Expel
+    } else {
+        ColumnAction::Consume
+    }
+}
+
 /// Pure rule behind [`FlowWM::edge_hop_target`]: an edge hop lands on the
 /// neighbouring monitor only when hops are enabled.
 #[must_use]
@@ -2353,6 +2433,67 @@ mod tests {
         assert!(
             matches!(resp, SocketResponse::Error { .. }),
             "expected Error (guard passed through to layout), got {resp:?}"
+        );
+    }
+
+    // ── consume-or-expel ──────────────────────────────────────────────
+
+    #[test]
+    fn consume_or_expel_rule_follows_the_column_population() {
+        assert_eq!(consume_or_expel_action(true), ColumnAction::Expel);
+        assert_eq!(consume_or_expel_action(false), ColumnAction::Consume);
+    }
+
+    /// Alone in its column the focused window is consumed into the
+    /// neighbour (merge-column); sharing a column it is expelled into a
+    /// column of its own (promote); with no neighbour to consume into the
+    /// command is an error and nothing moves.
+    #[test]
+    fn consume_or_expel_merges_when_alone_and_promotes_when_stacked() {
+        let mut flow =
+            flow_with_focused_state(WindowState::Tiling(TilingState::Active { col: 0, row: 0 }));
+        flow.config.borders.enabled = false;
+        let focused = WindowId(TEST_HWND);
+        let other = WindowId(0x10002);
+
+        // Alone, no neighbour: error, layout untouched.
+        let resp = flow.dispatch_consume_or_expel(Direction::Right);
+        assert!(matches!(resp, SocketResponse::Error { .. }), "{resp:?}");
+        assert_eq!(flow.active_scrolling().virtual_layout().columns.len(), 1);
+
+        // A second column to the right: consume into it.
+        let _ = flow.active_scrolling_mut().add_window(other);
+        assert_eq!(flow.active_scrolling().virtual_layout().columns.len(), 2);
+        assert_eq!(
+            flow.dispatch_consume_or_expel(Direction::Right),
+            SocketResponse::Ok
+        );
+        let strip = flow.active_scrolling().virtual_layout();
+        assert_eq!(strip.columns.len(), 1);
+        assert_eq!(strip.find_window(focused), Some((0, 1)));
+        assert_eq!(strip.find_window(other), Some((0, 0)));
+
+        // Now sharing a column: expel to the left into a column of its own.
+        assert_eq!(
+            flow.dispatch_consume_or_expel(Direction::Left),
+            SocketResponse::Ok
+        );
+        let strip = flow.active_scrolling().virtual_layout();
+        assert_eq!(strip.columns.len(), 2);
+        assert_eq!(strip.find_window(focused), Some((0, 0)));
+        assert_eq!(strip.find_window(other), Some((1, 0)));
+        assert_eq!(strip.columns[0].rows.len(), 1);
+
+        // Vertical directions are rejected like merge/promote reject them.
+        assert!(matches!(
+            flow.dispatch_consume_or_expel(Direction::Up),
+            SocketResponse::Error { .. }
+        ));
+        // Not an active tile: silent no-op.
+        flow.registry.clear_focused();
+        assert_eq!(
+            flow.dispatch_consume_or_expel(Direction::Left),
+            SocketResponse::Ok
         );
     }
 

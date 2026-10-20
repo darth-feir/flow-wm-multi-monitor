@@ -132,6 +132,25 @@ flow dispatch promote right
 
 Default hotkey: `Alt + Ctrl + Shift + h` (left) / `Alt + Ctrl + Shift + l` (right).
 
+### `consume-or-expel <direction>`
+
+The niri move in one key: if the focused window **shares its column** with
+other windows, this is [`promote <direction>`](#promote-direction) — the window
+is expelled into a column of its own on that side. If it is **alone** in its
+column, this is [`merge-column <direction>`](#merge-column-direction) — the
+window is consumed into the neighbouring column as its new bottom row. Pressing
+it twice therefore toggles a window in and out of a stack. `direction` is `left`
+or `right`.
+
+It is an error when there is no neighbouring column to consume into (the
+window is alone at the end of the strip), or when the expel is refused.
+
+```powershell
+flow dispatch consume-or-expel left
+```
+
+No default hotkey in `flow.ahk` — bind it yourself.
+
 ## Column sizing & the viewport
 
 ### `expand-column`
@@ -185,8 +204,8 @@ flow dispatch width 1/2       # flow: column width 1/2
 
 The command prints the preset the monitor landed on. `flow query all` reports
 each monitor's `width_preset`, and the loadout remembers it per monitor across a
-restart. No default hotkey in `flow.ahk` — bind it yourself (the `win-niri`
-keymap uses `Mod+R` for `width cycle`).
+restart. No default hotkey in `flow.ahk` — bind it yourself (`Mod+R` →
+`width cycle` is the natural choice).
 
 ### `center`
 

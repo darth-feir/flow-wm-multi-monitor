@@ -9,7 +9,7 @@
 //! | Loadout | `loadout save|load [path]` |
 //! | Config | `config init` / `reload` / `edit` / `path` / `check` |
 //! | Query | `query all` |
-//! | Dispatch | `dispatch focus\|swap-column\|move-window\|merge-column\|promote\|expand-column\|shrink-column\|width\|center\|close-window\|set-window\|switch-workspace\|move-to-workspace`, plus stub `swap-workspace` |
+//! | Dispatch | `dispatch focus\|swap-column\|move-window\|merge-column\|promote\|consume-or-expel\|expand-column\|shrink-column\|width\|center\|close-window\|set-window\|switch-workspace\|move-to-workspace`, plus stub `swap-workspace` |
 //!
 //! See the developer guide's *IPC & Watchdog* chapter
 //! (`docs/src/dev-guide/ipc-and-watchdog.md`) for the full command reference.
@@ -276,6 +276,17 @@ enum DispatchCommands {
         #[command(subcommand)]
         direction: HorizontalDirection,
     },
+    /// Consume the focused window into the neighbouring column, or expel it
+    /// into a column of its own.
+    ///
+    /// Maps to [`SocketMessage::ConsumeOrExpel`]. When the focused window
+    /// shares its column with other windows this is `promote <dir>`; when
+    /// it is alone in its column it is `merge-column <dir>`. An error when
+    /// there is no neighbour to consume into.
+    ConsumeOrExpel {
+        #[command(subcommand)]
+        direction: HorizontalDirection,
+    },
 
     /// Expand the focused column width by one column step.
     ///
@@ -425,7 +436,7 @@ enum FocusDirection {
     Down,
 }
 
-/// Horizontal direction for `flow dispatch swap-column|merge-column|promote <dir>`.
+/// Horizontal direction for `flow dispatch swap-column|merge-column|promote|consume-or-expel <dir>`.
 ///
 /// Only left/right is offered: column swaps, merges, and promotes are
 /// inherently horizontal operations between adjacent columns.
@@ -1203,6 +1214,12 @@ fn cmd_dispatch(command: DispatchCommands) -> Result<(), String> {
         DispatchCommands::MoveWindow { direction } => cmd_dispatch_move_window(direction),
         DispatchCommands::MergeColumn { direction } => cmd_dispatch_merge_column(direction),
         DispatchCommands::Promote { direction } => cmd_dispatch_promote(direction),
+        DispatchCommands::ConsumeOrExpel { direction } => send_command(
+            SocketMessage::ConsumeOrExpel {
+                direction: horizontal_to_direction(direction),
+            },
+            "window consumed or expelled",
+        ),
         DispatchCommands::ExpandColumn => {
             send_command(SocketMessage::ExpandColumn, "column expanded")
         }
@@ -1302,6 +1319,14 @@ fn cmd_dispatch_width(preset: &str) -> Result<(), String> {
         SocketResponse::Error { message } => Err(format!("daemon error: {message}")),
         SocketResponse::Busy => Err("daemon is busy (drag in progress), retry shortly".to_string()),
         SocketResponse::Pong { .. } => Err("unexpected pong reply to a command".to_string()),
+    }
+}
+
+/// Map the CLI's `HorizontalDirection` subcommand onto the IPC [`Direction`].
+fn horizontal_to_direction(direction: HorizontalDirection) -> Direction {
+    match direction {
+        HorizontalDirection::Left => Direction::Left,
+        HorizontalDirection::Right => Direction::Right,
     }
 }
 
@@ -2882,6 +2907,22 @@ mod tests {
         // Negative: the switch is mandatory and must be one of the three.
         assert!(Cli::try_parse_from(["flow", "dispatch", "tiling"]).is_err());
         assert!(Cli::try_parse_from(["flow", "dispatch", "tiling", "maybe"]).is_err());
+    }
+
+    #[test]
+    fn parse_dispatch_consume_or_expel() {
+        for (word, expected) in [("left", Direction::Left), ("right", Direction::Right)] {
+            let cli = Cli::try_parse_from(["flow", "dispatch", "consume-or-expel", word]).unwrap();
+            match cli.command {
+                Commands::Dispatch {
+                    command: DispatchCommands::ConsumeOrExpel { direction },
+                } => assert_eq!(horizontal_to_direction(direction), expected, "{word}"),
+                other => panic!("expected Dispatch::ConsumeOrExpel({word}), got: {other:?}"),
+            }
+        }
+        // Negative: horizontal only, and the direction is mandatory.
+        assert!(Cli::try_parse_from(["flow", "dispatch", "consume-or-expel", "up"]).is_err());
+        assert!(Cli::try_parse_from(["flow", "dispatch", "consume-or-expel"]).is_err());
     }
 
     #[test]

@@ -254,6 +254,19 @@ pub enum SocketMessage {
         /// Direction of the neighbour column to merge into (left or right).
         direction: Direction,
     },
+    /// Consume into the neighbouring column or expel into a column of its
+    /// own, depending on the focused window's column.
+    ///
+    /// When the focused window shares its column with other windows this is
+    /// exactly [`Promote`](Self::Promote) (expel it into a new single-row
+    /// column on that side); when it is alone in its column it is exactly
+    /// [`MergeColumn`](Self::MergeColumn) (consume it into the neighbouring
+    /// column as a new bottom row). An error when there is no neighbour to
+    /// consume into.
+    ConsumeOrExpel {
+        /// Side to expel to or neighbour to consume into (left or right).
+        direction: Direction,
+    },
     /// Close the focused window.
     CloseWindow,
 
@@ -402,6 +415,7 @@ impl SocketMessage {
                 | Self::ToggleMonocle
                 | Self::Promote { .. }
                 | Self::MergeColumn { .. }
+                | Self::ConsumeOrExpel { .. }
                 | Self::SwitchWorkspace { .. }
                 | Self::SwapWorkspace { .. }
                 | Self::MoveWindowToWorkspace { .. }
@@ -714,6 +728,9 @@ mod tests {
             },
             SocketMessage::MergeColumn {
                 direction: Direction::Right,
+            },
+            SocketMessage::ConsumeOrExpel {
+                direction: Direction::Left,
             },
             SocketMessage::CloseWindow,
             SocketMessage::QueryWindowsAll,
