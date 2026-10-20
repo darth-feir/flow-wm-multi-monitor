@@ -6,6 +6,6 @@
 mod types;
 
 pub use types::{
-    ColumnSnapshot, FloatingEntry, LoadoutFile, RectJson, RowSnapshot, ScrollingSnapshot,
-    WindowRef, WorkspaceSnapshot,
+    ColumnSnapshot, FloatingEntry, LoadoutFile, MonitorSnapshot, RectJson, RowSnapshot,
+    ScrollingSnapshot, WindowRef, WorkspaceSnapshot,
 };

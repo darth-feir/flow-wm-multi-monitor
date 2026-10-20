@@ -9,7 +9,7 @@
 //! | Loadout | `loadout save|load [path]` |
 //! | Config | `config init` / `reload` / `edit` / `path` / `check` |
 //! | Query | `query all` |
-//! | Dispatch | `dispatch focus\|swap-column\|move-window\|merge-column\|promote\|expand-column\|shrink-column\|center\|close-window\|set-window\|switch-workspace\|move-to-workspace`, plus stub `swap-workspace` |
+//! | Dispatch | `dispatch focus\|swap-column\|move-window\|merge-column\|promote\|expand-column\|shrink-column\|width\|center\|close-window\|set-window\|switch-workspace\|move-to-workspace`, plus stub `swap-workspace` |
 //!
 //! See the developer guide's *IPC & Watchdog* chapter
 //! (`docs/src/dev-guide/ipc-and-watchdog.md`) for the full command reference.
@@ -41,6 +41,7 @@ use flow_wm::config;
 use flow_wm::daemon::startup::{self, StartupState, StartupStatus};
 use flow_wm::ipc::message::SocketMessage;
 use flow_wm::ipc::message::SocketResponse;
+use flow_wm::ipc::message::WidthPresetRequest;
 use flow_wm::ipc::message::WindowMode;
 use flow_wm::ipc::transport;
 use flow_wm::logging;
@@ -286,6 +287,17 @@ enum DispatchCommands {
     /// Sends [`SocketMessage::ShrinkColumn`]. The daemon narrows the focused
     /// column to the previous `column_width` boundary and animates the result.
     ShrinkColumn,
+    /// Switch the focused monitor to another column width preset.
+    ///
+    /// Sends [`SocketMessage::SetWidthPreset`]. `PRESET` is `next`, `prev`,
+    /// `cycle` (same as `next`, wrapping) or a preset from `[columns]
+    /// presets` in flow.toml such as `1/2`. Every column on every workspace
+    /// of the focused monitor takes the new width, and new columns there
+    /// are created at it. Prints the preset the monitor landed on.
+    Width {
+        /// `next`, `prev`, `cycle` or a configured preset such as `1/2`.
+        preset: String,
+    },
     /// Center the viewport so the focused column lands at the monitor midpoint.
     ///
     /// Sends [`SocketMessage::Center`]. The daemon slides the viewport so the
@@ -1197,6 +1209,7 @@ fn cmd_dispatch(command: DispatchCommands) -> Result<(), String> {
         DispatchCommands::ShrinkColumn => {
             send_command(SocketMessage::ShrinkColumn, "column shrunk")
         }
+        DispatchCommands::Width { preset } => cmd_dispatch_width(&preset),
         DispatchCommands::Center => send_command(SocketMessage::Center, "viewport centered"),
         DispatchCommands::CloseWindow => send_command(SocketMessage::CloseWindow, "window closed"),
         DispatchCommands::SetWindow { mode } => cmd_dispatch_set_window(mode),
@@ -1258,6 +1271,37 @@ fn cmd_dispatch_tiling(state: TilingSwitch) -> Result<(), String> {
         SocketResponse::Error { message } => Err(format!("daemon error: {message}")),
         SocketResponse::Busy => Err("daemon is busy (drag in progress), retry shortly".to_string()),
         other => Err(format!("unexpected reply to tiling command: {other:?}")),
+    }
+}
+
+/// Send a column width preset command and print the preset it landed on.
+///
+/// Maps `flow dispatch width next|prev|cycle|<preset>` to
+/// [`SocketMessage::SetWidthPreset`]. The daemon answers with
+/// `{"width_preset": "<label>"}`, printed as `flow: column width <label>`.
+fn cmd_dispatch_width(preset: &str) -> Result<(), String> {
+    let msg = SocketMessage::SetWidthPreset {
+        preset: WidthPresetRequest::from_cli(preset),
+    };
+    grant_foreground_permission();
+    let response =
+        transport::send_message(&msg).map_err(|e| format!("failed to send command: {e}"))?;
+    match response {
+        SocketResponse::Data { payload } => {
+            let label = payload
+                .get("width_preset")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("malformed reply to width command: {payload}"))?;
+            println!("flow: column width {label}");
+            Ok(())
+        }
+        SocketResponse::Ok => {
+            println!("flow: column width set");
+            Ok(())
+        }
+        SocketResponse::Error { message } => Err(format!("daemon error: {message}")),
+        SocketResponse::Busy => Err("daemon is busy (drag in progress), retry shortly".to_string()),
+        SocketResponse::Pong { .. } => Err("unexpected pong reply to a command".to_string()),
     }
 }
 
@@ -2838,6 +2882,27 @@ mod tests {
         // Negative: the switch is mandatory and must be one of the three.
         assert!(Cli::try_parse_from(["flow", "dispatch", "tiling"]).is_err());
         assert!(Cli::try_parse_from(["flow", "dispatch", "tiling", "maybe"]).is_err());
+    }
+
+    #[test]
+    fn parse_dispatch_width() {
+        // Positive: the step words and a preset name all parse to `Width`.
+        for (word, expected) in [
+            ("next", WidthPresetRequest::Next),
+            ("prev", WidthPresetRequest::Prev),
+            ("cycle", WidthPresetRequest::Cycle),
+            ("1/2", WidthPresetRequest::Preset("1/2".into())),
+        ] {
+            let cli = Cli::try_parse_from(["flow", "dispatch", "width", word]).unwrap();
+            match cli.command {
+                Commands::Dispatch {
+                    command: DispatchCommands::Width { preset },
+                } => assert_eq!(WidthPresetRequest::from_cli(&preset), expected, "{word}"),
+                other => panic!("expected Dispatch::Width({word}), got: {other:?}"),
+            }
+        }
+        // Negative: the preset argument is mandatory.
+        assert!(Cli::try_parse_from(["flow", "dispatch", "width"]).is_err());
     }
 
     #[test]

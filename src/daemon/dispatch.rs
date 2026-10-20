@@ -153,6 +153,7 @@ impl FlowWM {
             SocketMessage::ExpandColumn => self.dispatch_expand(),
             SocketMessage::ShrinkColumn => self.dispatch_shrink(),
             SocketMessage::SetColumnWidth { width_px } => self.dispatch_set_column_width(*width_px),
+            SocketMessage::SetWidthPreset { preset } => self.dispatch_width_preset(preset),
 
             // --- Viewport center ---
             SocketMessage::Center => self.dispatch_center(),
@@ -1796,14 +1797,7 @@ impl FlowWM {
             return SocketResponse::Error { message: reason };
         }
 
-        // Re-derive layout geometry once (same params for every workspace).
-        // MonitorInfo is Copy, so this releases the &self borrow cheaply.
-        let monitor_info = *self.active_scrolling().monitor();
-        let layout_config = config_derive::derive_layout_config(&new_config, &monitor_info);
-        // When `column_width` is None it is auto-derived from this (active)
-        // monitor — consistent with startup, which derives once from the primary
-        // monitor. Per-display widths for multi-monitor setups are future work.
-        let columns_per_screen = new_config.columns_per_screen;
+        let had_presets = self.config.columns.is_some();
 
         // Publish the new config first: animate_layout and the border refresh
         // below read `self.config.borders` live.
@@ -1812,19 +1806,10 @@ impl FlowWM {
         // Reconfigure every workspace's geometry, preserving each space's
         // virtual_layout (window columns/order/focus/viewport). Only the active
         // workspace is on-screen; parked ones re-project silently and animate
-        // on their next switch.
-        for monitor in &mut self.monitors {
-            for workspace in monitor.workspaces_mut() {
-                workspace.scrolling.reconfigure(
-                    layout_config.column_width,
-                    layout_config.min_column_width_px,
-                    layout_config.min_window_height_px,
-                    layout_config.min_row_height_px,
-                    layout_config.padding,
-                    columns_per_screen,
-                );
-            }
-        }
+        // on their next switch. Each monitor derives its own base column
+        // width — from its width preset when `[columns]` is configured, else
+        // from `columns_per_screen` / `column_width` and its own work area.
+        self.reapply_base_widths_after_reload(had_presets);
 
         // Animate the active workspace into its new geometry (windows slide to
         // the new gaps) and sync registry slots/rects.

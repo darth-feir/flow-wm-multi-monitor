@@ -208,6 +208,8 @@ All defaults are from `FlowConfig::default()` in `src/config/types.rs`:
 
 The primary sizing mode uses `columns_per_screen`: the daemon computes the actual pixel width at startup as `base_content_width = (monitor_width - (N+1) * window_gap) / N` where `N = columns_per_screen`. Setting `column_width` to a fixed pixel value overrides this computation entirely.
 
+A `[columns]` section (`src/config/width_preset.rs`) replaces both with an ordered list of presets. Each `Monitor` carries its current preset index (`Monitor::width_preset`); the daemon derives the strip's base `column_width` from that preset and the monitor's own work area (`FlowWM::layout_config_for` in `src/daemon/width_preset.rs`, used at startup, on hotplug and on reload), and `flow dispatch width` (`SetWidthPreset`) re-bases every workspace of the focused monitor and sets every column to the new width (`ScrollingSpace::apply_column_width_to_all`). The per-monitor preset is saved in the loadout (`LoadoutFile::monitors`) and reported by `flow query all`.
+
 ## Window Classification Rules
 
 Rules are defined in `flow-rules.toml` and evaluated **top-to-bottom, first match wins** against new windows. If no rule matches, `default_action` (default: `float`) is used. See [window registry](window-registry.md) for how rules feed the classification pipeline, and [classification & learned rules](classification.md) for the whitelist model and the machine-written `history-flow-rules.toml`.

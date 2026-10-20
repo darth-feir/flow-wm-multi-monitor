@@ -43,6 +43,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::color::Color;
+use super::width_preset::ColumnsConfig;
 
 /// Top-level application configuration structure.
 ///
@@ -161,6 +162,14 @@ pub struct FlowConfig {
 
     /// Loadout save/restore configuration.
     pub loadout: LoadoutConfig,
+
+    /// Column width presets (`[columns]`). `None` when the section is absent:
+    /// columns are then sized from [`columns_per_screen`](Self::columns_per_screen)
+    /// / [`column_width`](Self::column_width) as before. When present, every
+    /// monitor starts on `columns.default` and `flow dispatch width` walks
+    /// the presets — see [`ColumnsConfig`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub columns: Option<ColumnsConfig>,
     /// Whether `flow start` should query GitHub for a newer release and print a
     /// one-line notification prompting `flow update` when one exists.
     ///
@@ -213,6 +222,7 @@ impl Default for FlowConfig {
             focus: FocusConfig::default(),
             drag: DragConfig::default(),
             loadout: LoadoutConfig::default(),
+            columns: None,
             check_for_updates: true,
         }
     }
@@ -331,6 +341,9 @@ impl FlowConfig {
                 "min_column_width_px ({}) must not exceed column_width ({})",
                 self.min_column_width_px, cw
             ));
+        }
+        if let Some(columns) = &self.columns {
+            columns.validate()?;
         }
         // Edge-scroll repeat interval: warn (not fail) when the configured value
         // sits below its effective floor. The runtime clamp via
@@ -1129,6 +1142,13 @@ strategy = "original_slot"
             loadout: LoadoutConfig {
                 default_path: "my-loadout.json".into(),
             },
+            columns: Some(
+                toml::from_str(
+                    "presets = [\"1/3\", \"1/2\"]
+default = \"1/2\"",
+                )
+                .expect("columns"),
+            ),
             check_for_updates: false,
         };
 
@@ -1165,6 +1185,9 @@ strategy = "original_slot"
         assert_eq!(parsed.drag.edge_scroll_initial_delay_ms, 350);
         assert_eq!(parsed.drag.edge_scroll_repeat_interval_ms, 200);
         assert_eq!(parsed.loadout.default_path, "my-loadout.json");
+        let columns = parsed.columns.as_ref().expect("columns round-trips");
+        assert_eq!(columns.labels(), vec!["1/3", "1/2"]);
+        assert_eq!(columns.default_index(), 1);
         assert!(!parsed.check_for_updates);
     }
 

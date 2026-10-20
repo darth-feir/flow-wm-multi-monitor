@@ -34,6 +34,36 @@ pub enum WindowMode {
     Cycle,
 }
 
+/// Which column width preset [`SocketMessage::SetWidthPreset`] asks for.
+///
+/// `Next` / `Cycle` step forward through `[columns] presets` (wrapping),
+/// `Prev` steps backward, `Preset` names one (`"1/2"`, `"0.5"`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WidthPresetRequest {
+    /// The next preset in the list, wrapping to the first after the last.
+    Next,
+    /// The previous preset in the list, wrapping to the last before the first.
+    Prev,
+    /// Same as `Next` (`flow dispatch width cycle`).
+    Cycle,
+    /// A named preset, as written in `flow.toml` or any equal fraction.
+    Preset(String),
+}
+
+impl WidthPresetRequest {
+    /// Parse the CLI word: `next`, `prev`, `cycle`, else a preset name.
+    #[must_use]
+    pub fn from_cli(word: &str) -> Self {
+        match word.trim().to_ascii_lowercase().as_str() {
+            "next" => Self::Next,
+            "prev" | "previous" => Self::Prev,
+            "cycle" => Self::Cycle,
+            _ => Self::Preset(word.trim().to_owned()),
+        }
+    }
+}
+
 /// Default named pipe path used by the daemon and CLI on Windows.
 pub const PIPE_NAME: &str = r"\\.\pipe\flow";
 
@@ -169,6 +199,16 @@ pub enum SocketMessage {
     SetColumnWidth {
         /// Target column width in pixels.
         width_px: u32,
+    },
+    /// Move the focused monitor to another column width preset
+    /// (`[columns] presets` in `flow.toml`) and set every column on every
+    /// workspace of that monitor to it. Answered with
+    /// [`SocketResponse::Data`] carrying `{"width_preset": "<label>",
+    /// "monitor": <index>}`; an error when no presets are configured or the
+    /// named preset is not one of them.
+    SetWidthPreset {
+        /// Which preset to move to.
+        preset: WidthPresetRequest,
     },
 
     // --- Viewport center ---
@@ -355,6 +395,7 @@ impl SocketMessage {
                 | Self::ExpandColumn
                 | Self::ShrinkColumn
                 | Self::SetColumnWidth { .. }
+                | Self::SetWidthPreset { .. }
                 | Self::Center
                 | Self::SetWindow { .. }
                 | Self::ToggleFloat
@@ -480,6 +521,47 @@ mod tests {
 
         let parsed: SocketMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, SocketMessage::SetColumnWidth { width_px: 960 });
+    }
+
+    // Positive: round-trip SetWidthPreset in both shapes, and the CLI words.
+    #[test]
+    fn roundtrip_set_width_preset() {
+        let msg = SocketMessage::SetWidthPreset {
+            preset: WidthPresetRequest::Preset("1/2".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"set_width_preset","preset":{"preset":"1/2"}}"#
+        );
+        let parsed: SocketMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, msg);
+
+        let msg = SocketMessage::SetWidthPreset {
+            preset: WidthPresetRequest::Cycle,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(json, r#"{"type":"set_width_preset","preset":"cycle"}"#);
+        let parsed: SocketMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, msg);
+        assert!(msg.is_layout_mutating());
+
+        assert_eq!(
+            WidthPresetRequest::from_cli("next"),
+            WidthPresetRequest::Next
+        );
+        assert_eq!(
+            WidthPresetRequest::from_cli("Prev"),
+            WidthPresetRequest::Prev
+        );
+        assert_eq!(
+            WidthPresetRequest::from_cli("cycle"),
+            WidthPresetRequest::Cycle
+        );
+        assert_eq!(
+            WidthPresetRequest::from_cli(" 1/3 "),
+            WidthPresetRequest::Preset("1/3".into())
+        );
     }
 
     // Positive: round-trip SwapColumn

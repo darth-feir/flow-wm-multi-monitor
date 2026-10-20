@@ -44,6 +44,8 @@
 //!   the phase-1 logoff rescue)
 //! - [`startup`] — staged startup reporting ([`StartupStage`],
 //!   [`StartupError`], the `flowd.status` file, `FLOW_FAIL_AT` injection)
+//! - `width_preset` — per-monitor column width presets (`[columns]`,
+//!   `flow dispatch width`)
 //! - `tiling` — the tiling on/off toggle: pause (every tile back
 //!   on-screen, borders dropped, daemon inert) and resume (rebuild from the
 //!   live desktop) without stopping the daemon
@@ -71,6 +73,7 @@ pub(crate) mod shutdown;
 pub mod startup;
 mod tiling;
 mod types;
+mod width_preset;
 
 pub use startup::{StartupError, StartupReporter, StartupStage};
 pub use types::FlowWM;

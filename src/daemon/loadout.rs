@@ -46,8 +46,8 @@ use crate::ipc::message::SocketResponse;
 use crate::layout::types::VirtualLayout;
 use crate::layout::types::{ActualLayout, AppliedLayout};
 use crate::loadout::{
-    ColumnSnapshot, FloatingEntry, LoadoutFile, RectJson, RowSnapshot, ScrollingSnapshot,
-    WindowRef, WorkspaceSnapshot,
+    ColumnSnapshot, FloatingEntry, LoadoutFile, MonitorSnapshot, RectJson, RowSnapshot,
+    ScrollingSnapshot, WindowRef, WorkspaceSnapshot,
 };
 use crate::registry::types::{FloatingState, WindowState};
 use crate::workspace::{Workspace, WorkspaceId, WorkspaceParking};
@@ -498,6 +498,10 @@ impl FlowWM {
         // across a neighbouring monitor, horizontal or stacked).
         let prev_rects = self.snapshot_stacked_prev_rects();
 
+        // 4a. Width presets: each monitor goes back to the preset it was
+        //     saved on (base width only; the columns below carry theirs).
+        self.restore_monitor_presets(&file.monitors);
+
         // 4b. Purge: every window the file references leaves every workspace
         //     on every monitor before any snapshot is applied, so a window
         //     cannot end up in two spaces when the file's monitor layout and
@@ -721,11 +725,71 @@ impl FlowWM {
         let file = LoadoutFile {
             version: LoadoutFile::CURRENT_VERSION,
             workspaces,
+            monitors: self.snapshot_monitors(),
         };
         let json = serde_json::to_string_pretty(&file)
             .map_err(|e| format!("serde serialization failed: {e}"))?;
         std::fs::write(path, json).map_err(|e| format!("failed to write {path:?}: {e}"))?;
         Ok(())
+    }
+
+    /// One [`MonitorSnapshot`] per monitor: the column width preset it is
+    /// on (`None` without presets).
+    fn snapshot_monitors(&self) -> Vec<MonitorSnapshot> {
+        (0..self.monitors.len())
+            .map(|mi| MonitorSnapshot {
+                index: mi as u32,
+                width_preset: self.monitor_preset_label(mi),
+            })
+            .collect()
+    }
+
+    /// Put every monitor named by the file back on the width preset it was
+    /// saved on, when presets are configured and the saved label is one of
+    /// them. Only the base width (the ladder) changes — the file's columns
+    /// carry their own widths. A label that is no longer configured is
+    /// logged and skipped.
+    fn restore_monitor_presets(&mut self, snapshots: &[MonitorSnapshot]) {
+        let Some(columns) = self.columns_config() else {
+            return;
+        };
+        let targets: Vec<(usize, usize)> = snapshots
+            .iter()
+            .filter_map(|snap| {
+                let mi = snap.index as usize;
+                if mi >= self.monitors.len() {
+                    return None;
+                }
+                let label = snap.width_preset.as_deref()?;
+                let wanted = match crate::config::width_preset::WidthPreset::parse(label) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::warn!("loadout load: monitor {mi} width preset {label:?} ignored: {e}");
+                        return None;
+                    }
+                };
+                match columns.index_of(&wanted) {
+                    Some(pi) => Some((mi, pi)),
+                    None => {
+                        log::warn!(
+                            "loadout load: monitor {mi} width preset {label:?} is not configured (presets: {}); keeping {}",
+                            columns.labels().join(", "),
+                            self.monitor_preset_label(mi).unwrap_or_default()
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+        for (mi, pi) in targets {
+            self.monitors[mi].set_width_preset(pi);
+            let info = *self.monitors[mi].active_scrolling().monitor();
+            if let Some(px) = self.preset_px_for(&info, pi) {
+                for ws in self.monitors[mi].workspaces_mut() {
+                    let _ = ws.scrolling.set_base_column_width(px);
+                }
+            }
+        }
     }
 
     /// Walk every monitor → workspace and produce a [`WorkspaceSnapshot`] per
@@ -1495,6 +1559,7 @@ mod tests {
         let mut flow = two_monitor_flow();
         let file = LoadoutFile {
             version: LoadoutFile::CURRENT_VERSION,
+            monitors: vec![],
             workspaces: vec![WorkspaceSnapshot {
                 monitor: 1,
                 workspace_id: 42,
@@ -1552,6 +1617,7 @@ mod tests {
         let mut flow = two_monitor_flow();
         let file = LoadoutFile {
             version: LoadoutFile::CURRENT_VERSION,
+            monitors: vec![],
             workspaces: vec![WorkspaceSnapshot {
                 monitor: 0,
                 workspace_id: 1,
@@ -1607,6 +1673,7 @@ mod tests {
         let mut flow = two_monitor_flow();
         let file = LoadoutFile {
             version: LoadoutFile::CURRENT_VERSION,
+            monitors: vec![],
             workspaces: vec![
                 WorkspaceSnapshot {
                     monitor: 0,
@@ -1696,6 +1763,7 @@ mod tests {
         let mut flow = two_monitor_flow();
         let file = LoadoutFile {
             version: LoadoutFile::CURRENT_VERSION,
+            monitors: vec![],
             workspaces: vec![WorkspaceSnapshot {
                 monitor: 0,
                 workspace_id: 1,
@@ -1739,6 +1807,7 @@ mod tests {
         let mut flow = two_monitor_flow();
         let file = LoadoutFile {
             version: LoadoutFile::CURRENT_VERSION,
+            monitors: vec![],
             workspaces: vec![WorkspaceSnapshot {
                 monitor: 0,
                 workspace_id: 2,

@@ -47,6 +47,11 @@ pub struct Monitor {
     active_workspace: usize,
     /// Win32 `HMONITOR` as an integer; `0` when unknown (tests).
     hmonitor: isize,
+    /// Index into the configured column width presets
+    /// (`[columns] presets` in `flow.toml`) this monitor is currently on.
+    /// Meaningless (kept at `0`) when no presets are configured; the daemon
+    /// clamps it whenever the preset list changes.
+    width_preset: usize,
 }
 
 impl Monitor {
@@ -79,6 +84,7 @@ impl Monitor {
             workspaces,
             active_workspace,
             hmonitor: 0,
+            width_preset: 0,
         }
     }
 
@@ -87,6 +93,25 @@ impl Monitor {
     pub fn with_hmonitor(mut self, hmonitor: isize) -> Self {
         self.hmonitor = hmonitor;
         self
+    }
+
+    /// Start this monitor on column width preset `index`.
+    #[must_use]
+    pub fn with_width_preset(mut self, index: usize) -> Self {
+        self.width_preset = index;
+        self
+    }
+
+    /// Index of the column width preset this monitor is on (see
+    /// [`with_width_preset`](Self::with_width_preset)).
+    #[must_use]
+    pub fn width_preset(&self) -> usize {
+        self.width_preset
+    }
+
+    /// Move this monitor to column width preset `index`.
+    pub fn set_width_preset(&mut self, index: usize) {
+        self.width_preset = index;
     }
 
     /// Win32 `HMONITOR` (as an integer) of this monitor; `0` if unknown.

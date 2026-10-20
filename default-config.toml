@@ -27,6 +27,19 @@ columns_per_screen = 4
 # Minimum column width in pixels. Columns cannot be resized below this.
 min_column_width_px = 640
 
+# Column width presets (optional). When this section is present every monitor
+# keeps its own current preset: new columns take that width, and
+# `flow dispatch width next|prev|cycle|<preset>` switches every column on the
+# focused monitor to another preset. A preset "1/n" is sized so that n columns
+# plus their gaps fill the work area exactly ("1/1" = the whole work area);
+# a plain number such as 0.5 is accepted too. `default` names the preset every
+# monitor starts on (it must be one of `presets`; omitted = the first one).
+# Without this section columns are sized from columns_per_screen / column_width.
+#
+# [columns]
+# presets = ["1/3", "1/2", "1/1"]
+# default = "1/2"
+
 # Minimum row height in pixels — the floor for any single window's allocated
 # height inside a column. Bounds the maximum number of rows that can stack
 # inside one column, and the lower clamp for future drag / IPC continuous

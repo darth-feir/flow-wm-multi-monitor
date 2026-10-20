@@ -50,6 +50,7 @@ Not every field can change at runtime. Reload applies **live** fields in place;
 | `padding.window_gap` | Re-projects every workspace's pixel layout — windows animate to the new gaps. |
 | `columns_per_screen` | Updates the cached threshold (no window movement; affects future auto-center). |
 | `column_width`, `min_column_width_px`, `min_window_height_px` | Update cached bounds; existing per-column widths preserved. |
+| `columns.presets`, `columns.default` | Each monitor's base width is re-derived from its preset (a monitor whose preset index no longer exists is clamped; a monitor that had no presets before starts on `default`). Existing per-column widths preserved. |
 | `animation.*` | New duration / easing / enabled flag applies to the next animation. |
 | **Workspace count (10), monitor geometry** | **Structural** — not reloadable. Restart the daemon. |
 
@@ -85,7 +86,7 @@ in the repo root — `flow config init` copies it verbatim.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `columns_per_screen` | `u32` | `4` | How many columns fit side-by-side on one monitor. The pixel width of each column is derived at runtime from this, the monitor resolution, and `padding.window_gap`. |
-| `column_width` | `Option<u32>` | `None` | Optional fixed pixel width per column. When set, ignores `columns_per_screen`. Useful on ultrawide monitors where you want consistent column sizes regardless of monitor count. |
+| `column_width` | `Option<u32>` | `None` | Optional fixed pixel width per column. When set, ignores `columns_per_screen`. Useful on ultrawide monitors where you want consistent column sizes regardless of monitor count. Both are ignored when a [`[columns]`](#columns--column-width-presets) section is present. |
 | `min_column_width_px` | `u32` | `640` | Floor for column width in pixels. Columns cannot be resized below this. |
 | `min_window_height_px` | `u32` | `100` | Minimum row height in pixels — the floor for any single window's allocated height inside a column. Bounds the maximum number of rows that can stack inside one column. |
 | `check_for_updates` | `bool` | `true` | Whether `flow start` checks GitHub for a newer release and prints a one-line notification prompting `flow update` when one exists. Runs after the daemon is ready, is bounded by a short timeout, and never blocks startup. The explicit `flow update --check` command is unaffected by this flag. |
@@ -98,6 +99,39 @@ columns_per_screen = 4
 min_column_width_px = 640
 min_window_height_px = 100
 check_for_updates = true       # set false to silence the start-time update notification
+```
+
+### `[columns]` — column width presets
+
+Optional. When present, column widths come from an **ordered list of presets**
+instead of `columns_per_screen` / `column_width`, and every monitor keeps its
+own current preset. `flow dispatch width <preset|next|prev|cycle>` moves the
+focused monitor through the list (see the
+[Command Reference](./dispatch-reference.md#width-presetnextprevcycle)).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `presets` | `Vec<String>` | `["1/3", "1/2", "1/1"]` | Ordered presets. Each is a fraction `"a/b"` of the work area, or a plain number in `(0, 1]` such as `0.5`. Must not be empty. |
+| `default` | `Option<String>` | `None` (= the first preset) | The preset every monitor starts on. Must be one of `presets`. |
+
+A preset `1/n` is sized so that `n` columns **plus their gaps** fill the work
+area exactly: `(work_area_width - window_gap * (n + 1)) / n`. So `"1/1"` is
+`work_area_width - 2 * window_gap` (the whole work area), and on a 1920 px
+monitor with the default 16 px gap `"1/2"` is 936 px and `"1/3"` is 618 px.
+Borders are unaffected. `min_column_width_px` still applies as a floor — with
+the default 640 px minimum, `"1/3"` on a 1920 px display becomes 640 px.
+
+The monitor's current preset is the base width of its strip: new columns are
+created at it (including windows that arrive from another monitor), and the
+`expand-column` / `shrink-column` ladder starts from it. `flow query all` shows
+each monitor's `width_preset`; the loadout saves and restores it per monitor.
+
+Example:
+
+```toml
+[columns]
+presets = ["1/3", "1/2", "1/1"]
+default = "1/2"
 ```
 
 ### `[padding]` — spacing

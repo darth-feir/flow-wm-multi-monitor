@@ -248,6 +248,49 @@ impl ScrollingSpace {
         }
     }
 
+    /// Change only the base column width (the `n = 0` rung of the
+    /// expand/shrink ladder and the width new columns are created at),
+    /// keeping every other parameter and every existing column's width.
+    /// [`reconfigure`](Self::reconfigure) with the current parameters.
+    pub fn set_base_column_width(&mut self, column_width: u32) -> ActualLayout {
+        let c = self.config;
+        self.reconfigure(
+            column_width,
+            c.min_column_width_px,
+            c.min_window_height_px,
+            c.min_row_height_px,
+            c.padding,
+            c.columns_per_screen,
+        )
+    }
+
+    /// Switch this strip to a new base column width **and** set every
+    /// column to it — `flow dispatch width <preset>`. The width is clamped
+    /// to `abs_max_width` (never wider than the work area); the caller
+    /// applies the `min_column_width_px` floor when it derives the preset.
+    /// Any monocle state is forgotten (the saved width belongs to the old
+    /// ladder) and the focused column is kept in view. Returns the
+    /// re-projected layout for the animator.
+    pub fn apply_column_width_to_all(&mut self, column_width: u32) -> AppliedLayout {
+        let _ = self.set_base_column_width(column_width);
+        let width = (column_width as i32).min(self.config.abs_max_width).max(1);
+        let mut new_layout = self.virtual_layout.clone();
+        for col in &mut new_layout.columns {
+            col.width_px = width;
+        }
+        self.monocle_saved_width = None;
+        if !new_layout.columns.is_empty() {
+            // Narrower columns can leave the camera past the end of the
+            // canvas; pull it back before revealing the focused column.
+            let canvas = projection::canvas_width(&new_layout, self.config.padding.window_gap);
+            let max_offset = (canvas - self.config.monitor_width).max(0);
+            new_layout.viewport_offset = new_layout.viewport_offset.min(max_offset);
+            let focus_col = self.focus_col_index().min(new_layout.columns.len() - 1);
+            new_layout = mutations::ensure_column_visible(&new_layout, focus_col, &self.config);
+        }
+        self.apply_mutation(new_layout)
+    }
+
     /// Replace the space's [`MonitorInfo`] (work area, virtual screen,
     /// neighbour flags) after a display-topology change and re-derive the
     /// ladder and projection from it with the current layout parameters,
@@ -990,6 +1033,48 @@ mod tests {
         assert_eq!(engine.last_focused_window(), Some(WindowId(1)));
         assert_eq!(engine.virtual_layout().columns.len(), 3);
         assert_eq!(engine.virtual_layout().window_count(), 3);
+    }
+
+    #[test]
+    fn apply_column_width_to_all_resizes_every_column_and_rebases_the_ladder() {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        engine.add_window(WindowId(1));
+        engine.add_window(WindowId(2));
+        engine.add_window(WindowId(3));
+        let _ = engine.expand_column(WindowId(2));
+        let _ = engine.toggle_monocle(WindowId(3));
+        let _ = engine.scroll_right();
+        assert_ne!(engine.virtual_layout().viewport_offset, 0);
+
+        let applied = engine.apply_column_width_to_all(600);
+        assert!(
+            applied
+                .virtual_layout
+                .columns
+                .iter()
+                .all(|c| c.width_px == 600),
+            "{:?}",
+            applied.virtual_layout.columns
+        );
+        assert_eq!(engine.config().column_width, 600);
+        assert_eq!(applied.actual_layout.entries.len(), 3);
+        // Three 600 px columns fit: the camera is pulled back onto the canvas.
+        let canvas = projection::canvas_width(&applied.virtual_layout, test_padding().window_gap);
+        assert!(canvas <= 1920);
+        assert!(applied.virtual_layout.viewport_offset <= 0);
+        // Monocle memory belongs to the old ladder and is forgotten.
+        assert!(engine.monocle_saved_width.is_none());
+        // Wider than the work area is clamped to abs_max_width.
+        let applied = engine.apply_column_width_to_all(5000);
+        assert!(
+            applied
+                .virtual_layout
+                .columns
+                .iter()
+                .all(|c| c.width_px == 1920 - 2 * test_padding().window_gap)
+        );
+        // The ladder floor follows the new base width.
+        assert!(engine.shrink_column(WindowId(1)).is_none());
     }
 
     #[test]

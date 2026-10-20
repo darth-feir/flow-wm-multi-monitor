@@ -65,7 +65,6 @@ use crate::registry::win32::{self as registry_win32, ForegroundPush, MonitorGeom
 use crate::workspace::{Monitor, ScrollingSpace, Workspace, WorkspaceId, WorkspaceParking};
 
 use super::animation::{PrevRects, WorkspaceTargets};
-use super::config_derive;
 use super::loadout::build_seating_batches;
 use super::types::{FlowWM, LayoutConfig};
 
@@ -568,9 +567,26 @@ impl FlowWM {
                 MonitorInfo::in_desktop(g.work_area, g.screen_rect, snap.virtual_screen, &others)
             })
             .collect();
+        // Layout parameters per monitor: a survivor keeps its width preset
+        // (re-derived on its new work area), a new monitor starts on the
+        // default preset; without presets the base width follows
+        // `columns_per_screen` / `column_width` on each monitor's own geometry.
+        let default_preset = self
+            .config
+            .columns
+            .as_ref()
+            .map(|c| c.default_index())
+            .unwrap_or(0);
         let configs: Vec<LayoutConfig> = infos
             .iter()
-            .map(|info| config_derive::derive_layout_config(&self.config, info))
+            .enumerate()
+            .map(|(ni, info)| {
+                let preset = matching.new_to_old[ni]
+                    .and_then(|oi| self.monitors.get(oi))
+                    .map(|m| m.width_preset())
+                    .unwrap_or(default_preset);
+                self.layout_config_for(info, preset)
+            })
             .collect();
         let columns_per_screen = self.config.columns_per_screen;
 
@@ -612,7 +628,10 @@ impl FlowWM {
                     }
                     new_monitors.push(m);
                 }
-                None => new_monitors.push(fresh_monitor(g, info, lc, columns_per_screen)),
+                None => new_monitors.push(
+                    fresh_monitor(g, info, lc, columns_per_screen)
+                        .with_width_preset(default_preset),
+                ),
             }
             log::info!(
                 "hotplug: monitor {ni}: screen ({},{},{},{}) work ({},{},{},{}) primary={} neighbours L={} R={} U={} D={}{}",

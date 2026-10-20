@@ -33,6 +33,7 @@ pub mod history;
 pub mod lifecycle;
 pub mod schema;
 pub mod types;
+pub mod width_preset;
 
 pub use color::Color;
 pub use lifecycle::{
@@ -42,3 +43,4 @@ pub use lifecycle::{
 pub use types::BorderConfig;
 pub use types::FlowConfig;
 pub use types::WindowRulesConfig;
+pub use width_preset::{ColumnsConfig, WidthPreset};

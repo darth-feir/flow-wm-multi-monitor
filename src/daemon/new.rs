@@ -132,6 +132,14 @@ impl FlowWM {
             layout_config: super::types::LayoutConfig,
             scrolling: ScrollingSpace,
         }
+        // Column width presets (`[columns]`): every monitor starts on the
+        // default preset, and its base column width is that preset's pixel
+        // width on its own work area.
+        let preset_index = app_config
+            .columns
+            .as_ref()
+            .map(|c| c.default_index())
+            .unwrap_or(0);
         let mut per_monitor: Vec<PerMonitor> = Vec::with_capacity(geometries.len());
         for (i, g) in geometries.iter().enumerate() {
             let others: Vec<Rect> = screen_rects
@@ -157,7 +165,22 @@ impl FlowWM {
                 info.neighbour_up,
                 info.neighbour_down,
             );
-            let layout_config = config_derive::derive_layout_config(&app_config, &info);
+            let mut layout_config = config_derive::derive_layout_config(&app_config, &info);
+            if let Some(columns) = &app_config.columns
+                && let Some(preset) = columns.presets.get(preset_index)
+            {
+                layout_config.column_width = super::width_preset::preset_width_px(
+                    preset,
+                    info.work_area.width,
+                    app_config.padding.window_gap,
+                    app_config.min_column_width_px,
+                );
+                log::debug!(
+                    "init: monitor {i}: width preset {} -> column_width {}px",
+                    preset.label(),
+                    layout_config.column_width
+                );
+            }
             let scrolling = ScrollingSpace::new(
                 info,
                 layout_config.column_width,
@@ -268,9 +291,17 @@ impl FlowWM {
             if focus_col.is_some() {
                 active_monitor = idx;
             }
+            // With width presets every column starts at the monitor's
+            // preset width; without them the pre-existing window widths
+            // are snapped onto the ladder as before.
+            let widths = if app_config.columns.is_some() {
+                None
+            } else {
+                Some(widths.as_slice())
+            };
             let diff = pm
                 .scrolling
-                .initialize_windows(tiling_ids, focus_col, Some(&widths));
+                .initialize_windows(tiling_ids, focus_col, widths);
             for entry in &diff.actual_layout.entries {
                 log::trace!(
                     "init target: {:?} rect ({},{},{},{})",
@@ -355,7 +386,9 @@ impl FlowWM {
                 workspaces.push(Workspace::new(WorkspaceId(id), empty_scrolling));
             }
             monitors.push(
-                Monitor::new(g.screen_rect, g.work_area, workspaces, 0).with_hmonitor(g.hmonitor),
+                Monitor::new(g.screen_rect, g.work_area, workspaces, 0)
+                    .with_hmonitor(g.hmonitor)
+                    .with_width_preset(preset_index),
             );
         }
 

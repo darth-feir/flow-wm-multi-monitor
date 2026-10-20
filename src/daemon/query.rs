@@ -44,6 +44,8 @@ impl FlowWM {
                         "neighbour_right": info.neighbour_right,
                         "neighbour_up": info.neighbour_up,
                         "neighbour_down": info.neighbour_down,
+                        "width_preset": self.monitor_preset_label(i),
+                        "column_width": m.active_scrolling().config().column_width,
                         "active_workspace": m.active_workspace_id().0,
                         "viewport_offset": m.active_scrolling().virtual_layout().viewport_offset,
                         "tiled_windows": m.active_scrolling().virtual_layout().window_count(),

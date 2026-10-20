@@ -16,6 +16,10 @@ pub struct LoadoutFile {
     pub version: u32,
     /// Per-workspace snapshots in the order they were saved.
     pub workspaces: Vec<WorkspaceSnapshot>,
+    /// Per-monitor state (the column width preset). Absent in files written
+    /// before presets existed, which maps to an empty list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub monitors: Vec<MonitorSnapshot>,
 }
 
 impl LoadoutFile {
@@ -26,6 +30,17 @@ impl LoadoutFile {
     /// `HWND` cannot be synthesized, so it is skipped with a logged reason
     /// rather than silently misread). Bump this on any breaking schema change.
     pub const CURRENT_VERSION: u32 = 3;
+}
+
+/// Per-monitor state that is not tied to a workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorSnapshot {
+    /// Index of the monitor (primary = 0).
+    pub index: u32,
+    /// Label of the column width preset the monitor was on (`"1/2"`), or
+    /// `None` when no presets were configured at save time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width_preset: Option<String>,
 }
 
 /// Snapshot of a single workspace's tiling and floating state.
@@ -141,6 +156,10 @@ mod tests {
     fn round_trip_full_loadout() {
         let file = LoadoutFile {
             version: LoadoutFile::CURRENT_VERSION,
+            monitors: vec![MonitorSnapshot {
+                index: 0,
+                width_preset: Some("1/2".into()),
+            }],
             workspaces: vec![WorkspaceSnapshot {
                 monitor: 0,
                 workspace_id: 0,
@@ -185,6 +204,8 @@ mod tests {
 
         assert_eq!(restored.version, LoadoutFile::CURRENT_VERSION);
         assert_eq!(restored.workspaces.len(), 1);
+        assert_eq!(restored.monitors.len(), 1);
+        assert_eq!(restored.monitors[0].width_preset.as_deref(), Some("1/2"));
         let ws = &restored.workspaces[0];
         assert_eq!(ws.workspace_id, 0);
         assert!(ws.active);
@@ -224,6 +245,7 @@ mod tests {
     fn workspace_monitor_field_round_trips() {
         let file = LoadoutFile {
             version: LoadoutFile::CURRENT_VERSION,
+            monitors: vec![],
             workspaces: vec![WorkspaceSnapshot {
                 monitor: 2,
                 workspace_id: 1,
@@ -249,6 +271,7 @@ mod tests {
     fn round_trip_empty_loadout() {
         let file = LoadoutFile {
             version: LoadoutFile::CURRENT_VERSION,
+            monitors: vec![],
             workspaces: vec![],
         };
 

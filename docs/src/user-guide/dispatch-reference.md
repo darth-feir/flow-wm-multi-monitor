@@ -47,7 +47,7 @@ flowchart LR
 | `Alt + p` | `flow stop` (shuts the daemon down) |
 
 Commands with **no default hotkey** (run them from the terminal, or bind them
-yourself): `swap-column`, `swap-workspace`.
+yourself): `swap-column`, `swap-workspace`, `width`.
 
 ---
 
@@ -146,6 +146,39 @@ flow dispatch shrink-column
 ```
 
 Default hotkey: `Alt + ,`
+
+### `width <preset|next|prev|cycle>`
+
+Switch the **focused monitor** to another column width preset. Presets come
+from the `[columns]` section of `flow.toml` (see the
+[Config Reference](./config-reference.md#columns--column-width-presets)); the
+command is refused with an error when that section is absent.
+
+- `width next` / `width cycle` — the next preset in the list, wrapping around
+  after the last one.
+- `width prev` — the previous preset, wrapping the other way.
+- `width 1/2` — a named preset (any fraction equal to a configured one works:
+  `2/4` selects `1/2`).
+
+Every column on **every workspace** of that monitor takes the new width — the
+active workspace animates, parked workspaces are re-laid out and slide in at
+their new widths on the next switch — and every column created on that monitor
+from then on (a new window, `set-window tile`, a window arriving by
+`move-to-monitor` or an edge hop) starts at it. Other monitors keep their own
+preset. `expand-column` / `shrink-column` keep working: their ladder starts
+from the monitor's current preset width, so one `expand-column` from `1/3`
+spans two thirds. `min_column_width_px` is a floor: a preset narrower than it
+on a small display is widened to the minimum.
+
+```powershell
+flow dispatch width cycle     # flow: column width 1/1
+flow dispatch width 1/2       # flow: column width 1/2
+```
+
+The command prints the preset the monitor landed on. `flow query all` reports
+each monitor's `width_preset`, and the loadout remembers it per monitor across a
+restart. No default hotkey in `flow.ahk` — bind it yourself (the `win-niri`
+keymap uses `Mod+R` for `width cycle`).
 
 ### `center`
 
