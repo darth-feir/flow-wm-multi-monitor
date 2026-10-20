@@ -24,8 +24,10 @@ use crate::common::WindowId;
 use crate::registry::hooks::remove_float_hwnd;
 use crate::registry::types::{FloatingState, ReclassifyResult, VisibilityChange, WindowState};
 use crate::registry::win32 as registry_win32;
+use crate::workspace::{WorkspaceId, WorkspaceParking};
 use windows::Win32::Foundation::HWND;
 
+use super::animation::PrevRects;
 use super::types::FlowWM;
 
 impl FlowWM {
@@ -188,6 +190,7 @@ impl FlowWM {
         // no-op for tiled/ignored windows.
         remove_float_hwnd(hwnd);
         self.remove_float_from_all_spaces(WindowId(hwnd));
+        self.forget_submitted(hwnd);
 
         self.registry.remove_window(hwnd);
         // Border overlay: cleaned up automatically — `remove_window` drops the
@@ -208,6 +211,7 @@ impl FlowWM {
 
         if was_tiling {
             self.remove_from_layout_and_refocus(WindowId(hwnd));
+            self.forget_submitted(hwnd);
         }
         // Border overlay: registry now records Minimized ⇒ refresh detaches.
         self.refresh_border_for(hwnd);
@@ -243,6 +247,7 @@ impl FlowWM {
         let change = self.registry.reconcile_visibility(hwnd);
         if change == VisibilityChange::Hidden && was_active_tiling {
             self.remove_from_layout_and_refocus(WindowId(hwnd));
+            self.forget_submitted(hwnd);
         }
         // Border overlay: registry now records Hidden ⇒ refresh detaches.
         self.refresh_border_for(hwnd);
@@ -273,15 +278,51 @@ impl FlowWM {
     /// already correct and we avoid a redundant (and potentially disruptive)
     /// `SetForegroundWindow` call.
     ///
-    /// # Non-active monitors
+    /// # Non-active monitors and foreign focus
     ///
     /// A window closing on a monitor the user is *not* working on must not
-    /// drag the foreground over there: the successor is only pushed when the
-    /// removed window held the user's focus (registry focus or OS foreground)
-    /// or lived on the active monitor — see [`should_refocus_after_removal`].
-    /// Otherwise the strip's bookkeeping is updated and nothing else moves.
+    /// drag the foreground over there, and neither must one closing on the
+    /// active monitor while the user is in a float or a window elsewhere:
+    /// the successor is only pushed when the removed window held the user's
+    /// focus (registry focus or OS foreground), or lived on the active
+    /// monitor *and* the registry's focus was nowhere else than that strip
+    /// — see [`should_refocus_after_removal`]. Otherwise the strip's
+    /// bookkeeping is updated and nothing else moves.
+    ///
+    /// # Parked workspaces
+    ///
+    /// The window is removed from the workspace that actually holds it. A
+    /// tile minimized or hidden while its workspace is parked (a minimize
+    /// from the taskbar, Windows minimizing it with a display change) leaves
+    /// that parked strip — never the active one, which does not contain it
+    /// — and the parked strip is re-seated at its parking offset with no
+    /// focus push. Leaving it in place would seat it twice when it comes
+    /// back.
     fn remove_from_layout_and_refocus(&mut self, window: WindowId) {
         let idx = self.monitor_index_for_window(window);
+        let active_id = self.monitors[idx].active_workspace_id();
+        let home = self.monitors[idx]
+            .find_workspace_containing(window)
+            .unwrap_or(active_id);
+        if home != active_id {
+            self.remove_from_parked_workspace(idx, home, window);
+            return;
+        }
+
+        // Who holds the user's focus, read before the removal changes the
+        // strip: nobody, the removed window, or a tile of this strip all
+        // let the successor take over; a float or a window elsewhere does not.
+        let focus_on_strip = match self.registry.focused() {
+            None => true,
+            Some(f) => {
+                f == window
+                    || self.monitors[idx]
+                        .active_scrolling()
+                        .virtual_layout()
+                        .find_window(f)
+                        .is_some()
+            }
+        };
         let prev_focus = self.monitors[idx].active_scrolling().last_focused_window();
         let applied = self.monitors[idx]
             .active_scrolling_mut()
@@ -295,6 +336,7 @@ impl FlowWM {
             new_focus,
             held_focus,
             idx == self.active_monitor,
+            focus_on_strip,
         ) && let Some(id) = new_focus
         {
             let target = id.0;
@@ -307,6 +349,37 @@ impl FlowWM {
         }
 
         self.animate_layout_on(idx, &applied);
+    }
+
+    /// Remove `window` from the strip of parked workspace `ws_id` on monitor
+    /// `idx`, re-seat that strip at its parking offset and sync the
+    /// registry's slots and rects for it. No focus push: the user is not
+    /// looking at that workspace.
+    fn remove_from_parked_workspace(&mut self, idx: usize, ws_id: WorkspaceId, window: WindowId) {
+        let (applied, offset) = {
+            let m = &mut self.monitors[idx];
+            let window_gap = m.active_scrolling().padding().window_gap;
+            let parking =
+                WorkspaceParking::new(m.active_scrolling().monitor(), m.screen_rect(), window_gap);
+            let offset = parking.offset(ws_id, m.active_workspace_id());
+            let Some(ws) = m.workspace_mut(ws_id) else {
+                return;
+            };
+            (ws.scrolling.remove_window(window), offset)
+        };
+        log::debug!(
+            "window {} removed from parked workspace {} on monitor {idx}",
+            window.0,
+            ws_id.0
+        );
+        self.animate_workspaces_on(
+            idx,
+            &[(applied.actual_layout.clone(), offset)],
+            PrevRects::Registry,
+        );
+        self.registry
+            .update_tiling_slots_from_layout(&applied.virtual_layout);
+        self.registry.update_tiled_rects(&applied.actual_layout);
     }
 
     /// Drop `window` from the floating space of every workspace on every
@@ -574,12 +647,28 @@ impl FlowWM {
     /// `MonitorFromWindow`, then the rect, then the active monitor. A window
     /// that was parked beyond the virtual screen when it was minimized has a
     /// rect that points nowhere useful, which is why the memory comes first.
-    fn readd_tile_to_home_monitor(&mut self, hwnd: isize) {
+    ///
+    /// A window that is **already seated** somewhere (the hotplug reconcile
+    /// seats the windows it restores itself, ahead of their `MINIMIZEEND`)
+    /// is left where it is: only the registry's slot and rect are re-synced
+    /// from that strip, so no second column is ever created.
+    pub(super) fn readd_tile_to_home_monitor(&mut self, hwnd: isize) {
+        let wid = WindowId(hwnd);
+        if let Some(idx) = self.monitor_index_containing(wid) {
+            if let Some(ws_id) = self.monitors[idx].find_workspace_containing(wid)
+                && let Some(ws) = self.monitors[idx].workspace(ws_id)
+            {
+                self.registry
+                    .update_tiling_slots_from_layout(ws.scrolling.virtual_layout());
+                self.registry
+                    .update_tiled_rects(ws.scrolling.actual_layout());
+            }
+            log::debug!("window {hwnd} is already seated on monitor {idx}; not re-adding");
+            return;
+        }
         let idx = self.home_monitor_for_hwnd(hwnd);
-        let applied = self.monitors[idx]
-            .active_scrolling_mut()
-            .add_window(WindowId(hwnd));
-        self.remember_monitor(WindowId(hwnd), idx);
+        let applied = self.monitors[idx].active_scrolling_mut().add_window(wid);
+        self.remember_monitor(wid, idx);
         self.animate_layout_on(idx, &applied);
     }
 
@@ -635,17 +724,25 @@ impl FlowWM {
 /// `prev_focus` / `new_focus` are the strip's last-focused window before and
 /// after the removal — they differ only when the removed window was the
 /// strip's focus cursor. `held_focus` says the removed window was the user's
-/// focus (registry focus or OS foreground); `on_active_monitor` says it lived
-/// on the monitor that owns keyboard focus. Without either, the user is
-/// working elsewhere and the successor must not steal the foreground (B6).
+/// focus (registry focus or OS foreground). `on_active_monitor` says it lived
+/// on the monitor that owns keyboard focus, and `focus_on_strip` that the
+/// registry's focused window, read before the removal, was nobody, the
+/// removed window or a tile of that strip — not a float and not a window on
+/// another strip. The successor is pushed when the removed window held the
+/// focus, or when it lived on the active monitor and the user's focus was
+/// on that strip; otherwise the user is working elsewhere and the successor
+/// must not steal the foreground (B6).
 #[must_use]
 pub(super) fn should_refocus_after_removal(
     prev_focus: Option<WindowId>,
     new_focus: Option<WindowId>,
     held_focus: bool,
     on_active_monitor: bool,
+    focus_on_strip: bool,
 ) -> bool {
-    new_focus != prev_focus && new_focus.is_some() && (held_focus || on_active_monitor)
+    new_focus != prev_focus
+        && new_focus.is_some()
+        && (held_focus || (on_active_monitor && focus_on_strip))
 }
 
 #[cfg(test)]
@@ -658,31 +755,224 @@ mod refocus_tests {
 
     #[test]
     fn focused_window_closing_refocuses_the_successor() {
-        assert!(should_refocus_after_removal(A, B, true, true));
+        assert!(should_refocus_after_removal(A, B, true, true, true));
         // Held the OS foreground even though its monitor is not active.
-        assert!(should_refocus_after_removal(A, B, true, false));
+        assert!(should_refocus_after_removal(A, B, true, false, false));
     }
 
     #[test]
-    fn closing_on_the_active_monitor_refocuses_even_without_held_focus() {
-        assert!(should_refocus_after_removal(A, B, false, true));
+    fn closing_on_the_active_monitor_refocuses_when_focus_was_on_the_strip() {
+        // Registry focus was None / the removed window / a tile of the strip.
+        assert!(should_refocus_after_removal(A, B, false, true, true));
+    }
+
+    #[test]
+    fn closing_on_the_active_monitor_never_steals_focus_from_a_float_or_elsewhere() {
+        // The user is in a float (or a window on another strip): the strip's
+        // cursor moves, the foreground stays.
+        assert!(!should_refocus_after_removal(A, B, false, true, false));
     }
 
     #[test]
     fn closing_on_a_background_monitor_never_steals_focus() {
         // The B6 scenario: strip focus cursor moved, but the user is on
         // another monitor and this window was not their focus.
-        assert!(!should_refocus_after_removal(A, B, false, false));
+        assert!(!should_refocus_after_removal(A, B, false, false, true));
+        assert!(!should_refocus_after_removal(A, B, false, false, false));
     }
 
     #[test]
     fn unchanged_strip_focus_never_pushes() {
-        assert!(!should_refocus_after_removal(A, A, true, true));
+        assert!(!should_refocus_after_removal(A, A, true, true, true));
     }
 
     #[test]
     fn empty_strip_after_removal_never_pushes() {
-        assert!(!should_refocus_after_removal(A, None, true, true));
+        assert!(!should_refocus_after_removal(A, None, true, true, true));
+    }
+}
+
+#[cfg(test)]
+mod readd_tests {
+    use super::*;
+    use crate::common::Rect;
+    use crate::config::types::WindowRulesConfig;
+    use crate::layout::types::{MonitorInfo, Padding};
+    use crate::registry::WindowRegistry;
+    use crate::registry::types::TilingState;
+    use crate::workspace::{Monitor, ScrollingSpace, Workspace, WorkspaceId};
+
+    const A: isize = 0xA;
+    const B: isize = 0xB;
+
+    fn tiled(registry: &mut WindowRegistry, hwnd: isize) {
+        let info = crate::registry::win32::WindowInfo {
+            hwnd: HWND(hwnd as *mut _),
+            title: format!("win{hwnd}"),
+            class: "C".into(),
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+            exe: "app.exe".into(),
+            process_path: "C:\\app.exe".into(),
+            is_visible: true,
+            is_maximized: false,
+            is_fullscreen: false,
+        };
+        registry.register_window_from_info(&info);
+        if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {
+            w.state = WindowState::Tiling(TilingState::Active { col: 0, row: 0 });
+        }
+    }
+
+    /// One monitor, workspaces 1 (active, holding A) and 2 (parked, holding B).
+    fn flow() -> FlowWM {
+        let rules = WindowRulesConfig::default();
+        let mut registry = WindowRegistry::new(&rules, &rules);
+        tiled(&mut registry, A);
+        tiled(&mut registry, B);
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let info = MonitorInfo::single(screen);
+        let padding = Padding {
+            window_gap: 4,
+            up: 0,
+            down: 0,
+        };
+        let ws = |id: u32| {
+            Workspace::new(
+                WorkspaceId(id),
+                ScrollingSpace::new(info, 960, 320, 100, 100, padding, 4),
+            )
+        };
+        let mut monitor = Monitor::new(screen, screen, vec![ws(1), ws(2)], 0);
+        monitor.active_scrolling_mut().add_window(WindowId(A));
+        monitor
+            .workspace_mut(WorkspaceId(2))
+            .expect("workspace 2")
+            .scrolling
+            .add_window(WindowId(B));
+        registry.set_monitor(A, 0);
+        registry.set_monitor(B, 0);
+        FlowWM::new_for_test(registry, vec![monitor])
+    }
+
+    fn columns_holding(flow: &FlowWM, ws: u32, hwnd: isize) -> usize {
+        flow.monitors[0]
+            .workspace(WorkspaceId(ws))
+            .expect("workspace")
+            .scrolling
+            .virtual_layout()
+            .columns
+            .iter()
+            .filter(|c| c.rows.iter().any(|r| r.window_id == WindowId(hwnd)))
+            .count()
+    }
+
+    #[test]
+    fn readding_a_seated_tile_does_not_create_a_second_column() {
+        let mut flow = flow();
+        flow.readd_tile_to_home_monitor(A);
+        assert_eq!(columns_holding(&flow, 1, A), 1);
+        assert_eq!(
+            flow.monitors[0]
+                .active_scrolling()
+                .virtual_layout()
+                .window_count(),
+            1
+        );
+        // The parked workspace's tile is seated too: no re-add either.
+        flow.readd_tile_to_home_monitor(B);
+        assert_eq!(columns_holding(&flow, 2, B), 1);
+        assert_eq!(columns_holding(&flow, 1, B), 0);
+    }
+
+    #[test]
+    fn hiding_a_window_moved_to_another_workspace_after_switching_back() {
+        // The integration scenario: move A to workspace 2 (which follows
+        // it), switch back to 1, then A is hidden while 2 is parked — it
+        // leaves workspace 2's strip. Workspace 2 also carries a rowless
+        // column from a stale loadout file, which the successor lookup must
+        // step over.
+        let mut flow = flow();
+        {
+            let ws2 = &mut flow.monitors[0]
+                .workspace_mut(WorkspaceId(2))
+                .expect("workspace 2")
+                .scrolling;
+            ws2.remove_window(WindowId(B));
+            let mut stale = ws2.virtual_layout().clone();
+            stale
+                .columns
+                .push(crate::layout::types::Column::with_rows(448, Vec::new()));
+            ws2.commit_layout(stale);
+        }
+        flow.registry.set_focused(A);
+        // The move-to-workspace dispatch, minus the IPC shell.
+        let src = flow.monitors[0]
+            .active_scrolling_mut()
+            .remove_window(WindowId(A));
+        flow.registry
+            .update_tiling_slots_from_layout(&src.virtual_layout);
+        flow.registry.update_tiled_rects(&src.actual_layout);
+        let dst = {
+            let ws = flow.monitors[0]
+                .workspace_mut(WorkspaceId(2))
+                .expect("ws 2");
+            let _ = ws.scrolling.insert_window_with_width(WindowId(A), 960);
+            ws.scrolling.center_canvas().expect("non-empty")
+        };
+        flow.registry
+            .update_tiling_slots_from_layout(&dst.virtual_layout);
+        flow.registry.update_tiled_rects(&dst.actual_layout);
+        assert!(flow.switch_workspace_layout(WorkspaceId(2), WorkspaceId(1)));
+        assert_eq!(flow.monitors[0].active_workspace_id(), WorkspaceId(2));
+        assert!(flow.switch_workspace_layout(WorkspaceId(1), WorkspaceId(2)));
+        assert_eq!(columns_holding(&flow, 2, A), 1);
+        flow.on_window_hidden(A);
+        assert_eq!(columns_holding(&flow, 2, A), 0);
+        assert_eq!(columns_holding(&flow, 1, A), 0);
+    }
+
+    #[test]
+    fn minimizing_a_tile_on_a_parked_workspace_removes_it_from_that_strip() {
+        let mut flow = flow();
+        flow.record_submitted(&[(
+            B,
+            Rect {
+                x: 4,
+                y: 4,
+                width: 960,
+                height: 1072,
+            },
+        )]);
+        flow.on_window_minimized(B);
+        assert_eq!(columns_holding(&flow, 2, B), 0, "B left the parked strip");
+        assert_eq!(
+            columns_holding(&flow, 1, A),
+            1,
+            "the active strip is untouched"
+        );
+        assert!(matches!(
+            flow.registry
+                .get_window(HWND(B as *mut _))
+                .map(|w| w.state.clone()),
+            Some(WindowState::Tiling(TilingState::Minimized))
+        ));
+        assert_eq!(flow.last_submitted_rect(B), None);
+        // Coming back (the restore hook's layout half), it is appended to
+        // the active strip exactly once.
+        flow.registry.restore_window(B);
+        flow.readd_tile_to_home_monitor(B);
+        assert_eq!(columns_holding(&flow, 1, B), 1);
+        assert_eq!(columns_holding(&flow, 2, B), 0);
     }
 }
 

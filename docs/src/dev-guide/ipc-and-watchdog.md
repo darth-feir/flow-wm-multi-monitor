@@ -545,9 +545,14 @@ which sets a static flag and signals the hook event — the same pattern as
 only takes the flag on each wake and re-arms a settle deadline
 (`TOPOLOGY_SETTLE`, 300 ms); the deadline is folded into the loop's wait
 timeout like the float-resume and foreground-sync deadlines, and the reconcile
-runs once, after the last message. A reconcile that falls inside a tile drag is
-postponed by one settle period; one requested after a shutdown is skipped, so
-the fail-back rescues with the geometry it has instead of fighting a re-seat.
+runs once, after the last message. The instant of the *first* report is kept
+(`topology_first_report`) for the casualty test below. A reconcile that falls
+inside a tile drag is postponed by one settle period; one requested after a
+shutdown is skipped, so the fail-back rescues with the geometry it has instead
+of fighting a re-seat. A reconcile that fails (enumeration error, or the empty
+enumeration Windows reports transiently mid-switch) re-arms the settle timer
+and retries up to `MAX_RECONCILE_RETRIES` (5) times before logging an error
+and giving up until the next report.
 
 **Reconcile** (`FlowWM::reconcile_monitors`). The animator is cancelled and
 joined first — a batch in flight would keep steering windows to the old parked
@@ -558,12 +563,17 @@ position), then the old primary to the new primary (a resolution change on a
 single display keeps its workspaces). Every survivor gets its rects and handle
 updated and all ten of its workspaces are re-projected in place — new
 `MonitorInfo` (work area, virtual screen, neighbour flags), re-derived layout
-parameters, and row heights rescaled proportionally into a changed work-area
-height (`mutations::refit_heights`), because row heights are the layout's
-source of truth and projection never rescales them. An added display gets a
-fresh `Monitor` with ten empty workspaces. The enumeration failing (or coming
-back empty, which Windows does transiently mid-switch) leaves the monitor list
-untouched.
+parameters, row heights rescaled proportionally into a changed row budget
+(`mutations::refit_heights` — the work-area height *or* the gap, which the
+per-column budget depends on), because row heights are the layout's source of
+truth and projection never rescales them, and column widths clamped to the new
+`abs_max_width` when the work area narrowed (a column wider than the work area
+would be parked by the overhang rule whenever a neighbour sits on that side —
+projection no longer exempts wide columns from that rule). A survivor's floats
+on every workspace are clamped into its new work area like migrated ones. An
+added display gets a fresh `Monitor` with ten empty workspaces. The enumeration
+failing (or coming back empty) leaves the monitor list untouched and is retried
+as described above.
 
 **Migrate** (`plan_migration`). Every window of a vanished monitor — tiles and
 floats on all ten workspaces — moves to the *active* workspace of its fallback
@@ -573,20 +583,41 @@ area. The registry's owning-monitor memory is remapped for every tracked
 window with the same rule (`remap_owner`: the survivor's new index, else
 `MonitorFromWindow`, else the primary), including the minimized and hidden
 windows that live in no space, so loadout snapshots (built live from the
-monitor list) and the restore path both see the new indices. Windows that
-Windows itself minimized when their display went away (`IsIconic`, rect at
-−32000) are restored with `ShowWindow(SW_RESTORE)`; the resulting
-`MINIMIZEEND` hook re-adds them through the normal restore path, onto the
-owner just recorded. The active monitor follows the focused window, else stays
-where it was if that monitor survived, else moves to the primary.
+monitor list) and the restore path both see the new indices. A window is never
+seated twice: the migration, the restore/show hooks
+(`readd_tile_to_home_monitor`) and `ScrollingSpace`'s own insert methods all
+skip a window that already has a seat.
+
+**Restore casualties.** Windows minimizes every window whose *nearest* display
+vanished: the vanished monitor's whole strip, but also a surviving monitor's
+columns parked beyond that neighbour (`MonitorFromWindow` resolves a far-parked
+rect to the display that is gone). Those `MINIMIZESTART` hooks are processed
+before the settle timer fires, so by reconcile time the windows are
+`Minimized`, out of their strips (a tile is removed from the workspace that
+actually holds it, parked or active) and stamped with
+`Window::minimized_at`. A casualty is any tracked window minimized at or after
+the first topology report (`is_hotplug_casualty`, with a one-second grace
+before it, since the hooks can beat the broadcast) that is still iconic; a
+window the user minimized before the change is left minimized. Casualties are
+restored with `ShowWindow(SW_SHOWNOACTIVATE)` — never `SW_RESTORE`, which would
+bounce the foreground (and the active monitor) through every one of them — and
+**seated by the reconcile itself**, in their old `(monitor, column, row)`
+order: a column whose strip survived goes back into its old column slot
+(`ScrollingSpace::seat_window_at`, which moves neither focus nor viewport), one
+from a vanished monitor is appended in order behind the migrated tiles. The
+later `MINIMIZEEND` hook finds the window seated and only re-syncs its registry
+slot. The active monitor follows the focused window, else stays where it was
+if that monitor survived, else moves to the primary.
 
 Finally every monitor's workspaces are re-seated as **instant** animator
 targets (`instant_seating_targets`: the active workspace at its projected
-rects, the others at their new `WorkspaceParking` slots), the registry's slots
-and rects are synced from every workspace, the float-tracking set is rebuilt
-and the border overlays refreshed. Instant because the windows' previous
-positions belong to a geometry that no longer exists; a tween from an old
-parked slot would sweep across the screen. The pass ends with one summary line:
+rects, the others at their new `WorkspaceParking` slots), recorded as every
+window's last submitted rect, the registry's slots and rects are synced from
+every workspace, the float-tracking set is rebuilt and the border overlays
+refreshed. Instant because the windows' previous positions belong to a
+geometry that no longer exists; a tween from an old parked slot would sweep
+across the screen. If anything was restored, OS focus is pushed once to the
+registry's focused window. The pass ends with one summary line:
 
 ```text
 hotplug: 1 monitor(s) (+0 -1), 4 window(s) migrated, 1 restored
@@ -596,7 +627,9 @@ hotplug: 1 monitor(s) (+0 -1), 4 window(s) migrated, 1 restored
 `active_monitor`, per-window `monitor`) read the live list, so they reflect the
 new topology immediately. The Win32 questions the reconcile asks are behind the
 `TopologyProbe` trait, so the whole pass — removal with migration, addition
-with neighbour updates, work-area-only change — is unit-tested against a mock
+with neighbour updates, work-area-only change, restore order, a survivor's
+parked column returning to its slot, a user-minimized window staying put, no
+duplicate column when the restore hook follows — is unit-tested against a mock
 desktop.
 
 ## Watchdog

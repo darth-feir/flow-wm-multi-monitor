@@ -153,6 +153,14 @@ pub struct Window {
     /// Remembered virtual-slot position for minimize/restore cycles.
     pub last_virtual_slot: Option<VirtualSlot>,
 
+    /// When the minimize hook last moved this window to a `Minimized`
+    /// state; cleared on restore. The monitor-hotplug reconcile uses it to
+    /// tell a window Windows minimized *with a display change* (and should
+    /// restore) from one the user minimized earlier (and should leave).
+    /// Process-local, so never serialised.
+    #[serde(skip)]
+    pub minimized_at: Option<std::time::Instant>,
+
     /// Current tiled position computed by the layout engine's projection layer.
     ///
     /// Updated after every layout mutation. `None` if the window has never
@@ -251,6 +259,7 @@ impl Window {
             pre_manage_rect,
             last_natural_size,
             last_virtual_slot: None,
+            minimized_at: None,
             tiled_rect: None,
             invisible_bounds,
             border: None,

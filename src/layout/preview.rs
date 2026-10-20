@@ -252,8 +252,12 @@ fn build_visible_column_rects(applied: &AppliedLayout, wa: &Rect) -> Vec<(usize,
 ///
 /// Pure: reads only `applied`, `monitor`, and the three config knobs; touches
 /// no live state or Win32 APIs. Total over the work area, every cursor
-/// position maps to a zone. Returns `None` only for the empty-workspace
-/// degenerate (no columns), which cannot arise for a tile drag.
+/// position inside it maps to a zone. Returns `None` for the empty-workspace
+/// degenerate (no columns), which cannot arise for a tile drag, and for a
+/// cursor **above or below the work area** (`my` outside
+/// `[wa.y, wa.bottom())`): on a stacked pair the display above or below
+/// shares this strip's x range, and a cursor over there must hit neither a
+/// scroll band nor a column zone of this strip.
 ///
 /// Map: edge scroll, column-edge band, column body
 /// ((n+1) equal row regions). See (`docs/src/dev-guide/tile-drag.md`).
@@ -281,6 +285,11 @@ pub fn resolve_drop_zone(
 
     let vis_cols = build_visible_column_rects(applied, wa);
     if vis_cols.is_empty() {
+        return None;
+    }
+    // Above or below this strip's work area the cursor is on a stacked
+    // neighbour (or off-screen): no zone of this strip.
+    if my < wa.y || my >= wa.y + wa.height {
         return None;
     }
 
@@ -1751,6 +1760,99 @@ mod tests {
             ),
             "got {on_primary:?}"
         );
+    }
+
+    // -- stacked monitors: the strip has no zones above or below it --
+
+    /// The same strip on the lower display of a stacked pair: work area
+    /// (0, 1440, 1000, 1000) under a display spanning y in [0, 1440).
+    fn rdz_stacked_lower() -> (AppliedLayout, MonitorInfo) {
+        let lower = Rect {
+            x: 0,
+            y: 1440,
+            width: 1000,
+            height: 1000,
+        };
+        let upper = Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 1440,
+        };
+        let vs = Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 2440,
+        };
+        let monitor = MonitorInfo::in_desktop(lower, lower, vs, &[upper]);
+        let vl = VirtualLayout::with_columns(
+            vec![
+                Column::with_row(490, Row::new(WindowId(1), 1000)),
+                Column::with_row(490, Row::new(WindowId(2), 1000)),
+                Column::with_row(490, Row::new(WindowId(3), 1000)),
+                Column::with_row(490, Row::new(WindowId(4), 1000)),
+            ],
+            500,
+        );
+        let actual = projection::project(&vl, &monitor, &rdz_padding(10));
+        (
+            AppliedLayout {
+                virtual_layout: vl,
+                actual_layout: actual,
+            },
+            monitor,
+        )
+    }
+
+    #[test]
+    fn rdz_cursor_on_the_display_above_hits_nothing() {
+        let (layout, monitor) = rdz_stacked_lower();
+        // Same x as the strip's left scroll band / first column / seam, but
+        // on the upper display: no zone at all.
+        for mx in [5, 100, 500, 995] {
+            assert_eq!(
+                resolve_drop_zone(&layout, &monitor, WindowId(99), mx, 700, 30, 0.18, 72),
+                None,
+                "mx={mx} on the upper display"
+            );
+            // The last pixel above the work area, too.
+            assert_eq!(
+                resolve_drop_zone(&layout, &monitor, WindowId(99), mx, 1439, 30, 0.18, 72),
+                None,
+                "mx={mx} just above the work area"
+            );
+        }
+        // Inside the strip the same x values resolve as usual.
+        assert_eq!(
+            resolve_drop_zone(&layout, &monitor, WindowId(99), 5, 1440, 30, 0.18, 72),
+            Some(DropZone::ScrollLeft),
+        );
+        assert_eq!(
+            resolve_drop_zone(&layout, &monitor, WindowId(99), 995, 2000, 30, 0.18, 72),
+            Some(DropZone::ScrollRight),
+        );
+        assert!(matches!(
+            resolve_drop_zone(&layout, &monitor, WindowId(99), 300, 2000, 30, 0.18, 72),
+            Some(DropZone::Row { .. } | DropZone::Column { .. })
+        ));
+    }
+
+    #[test]
+    fn rdz_cursor_below_the_work_area_hits_nothing() {
+        let (layout, monitor) = rdz_stacked_lower();
+        // wa.bottom() is the first pixel past the strip (a display below,
+        // or off-screen): nothing.
+        for mx in [5, 300, 995] {
+            assert_eq!(
+                resolve_drop_zone(&layout, &monitor, WindowId(99), mx, 2440, 30, 0.18, 72),
+                None
+            );
+            assert_eq!(
+                resolve_drop_zone(&layout, &monitor, WindowId(99), mx, 3000, 30, 0.18, 72),
+                None
+            );
+        }
     }
 
     // -- column-edge band: .max(1) floor in compute_col_edge_band --

@@ -115,15 +115,17 @@ pub fn project(
         let x = if visible {
             let on_screen_x = monitor_rect.x + (canvas_col_left - viewport_left);
             // A column that overhangs an edge with a neighbouring monitor
-            // beyond it would spill onto that neighbour. Park it instead.
-            // Columns at least as wide as the viewport (monocle) are never
-            // parked: they are what the user is looking at.
-            let fits = col_width < monitor_rect.width;
+            // beyond it would spill onto that neighbour. Park it instead —
+            // whatever its width: a column wider than the work area (a
+            // monitor that shrank under a hotplug, an oversized configured
+            // width) must not be exempt, or it would cover the neighbour.
+            // Monocle never overhangs (its width is `monitor_width − 2·gap`
+            // at the viewport's left edge), so it is never parked by this.
             let overhangs_left = on_screen_x < monitor_rect.x;
             let overhangs_right = on_screen_x + col_width > monitor_rect.right();
-            if fits && overhangs_left && monitor.neighbour_left {
+            if overhangs_left && monitor.neighbour_left {
                 park_left_x(monitor, col_width)
-            } else if fits && overhangs_right && monitor.neighbour_right {
+            } else if overhangs_right && monitor.neighbour_right {
                 park_right_x(monitor)
             } else {
                 on_screen_x
@@ -890,16 +892,35 @@ mod tests {
     }
 
     #[test]
-    fn viewport_wide_column_is_never_parked_for_overhang() {
+    fn monocle_width_column_at_the_viewport_edge_stays_on_screen() {
         let padding = test_padding();
-        // A monocle-width column (1920 wide) with a slight negative offset
-        // overhangs both edges; it must stay on screen regardless of neighbours.
+        // A monocle column (monitor width − 2·gap) at the viewport's left
+        // edge fills the work area without overhanging either side.
+        let layout =
+            VirtualLayout::with_columns(vec![Column::with_row(1912, Row::new(WindowId(1), 0))], 0);
+        let m = primary_with_left_neighbour();
+        let actual = project(&layout, &m, &padding);
+        assert!(!m.is_parked(actual.entries[0].rect));
+        assert_eq!(actual.entries[0].rect.x, 4);
+        assert_eq!(actual.entries[0].rect.right(), 1916);
+    }
+
+    #[test]
+    fn column_wider_than_the_work_area_is_parked_like_any_overhang() {
+        let padding = test_padding();
+        // A 1920-wide column (the width of the whole monitor) scrolled 10 px
+        // overhangs the left edge, where DISPLAY2 sits: it is parked, not
+        // exempt — on screen it would cover the neighbour.
         let layout =
             VirtualLayout::with_columns(vec![Column::with_row(1920, Row::new(WindowId(1), 0))], 10);
         let m = primary_with_left_neighbour();
         let actual = project(&layout, &m, &padding);
-        assert!(!m.is_parked(actual.entries[0].rect));
-        assert!(actual.entries[0].rect.overlaps(m.work_area));
+        assert!(m.is_parked(actual.entries[0].rect));
+        // With no neighbour on that side it keeps its overhang as before.
+        let lone = MonitorInfo::single(m.work_area);
+        let actual = project(&layout, &lone, &padding);
+        assert!(!lone.is_parked(actual.entries[0].rect));
+        assert_eq!(actual.entries[0].rect.x, 4 - 10);
     }
 
     #[test]

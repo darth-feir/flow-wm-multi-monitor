@@ -223,9 +223,13 @@ no gaps.
 `Column { col: 0 }`; right of the last column maps to append.
 
 **Totality.** Every cursor position in the work area maps to a zone. The
-function returns `None` only for the empty-workspace degenerate (no columns),
-which cannot arise during a tile drag — the dragged window is itself a column
-member.
+function returns `None` for the empty-workspace degenerate (no columns), which
+cannot arise during a tile drag — the dragged window is itself a column member
+— and for a cursor **above or below the work area**: on a stacked pair the
+display above or below shares this strip's x range, so a cursor over there must
+hit neither a scroll band nor a column zone (the horizontal bound on the scroll
+bands covers the side-by-side case). `None` mid-drag previews nothing and, on
+release, snaps the window back into its own strip.
 
 **Own-column allowed.** The dragged window's own column is *not* excluded
 from the map. This enables within-column reordering (drag a window down past

@@ -27,13 +27,27 @@
 //!    else the primary. Tiles are appended as columns; floats are clamped
 //!    into the fallback's work area. Owner memory in the registry is
 //!    remapped for every tracked window ([`remap_owner`]), including the
-//!    minimized and hidden ones that live in no space. Windows that Windows
-//!    itself minimized when their display went away are restored so they
-//!    come back through the normal restore path, onto their new owner.
+//!    minimized and hidden ones that live in no space.
+//! 4. **Restore casualties.** Windows minimizes every window whose nearest
+//!    display vanished — the vanished monitor's own strip, but also a
+//!    *surviving* monitor's columns parked beyond that neighbour. Any window
+//!    of ours minimized since the first topology report
+//!    ([`is_hotplug_casualty`]) and still iconic is restored without
+//!    activation (`SW_SHOWNOACTIVATE`) and seated right here, in its old
+//!    `(monitor, column, row)` order: back into its old column slot when
+//!    its strip survived, appended in order otherwise. The later
+//!    `MINIMIZEEND` hook then finds the window already seated and does
+//!    nothing. A window the user minimized *before* the change is left
+//!    minimized (its owner memory is remapped like everyone else's).
 //!
 //! Afterwards every monitor's workspaces are re-seated as **instant**
 //! animator targets: the old parked slots are meaningless under the new
 //! geometry and a tween from one of them would sweep across the screen.
+//! If anything was restored, OS focus is pushed once to the registry's
+//! focused window so the restores cannot have moved it.
+//!
+//! A failed enumeration re-arms the settle timer and retries up to
+//! [`MAX_RECONCILE_RETRIES`] times before giving up until the next report.
 //!
 //! The Win32 questions the reconcile asks are behind [`TopologyProbe`] so
 //! the whole pass is unit-tested with a mock desktop.
@@ -43,7 +57,6 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
 
-use crate::animation::WindowTarget;
 use crate::common::{Rect, WindowId};
 use crate::layout::types::MonitorInfo;
 use crate::registry::hooks;
@@ -51,7 +64,7 @@ use crate::registry::types::{FloatingState, TilingState, WindowState};
 use crate::registry::win32::{self as registry_win32, MonitorGeometry};
 use crate::workspace::{Monitor, ScrollingSpace, Workspace, WorkspaceId, WorkspaceParking};
 
-use super::animation::PrevRects;
+use super::animation::{PrevRects, WorkspaceTargets};
 use super::config_derive;
 use super::loadout::build_seating_batches;
 use super::types::{FlowWM, LayoutConfig};
@@ -62,6 +75,43 @@ use super::types::{FlowWM, LayoutConfig};
 /// work-area updates); handling them one by one would re-seat every window
 /// several times.
 pub(super) const TOPOLOGY_SETTLE: Duration = Duration::from_millis(300);
+
+/// How many times a failed reconcile (enumeration error, empty enumeration
+/// mid-switch) is re-armed for another settle period before the daemon
+/// gives up until the next display report.
+pub(super) const MAX_RECONCILE_RETRIES: u8 = 5;
+
+/// How long *before* the first topology report a minimize is still
+/// attributed to the display change. Windows minimizes the windows of a
+/// vanishing display as part of the same desktop rearrangement that
+/// broadcasts `WM_DISPLAYCHANGE`, and the `MINIMIZESTART` hooks can reach
+/// the daemon a little ahead of that broadcast.
+pub(super) const HOTPLUG_MINIMIZE_GRACE: Duration = Duration::from_millis(1000);
+
+/// Whether a minimized window is a hotplug casualty: it went minimized
+/// (`minimized_at`, see [`Window::minimized_at`](crate::registry::types::Window::minimized_at))
+/// at or after the first report of the pending topology change
+/// (`first_report`, less [`HOTPLUG_MINIMIZE_GRACE`]). A window minimized
+/// earlier was minimized by the user and stays that way; one that never
+/// went through the minimize hook is not a casualty either.
+#[must_use]
+pub(super) fn is_hotplug_casualty(
+    minimized_at: Option<Instant>,
+    first_report: Option<Instant>,
+) -> bool {
+    match (minimized_at, first_report) {
+        (Some(minimized), Some(first)) => minimized + HOTPLUG_MINIMIZE_GRACE >= first,
+        _ => false,
+    }
+}
+
+/// The retry counter after one failed reconcile: `Some(next)` when another
+/// settle period should be armed, `None` when the budget
+/// ([`MAX_RECONCILE_RETRIES`]) is spent and the daemon gives up.
+#[must_use]
+pub(super) fn next_reconcile_retry(retries: u8) -> Option<u8> {
+    (retries < MAX_RECONCILE_RETRIES).then_some(retries + 1)
+}
 
 /// Workspaces created on a monitor that appeared after startup — the same
 /// count `FlowWM::new` gives every monitor.
@@ -109,8 +159,12 @@ pub(super) trait TopologyProbe {
     fn monitor_handle_for_window(&self, hwnd: isize) -> isize;
     /// `IsIconic(hwnd)`.
     fn is_iconic(&self, hwnd: isize) -> bool;
-    /// `ShowWindow(hwnd, SW_RESTORE)`; `true` when issued on a live window.
+    /// `ShowWindow(hwnd, SW_SHOWNOACTIVATE)` — restore from minimized
+    /// without activating; `true` when issued on a live window.
     fn restore_window(&self, hwnd: isize) -> bool;
+    /// `SetForegroundWindow(hwnd)`; `true` when the window took the
+    /// foreground.
+    fn focus_window(&self, hwnd: isize) -> bool;
 }
 
 /// The production [`TopologyProbe`]: plain Win32.
@@ -135,6 +189,10 @@ impl TopologyProbe for Win32Topology {
 
     fn restore_window(&self, hwnd: isize) -> bool {
         registry_win32::show_window_restored(hwnd)
+    }
+
+    fn focus_window(&self, hwnd: isize) -> bool {
+        registry_win32::set_foreground_window(hwnd)
     }
 }
 
@@ -333,9 +391,25 @@ pub(super) struct HotplugSummary {
     pub removed: usize,
     /// Windows moved off vanished monitors.
     pub migrated: usize,
-    /// Windows Windows had minimized on a vanished display that were
-    /// restored.
+    /// Hotplug casualties (windows Windows minimized with the display
+    /// change) that were restored.
     pub restored: usize,
+}
+
+/// A minimized window the reconcile restores, in seating order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Casualty {
+    /// Old index of the monitor it was remembered on (`usize::MAX` when
+    /// none), the first sort key.
+    old_monitor: usize,
+    /// Its saved column and row, the second key.
+    col: usize,
+    /// See `col`.
+    row: usize,
+    /// The window (last key, for a deterministic order).
+    hwnd: isize,
+    /// Whether it was a tile (else a float, which keeps its float seat).
+    tile: bool,
 }
 
 impl FlowWM {
@@ -351,6 +425,9 @@ impl FlowWM {
     pub(super) fn poll_topology_change(&mut self) {
         let now = Instant::now();
         let reported = hooks::take_topology_dirty();
+        if reported && self.topology_first_report.is_none() {
+            self.topology_first_report = Some(now);
+        }
         self.topology_deadline = settle_deadline(self.topology_deadline, reported, now);
         if !settle_due(self.topology_deadline, now) {
             return;
@@ -363,10 +440,32 @@ impl FlowWM {
         self.topology_deadline = None;
         if hooks::shutdown_requested() {
             log::info!("hotplug: shutdown requested, skipping the reconcile");
+            self.topology_first_report = None;
+            self.topology_retries = 0;
             return;
         }
-        if let Err(e) = self.reconcile_monitors() {
-            log::warn!("hotplug: reconcile failed, keeping the current monitor list: {e}");
+        match self.reconcile_monitors() {
+            Ok(_) => {
+                self.topology_first_report = None;
+                self.topology_retries = 0;
+            }
+            Err(e) => match next_reconcile_retry(self.topology_retries) {
+                Some(next) => {
+                    self.topology_retries = next;
+                    self.topology_deadline = Some(now + TOPOLOGY_SETTLE);
+                    log::warn!(
+                        "hotplug: reconcile failed, retry {next}/{MAX_RECONCILE_RETRIES} in {} ms: {e}",
+                        TOPOLOGY_SETTLE.as_millis()
+                    );
+                }
+                None => {
+                    self.topology_first_report = None;
+                    self.topology_retries = 0;
+                    log::error!(
+                        "hotplug: reconcile failed {MAX_RECONCILE_RETRIES} times, keeping the current monitor list until the next display change: {e}"
+                    );
+                }
+            },
         }
     }
 
@@ -472,6 +571,13 @@ impl FlowWM {
                             columns_per_screen,
                         );
                         let _ = ws.scrolling.set_monitor_info(info);
+                        // Floats keep their rect across a geometry change
+                        // unless it no longer fits the work area (a display
+                        // that shrank, a taskbar that grew): clamp them in
+                        // like migrated floats, on every workspace.
+                        for (wid, rect) in clamp_floats_into(ws, g.work_area) {
+                            self.mirror_float_rect(wid, rect);
+                        }
                     }
                     new_monitors.push(m);
                 }
@@ -543,6 +649,12 @@ impl FlowWM {
 
         self.monitors = new_monitors;
         for mv in &migrations {
+            // A window can only have one seat: skip one that is somehow
+            // already in a surviving space (add_window has no membership
+            // check of its own).
+            if self.monitor_index_containing(mv.window).is_some() {
+                continue;
+            }
             match mv.seat {
                 Seat::Tile => {
                     let _ = self.monitors[mv.to]
@@ -554,11 +666,7 @@ impl FlowWM {
                         .active_workspace_mut()
                         .floating
                         .add(mv.window, rect);
-                    if let Some(w) = self.registry.get_window_mut(HWND(mv.window.0 as *mut _))
-                        && matches!(w.state, WindowState::Floating(FloatingState::Active { .. }))
-                    {
-                        w.state = WindowState::Floating(FloatingState::Active { rect });
-                    }
+                    self.mirror_float_rect(mv.window, rect);
                 }
             }
             self.remember_monitor(mv.window, mv.to);
@@ -588,36 +696,91 @@ impl FlowWM {
                 .set_monitor(hwnd, remap_owner(old_idx, &matching, nearest, primary_new));
         }
 
-        // Windows that Windows minimized because their display went away:
-        // anything we owned on a vanished monitor that is iconic now. They
-        // are restored and come back through the normal restore hook, onto
-        // the owner just recorded. (A window the user had minimized there
-        // earlier comes back too — it has nowhere else to go.)
-        let removed_set: HashSet<usize> = matching.removed().into_iter().collect();
-        let candidates: HashSet<isize> = remembered
-            .iter()
-            .filter(|(_, old_idx)| removed_set.contains(old_idx))
-            .map(|(hwnd, _)| *hwnd)
-            .chain(migrated.iter().copied())
+        // Hotplug casualties: windows Windows minimized because the display
+        // nearest to them went away — the vanished monitor's strip, but also
+        // a survivor's columns parked beyond that neighbour. They are the
+        // windows minimized since the first topology report that are still
+        // iconic; a window the user minimized before the change stays
+        // minimized. Restored without activation and seated here, in their
+        // old (monitor, column, row) order, so the strip comes back as it
+        // was instead of in whatever order the MINIMIZEEND hooks arrive
+        // (those find the window already seated and do nothing).
+        let first_report = self.topology_first_report;
+        let old_owner: HashMap<isize, usize> = remembered.iter().copied().collect();
+        let mut casualties: Vec<Casualty> = self
+            .registry
+            .windows()
+            .filter_map(|w| {
+                let hwnd = w.hwnd.0 as isize;
+                let tile = match w.state {
+                    WindowState::Tiling(TilingState::Minimized) => true,
+                    WindowState::Floating(FloatingState::Minimized) => false,
+                    _ => return None,
+                };
+                if !is_hotplug_casualty(w.minimized_at, first_report) {
+                    return None;
+                }
+                let (col, row) = w
+                    .last_virtual_slot
+                    .as_ref()
+                    .map_or((usize::MAX, 0), |s| (s.col, s.row));
+                Some(Casualty {
+                    old_monitor: old_owner.get(&hwnd).copied().unwrap_or(usize::MAX),
+                    col,
+                    row,
+                    hwnd,
+                    tile,
+                })
+            })
             .collect();
+        casualties.sort_unstable();
         let mut restored = 0_usize;
-        for hwnd in candidates {
-            let minimized = self
-                .registry
-                .get_window(HWND(hwnd as *mut _))
-                .is_some_and(|w| {
-                    matches!(
-                        w.state,
-                        WindowState::Tiling(TilingState::Minimized)
-                            | WindowState::Floating(FloatingState::Minimized)
-                    )
-                });
-            if (minimized || migrated.contains(&hwnd))
+        for c in casualties {
+            if !probe.is_iconic(c.hwnd) || !probe.restore_window(c.hwnd) {
+                continue;
+            }
+            self.registry.restore_window(c.hwnd);
+            restored += 1;
+            let wid = WindowId(c.hwnd);
+            if !c.tile || self.monitor_index_containing(wid).is_some() {
+                // A float kept its float seat while minimized.
+                continue;
+            }
+            // Back into its old column slot when its strip survived (the
+            // owner memory still names that monitor), appended in slot
+            // order otherwise — behind the migrated tiles, like the
+            // migration itself appends.
+            let dest = self
+                .remembered_monitor(wid)
+                .unwrap_or(primary_new)
+                .min(self.monitors.len() - 1);
+            let strip_survived =
+                matching.old_to_new.get(c.old_monitor).copied().flatten() == Some(dest);
+            let slot = if strip_survived { c.col } else { usize::MAX };
+            let _ = self.monitors[dest]
+                .active_scrolling_mut()
+                .seat_window_at(slot, wid);
+            self.remember_monitor(wid, dest);
+            log::debug!(
+                "hotplug: restored window {} minimized with the display change, seated on monitor {dest} at column {}",
+                c.hwnd,
+                if strip_survived {
+                    c.col.to_string()
+                } else {
+                    "end".to_owned()
+                }
+            );
+        }
+        // A tile of a vanished monitor that is iconic but was not minimized
+        // through our hook (state still Active): restore it too — it is
+        // already seated by the migration.
+        for &hwnd in &migrated {
+            if self.registry.is_tiling_active(hwnd)
                 && probe.is_iconic(hwnd)
                 && probe.restore_window(hwnd)
             {
                 restored += 1;
-                log::debug!("hotplug: restored window {hwnd} minimized with its display");
+                log::debug!("hotplug: restored migrated window {hwnd} that was still iconic");
             }
         }
 
@@ -634,6 +797,16 @@ impl FlowWM {
 
         self.seat_all_monitors_instantly();
         self.rebuild_float_hwnds();
+
+        // Restores never activate, but push the foreground once to where the
+        // registry says it belongs so a restore cannot have left it elsewhere.
+        if restored > 0
+            && let Some(focused) = self.registry.focused()
+            && self.monitor_index_containing(focused).is_some()
+            && !probe.focus_window(focused.0)
+        {
+            log::debug!("hotplug: could not push focus back to {}", focused.0);
+        }
 
         let summary = HotplugSummary {
             monitors: self.monitors.len(),
@@ -663,28 +836,37 @@ impl FlowWM {
     /// because the windows' previous positions belong to a geometry that no
     /// longer exists.
     #[must_use]
-    pub(super) fn instant_seating_targets(&self) -> Vec<WindowTarget> {
+    pub(super) fn instant_seating_targets(&self) -> WorkspaceTargets {
         let no_prev = HashMap::new();
-        let mut targets = Vec::new();
+        let mut out = WorkspaceTargets::default();
         for (mi, m) in self.monitors.iter().enumerate() {
             let window_gap = m.active_scrolling().padding().window_gap;
             let parking =
                 WorkspaceParking::new(m.active_scrolling().monitor(), m.screen_rect(), window_gap);
             let batches = build_seating_batches(m.workspaces(), m.active_workspace_id(), &parking);
-            let (mut t, _) = self.workspace_targets(mi, &batches, PrevRects::Snapshot(&no_prev));
-            for target in &mut t {
+            let WorkspaceTargets {
+                mut targets,
+                has_float_target,
+                submitted,
+            } = self.workspace_targets(mi, &batches, PrevRects::Snapshot(&no_prev));
+            for target in &mut targets {
                 target.instant = true;
             }
-            targets.extend(t);
+            out.targets.extend(targets);
+            out.has_float_target |= has_float_target;
+            out.submitted.extend(submitted);
         }
-        targets
+        out
     }
 
-    /// Submit [`instant_seating_targets`](Self::instant_seating_targets) and
-    /// sync the registry's tiling slots and (workspace-local) tiled rects
-    /// from every workspace.
+    /// Submit [`instant_seating_targets`](Self::instant_seating_targets),
+    /// record them as every window's last submitted rect, and sync the
+    /// registry's tiling slots and (workspace-local) tiled rects from every
+    /// workspace.
     fn seat_all_monitors_instantly(&mut self) {
-        let targets = self.instant_seating_targets();
+        let WorkspaceTargets {
+            targets, submitted, ..
+        } = self.instant_seating_targets();
         if !targets.is_empty() {
             log::debug!(
                 "hotplug: re-seating {} target(s) instantly across {} monitor(s)",
@@ -695,6 +877,7 @@ impl FlowWM {
                 log::warn!("hotplug: re-seat animation error: {e}");
             }
         }
+        self.record_submitted(&submitted);
         for m in &self.monitors {
             for ws in m.workspaces() {
                 self.registry
@@ -704,6 +887,37 @@ impl FlowWM {
             }
         }
     }
+}
+
+impl FlowWM {
+    /// Mirror a float's new rect into the registry's
+    /// [`FloatingState::Active`] record (a non-active float is left alone).
+    fn mirror_float_rect(&mut self, wid: WindowId, rect: Rect) {
+        if let Some(w) = self.registry.get_window_mut(HWND(wid.0 as *mut _))
+            && matches!(w.state, WindowState::Floating(FloatingState::Active { .. }))
+        {
+            w.state = WindowState::Floating(FloatingState::Active { rect });
+        }
+    }
+}
+
+/// Clamp every float of `ws` into `work_area` (same size, moved inside —
+/// [`Rect::clamped_into`]) and return the ones that moved, so the caller can
+/// mirror them into the registry.
+fn clamp_floats_into(ws: &mut Workspace, work_area: Rect) -> Vec<(WindowId, Rect)> {
+    let moved: Vec<(WindowId, Rect)> = ws
+        .floating
+        .windows()
+        .iter()
+        .filter_map(|e| {
+            let clamped = e.rect.clamped_into(work_area);
+            (clamped != e.rect).then_some((e.window_id, clamped))
+        })
+        .collect();
+    for &(wid, rect) in &moved {
+        ws.floating.add(wid, rect);
+    }
+    moved
 }
 
 /// A monitor that appeared after startup: ten empty workspaces, like the
@@ -953,6 +1167,8 @@ mod tests {
         nearest: HashMap<isize, isize>,
         iconic: HashSet<isize>,
         restored: RefCell<Vec<isize>>,
+        /// Every `focus_window` call, in order.
+        focused: RefCell<Vec<isize>>,
     }
 
     impl MockTopology {
@@ -979,6 +1195,7 @@ mod tests {
                 nearest: HashMap::new(),
                 iconic: HashSet::new(),
                 restored: RefCell::new(Vec::new()),
+                focused: RefCell::new(Vec::new()),
             }
         }
     }
@@ -995,6 +1212,10 @@ mod tests {
         }
         fn restore_window(&self, hwnd: isize) -> bool {
             self.restored.borrow_mut().push(hwnd);
+            true
+        }
+        fn focus_window(&self, hwnd: isize) -> bool {
+            self.focused.borrow_mut().push(hwnd);
             true
         }
     }
@@ -1020,6 +1241,22 @@ mod tests {
 
     fn tile() -> WindowState {
         WindowState::Tiling(TilingState::Active { col: 0, row: 0 })
+    }
+
+    /// Mark `hwnd` as a tile minimized at `at` from column `col`, row `row`
+    /// — what the minimize hook records.
+    fn minimized_tile(
+        registry: &mut WindowRegistry,
+        hwnd: isize,
+        col: usize,
+        row: usize,
+        at: Instant,
+    ) {
+        if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {
+            w.state = WindowState::Tiling(TilingState::Minimized);
+            w.last_virtual_slot = Some(crate::registry::types::VirtualSlot { col, row });
+            w.minimized_at = Some(at);
+        }
     }
 
     /// A monitor with `hmonitor` at `screen` on a desktop whose other
@@ -1070,11 +1307,9 @@ mod tests {
                 rect: r(-1500, 100, 400, 300),
             }),
         );
-        fake_window(
-            &mut registry,
-            M,
-            WindowState::Tiling(TilingState::Minimized),
-        );
+        fake_window(&mut registry, M, tile());
+        // M was minimized by Windows with the display change.
+        minimized_tile(&mut registry, M, 2, 0, Instant::now());
         let vs = r(-1920, 0, 3840, 1080);
         let mut m0 = monitor(1, PRIMARY, &[LEFT], vs);
         let mut m1 = monitor(2, LEFT, &[PRIMARY], vs);
@@ -1095,6 +1330,9 @@ mod tests {
         registry.set_focused(B);
         let mut flow = FlowWM::new_for_test(registry, vec![m0, m1]);
         flow.active_monitor = 1;
+        // The first display report arrived just before the fixture's
+        // minimize stamps.
+        flow.topology_first_report = Some(Instant::now() - Duration::from_millis(50));
         flow
     }
 
@@ -1149,8 +1387,14 @@ mod tests {
         for hwnd in [A, B, C, D, F, M] {
             assert_eq!(flow.registry.remembered_monitor(hwnd), Some(0), "{hwnd:#x}");
         }
-        // The minimized window was restored (it comes back via the hook).
+        // The minimized window was restored and seated by the reconcile
+        // itself, behind the migrated tiles, as an active tile.
         assert_eq!(*probe.restored.borrow(), vec![M]);
+        assert!(flow.registry.is_tiling_active(M));
+        let strip = flow.monitors[0].active_scrolling().virtual_layout();
+        assert_eq!(strip.find_window(WindowId(M)).map(|(c, _)| c), Some(4));
+        // Focus was pushed once, to the registry's focused window (B).
+        assert_eq!(*probe.focused.borrow(), vec![B]);
 
         // Nothing projects onto the dead display: every tiled rect is inside
         // the primary or parked beyond its (now single-monitor) virtual
@@ -1166,10 +1410,237 @@ mod tests {
         // The active monitor follows the focused window (B) onto 0.
         assert_eq!(flow.active_monitor, 0);
 
-        // Re-seating targets are all instant.
-        let targets = flow.instant_seating_targets();
-        assert!(!targets.is_empty());
-        assert!(targets.iter().all(|t| t.instant));
+        // Re-seating targets are all instant, and every one was recorded as
+        // the window's last submitted rect.
+        let seating = flow.instant_seating_targets();
+        assert!(!seating.targets.is_empty());
+        assert!(seating.targets.iter().all(|t| t.instant));
+        for (hwnd, rect) in &seating.submitted {
+            assert_eq!(flow.last_submitted_rect(*hwnd), Some(*rect));
+        }
+    }
+
+    // ── casualties: order, slots, timing, duplicates ─────────────────
+
+    #[test]
+    fn casualty_predicate_follows_the_first_report() {
+        let t0 = Instant::now();
+        let first = Some(t0);
+        // Minimized after the first report: a casualty.
+        assert!(is_hotplug_casualty(
+            Some(t0 + Duration::from_millis(10)),
+            first
+        ));
+        // Just before it, within the grace: still a casualty.
+        assert!(is_hotplug_casualty(
+            Some(t0 - HOTPLUG_MINIMIZE_GRACE + Duration::from_millis(1)),
+            first
+        ));
+        // Well before: the user minimized it on purpose.
+        assert!(!is_hotplug_casualty(
+            Some(t0 - Duration::from_secs(30)),
+            first
+        ));
+        // Never minimized through the hook, or no report pending: no.
+        assert!(!is_hotplug_casualty(None, first));
+        assert!(!is_hotplug_casualty(Some(t0), None));
+    }
+
+    #[test]
+    fn reconcile_retries_are_bounded() {
+        assert_eq!(next_reconcile_retry(0), Some(1));
+        assert_eq!(
+            next_reconcile_retry(MAX_RECONCILE_RETRIES - 1),
+            Some(MAX_RECONCILE_RETRIES)
+        );
+        assert_eq!(next_reconcile_retry(MAX_RECONCILE_RETRIES), None);
+    }
+
+    #[test]
+    fn restore_order_preserved_for_a_vanished_strip() {
+        // The LEFT monitor's whole strip (B, C, D) was minimized by Windows,
+        // so the MINIMIZESTART hooks already emptied it. The windows come
+        // back on the primary in their old column order, behind A, no
+        // matter the registry's iteration order.
+        let rules = WindowRulesConfig::default();
+        let mut registry = WindowRegistry::new(&rules, &rules);
+        for hwnd in [A, B, C, D] {
+            fake_window(&mut registry, hwnd, tile());
+        }
+        let t = Instant::now();
+        minimized_tile(&mut registry, D, 2, 0, t);
+        minimized_tile(&mut registry, B, 0, 0, t);
+        minimized_tile(&mut registry, C, 1, 0, t);
+        let vs = r(-1920, 0, 3840, 1080);
+        let mut m0 = monitor(1, PRIMARY, &[LEFT], vs);
+        let m1 = monitor(2, LEFT, &[PRIMARY], vs);
+        m0.active_scrolling_mut().add_window(WindowId(A));
+        registry.set_monitor(A, 0);
+        for hwnd in [B, C, D] {
+            registry.set_monitor(hwnd, 1);
+        }
+        registry.set_focused(A);
+        let mut flow = FlowWM::new_for_test(registry, vec![m0, m1]);
+        flow.topology_first_report = Some(t - Duration::from_millis(20));
+
+        let mut probe = MockTopology::new(vec![geo(1, PRIMARY, true)]);
+        for hwnd in [B, C, D] {
+            probe.nearest.insert(hwnd, 1);
+            probe.iconic.insert(hwnd);
+        }
+        let summary = flow
+            .reconcile_monitors_with(&probe)
+            .expect("reconcile succeeds");
+        assert_eq!(summary.migrated, 0);
+        assert_eq!(summary.restored, 3);
+        assert_eq!(*probe.restored.borrow(), vec![B, C, D]);
+        let strip = flow.monitors[0].active_scrolling().virtual_layout();
+        let order: Vec<WindowId> = strip.columns.iter().map(|c| c.rows[0].window_id).collect();
+        assert_eq!(
+            order,
+            vec![WindowId(A), WindowId(B), WindowId(C), WindowId(D)]
+        );
+        for hwnd in [B, C, D] {
+            assert!(flow.registry.is_tiling_active(hwnd), "{hwnd:#x}");
+            assert_eq!(flow.registry.remembered_monitor(hwnd), Some(0));
+        }
+        // Restoring never moved the foreground: it was pushed back to A.
+        assert_eq!(*probe.focused.borrow(), vec![A]);
+    }
+
+    #[test]
+    fn survivor_parked_column_minimized_in_the_settle_window_returns_to_its_slot() {
+        // The primary's column 1 (P) was parked beyond the LEFT display, so
+        // Windows minimized it with that display even though the primary
+        // survives. It goes back into column 1.
+        const P: isize = 0x5;
+        const Q: isize = 0x6;
+        let rules = WindowRulesConfig::default();
+        let mut registry = WindowRegistry::new(&rules, &rules);
+        for hwnd in [A, P, Q] {
+            fake_window(&mut registry, hwnd, tile());
+        }
+        let t = Instant::now();
+        minimized_tile(&mut registry, P, 1, 0, t);
+        let vs = r(-1920, 0, 3840, 1080);
+        let mut m0 = monitor(1, PRIMARY, &[LEFT], vs);
+        let m1 = monitor(2, LEFT, &[PRIMARY], vs);
+        m0.active_scrolling_mut().add_window(WindowId(A));
+        m0.active_scrolling_mut().add_window(WindowId(Q));
+        for hwnd in [A, P, Q] {
+            registry.set_monitor(hwnd, 0);
+        }
+        let mut flow = FlowWM::new_for_test(registry, vec![m0, m1]);
+        flow.topology_first_report = Some(t - Duration::from_millis(20));
+
+        let mut probe = MockTopology::new(vec![geo(1, PRIMARY, true)]);
+        probe.nearest.insert(P, 1);
+        probe.iconic.insert(P);
+        let summary = flow
+            .reconcile_monitors_with(&probe)
+            .expect("reconcile succeeds");
+        assert_eq!(summary.restored, 1);
+        let strip = flow.monitors[0].active_scrolling().virtual_layout();
+        let order: Vec<WindowId> = strip.columns.iter().map(|c| c.rows[0].window_id).collect();
+        assert_eq!(order, vec![WindowId(A), WindowId(P), WindowId(Q)]);
+        assert!(flow.registry.is_tiling_active(P));
+    }
+
+    #[test]
+    fn window_minimized_by_the_user_before_the_change_stays_minimized() {
+        let mut flow = side_by_side_flow();
+        // M was minimized half a minute before the first report.
+        if let Some(w) = flow.registry.get_window_mut(HWND(M as *mut _)) {
+            w.minimized_at = Some(Instant::now() - Duration::from_secs(30));
+        }
+        let mut probe = MockTopology::new(vec![geo(1, PRIMARY, true)]);
+        for hwnd in [A, B, C, D, F, M] {
+            probe.nearest.insert(hwnd, 1);
+        }
+        probe.iconic.insert(M);
+        let summary = flow
+            .reconcile_monitors_with(&probe)
+            .expect("reconcile succeeds");
+        assert_eq!(summary.restored, 0);
+        assert!(probe.restored.borrow().is_empty());
+        assert!(probe.focused.borrow().is_empty());
+        // Still minimized, but its owner memory moved to the survivor.
+        assert!(matches!(
+            flow.registry
+                .get_window(HWND(M as *mut _))
+                .map(|w| w.state.clone()),
+            Some(WindowState::Tiling(TilingState::Minimized))
+        ));
+        assert_eq!(flow.registry.remembered_monitor(M), Some(0));
+        assert!(
+            flow.monitors[0]
+                .active_scrolling()
+                .virtual_layout()
+                .find_window(WindowId(M))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn no_duplicate_column_when_the_restore_hook_follows_the_reconcile() {
+        let mut flow = side_by_side_flow();
+        let mut probe = MockTopology::new(vec![geo(1, PRIMARY, true)]);
+        for hwnd in [A, B, C, D, F, M] {
+            probe.nearest.insert(hwnd, 1);
+        }
+        probe.iconic.insert(M);
+        flow.reconcile_monitors_with(&probe)
+            .expect("reconcile succeeds");
+        let count = |flow: &FlowWM| {
+            flow.monitors[0]
+                .active_scrolling()
+                .virtual_layout()
+                .columns
+                .iter()
+                .filter(|c| c.rows.iter().any(|r| r.window_id == WindowId(M)))
+                .count()
+        };
+        assert_eq!(count(&flow), 1);
+        // The MINIMIZEEND hook for M arrives after the reconcile seated it
+        // (its layout half; the border refresh needs a desktop).
+        flow.registry.restore_window(M);
+        flow.readd_tile_to_home_monitor(M);
+        assert_eq!(
+            count(&flow),
+            1,
+            "the restore hook must not add a second column"
+        );
+        assert_eq!(
+            flow.monitors[0]
+                .active_scrolling()
+                .virtual_layout()
+                .window_count(),
+            5
+        );
+    }
+
+    #[test]
+    fn survivor_floats_are_clamped_into_a_shrunk_work_area() {
+        let mut flow = side_by_side_flow();
+        // F sits at (-1500, 100, 400, 300) on the LEFT monitor, which now
+        // loses its bottom 800 px to a taskbar: F no longer fits and is
+        // moved up, same size.
+        let shrunk = r(-1920, 0, 1920, 280);
+        let mut left = geo(2, LEFT, false);
+        left.work_area = shrunk;
+        let probe = MockTopology::new(vec![geo(1, PRIMARY, true), left]);
+        flow.reconcile_monitors_with(&probe)
+            .expect("reconcile succeeds");
+        let floats = flow.monitors[1].active_workspace().floating.windows();
+        assert_eq!(floats.len(), 1);
+        let f = floats[0].rect;
+        // Shrunk to the 280 px work-area height, width untouched.
+        assert_eq!((f.width, f.height), (400, 280));
+        assert!(f.y >= 0 && f.bottom() <= 280, "{f:?}");
+        assert!(matches!(
+            flow.registry.get_window(HWND(F as *mut _)).map(|w| w.state.clone()),
+            Some(WindowState::Floating(FloatingState::Active { rect })) if rect == f
+        ));
     }
 
     #[test]

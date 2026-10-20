@@ -413,20 +413,21 @@ pub fn next_available_window(layout: &VirtualLayout, col: usize, row: usize) -> 
     }
 
     // No vertical sibling — snap to an adjacent column so attention stays at
-    // roughly the same horizontal position. Left first, then right.
-    if col > 0 {
-        let left = &layout.columns[col - 1];
-        let r = closest_row(left, row);
-        return Some(left.rows[r].window_id);
+    // roughly the same horizontal position. Nearest non-empty column to the
+    // left first, then to the right. A column with no rows cannot be a
+    // successor (and must never index its rows): the invariant says every
+    // column has one, but a layout rebuilt from a stale file is skipped
+    // over rather than trusted.
+    let pick = |candidate: &Column| {
+        candidate
+            .rows
+            .get(closest_row(candidate, row))
+            .map(|r| r.window_id)
+    };
+    if let Some(found) = layout.columns[..col].iter().rev().find_map(pick) {
+        return Some(found);
     }
-    let right_idx = col + 1;
-    if right_idx < layout.columns.len() {
-        let right = &layout.columns[right_idx];
-        let r = closest_row(right, row);
-        return Some(right.rows[r].window_id);
-    }
-
-    None
+    layout.columns[col + 1..].iter().find_map(pick)
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,15 +1096,15 @@ pub fn set_layout(
     columns: Vec<(u32, Vec<WindowId>)>,
     viewport_offset: i32,
 ) -> VirtualLayout {
-    if columns.is_empty() {
-        return VirtualLayout::new();
-    }
-
     let gap = config.padding.window_gap;
     let available = config.available_height();
 
+    // A column spec with no rows (a loadout column whose windows were all
+    // gone when it was saved) builds no column: a column always has at least
+    // one row, and the focus-successor and projection code rely on it.
     let built: Vec<Column> = columns
         .into_iter()
+        .filter(|(_, row_ids)| !row_ids.is_empty())
         .map(|(raw_width, row_ids)| {
             let width = quantize_to_ladder(raw_width as i32, config);
             let n = row_ids.len();
@@ -1116,6 +1117,9 @@ pub fn set_layout(
             Column::with_rows(width, rows)
         })
         .collect();
+    if built.is_empty() {
+        return VirtualLayout::new();
+    }
 
     VirtualLayout {
         columns: built,
@@ -1215,6 +1219,27 @@ pub fn insert_window_at(
         single_row_column(window, config.column_width as i32, config),
     );
     ensure_column_visible(&new_layout, idx, config)
+}
+
+/// Insert `window` as a new single-row column at column index `col_idx`
+/// (clamped to the column count) **without** touching the viewport: the
+/// silent counterpart of [`insert_window_at`], for putting a window back
+/// into a slot it used to hold (the monitor-hotplug reconcile restoring a
+/// column Windows minimized) while the user's view stays where it is.
+#[must_use]
+pub fn seat_window_at(
+    layout: &VirtualLayout,
+    col_idx: usize,
+    window: WindowId,
+    config: &MutationConfig,
+) -> VirtualLayout {
+    let mut new_layout = layout.clone();
+    let idx = col_idx.min(new_layout.columns.len());
+    new_layout.columns.insert(
+        idx,
+        single_row_column(window, config.column_width as i32, config),
+    );
+    new_layout
 }
 
 /// Insert a new window as a column after the focused window, at an explicit
@@ -4769,6 +4794,66 @@ mod tests {
         // The appended column (canvas 2896..3856) is scrolled into view.
         assert!(out.viewport_offset <= 2896);
         assert!(out.viewport_offset + 1920 >= 3856);
+    }
+
+    #[test]
+    fn next_available_window_skips_columns_without_rows() {
+        // [W1] [∅] [W3]: closing W3 must land on W1, not index the empty
+        // column; closing W1 must land on W3.
+        let layout = VirtualLayout::with_columns(
+            vec![
+                Column::with_row(100, Row::new(WindowId(1), 500)),
+                Column::with_rows(100, Vec::new()),
+                Column::with_row(100, Row::new(WindowId(3), 500)),
+            ],
+            0,
+        );
+        assert_eq!(next_available_window(&layout, 2, 0), Some(WindowId(1)));
+        assert_eq!(next_available_window(&layout, 0, 0), Some(WindowId(3)));
+        // Only empty neighbours: nothing to focus.
+        let lonely = VirtualLayout::with_columns(
+            vec![
+                Column::with_rows(100, Vec::new()),
+                Column::with_row(100, Row::new(WindowId(2), 500)),
+                Column::with_rows(100, Vec::new()),
+            ],
+            0,
+        );
+        assert_eq!(next_available_window(&lonely, 1, 0), None);
+    }
+
+    #[test]
+    fn set_layout_drops_column_specs_without_rows() {
+        let config = test_config();
+        let layout = set_layout(
+            &config,
+            vec![(448, vec![]), (448, vec![WindowId(7)]), (448, vec![])],
+            3248,
+        );
+        assert_eq!(layout.columns.len(), 1);
+        assert_eq!(layout.columns[0].rows[0].window_id, WindowId(7));
+        assert_eq!(layout.viewport_offset, 3248);
+        // Nothing but empty specs: an empty layout at offset 0.
+        let empty = set_layout(&config, vec![(448, vec![]), (448, vec![])], 3248);
+        assert!(empty.columns.is_empty());
+        assert_eq!(empty.viewport_offset, 0);
+    }
+
+    #[test]
+    fn seat_window_at_keeps_the_viewport_and_clamps_the_index() {
+        let config = test_config();
+        let mut layout = three_column_layout();
+        layout.viewport_offset = 2000;
+        let seated = seat_window_at(&layout, 1, WindowId(9), &config);
+        assert_eq!(seated.columns.len(), 4);
+        assert_eq!(seated.columns[1].rows[0].window_id, WindowId(9));
+        assert_eq!(
+            seated.viewport_offset, 2000,
+            "seating never scrolls the viewport"
+        );
+        let appended = seat_window_at(&layout, usize::MAX, WindowId(8), &config);
+        assert_eq!(appended.columns[3].rows[0].window_id, WindowId(8));
+        assert_eq!(appended.viewport_offset, 2000);
     }
 
     #[test]

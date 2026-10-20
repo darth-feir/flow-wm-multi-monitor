@@ -80,9 +80,22 @@ fn rect_json_to_rect(rj: &RectJson) -> Rect {
 /// persisted in the file despite never driving the match.
 ///
 /// This is the whole matcher: a single exact `HWND` lookup, no scoring.
-fn resolve_hwnd(live: &mut HashSet<isize>, window: &WindowRef) -> Result<WindowId, String> {
+/// Each live window may be claimed once; a second slot naming the same
+/// window is reported as such (`claimed` holds the windows taken so far)
+/// rather than as a window that is not open.
+fn resolve_hwnd(
+    live: &mut HashSet<isize>,
+    claimed: &mut HashSet<isize>,
+    window: &WindowRef,
+) -> Result<WindowId, String> {
     if live.remove(&window.hwnd) {
+        claimed.insert(window.hwnd);
         Ok(WindowId(window.hwnd))
+    } else if claimed.contains(&window.hwnd) {
+        Err(format!(
+            "window referenced twice in the loadout: \"{}\" ({}, hwnd {:#x}) — aborting load (no-partial)",
+            window.title, window.exe, window.hwnd as u64
+        ))
     } else {
         Err(format!(
             "window not currently open: \"{}\" ({}, hwnd {:#x}) — aborting load (no-partial)",
@@ -403,6 +416,7 @@ impl FlowWM {
             }
             live.insert(win.hwnd.0 as isize);
         }
+        let mut claimed: HashSet<isize> = HashSet::new();
 
         struct ResolvedWorkspace {
             monitor: u32,
@@ -420,7 +434,7 @@ impl FlowWM {
             for col_snap in &ws_snap.scrolling.columns {
                 let mut rows = Vec::new();
                 for row_snap in &col_snap.rows {
-                    rows.push(resolve_hwnd(&mut live, &row_snap.window)?);
+                    rows.push(resolve_hwnd(&mut live, &mut claimed, &row_snap.window)?);
                 }
                 columns.push((col_snap.width_px, rows));
             }
@@ -428,7 +442,7 @@ impl FlowWM {
             // Resolve floating entries by HWND.
             let mut floating = Vec::new();
             for float_entry in &ws_snap.floating {
-                let hwnd = resolve_hwnd(&mut live, &float_entry.window)?;
+                let hwnd = resolve_hwnd(&mut live, &mut claimed, &float_entry.window)?;
                 let rect = rect_json_to_rect(&float_entry.rect);
                 floating.push((hwnd, rect));
             }
@@ -471,6 +485,10 @@ impl FlowWM {
                 leftovers.push(WindowId(hwnd));
             }
         }
+        // Floats of a snapshot that names a workspace no monitor has (see
+        // phase D): seated on the fallback monitor's active workspace below,
+        // clamped into its work area, instead of nowhere.
+        let mut float_leftovers: Vec<(WindowId, Rect)> = Vec::new();
 
         // Where every window really is right now (parking offsets of its
         // current workspace applied), captured before phase D rewrites the
@@ -515,11 +533,18 @@ impl FlowWM {
                 })
             };
             let Some((monitor_idx, ws_idx)) = found else {
+                // The purge above already took these windows out of every
+                // space; skipping the snapshot outright would seat them
+                // nowhere. Hand them to the leftover pass instead.
                 log::warn!(
-                    "loadout load: workspace {} (monitor {}) not found on any monitor, skipping",
+                    "loadout load: workspace {} (monitor {}) not found on any monitor; its {} tile(s) and {} float(s) go to the active workspace",
                     rw.workspace_id,
-                    rw.monitor
+                    rw.monitor,
+                    rw.columns.iter().map(|(_, rows)| rows.len()).sum::<usize>(),
+                    rw.floating.len()
                 );
+                leftovers.extend(rw.columns.iter().flat_map(|(_, rows)| rows.iter().copied()));
+                float_leftovers.extend(rw.floating.iter().copied());
                 continue;
             };
             let merge = !in_range;
@@ -606,6 +631,21 @@ impl FlowWM {
             self.registry
                 .update_tiling_slots_from_layout(&applied.virtual_layout);
             self.registry.update_tiled_rects(&applied.actual_layout);
+        }
+        let fallback_work_area = self.monitors[active_idx].work_area();
+        for (wid, rect) in float_leftovers {
+            if self.monitor_index_containing(wid).is_some() {
+                continue;
+            }
+            let rect = rect.clamped_into(fallback_work_area);
+            self.monitors[active_idx]
+                .active_workspace_mut()
+                .floating
+                .add(wid, rect);
+            if let Some(window) = self.registry.get_window_mut(HWND(wid.0 as *mut _)) {
+                window.state = WindowState::Floating(FloatingState::Active { rect });
+            }
+            self.remember_monitor(wid, active_idx);
         }
 
         // 7. Resolve the seating target. Preferred: the workspace that holds
@@ -719,10 +759,13 @@ impl FlowWM {
             .last_focused_window()
             .and_then(|wid| self.window_ref_for(wid));
 
+        // A column whose rows all failed to resolve (their windows left the
+        // registry) is not written: a column with no rows would come back
+        // from the file as an empty column.
         let columns: Vec<ColumnSnapshot> = vl
             .columns
             .iter()
-            .map(|col| {
+            .filter_map(|col| {
                 let rows: Vec<RowSnapshot> = col
                     .rows
                     .iter()
@@ -733,10 +776,10 @@ impl FlowWM {
                         })
                     })
                     .collect();
-                ColumnSnapshot {
+                (!rows.is_empty()).then_some(ColumnSnapshot {
                     width_px: col.width_px as u32,
                     rows,
-                }
+                })
             })
             .collect();
 
@@ -1426,17 +1469,133 @@ mod tests {
     }
 
     fn write_loadout(file: &LoadoutFile) -> PathBuf {
+        // Tests run in parallel and the clock is coarse: a per-process
+        // counter keeps two tests from writing (and reading) the same file.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "flowwm-loadout-test-{}-{}.json",
+            "flowwm-loadout-test-{}-{}-{}.json",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::write(&path, serde_json::to_string(file).expect("serialise"))
             .expect("write loadout");
         path
+    }
+
+    /// A snapshot naming a workspace no monitor has (workspace 42): its
+    /// windows are purged from their old seats and must come back as
+    /// leftovers on the active workspace, not be seated nowhere.
+    #[test]
+    fn apply_seats_windows_of_an_unknown_workspace_as_leftovers() {
+        let mut flow = two_monitor_flow();
+        let file = LoadoutFile {
+            version: LoadoutFile::CURRENT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                monitor: 1,
+                workspace_id: 42,
+                active: false,
+                scrolling: ScrollingSnapshot {
+                    viewport_offset: 0,
+                    focus: Some(window_ref(0xB)),
+                    columns: vec![tiled_column(0xB)],
+                },
+                floating: vec![FloatingEntry {
+                    window: window_ref(0xF),
+                    rect: RectJson {
+                        x: 5000,
+                        y: 50,
+                        w: 400,
+                        h: 300,
+                    },
+                }],
+            }],
+        };
+        let path = write_loadout(&file);
+        let result = flow.apply_loadout(Some(path.clone()));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(result, Ok(()));
+
+        // B and F left monitor 1 and landed on the active monitor (0).
+        assert_eq!(flow.monitor_index_containing(WindowId(0xB)), Some(0));
+        assert_eq!(flow.monitor_index_containing(WindowId(0xF)), Some(0));
+        assert!(
+            flow.monitors[0]
+                .active_scrolling()
+                .virtual_layout()
+                .find_window(WindowId(0xB))
+                .is_some()
+        );
+        let floats = flow.monitors[0].active_workspace().floating.windows();
+        assert_eq!(floats.len(), 1);
+        assert_eq!(floats[0].window_id, WindowId(0xF));
+        // Clamped into monitor 0's work area, same size.
+        let f = floats[0].rect;
+        assert_eq!((f.width, f.height), (400, 300));
+        assert!(f.right() <= 1920 && f.x >= 0, "{f:?}");
+        assert_eq!(flow.registry.remembered_monitor(0xB), Some(0));
+        assert_eq!(flow.registry.remembered_monitor(0xF), Some(0));
+        assert!(matches!(
+            flow.registry.get_window(HWND(0xF as *mut _)).map(|w| w.state.clone()),
+            Some(WindowState::Floating(FloatingState::Active { rect })) if rect == f
+        ));
+    }
+
+    /// A file naming the same window in two slots is rejected as such, not
+    /// as a window that is not open.
+    #[test]
+    fn apply_rejects_a_window_referenced_twice() {
+        let mut flow = two_monitor_flow();
+        let file = LoadoutFile {
+            version: LoadoutFile::CURRENT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                monitor: 0,
+                workspace_id: 1,
+                active: true,
+                scrolling: ScrollingSnapshot {
+                    viewport_offset: 0,
+                    focus: None,
+                    columns: vec![tiled_column(0xA), tiled_column(0xA)],
+                },
+                floating: vec![],
+            }],
+        };
+        let path = write_loadout(&file);
+        let result = flow.apply_loadout(Some(path.clone()));
+        let _ = std::fs::remove_file(&path);
+        let err = result.expect_err("a duplicate reference aborts the load");
+        assert!(err.contains("referenced twice"), "{err}");
+        assert!(!err.contains("not currently open"), "{err}");
+        // No-partial: nothing moved.
+        assert_eq!(flow.monitor_index_containing(WindowId(0xB)), Some(1));
+        assert_eq!(
+            flow.monitors[0]
+                .active_scrolling()
+                .virtual_layout()
+                .window_count(),
+            1
+        );
+    }
+
+    /// A column whose window is no longer tracked is left out of the
+    /// snapshot instead of being written with no rows.
+    #[test]
+    fn snapshot_skips_columns_whose_windows_are_gone() {
+        let mut flow = two_monitor_flow();
+        // A stale column: a window id the registry never saw.
+        flow.monitors[0]
+            .active_scrolling_mut()
+            .add_window(WindowId(0xDEAD));
+        let snaps = flow.snapshot_workspaces();
+        let ws1 = snaps
+            .iter()
+            .find(|s| s.monitor == 0 && s.workspace_id == 1)
+            .expect("monitor 0 workspace 1");
+        assert_eq!(ws1.scrolling.columns.len(), 1);
+        assert_eq!(ws1.scrolling.columns[0].rows[0].window.hwnd, 0xA);
     }
 
     /// A file saved on a three-monitor desktop puts B and F on monitor 2,

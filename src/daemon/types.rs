@@ -237,6 +237,38 @@ pub struct FlowWM {
     /// one. Folded into the loop's wait timeout like the other deadlines.
     /// See `daemon::hotplug`.
     pub(super) topology_deadline: Option<std::time::Instant>,
+
+    /// When the first `WM_DISPLAYCHANGE` / `SPI_SETWORKAREA` report of the
+    /// pending topology change arrived; `None` while no change is pending.
+    ///
+    /// The reconcile uses it to tell a window Windows minimized *because
+    /// its display vanished* (minimized at or after this instant, see
+    /// [`Window::minimized_at`](crate::registry::types::Window::minimized_at))
+    /// from one the user minimized earlier on purpose. Cleared once the
+    /// reconcile succeeds or gives up retrying.
+    pub(super) topology_first_report: Option<std::time::Instant>,
+
+    /// How many times the pending reconcile has failed and been re-armed
+    /// (`daemon::hotplug::MAX_RECONCILE_RETRIES` bounds it). Reset to zero on
+    /// success.
+    pub(super) topology_retries: u8,
+
+    /// The last rect every submit path commanded for each window, keyed by
+    /// HWND value: the layout's **visible** rect with any workspace parking
+    /// offset applied — the coordinates [`plan_move`](super::animation::plan_move)
+    /// reasons in.
+    ///
+    /// The registry's tiled rect only changes when a layout is *committed*,
+    /// but drag and resize previews, bystander teleports and the hotplug
+    /// re-seat all move windows without committing. The neighbour-teleport
+    /// rule needs the window's real last commanded position (a column that a
+    /// preview brought on-screen must not be told to `Stay` parked by the
+    /// next preview, nor tween from a far slot it no longer occupies), so
+    /// every submit path records here and reads it back first, falling back
+    /// to the registry rect for a window never submitted since start-up. An
+    /// entry is dropped when the window leaves the layout (destroyed,
+    /// minimized, hidden).
+    pub(super) submitted_rects: std::collections::HashMap<isize, crate::common::Rect>,
 }
 
 impl FlowWM {

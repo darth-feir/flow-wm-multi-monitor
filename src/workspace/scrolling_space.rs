@@ -191,6 +191,12 @@ impl ScrollingSpace {
     /// monocle state are all preserved. Used by config hot-reload; see
     /// (`docs/src/dev-guide/config-and-persistence.md`).
     ///
+    /// Column widths and row heights are refitted to the new bounds like
+    /// [`set_monitor_info`](Self::set_monitor_info) does — a larger
+    /// `window_gap` shrinks every column's row budget and the ladder top
+    /// (`abs_max_width`), and the rows would otherwise spill past the work
+    /// area.
+    ///
     /// Returns the freshly projected [`ActualLayout`] so the caller can animate
     /// windows into their new positions (e.g. after a `window_gap` change).
     pub fn reconfigure(
@@ -202,6 +208,7 @@ impl ScrollingSpace {
         padding: Padding,
         columns_per_screen: u32,
     ) -> ActualLayout {
+        let old = self.config;
         self.config = build_mutation_config(
             &self.monitor,
             column_width,
@@ -211,9 +218,34 @@ impl ScrollingSpace {
             padding,
             columns_per_screen,
         );
+        self.refit_to_config(&old);
         self.actual =
             projection::project(&self.virtual_layout, &self.monitor, &self.config.padding);
         self.actual.clone()
+    }
+
+    /// Bring the existing layout within the bounds of a freshly built
+    /// [`MutationConfig`] (`old` is the one it replaced):
+    ///
+    /// - every column wider than the new `abs_max_width` is clamped to it,
+    ///   so a monitor that narrowed never projects a column onto a
+    ///   neighbour (the overhang rule would park such a column, hiding it);
+    /// - when the per-column row budget changed — the available height
+    ///   *or* the window gap, which `available − (n + 1) · gap` depends on
+    ///   — every column's rows are rescaled in proportion
+    ///   ([`mutations::refit_heights`]).
+    fn refit_to_config(&mut self, old: &MutationConfig) {
+        let max = self.config.abs_max_width;
+        if self.virtual_layout.columns.iter().any(|c| c.width_px > max) {
+            for col in &mut self.virtual_layout.columns {
+                col.width_px = col.width_px.min(max);
+            }
+        }
+        if self.config.available_height() != old.available_height()
+            || self.config.padding.window_gap != old.padding.window_gap
+        {
+            self.virtual_layout = mutations::refit_heights(&self.virtual_layout, &self.config);
+        }
     }
 
     /// Replace the space's [`MonitorInfo`] (work area, virtual screen,
@@ -228,25 +260,26 @@ impl ScrollingSpace {
     /// Row heights are the layout's source of truth (projection consumes
     /// them verbatim), so when the work area's height changed every column's
     /// rows are rescaled into the new budget in proportion
-    /// ([`mutations::refit_heights`]); a width-only change leaves them alone.
+    /// ([`mutations::refit_heights`]). When it *narrowed*, every column
+    /// wider than the new `abs_max_width` is clamped to it: a column wider
+    /// than the work area would be parked by the overhang rule whenever a
+    /// neighbour sits on that side and the user would never see it again.
+    /// A change that touches neither leaves the layout alone.
     ///
     /// Returns the freshly projected [`ActualLayout`] for the new geometry.
     pub fn set_monitor_info(&mut self, monitor: MonitorInfo) -> ActualLayout {
-        let old_available = self.config.available_height();
+        let old = self.config;
         self.monitor = monitor;
-        let c = self.config;
         self.config = build_mutation_config(
             &self.monitor,
-            c.column_width,
-            c.min_column_width_px,
-            c.min_window_height_px,
-            c.min_row_height_px,
-            c.padding,
-            c.columns_per_screen,
+            old.column_width,
+            old.min_column_width_px,
+            old.min_window_height_px,
+            old.min_row_height_px,
+            old.padding,
+            old.columns_per_screen,
         );
-        if self.config.available_height() != old_available {
-            self.virtual_layout = mutations::refit_heights(&self.virtual_layout, &self.config);
-        }
+        self.refit_to_config(&old);
         self.actual =
             projection::project(&self.virtual_layout, &self.monitor, &self.config.padding);
         self.actual.clone()
@@ -562,7 +595,16 @@ impl ScrollingSpace {
     // -----------------------------------------------------------------------
 
     /// Add a window as a new column appended to the right.
+    ///
+    /// A window that is already in the strip is **not** added again: the
+    /// current layout is returned unchanged (every seating path — the
+    /// restore and show hooks, the hotplug migration, the loadout leftovers
+    /// — goes through one of the insert methods, and none may create a
+    /// second column for a window that already has one).
     pub fn add_window(&mut self, window: WindowId) -> AppliedLayout {
+        if let Some(seated) = self.already_seated(window) {
+            return seated;
+        }
         let new_layout = mutations::add_window(&self.virtual_layout, window, &self.config);
         self.last_focused_window = Some(window);
         self.apply_mutation(new_layout)
@@ -571,11 +613,50 @@ impl ScrollingSpace {
     /// Insert `window` as a new column at the **left end** of the strip and
     /// focus it. The counterpart of [`add_window`](Self::add_window) (which
     /// appends at the right end); used when a window arrives from the
-    /// monitor to the left so it lands at the near edge.
+    /// monitor to the left so it lands at the near edge. A window already in
+    /// the strip is left where it is.
     pub fn prepend_window(&mut self, window: WindowId) -> AppliedLayout {
-        let new_layout = mutations::insert_window_at(&self.virtual_layout, 0, window, &self.config);
+        self.insert_window_at(0, window)
+    }
+
+    /// Insert `window` as a new single-row column at column index `col_idx`
+    /// (clamped to the column count, so `usize::MAX` appends), focus it and
+    /// bring it into view. This is how the monitor-hotplug reconcile puts a
+    /// restored column back into its old slot. A window already in the strip
+    /// is left where it is and the current layout is returned.
+    pub fn insert_window_at(&mut self, col_idx: usize, window: WindowId) -> AppliedLayout {
+        if let Some(seated) = self.already_seated(window) {
+            return seated;
+        }
+        let new_layout =
+            mutations::insert_window_at(&self.virtual_layout, col_idx, window, &self.config);
         self.last_focused_window = Some(window);
         self.apply_mutation(new_layout)
+    }
+
+    /// Put `window` back into column index `col_idx` (clamped, so
+    /// `usize::MAX` appends) **silently**: no focus change and no viewport
+    /// scroll, unlike [`insert_window_at`](Self::insert_window_at). This is
+    /// how the monitor-hotplug reconcile re-seats a column Windows minimized
+    /// with a display change — the user's view and focus cursor stay as they
+    /// were. A window already in the strip is left where it is.
+    pub fn seat_window_at(&mut self, col_idx: usize, window: WindowId) -> AppliedLayout {
+        if let Some(seated) = self.already_seated(window) {
+            return seated;
+        }
+        let new_layout =
+            mutations::seat_window_at(&self.virtual_layout, col_idx, window, &self.config);
+        self.apply_mutation(new_layout)
+    }
+
+    /// The current layout when `window` already has a seat in this strip
+    /// (the membership guard shared by every insert method), else `None`.
+    fn already_seated(&self, window: WindowId) -> Option<AppliedLayout> {
+        self.virtual_layout.find_window(window)?;
+        Some(AppliedLayout {
+            virtual_layout: self.virtual_layout.clone(),
+            actual_layout: self.actual.clone(),
+        })
     }
 
     /// Insert a new window as a column immediately after the focused window.
@@ -615,6 +696,9 @@ impl ScrollingSpace {
     /// assert_eq!(engine.last_focused_window(), Some(WindowId(3)));
     /// ```
     pub fn insert_window(&mut self, window: WindowId) -> AppliedLayout {
+        if let Some(seated) = self.already_seated(window) {
+            return seated;
+        }
         let focused = self.last_focused_window;
         let new_layout = mutations::insert_window_after_focused(
             &self.virtual_layout,
@@ -935,6 +1019,125 @@ mod tests {
         // … and the ladder was re-derived from the new monitor.
         assert_eq!(engine.config().monitor_height, 1000);
         assert_eq!(engine.config().available_height(), 1000);
+    }
+
+    #[test]
+    fn set_monitor_info_clamps_column_widths_when_the_work_area_narrows() {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        engine.add_window(WindowId(1));
+        engine.add_window(WindowId(2));
+        // Column 0 at the monocle width of the 1920 monitor.
+        engine
+            .toggle_monocle(WindowId(1))
+            .expect("monocle on column 0");
+        let wide = engine.virtual_layout().columns[0].width_px;
+        assert_eq!(wide, 1920 - 2 * test_padding().window_gap);
+        // The display is replaced by a 1280-wide one.
+        let narrower = MonitorInfo::single(Rect {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 1080,
+        });
+        let actual = engine.set_monitor_info(narrower);
+        let max = engine.config().abs_max_width;
+        assert_eq!(max, 1280 - 2 * test_padding().window_gap);
+        assert_eq!(engine.virtual_layout().columns[0].width_px, max);
+        // The narrower column was left alone.
+        assert_eq!(engine.virtual_layout().columns[1].width_px, 960);
+        // Nothing projects past the new right edge.
+        let col0 = actual.find(WindowId(1)).expect("column 0 projected").rect;
+        assert!(col0.right() <= 1280, "{col0:?}");
+    }
+
+    #[test]
+    fn reconfigure_refits_row_heights_when_only_the_gap_changes() {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        engine.add_window(WindowId(1));
+        engine
+            .add_window_to_focused_column(WindowId(2))
+            .expect("second row");
+        let rows_sum = |engine: &ScrollingSpace| -> i32 {
+            engine.virtual_layout().columns[0]
+                .rows
+                .iter()
+                .map(|r| r.height)
+                .sum()
+        };
+        let before = rows_sum(&engine);
+        // Same monitor, same widths, a 100 px gap instead of 4: the two rows
+        // plus three gaps must still fit the 1080 budget.
+        let big_gap = Padding {
+            window_gap: 100,
+            up: 0,
+            down: 0,
+        };
+        let actual = engine.reconfigure(960, 320, 100, 100, big_gap, 4);
+        let after = rows_sum(&engine);
+        assert_eq!(after, 1080 - 3 * 100);
+        assert!(after < before);
+        for entry in &actual.entries {
+            assert!(entry.rect.bottom() <= 1080, "{entry:?}");
+        }
+    }
+
+    #[test]
+    fn adding_a_seated_window_again_does_not_create_a_second_column() {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        engine.add_window(WindowId(1));
+        engine.add_window(WindowId(2));
+        engine.set_focus(WindowId(2));
+        let before = engine.virtual_layout().clone();
+        let applied = engine.add_window(WindowId(1));
+        assert_eq!(engine.virtual_layout(), &before);
+        assert_eq!(&applied.virtual_layout, &before);
+        assert_eq!(engine.last_focused_window(), Some(WindowId(2)));
+        engine.insert_window(WindowId(1));
+        engine.prepend_window(WindowId(1));
+        engine.insert_window_at(1, WindowId(1));
+        engine.seat_window_at(0, WindowId(1));
+        assert_eq!(engine.virtual_layout(), &before);
+        assert_eq!(engine.virtual_layout().window_count(), 2);
+    }
+
+    #[test]
+    fn seat_window_at_leaves_focus_and_viewport_alone() {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        for id in 1..=4 {
+            engine.insert_window(WindowId(id));
+        }
+        // Inserting (and revealing) 4 scrolled the viewport right.
+        let offset = engine.virtual_layout().viewport_offset;
+        assert!(offset > 0);
+        engine.seat_window_at(1, WindowId(9));
+        assert_eq!(engine.virtual_layout().viewport_offset, offset);
+        assert_eq!(engine.last_focused_window(), Some(WindowId(4)));
+        assert_eq!(
+            engine.virtual_layout().columns[1].rows[0].window_id,
+            WindowId(9)
+        );
+    }
+
+    #[test]
+    fn insert_window_at_seats_a_window_at_the_given_column() {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        engine.add_window(WindowId(1));
+        engine.add_window(WindowId(3));
+        engine.insert_window_at(1, WindowId(2));
+        let order: Vec<WindowId> = engine
+            .virtual_layout()
+            .columns
+            .iter()
+            .map(|c| c.rows[0].window_id)
+            .collect();
+        assert_eq!(order, vec![WindowId(1), WindowId(2), WindowId(3)]);
+        assert_eq!(engine.last_focused_window(), Some(WindowId(2)));
+        // Past the end appends.
+        engine.insert_window_at(usize::MAX, WindowId(4));
+        assert_eq!(
+            engine.virtual_layout().columns[3].rows[0].window_id,
+            WindowId(4)
+        );
     }
 
     #[test]

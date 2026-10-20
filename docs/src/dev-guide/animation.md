@@ -229,10 +229,24 @@ neighbour, sliding in from behind it, or sliding from one blocked slot across
 to the other. Parking on a free side keeps the ordinary slide, as does any
 on-screen to on-screen move. When the previous rect equals the new one *and*
 that slot is on a blocked side, the window is already there (its last move was
-instant, so no tween can be in flight) and **no target is emitted** at all, so
-a layout does not re-`SetWindowPos` every parked window. Free-side parked
-windows are always resubmitted because their slide may still be mid-flight and
-a superseding batch would otherwise strand them.
+instant, so no tween can be in flight) and **no target is emitted** at all
+(`Move::Stay`), so a layout does not re-`SetWindowPos` every parked window.
+Free-side parked windows are always resubmitted because their slide may still
+be mid-flight and a superseding batch would otherwise strand them.
+
+`Stay` is only sound when "the previous rect" is the rect the window was
+**last sent to by any path**, not the registry's last *committed* rect: drag
+and resize previews, bystander teleports and the hotplug re-seat all move
+windows without committing. `FlowWM::submitted_rects` keeps that per-HWND
+record — the visible rect with any workspace offset applied, written by every
+submit path (`push_targets` collects it, the teleports record only a
+`SetWindowPos` that succeeded) and read first by every target builder, with
+the registry rect or the caller's snapshot as the fallback for a window never
+submitted since start-up. Without it a parked column that one preview brought
+on-screen would be told to `Stay` parked by the next preview (left overhanging
+the neighbour), or the preview after that would tween it from a far slot it no
+longer occupies. The entry is dropped when the window leaves the layout
+(destroyed, minimized, hidden).
 
 The rule covers both axes. Columns park **left/right** of the virtual screen;
 inactive workspaces park **above/below** it when the monitor has a display
@@ -252,8 +266,9 @@ one side free the strip still slides in from (or out to) that side.
 Every submit path builds its targets through one helper (`push_targets`):
 `animate_layout`'s `collect_targets`, `animate_workspaces[_on]` (workspace
 switches, float toggles, the loadout apply) and the construction-time
-`animate_layout_raw`. The decision needs each window's **pre-batch** rect, so
-callers submit before syncing the registry's tiled rects
+`animate_layout_raw`. The decision needs each window's **pre-batch** rect:
+the last submitted one when there is a record (see above), else the one the
+caller names — callers submit before syncing the registry's tiled rects
 (`PrevRects::Registry`), or capture the rects first and pass
 `PrevRects::Snapshot`. The registry's rects are *workspace-local* — a window
 in a parked workspace is recorded at its on-screen layout rect — so

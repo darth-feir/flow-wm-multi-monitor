@@ -128,13 +128,20 @@ The load path (`FlowWM::apply_loadout`) is shared by auto-restore and manual
 1. Parse; reject on a non-current `version`.
 2. Collect live managed windows' `HWND`s (skip `Ignored`).
 3. **Resolve** every saved slot's `HWND` against that set — no daemon mutation.
-   The first missing `HWND` aborts the whole load.
-4. **Apply** per-workspace: `set_layout` replaces the tiling canvas, floating
-   windows are placed at their saved rectangles, and registry state is synced.
-   Focus is restored by its saved `HWND` directly.
-5. **Leftover** windows — open now but not referenced by the loadout — are
-   appended as new columns on the active workspace, so no open window
-   disappears.
+   The first missing `HWND` aborts the whole load ("window not currently
+   open"); a window named by two slots aborts it too, with its own reason
+   ("window referenced twice").
+4. **Apply** per-workspace: `set_layout` replaces the tiling canvas (a saved
+   column with no rows builds no column — and the writer never emits one),
+   floating windows are placed at their saved rectangles, and registry state
+   is synced. Focus is restored by its saved `HWND` directly. A snapshot whose
+   workspace id exists on no monitor is not applied; its tiles and floats are
+   handed to the leftover pass instead of being seated nowhere (every
+   referenced window was purged from its old seat before this phase).
+5. **Leftover** windows — open now but not referenced by the loadout, plus
+   the tiles and floats of an unknown-workspace snapshot — are appended as
+   new columns on the active workspace (floats clamped into its work area),
+   so no open window disappears.
 
 There is no staleness check: a loadout is restored whenever every saved `HWND`
 is live, and the no-partial abort handles the rest. See the Design Decisions

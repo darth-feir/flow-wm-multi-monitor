@@ -46,6 +46,11 @@ use super::types::FlowWM;
 /// [`FlowWM::snapshot_stacked_prev_rects`] snapshot, which applies the
 /// current parking offsets; otherwise a window coming back from behind a
 /// stacked neighbour reads as on-screen → on-screen and tweens across it.
+///
+/// Both sources are only consulted for a window that has **no** entry in
+/// [`FlowWM::submitted_rects`]: the rect a previous submit (committed or
+/// not) last commanded always wins, see
+/// [`FlowWM::last_submitted_rect`].
 #[derive(Debug, Clone, Copy)]
 pub(super) enum PrevRects<'a> {
     /// The registry's tiled / float rects still describe the pre-batch
@@ -148,8 +153,9 @@ impl FlowWM {
     /// windows stop wherever the second submission caught them.
     pub(super) fn animate_layouts_on(&mut self, layouts: &[(usize, &AppliedLayout)]) {
         let mut targets: Vec<WindowTarget> = Vec::new();
+        let mut submitted: Vec<(isize, Rect)> = Vec::new();
         for (idx, layout) in layouts {
-            self.collect_targets(layout, *idx, &mut targets);
+            self.collect_targets(layout, *idx, &mut targets, &mut submitted);
         }
         if !targets.is_empty() {
             log::debug!(
@@ -161,6 +167,7 @@ impl FlowWM {
                 log::warn!("animation error: {e}");
             }
         }
+        self.record_submitted(&submitted);
         for (_, layout) in layouts {
             self.registry
                 .update_tiling_slots_from_layout(&layout.virtual_layout);
@@ -183,7 +190,9 @@ impl FlowWM {
     /// position as intended.
     fn submit_animation(&mut self, layout: &AppliedLayout, monitor_idx: usize) {
         let mut targets: Vec<WindowTarget> = Vec::new();
-        self.collect_targets(layout, monitor_idx, &mut targets);
+        let mut submitted: Vec<(isize, Rect)> = Vec::new();
+        self.collect_targets(layout, monitor_idx, &mut targets, &mut submitted);
+        self.record_submitted(&submitted);
         if targets.is_empty() {
             return;
         }
@@ -196,14 +205,41 @@ impl FlowWM {
         }
     }
 
+    /// The rect the last submit commanded for `hwnd`, if any — see
+    /// [`submitted_rects`](FlowWM::submitted_rects). This is the pre-batch
+    /// rect every target builder reads first; a committed registry rect or a
+    /// caller's snapshot only fills in for a window never submitted.
+    #[must_use]
+    pub(super) fn last_submitted_rect(&self, hwnd: isize) -> Option<Rect> {
+        self.submitted_rects.get(&hwnd).copied()
+    }
+
+    /// Record the visible rects a submit path just commanded (see
+    /// [`submitted_rects`](FlowWM::submitted_rects)).
+    pub(super) fn record_submitted(&mut self, submitted: &[(isize, Rect)]) {
+        for &(hwnd, rect) in submitted {
+            self.submitted_rects.insert(hwnd, rect);
+        }
+    }
+
+    /// Drop `hwnd`'s last-submitted rect: the window left the layout
+    /// (destroyed, minimized, hidden), so the next time it is seated nothing
+    /// may assume it still sits where it was last sent.
+    pub(super) fn forget_submitted(&mut self, hwnd: isize) {
+        self.submitted_rects.remove(&hwnd);
+    }
+
     /// Append the animator targets for `layout` (produced by `monitor_idx`'s
     /// scrolling space) to `targets`, teleporting the windows whose tween
-    /// would cross a neighbouring monitor.
-    fn collect_targets(
+    /// would cross a neighbouring monitor, and the visible rect commanded
+    /// for each window to `submitted` (for
+    /// [`record_submitted`](Self::record_submitted) once the batch is sent).
+    pub(super) fn collect_targets(
         &self,
         layout: &AppliedLayout,
         monitor_idx: usize,
         targets: &mut Vec<WindowTarget>,
+        submitted: &mut Vec<(isize, Rect)>,
     ) {
         if layout.actual_layout.entries.is_empty() {
             return;
@@ -264,11 +300,16 @@ impl FlowWM {
                 .visible_to_window(entry.rect)
                 .inset(border_thickness - border_overlap);
 
-            // The registry's tiled rect is still the pre-mutation one here:
-            // animate_layouts_on syncs the registry after submitting.
-            let prev_rect = registry_prev_rect(window);
+            // The last commanded rect first (a preview may have moved the
+            // window without committing); the registry's tiled rect — still
+            // the pre-mutation one here, animate_layouts_on syncs it after
+            // submitting — only for a window never submitted.
+            let prev_rect = self
+                .last_submitted_rect(entry.window_id.0)
+                .or_else(|| registry_prev_rect(window));
             push_targets(
                 targets,
+                submitted,
                 &monitor_info,
                 entry.window_id.0,
                 prev_rect,
@@ -412,7 +453,12 @@ impl FlowWM {
             return;
         }
 
-        let (targets, has_float_target) = self.workspace_targets(monitor_idx, batches, prev);
+        let WorkspaceTargets {
+            targets,
+            has_float_target,
+            submitted,
+        } = self.workspace_targets(monitor_idx, batches, prev);
+        self.record_submitted(&submitted);
 
         if targets.is_empty() {
             return;
@@ -437,21 +483,24 @@ impl FlowWM {
         }
     }
 
-    /// The animator targets for a workspace batch on `monitor_idx`, and
-    /// whether any of them is a tracked float window.
+    /// The animator targets for a workspace batch on `monitor_idx`, whether
+    /// any of them is a tracked float window, and the visible rect commanded
+    /// for each window.
     ///
     /// This is the pure half of
     /// [`animate_workspaces_on`](Self::animate_workspaces_on): every window of
     /// every `(layout, y_offset)` pair is shifted by its offset and run
-    /// through [`push_targets`] with its pre-batch rect from `prev`, so the
-    /// neighbour-teleport decision is made here. Split out so tests can
-    /// inspect the decisions without an animator.
+    /// through [`push_targets`] with its pre-batch rect — the last submitted
+    /// one, else the one `prev` supplies — so the neighbour-teleport
+    /// decision is made here. Split out so tests can inspect the decisions
+    /// without an animator; the caller records `submitted` once the batch
+    /// is sent.
     pub(super) fn workspace_targets(
         &self,
         monitor_idx: usize,
         batches: &[(ActualLayout, i32)],
         prev: PrevRects<'_>,
-    ) -> (Vec<WindowTarget>, bool) {
+    ) -> WorkspaceTargets {
         let border_thickness = self.config.borders.thickness as i32;
         let border_overlap = self.config.borders.overlap as i32;
         let monitor_info = *self.monitors[monitor_idx].active_scrolling().monitor();
@@ -460,6 +509,7 @@ impl FlowWM {
         // (rather than `flat_map`) lets us hold one `&self.registry` borrow
         // at a time without entangling the borrow checker across closures.
         let mut targets: Vec<WindowTarget> = Vec::new();
+        let mut submitted: Vec<(isize, Rect)> = Vec::new();
         // Whether any target in this batch is a tracked float window. Used
         // after the loop to decide whether to suppress LOCATIONCHANGE capture
         // for the animation's duration.
@@ -492,9 +542,12 @@ impl FlowWM {
                 // The border overlay sits at the visible rect (same y_offset)
                 // so it moves in lockstep with the window across the switch.
                 let next = shift(entry.rect);
-                let prev_rect = prev.rect_for(entry.window_id.0, window);
+                let prev_rect = self
+                    .last_submitted_rect(entry.window_id.0)
+                    .or_else(|| prev.rect_for(entry.window_id.0, window));
                 push_targets(
                     &mut targets,
+                    &mut submitted,
                     &monitor_info,
                     entry.window_id.0,
                     prev_rect,
@@ -504,7 +557,11 @@ impl FlowWM {
                 );
             }
         }
-        (targets, has_float_target)
+        WorkspaceTargets {
+            targets,
+            has_float_target,
+            submitted,
+        }
     }
 
     /// Silently teleport windows across multiple workspaces, bypassing the animator.
@@ -538,10 +595,13 @@ impl FlowWM {
     ///
     /// Per-window failures are logged at `warn` level but never propagated.
     /// A failed teleport leaves a window at its old position — a minor
-    /// visual inconsistency on a non-visible workspace, not a crash.
-    pub(super) fn teleport_workspaces(&self, batches: &[(ActualLayout, i32)]) {
+    /// visual inconsistency on a non-visible workspace, not a crash — and
+    /// is **not** recorded as the window's last submitted rect, so the next
+    /// batch still moves it from where it really is.
+    pub(super) fn teleport_workspaces(&mut self, batches: &[(ActualLayout, i32)]) {
         let border_thickness = self.config.borders.thickness as i32;
         let border_overlap = self.config.borders.overlap as i32;
+        let mut submitted: Vec<(isize, Rect)> = Vec::new();
         for (layout, y_offset) in batches {
             for entry in &layout.entries {
                 let window = self.registry.get_window(HWND(entry.window_id.0 as *mut _));
@@ -553,30 +613,35 @@ impl FlowWM {
                 let target_y = window_rect.y + y_offset;
 
                 // Direct SetWindowPos — bypass the animator entirely.
-                // Per-window result ignored: teleport is best-effort, and a
-                // single failure must not abort the rest of the batch.
-                let _ = crate::registry::win32::set_window_rect(
+                // Teleport is best-effort: a single failure must not abort
+                // the rest of the batch, it only keeps the window out of the
+                // submitted-rect record.
+                let visible = Rect {
+                    x: entry.rect.x,
+                    y: entry.rect.y + y_offset,
+                    width: entry.rect.width,
+                    height: entry.rect.height,
+                };
+                if crate::registry::win32::set_window_rect(
                     entry.window_id.0,
                     window_rect.x,
                     target_y,
                     window_rect.width,
                     window_rect.height,
-                );
+                ) {
+                    submitted.push((entry.window_id.0, visible));
+                }
 
                 // Teleport the border overlay to match. `set_geometry` calls
                 // `SetWindowPos`, which triggers `WM_SIZE` → repaint if the size
                 // changed, keeping the bitmap in sync on instant repositioning.
                 // Option<&Window> is Copy so re-using `window` here is sound.
                 if let Some(border) = window.and_then(|w| w.border.as_ref()) {
-                    border.set_geometry(Rect {
-                        x: entry.rect.x,
-                        y: entry.rect.y + y_offset,
-                        width: entry.rect.width,
-                        height: entry.rect.height,
-                    });
+                    border.set_geometry(visible);
                 }
             }
         }
+        self.record_submitted(&submitted);
     }
 
     /// Non-committing teleport preview for a resize drag.
@@ -597,9 +662,10 @@ impl FlowWM {
     /// single active-workspace [`AppliedLayout`] and honors the drag-exclusion
     /// filter — the resize analog of [`animate_preview_on`](Self::animate_preview_on),
     /// except it bypasses the animator (Teleport, not animation) per ADR-0004.
-    pub(super) fn teleport_preview(&self, preview: &AppliedLayout) {
+    pub(super) fn teleport_preview(&mut self, preview: &AppliedLayout) {
         let border_thickness = self.config.borders.thickness as i32;
         let border_overlap = self.config.borders.overlap as i32;
+        let mut submitted: Vec<(isize, Rect)> = Vec::new();
 
         // Active-drag exclusion filter — same intent as submit_animation's, so
         // the animator-free teleport also leaves the dragged window alone.
@@ -628,21 +694,39 @@ impl FlowWM {
                 .visible_to_window(entry.rect)
                 .inset(border_thickness - border_overlap);
             // Direct SetWindowPos — bypass the animator entirely so the boundary
-            // follows the cursor with no tween lag.
-            let _ = crate::registry::win32::set_window_rect(
+            // follows the cursor with no tween lag. A successful move is the
+            // window's new last-submitted rect (the preview never commits to
+            // the registry, so this record is all the next batch has).
+            if crate::registry::win32::set_window_rect(
                 entry.window_id.0,
                 window_rect.x,
                 window_rect.y,
                 window_rect.width,
                 window_rect.height,
-            );
+            ) {
+                submitted.push((entry.window_id.0, entry.rect));
+            }
 
             // Teleport the border overlay to match (option<&Window> is Copy).
             if let Some(border) = window.and_then(|w| w.border.as_ref()) {
                 border.set_geometry(entry.rect);
             }
         }
+        self.record_submitted(&submitted);
     }
+}
+
+/// What [`FlowWM::workspace_targets`] builds for one batch.
+#[derive(Debug, Default)]
+pub(super) struct WorkspaceTargets {
+    /// The animator targets (windows and their border overlays).
+    pub targets: Vec<WindowTarget>,
+    /// Whether any target is a tracked float window (the caller suppresses
+    /// float-location tracking for the animation's duration if so).
+    pub has_float_target: bool,
+    /// The visible rect commanded for each window, for
+    /// [`FlowWM::record_submitted`].
+    pub submitted: Vec<(isize, Rect)>,
 }
 
 /// Convert an [`AppliedLayout`] into animation targets and submit to an animator.
@@ -685,6 +769,9 @@ pub(super) fn animate_layout_raw(
     }
 
     let mut targets: Vec<WindowTarget> = Vec::new();
+    // Nothing records these: the daemon's submitted-rect map does not exist
+    // yet, and its readers fall back to the registry rect this snap sets.
+    let mut submitted: Vec<(isize, Rect)> = Vec::new();
     for entry in &layout.actual_layout.entries {
         let window = registry.get_window(HWND(entry.window_id.0 as *mut _));
         let invisible_bounds = window.map(|w| w.invisible_bounds).unwrap_or_default();
@@ -700,6 +787,7 @@ pub(super) fn animate_layout_raw(
         // Nothing has been laid out yet, so there is no previous rect.
         push_targets(
             &mut targets,
+            &mut submitted,
             monitor,
             entry.window_id.0,
             None,
@@ -820,9 +908,14 @@ pub(super) enum Move {
 /// When `prev == Some(next)` and that slot is on a blocked side the window
 /// is already there — its last move was instant, so no tween can be in
 /// flight for it — and the answer is [`Move::Stay`], which saves a
-/// `SetWindowPos` per parked window per layout. Free-side parked windows
-/// never get `Stay`: they slid there, may still be mid-flight, and must be
-/// resubmitted so a superseding batch does not strand them.
+/// `SetWindowPos` per parked window per layout. For that to hold, `prev`
+/// must be the rect the window was **last sent to** by any path, committed
+/// or not ([`FlowWM::last_submitted_rect`]), never merely the registry's
+/// last committed rect: a drag preview can move a parked column on-screen
+/// without committing, and the next preview must then move it back instead
+/// of staying put. Free-side parked windows never get `Stay`: they slid
+/// there, may still be mid-flight, and must be resubmitted so a superseding
+/// batch does not strand them.
 pub(super) fn plan_move(monitor: &MonitorInfo, prev: Option<Rect>, next: Rect) -> Move {
     let next_blocked = parked_on_blocked_side(monitor, next);
     let prev_blocked = prev.is_some_and(|p| parked_on_blocked_side(monitor, p));
@@ -846,8 +939,11 @@ fn tween_crosses_neighbour(monitor: &MonitorInfo, prev: Option<Rect>, next: Rect
 
 /// Append the animator target(s) for one window — the window itself and,
 /// when it has one, its border overlay — to `targets`, choosing tween,
-/// instant move or no target per [`plan_move`]. Every submit path builds its
-/// targets through here so the teleport rule is applied uniformly.
+/// instant move or no target per [`plan_move`], and `(hwnd, next)` to
+/// `submitted` so the caller can record where the window was sent
+/// ([`FlowWM::record_submitted`]; a `Stay` is recorded too — the window is
+/// there). Every submit path builds its targets through here so the
+/// teleport rule is applied uniformly.
 ///
 /// `next` is the layout's visible rect (any workspace `y_offset` already
 /// applied): it drives the decision and seats the border overlay, which sits
@@ -859,8 +955,10 @@ fn tween_crosses_neighbour(monitor: &MonitorInfo, prev: Option<Rect>, next: Rect
 /// the overlay HWND like any other window).
 ///
 /// Returns the decision so callers can log or count it.
+#[allow(clippy::too_many_arguments)]
 fn push_targets(
     targets: &mut Vec<WindowTarget>,
+    submitted: &mut Vec<(isize, Rect)>,
     monitor: &MonitorInfo,
     hwnd: isize,
     prev: Option<Rect>,
@@ -869,6 +967,7 @@ fn push_targets(
     border_hwnd: Option<isize>,
 ) -> Move {
     let decision = plan_move(monitor, prev, next);
+    submitted.push((hwnd, next));
     log::debug!(
         "animate: hwnd={hwnd} {decision:?} ({},{},{},{}) [visible] → ({},{},{},{}) [window]",
         next.x,
@@ -1012,8 +1111,10 @@ mod tests {
         assert_eq!(plan_move(&m, Some(parked_left), parked_left), Move::Stay);
         assert!(!tween_crosses_neighbour(&m, Some(parked_left), parked_left));
         let mut targets = Vec::new();
+        let mut submitted = Vec::new();
         let decision = push_targets(
             &mut targets,
+            &mut submitted,
             &m,
             7,
             Some(parked_left),
@@ -1023,6 +1124,7 @@ mod tests {
         );
         assert_eq!(decision, Move::Stay);
         assert!(targets.is_empty(), "no target is emitted for a Stay");
+        assert_eq!(submitted, vec![(7, parked_left)]);
     }
 
     #[test]
@@ -1038,9 +1140,11 @@ mod tests {
     fn push_targets_marks_window_and_border_instant_together() {
         let m = primary_with_left_neighbour();
         let mut targets = Vec::new();
+        let mut submitted = Vec::new();
         let next = col(-2401);
         let decision = push_targets(
             &mut targets,
+            &mut submitted,
             &m,
             7,
             Some(col(11)),
@@ -1057,7 +1161,16 @@ mod tests {
         assert_eq!(targets[1].as_rect().x, next.x);
 
         let mut targets = Vec::new();
-        let decision = push_targets(&mut targets, &m, 7, Some(col(11)), col(487), col(487), None);
+        let decision = push_targets(
+            &mut targets,
+            &mut submitted,
+            &m,
+            7,
+            Some(col(11)),
+            col(487),
+            col(487),
+            None,
+        );
         assert_eq!(decision, Move::Tween);
         assert_eq!(targets.len(), 1);
         assert!(!targets[0].instant);
@@ -1157,8 +1270,10 @@ mod tests {
         let on_screen = col(11);
         assert_eq!(plan_move(&m, Some(parked), on_screen), Move::Instant);
         let mut targets = Vec::new();
+        let mut submitted = Vec::new();
         let decision = push_targets(
             &mut targets,
+            &mut submitted,
             &m,
             7,
             Some(parked),
@@ -1347,7 +1462,9 @@ mod tests {
         // With the stacked snapshot (what the switch uses) the incoming
         // window is instant and the outgoing one still slides.
         let snap = flow.snapshot_stacked_prev_rects();
-        let (targets, _) = flow.workspace_targets(0, &batches, PrevRects::Snapshot(&snap));
+        let targets = flow
+            .workspace_targets(0, &batches, PrevRects::Snapshot(&snap))
+            .targets;
         assert_eq!(
             find(&targets, WS1_HWND),
             Some(true),
@@ -1362,7 +1479,9 @@ mod tests {
         // The workspace-local registry rects would have hidden the parked
         // position (on-screen -> on-screen reads as a tween): this is the
         // VM failure and why the switch must not use `PrevRects::Registry`.
-        let (targets, _) = flow.workspace_targets(0, &batches, PrevRects::Registry);
+        let targets = flow
+            .workspace_targets(0, &batches, PrevRects::Registry)
+            .targets;
         assert_eq!(find(&targets, WS1_HWND), Some(false));
     }
 
@@ -1375,6 +1494,169 @@ mod tests {
         let mut flow = stacked_flow_with_ws1_parked_above();
         assert!(flow.switch_workspace_layout(WorkspaceId(1), WorkspaceId(2)));
         assert_eq!(flow.monitors[0].active_workspace_id(), WorkspaceId(1));
+    }
+
+    /// A daemon on `primary_with_left_neighbour` whose strip holds three
+    /// 960-wide columns with the viewport at the end, so column 0 (`P`) is
+    /// parked behind the left neighbour and the registry records it there.
+    fn flow_with_a_column_parked_behind_the_left_neighbour() -> (FlowWM, isize) {
+        use crate::config::types::WindowRulesConfig;
+        use crate::layout::types::Padding;
+        use crate::registry::WindowRegistry;
+        use crate::registry::win32::WindowInfo;
+        use crate::workspace::{Monitor, ScrollingSpace, Workspace, WorkspaceId};
+        use windows::Win32::Foundation::HWND;
+
+        const P: isize = 0x30001;
+        let rules = WindowRulesConfig::default();
+        let mut registry = WindowRegistry::new(&rules, &rules);
+        for hwnd in [P, 0x30002, 0x30003] {
+            registry.register_window_from_info(&WindowInfo {
+                hwnd: HWND(hwnd as *mut _),
+                title: "TestWindow".into(),
+                class: "TestClass".into(),
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 800,
+                    height: 600,
+                },
+                exe: "test.exe".into(),
+                process_path: "C:\test.exe".into(),
+                is_visible: true,
+                is_maximized: false,
+                is_fullscreen: false,
+            });
+        }
+        let info = primary_with_left_neighbour();
+        let padding = Padding {
+            window_gap: 4,
+            up: 0,
+            down: 0,
+        };
+        let mut scrolling = ScrollingSpace::new(info, 960, 320, 100, 100, padding, 4);
+        for hwnd in [P, 0x30002, 0x30003] {
+            // insert_window reveals each new column, scrolling the viewport.
+            scrolling.insert_window(WindowId(hwnd));
+        }
+        registry.update_tiling_slots_from_layout(scrolling.virtual_layout());
+        registry.update_tiled_rects(scrolling.actual_layout());
+        let parked = scrolling
+            .actual_layout()
+            .find(WindowId(P))
+            .expect("P projected")
+            .rect;
+        assert!(info.is_parked(parked), "P must start parked: {parked:?}");
+        assert!(parked.right() <= info.virtual_screen.x, "parked left");
+        let screen = info.work_area;
+        let monitor = Monitor::new(
+            screen,
+            screen,
+            vec![Workspace::new(WorkspaceId(1), scrolling)],
+            0,
+        );
+        (FlowWM::new_for_test(registry, vec![monitor]), P)
+    }
+
+    /// The decision `collect_targets` would make for `hwnd` under `layout`,
+    /// and whether a target was emitted for it.
+    fn decision_for(
+        flow: &FlowWM,
+        layout: &crate::layout::types::AppliedLayout,
+        hwnd: isize,
+    ) -> (Option<bool>, Rect) {
+        let mut targets = Vec::new();
+        let mut submitted = Vec::new();
+        flow.collect_targets(layout, 0, &mut targets, &mut submitted);
+        let instant = targets
+            .iter()
+            .find(|t| t.window_ref.0 == hwnd)
+            .map(|t| t.instant);
+        let next = submitted
+            .iter()
+            .find(|(h, _)| *h == hwnd)
+            .map(|(_, r)| *r)
+            .expect("every window in the layout is recorded");
+        (instant, next)
+    }
+
+    #[test]
+    fn preview_sequence_moves_a_parked_column_instantly_each_time_and_never_stays_stale() {
+        // Drag previews never commit to the registry. A parked column that
+        // one preview brings on-screen must be sent back instantly by the
+        // next preview (not told to Stay because the registry still says
+        // "parked"), and a third preview that leaves it parked is a Stay.
+        let (mut flow, p) = flow_with_a_column_parked_behind_the_left_neighbour();
+        let committed = {
+            let space = flow.monitors[0].active_scrolling();
+            crate::layout::types::AppliedLayout {
+                virtual_layout: space.virtual_layout().clone(),
+                actual_layout: space.actual_layout().clone(),
+            }
+        };
+        let parked_rect = committed
+            .actual_layout
+            .find(WindowId(p))
+            .expect("P in the layout")
+            .rect;
+        // A preview with the viewport back at the start: P comes on-screen.
+        let on_screen_preview = {
+            let mut vl = committed.virtual_layout.clone();
+            vl.viewport_offset = 0;
+            let monitor = *flow.monitors[0].active_scrolling().monitor();
+            let padding = flow.monitors[0].active_scrolling().padding();
+            let actual = crate::layout::projection::project(&vl, &monitor, &padding);
+            crate::layout::types::AppliedLayout {
+                virtual_layout: vl,
+                actual_layout: actual,
+            }
+        };
+        let on_screen_rect = on_screen_preview
+            .actual_layout
+            .find(WindowId(p))
+            .expect("P in the preview")
+            .rect;
+        assert!(on_screen_rect.overlaps(flow.monitors[0].work_area()));
+
+        // 1. Parked (registry) -> on-screen preview: instant, from behind
+        //    the neighbour.
+        assert_eq!(flow.last_submitted_rect(p), None);
+        let (instant, next) = decision_for(&flow, &on_screen_preview, p);
+        assert_eq!(instant, Some(true));
+        assert_eq!(next, on_screen_rect);
+        flow.animate_preview_on(0, &on_screen_preview);
+        assert_eq!(flow.last_submitted_rect(p), Some(on_screen_rect));
+        // The registry still holds the committed (parked) rect: the preview
+        // never commits.
+        assert_eq!(
+            flow.registry
+                .get_window(HWND(p as *mut _))
+                .and_then(|w| w.tiled_rect),
+            Some(parked_rect)
+        );
+
+        // 2. On-screen (last submitted) -> parked preview: instant again,
+        //    not a Stay — the window is not where the registry says.
+        let (instant, next) = decision_for(&flow, &committed, p);
+        assert_eq!(
+            instant,
+            Some(true),
+            "must be sent back behind the neighbour"
+        );
+        assert_eq!(next, parked_rect);
+        flow.animate_preview_on(0, &committed);
+        assert_eq!(flow.last_submitted_rect(p), Some(parked_rect));
+
+        // 3. Parked (last submitted) -> parked preview: already there, Stay.
+        let (instant, _) = decision_for(&flow, &committed, p);
+        assert_eq!(instant, None, "a Stay emits no target");
+
+        // Leaving the layout forgets the record; the registry rect is the
+        // fallback again.
+        flow.forget_submitted(p);
+        assert_eq!(flow.last_submitted_rect(p), None);
+        let (instant, _) = decision_for(&flow, &committed, p);
+        assert_eq!(instant, None, "registry says parked: Stay");
     }
 
     #[test]

@@ -153,6 +153,9 @@ impl FlowWM {
     /// entry moves to that monitor's active workspace, the owning-monitor
     /// memory is updated and the float set is rebuilt, so `move-to-monitor`
     /// and the next workspace switch reason from the right monitor (B9).
+    /// When the re-homed float is the registry's focused window the active
+    /// monitor follows it too: the user dragged their focus over there, and
+    /// no focus event will say so.
     ///
     /// Pure bookkeeping (no Win32): the caller reads the rect.
     pub(super) fn relocate_float(&mut self, wid: WindowId, visible_rect: Rect) -> bool {
@@ -186,6 +189,9 @@ impl FlowWM {
         self.remember_monitor(wid, target);
         if target != owner {
             self.rebuild_float_hwnds();
+            if self.registry.focused() == Some(wid) {
+                self.set_active_monitor(target);
+            }
         }
         true
     }
@@ -347,6 +353,30 @@ mod tests {
     #[test]
     fn union_of_no_floats_is_empty() {
         assert!(float_hwnds_union(&[monitor_at(0), monitor_at(1920)]).is_empty());
+    }
+
+    #[test]
+    fn rehoming_the_focused_float_moves_the_active_monitor_with_it() {
+        let rules = WindowRulesConfig::default();
+        let mut registry = WindowRegistry::new(&rules, &rules);
+        float_window(&mut registry, 0x11, rect(100, 100, 400, 300));
+        float_window(&mut registry, 0x12, rect(100, 500, 400, 300));
+        registry.set_focused(0x11);
+        let mut flow = FlowWM::new_for_test(registry, vec![monitor_at(0), monitor_at(1920)]);
+        for hwnd in [0x11, 0x12] {
+            flow.monitors[0]
+                .active_workspace_mut()
+                .floating
+                .add(WindowId(hwnd), rect(100, 100, 400, 300));
+            flow.remember_monitor(WindowId(hwnd), 0);
+        }
+        assert_eq!(flow.active_monitor, 0);
+        // An unfocused float dragged over: the active monitor stays.
+        assert!(flow.relocate_float(WindowId(0x12), rect(2500, 300, 400, 300)));
+        assert_eq!(flow.active_monitor, 0);
+        // The focused float dragged over: the active monitor follows.
+        assert!(flow.relocate_float(WindowId(0x11), rect(2500, 300, 400, 300)));
+        assert_eq!(flow.active_monitor, 1);
     }
 
     #[test]

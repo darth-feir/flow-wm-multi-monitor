@@ -416,6 +416,10 @@ impl WindowRegistry {
     /// - **Floating::Active { .. }** → transitions to `Floating::Minimized`.
     /// - **Already minimized or ignored** → no-op (returns early).
     ///
+    /// Either transition stamps
+    /// [`minimized_at`](super::types::Window::minimized_at) with `now`, for
+    /// the hotplug reconcile's "minimized with the display change" test.
+    ///
     /// # Design: Why Save the Virtual Slot?
     ///
     /// When a tiled window is minimized, its position in the layout grid
@@ -447,6 +451,7 @@ impl WindowRegistry {
                 _ => return, // Already minimized or ignored — no-op.
             };
             window.state = new_state;
+            window.minimized_at = Some(std::time::Instant::now());
             log::info!("minimized window: isize={hwnd_val}");
         }
     }
@@ -488,6 +493,7 @@ impl WindowRegistry {
                 _ => return, // Not minimized — no-op.
             };
             window.state = new_state;
+            window.minimized_at = None;
             log::info!("restored window: isize={hwnd_val}");
         }
     }
