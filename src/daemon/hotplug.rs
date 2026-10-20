@@ -1567,6 +1567,39 @@ mod tests {
         assert_eq!(next_reconcile_retry(MAX_RECONCILE_RETRIES), None);
     }
 
+    /// With presets configured, tiles migrating from a vanished display are
+    /// created at the survivor's current preset width — widths follow the
+    /// monitor — while the survivor's own columns keep theirs.
+    #[test]
+    fn migrated_tiles_take_the_survivors_preset_width() {
+        let mut flow = side_by_side_flow();
+        flow.config.padding.window_gap = 4;
+        flow.config.min_column_width_px = 320;
+        flow.config.columns =
+            Some(toml::from_str("presets = [\"1/3\", \"1/2\", \"1/1\"]").expect("columns"));
+        flow.monitors[0].set_width_preset(2); // 1/1 on the primary: 1920 - 8
+        let mut probe = MockTopology::new(vec![geo(1, PRIMARY, true)]);
+        for hwnd in [A, B, C, D, F, M] {
+            probe.nearest.insert(hwnd, 1);
+        }
+        probe.iconic.insert(M);
+        flow.reconcile_monitors_with(&probe)
+            .expect("reconcile succeeds");
+
+        let strip = flow.monitors[0].active_scrolling().virtual_layout();
+        assert_eq!(
+            flow.monitors[0].active_scrolling().config().column_width,
+            1912
+        );
+        for hwnd in [B, C, D, M] {
+            let (col, _) = strip.find_window(WindowId(hwnd)).expect("migrated");
+            assert_eq!(strip.columns[col].width_px, 1912, "{hwnd:#x}");
+        }
+        // The survivor's own column was not resized by the reconcile.
+        let (col, _) = strip.find_window(WindowId(A)).expect("A");
+        assert_eq!(strip.columns[col].width_px, 960);
+    }
+
     #[test]
     fn restore_order_preserved_for_a_vanished_strip() {
         // The LEFT monitor's whole strip (B, C, D) was minimized by Windows,

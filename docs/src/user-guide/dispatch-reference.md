@@ -294,9 +294,15 @@ Default hotkey: `Alt + [` / `Alt + ]`.
 
 Move the focused window to the active workspace of the monitor in that
 direction. A tiled window joins that strip at the near edge (moving right puts
-it at the left end of the right-hand monitor); a float keeps its position
-relative to the work area. Focus follows the window. `move-window left` /
-`move-window right` at the edge of a strip does the same hop.
+it at the left end of the right-hand monitor) and takes **that monitor's**
+column width — its current [`width` preset](#width-presetnextprevcycle) when
+`[columns]` is configured, else the base width derived for that monitor; a
+float keeps its position relative to the work area. Focus follows the window.
+`move-window left` / `move-window right` at the edge of a strip does the same
+hop. The same rule applies to every other way a column arrives on a monitor:
+a window re-tiled from floating or fullscreen there, a column migrated by a
+display change, or a loadout column merged from a monitor that is no longer
+attached.
 
 ```powershell
 flow dispatch move-to-monitor right

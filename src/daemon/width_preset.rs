@@ -103,6 +103,16 @@ impl FlowWM {
         ))
     }
 
+    /// Pixel width of the preset monitor `idx` is on, on its own work area
+    /// (`min_column_width_px` floored); `None` without presets. This is the
+    /// width every column arriving on that monitor is created at.
+    #[must_use]
+    pub(super) fn monitor_preset_px(&self, idx: usize) -> Option<u32> {
+        let m = self.monitors.get(idx)?;
+        let info = *m.active_scrolling().monitor();
+        self.preset_px_for(&info, m.width_preset())
+    }
+
     /// Layout parameters for a monitor with geometry `info` that is on
     /// preset `preset_idx`: [`derive_layout_config`] with the base column
     /// width replaced by the preset's pixel width when presets are
@@ -342,6 +352,102 @@ mod tests {
             .scrolling
             .config()
             .column_width
+    }
+
+    /// Monitor 0 on "1/2" (936 px), monitor 1 on "1/1" (1888 px), borders
+    /// off so no overlay window is created by the focus bookkeeping.
+    fn two_preset_fixture() -> FlowWM {
+        let mut flow = fixture();
+        flow.config.borders.enabled = false;
+        flow.apply_width_preset(1, 2);
+        assert_eq!(base_width(&flow, 1, 1), 1888);
+        assert_eq!(widths(&flow, 1, 1), vec![1888, 1888]);
+        flow
+    }
+
+    #[test]
+    fn move_to_monitor_gives_the_window_the_target_monitors_preset_width() {
+        let mut flow = two_preset_fixture();
+        // A (936 wide on monitor 0) moves left onto monitor 1 (1/1).
+        flow.registry.set_focused(A);
+        assert_eq!(
+            flow.dispatch(&SocketMessage::MoveWindowToMonitor {
+                direction: crate::common::Direction::Left,
+            }),
+            SocketResponse::Ok
+        );
+        assert_eq!(widths(&flow, 0, 1), Vec::<i32>::new());
+        let strip = flow.monitors[1].active_scrolling().virtual_layout();
+        let (col, _) = strip.find_window(WindowId(A)).expect("A on monitor 1");
+        assert_eq!(strip.columns[col].width_px, 1888);
+        assert_eq!(flow.active_monitor, 1);
+
+        // And back: A (now 1888 wide, the right-most column of monitor 1)
+        // hops right by move-window at the strip edge and lands on monitor
+        // 0 at 936.
+        flow.registry.set_focused(A);
+        assert_eq!(
+            flow.dispatch(&SocketMessage::MoveWindow {
+                direction: crate::common::Direction::Right,
+            }),
+            SocketResponse::Ok
+        );
+        let strip = flow.monitors[0].active_scrolling().virtual_layout();
+        let (col, _) = strip.find_window(WindowId(A)).expect("A back on monitor 0");
+        assert_eq!(strip.columns[col].width_px, 936);
+        assert_eq!(widths(&flow, 1, 1), vec![1888, 1888]);
+    }
+
+    #[test]
+    fn a_column_merged_from_a_detached_monitor_takes_the_receivers_preset_width() {
+        let mut flow = two_preset_fixture();
+        use crate::loadout::{
+            ColumnSnapshot, LoadoutFile, RowSnapshot, ScrollingSnapshot, WindowRef,
+            WorkspaceSnapshot,
+        };
+        // A snapshot from monitor 7 (not attached) carrying C at 1200 px.
+        let file = LoadoutFile {
+            version: LoadoutFile::CURRENT_VERSION,
+            monitors: vec![],
+            workspaces: vec![WorkspaceSnapshot {
+                monitor: 7,
+                workspace_id: 1,
+                active: true,
+                scrolling: ScrollingSnapshot {
+                    viewport_offset: 0,
+                    focus: None,
+                    columns: vec![ColumnSnapshot {
+                        width_px: 1200,
+                        rows: vec![RowSnapshot {
+                            window: WindowRef {
+                                hwnd: C,
+                                exe: "app.exe".into(),
+                                title: "winC".into(),
+                            },
+                            height_px: 1000,
+                        }],
+                    }],
+                },
+                floating: vec![],
+            }],
+        };
+        let path = std::env::temp_dir().join(format!(
+            "flowwm-width-merge-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, serde_json::to_string(&file).expect("json")).expect("write");
+        assert_eq!(
+            flow.dispatch_loadout_load(Some(path.clone())),
+            SocketResponse::Ok
+        );
+        let _ = std::fs::remove_file(&path);
+        // Merged into monitor 0 (the first with workspace 1): at 936, not 1200.
+        let strip = flow.monitors[0].active_scrolling().virtual_layout();
+        let (col, _) = strip
+            .find_window(WindowId(C))
+            .expect("C merged onto monitor 0");
+        assert_eq!(strip.columns[col].width_px, 936);
     }
 
     #[test]

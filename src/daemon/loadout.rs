@@ -556,6 +556,13 @@ impl FlowWM {
                 merged_snapshots += 1;
             }
             let work_area = self.monitors[monitor_idx].work_area();
+            // Columns arriving from a monitor that is no longer attached
+            // take the receiving monitor's current preset width (widths
+            // follow the monitor); without presets they keep their own.
+            let columns = match (merge, self.monitor_preset_px(monitor_idx)) {
+                (true, Some(px)) => rw.columns.into_iter().map(|(_, rows)| (px, rows)).collect(),
+                _ => rw.columns,
+            };
 
             // We need &mut access to both the workspace (for set_layout +
             // float adds) and the registry (for slot/rect sync). Use index-
@@ -569,14 +576,14 @@ impl FlowWM {
                         columns_of(vl),
                         ws.scrolling.last_focused_window(),
                         vl.viewport_offset,
-                        rw.columns,
+                        columns,
                         rw.focus,
                         rw.floating,
                         work_area,
                     )
                 } else {
                     WorkspacePlan {
-                        columns: rw.columns,
+                        columns,
                         focus: rw.focus,
                         viewport_offset: rw.viewport_offset,
                         floats: rw.floating,

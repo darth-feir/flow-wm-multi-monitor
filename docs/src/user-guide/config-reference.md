@@ -122,8 +122,12 @@ Borders are unaffected. `min_column_width_px` still applies as a floor — with
 the default 640 px minimum, `"1/3"` on a 1920 px display becomes 640 px.
 
 The monitor's current preset is the base width of its strip: new columns are
-created at it (including windows that arrive from another monitor), and the
-`expand-column` / `shrink-column` ladder starts from it. `flow query all` shows
+created at it, and the `expand-column` / `shrink-column` ladder starts from it.
+Widths follow the monitor: a column that arrives from elsewhere —
+`move-to-monitor`, an edge hop, a window re-tiled from floating or fullscreen,
+a column migrated by a display change, a loadout column merged from a detached
+monitor — takes the receiving monitor's preset width, never the width it had
+where it came from. `flow query all` shows
 each monitor's `width_preset`; the loadout saves and restores it per monitor.
 
 Example:

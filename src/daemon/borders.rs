@@ -39,6 +39,7 @@ impl FlowWM {
     ///
     /// Returns `None` when the window should NOT currently have a visible
     /// overlay:
+    /// - `[borders] enabled = false` turns every overlay off.
     /// - **Ignored** windows never get an overlay.
     /// - **Minimized / Hidden** windows are detached — the overlay is
     ///   destroyed and recreated on the next restore/show. This avoids
@@ -50,6 +51,11 @@ impl FlowWM {
     /// source of truth for border color, so the focus-change hook is the only
     /// path that needs to refresh color — toggle and drag never special-case it.
     pub(super) fn border_style_for(&self, hwnd: isize) -> Option<BorderStyle> {
+        // `[borders] enabled = false`: the master switch — no overlay is
+        // ever created, and an existing one is dropped on the next refresh.
+        if !self.config.borders.enabled {
+            return None;
+        }
         let window = self.registry.get_window(HWND(hwnd as *mut _))?;
         let is_focused = self.registry.focused() == Some(crate::common::WindowId(hwnd));
         let state = match window.state {
