@@ -359,7 +359,8 @@ impl FlowWM {
                 }
                 // Resolve the resized column AND row index from the committed
                 // layout once; they are frozen for the drag's duration.
-                let pos = self
+                let mi = self.monitor_index_for_window(classifying.dragged_id);
+                let pos = self.monitors[mi]
                     .active_scrolling()
                     .virtual_layout()
                     .find_window(classifying.dragged_id);
@@ -469,9 +470,11 @@ impl FlowWM {
             ));
         }
 
-        // Snapshot the frozen committed layout + config + monitor.
+        // Snapshot the frozen committed layout + config + monitor of the
+        // strip that holds the dragged window (not blindly the active one).
+        let mi = self.drag_monitor_index();
         let (vl, config, monitor) = {
-            let space = self.active_scrolling();
+            let space = self.monitors[mi].active_scrolling();
             (
                 space.virtual_layout().clone(),
                 *space.config(),
@@ -580,9 +583,13 @@ impl FlowWM {
             }
         };
 
-        // 3. Snapshot committed layout for zone resolution.
+        // 3. Snapshot the committed layout of the strip that holds the dragged
+        //    window for zone resolution. The drop zone is resolved against
+        //    THAT monitor's work area, so hovering over a neighbour monitor
+        //    falls outside every band and never auto-scrolls this strip.
+        let mi = self.drag_monitor_index();
         let (applied, config, monitor) = {
-            let space = self.active_scrolling();
+            let space = self.monitors[mi].active_scrolling();
             (
                 AppliedLayout {
                     virtual_layout: space.virtual_layout().clone(),
@@ -680,8 +687,8 @@ impl FlowWM {
                 if should_submit_preview(prev_zone, new_zone) =>
             {
                 match preview_move(&applied.virtual_layout, dragged_id, zone, &config, &monitor) {
-                    Some(preview) => self.animate_preview(&preview),
-                    None => self.animate_preview(&applied),
+                    Some(preview) => self.animate_preview_on(mi, &preview),
+                    None => self.animate_preview_on(mi, &applied),
                 }
             }
             // Zone unchanged from the previous move — skip the preview so a
@@ -750,9 +757,13 @@ impl FlowWM {
     /// The `Translate` variant's release commit — the existing title-bar
     /// reorder commit logic, unchanged by ticket #9.
     fn on_translate_end(&mut self, drag: DragState) {
-        // Commit the final zone — the ONLY window-placement commit in the drag.
+        // Commit the final zone — the ONLY window-placement commit in the drag
+        // — into the strip that owns the dragged window. Releasing over
+        // another monitor resolves to no zone there, so the window snaps
+        // back into its own strip (a cross-monitor drop is not modelled).
+        let mi = self.monitor_index_for_window(drag.dragged_id);
         let (vl, config, monitor) = {
-            let space = self.active_scrolling();
+            let space = self.monitors[mi].active_scrolling();
             (
                 space.virtual_layout().clone(),
                 *space.config(),
@@ -776,8 +787,10 @@ impl FlowWM {
             Some((col, _)) => ensure_column_visible(&target_vl, col, &config),
             None => target_vl,
         };
-        let applied = self.active_scrolling_mut().commit_layout(target_vl);
-        self.animate_layout(&applied);
+        let applied = self.monitors[mi]
+            .active_scrolling_mut()
+            .commit_layout(target_vl);
+        self.animate_layout_on(mi, &applied);
 
         // Re-resolve border style + position for the (unchanged) window state.
         self.refresh_border_for(drag.dragged_hwnd);
@@ -797,8 +810,9 @@ impl FlowWM {
     /// it visibly snaps from its native overshoot rect into its clamped tile
     /// (the elastic-pin snap-back).
     fn on_resize_end(&mut self, drag: ResizeDrag) {
+        let mi = self.monitor_index_for_window(drag.dragged_id);
         let (vl, config) = {
-            let space = self.active_scrolling();
+            let space = self.monitors[mi].active_scrolling();
             (space.virtual_layout().clone(), *space.config())
         };
 
@@ -870,8 +884,10 @@ impl FlowWM {
         // scrolled mid-grab). drag_state is take()n, so animate_layout includes
         // the dragged window — it snaps from its overshoot to its clamped tile.
         let target_vl = ensure_column_visible(&target_vl, drag.col, &config);
-        let applied = self.active_scrolling_mut().commit_layout(target_vl);
-        self.animate_layout(&applied);
+        let applied = self.monitors[mi]
+            .active_scrolling_mut()
+            .commit_layout(target_vl);
+        self.animate_layout_on(mi, &applied);
 
         self.refresh_border_for(drag.dragged_hwnd);
 
@@ -894,9 +910,13 @@ impl FlowWM {
     /// re-commit + animate is a defensive snap-back of an unchanged layout
     /// (story #4 — "nothing changes"); it produces no visible move.
     fn on_classifying_end(&mut self, drag: ClassifyingDrag) {
-        let vl = self.active_scrolling().virtual_layout().clone();
-        let applied = self.active_scrolling_mut().commit_layout(vl);
-        self.animate_layout(&applied);
+        let mi = self.monitor_index_for_window(drag.dragged_id);
+        let vl = self.monitors[mi]
+            .active_scrolling()
+            .virtual_layout()
+            .clone();
+        let applied = self.monitors[mi].active_scrolling_mut().commit_layout(vl);
+        self.animate_layout_on(mi, &applied);
         self.refresh_border_for(drag.dragged_hwnd);
         log::debug!("drag end (classifying/no-op): hwnd={}", drag.dragged_hwnd);
     }
@@ -911,18 +931,31 @@ impl FlowWM {
     /// their scrolled slots. Returns whether a scroll happened (the boolean the
     /// scheduler's outcome feedback consumes).
     fn perform_edge_scroll(&mut self, direction: Direction) -> bool {
+        let mi = self.drag_monitor_index();
         let scrolled = match direction {
-            Direction::Left => self.active_scrolling_mut().scroll_left(),
-            Direction::Right => self.active_scrolling_mut().scroll_right(),
+            Direction::Left => self.monitors[mi].active_scrolling_mut().scroll_left(),
+            Direction::Right => self.monitors[mi].active_scrolling_mut().scroll_right(),
             // Edge scroll is horizontal only; Up/Down never reach here.
             Direction::Up | Direction::Down => return false,
         };
         match scrolled {
             Some(applied) => {
-                self.animate_layout(&applied);
+                self.animate_layout_on(mi, &applied);
                 true
             }
             None => false,
+        }
+    }
+
+    /// Index of the monitor whose strip holds the window being dragged, or
+    /// the active monitor when no drag is in progress. Every drag handler
+    /// reads and commits through this strip rather than the active monitor's:
+    /// a drag can start on a background monitor, and the active monitor can
+    /// change under a drag.
+    fn drag_monitor_index(&self) -> usize {
+        match self.drag_state.as_ref() {
+            Some(d) => self.monitor_index_for_window(d.dragged_id()),
+            None => self.active_monitor,
         }
     }
 

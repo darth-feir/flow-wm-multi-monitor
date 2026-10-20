@@ -125,6 +125,12 @@ undecided.
 | `Busy` | -- | A tile drag is in progress; layout-mutating commands are rejected for now |
 | `Pong` | `version: String`, `pid: u32`, `monitors: usize`, `hooks_registered: usize`, `ahk_pid: Option<u32>` | Reply to `Ping` — identity and health (including the pid of the hotkey script the daemon launched, if still running), never touches layout |
 
+A line the daemon cannot decode as a `SocketMessage` — typically a newer
+`flow` CLI sending a command an older daemon does not know — is answered with
+`Error { message: "unrecognised message (client newer than daemon?)" }` before
+the daemon disconnects the client (`unrecognised_message_response` in
+`src/ipc/transport.rs`), so the CLI prints a reason instead of a closed pipe.
+
 Responses use a `"status"` tag (`"ok"`, `"error"`, `"data"`, `"busy"`,
 `"pong"`), distinct from the message `"type"` tag. A response-shaped JSON will not parse as a `SocketMessage`
 and vice versa -- the tests in [`src/ipc/message.rs`](../../src/ipc/message.rs)
@@ -313,6 +319,13 @@ daemon. The config directory resolution chain is documented in
 | Command | Action |
 |---------|--------|
 | `flow query all` | Send `QueryWindowsAll`, pretty-print JSON response |
+
+The `QueryWindowsAll` payload lists every tracked window plus a `monitors`
+array (index, `hmonitor`, screen rect, work area, neighbours, active
+workspace) and `active_monitor`. Each window entry carries a `monitor` field:
+the index of the monitor whose workspace holds it (falling back to the
+owning monitor the registry remembers for a minimized or hidden window), or
+`null` when it is seated nowhere.
 
 ### Dispatch
 

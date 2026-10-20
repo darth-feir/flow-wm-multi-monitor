@@ -231,12 +231,24 @@ Default hotkey: `Alt + Shift + 1`…`9`, `0` (0 = workspace 10).
 Every monitor has its own scrolling strip and its own set of workspaces. The
 *active* monitor is the one holding the focused window; commands act there.
 
+Each window remembers the monitor it was seated on. A window you minimize,
+hide to the tray or maximize comes back to *that* monitor when it reappears,
+even if it was parked off-screen at the time. Closing a window on a monitor
+you are not working on only tidies that strip; focus stays where you are.
+A float you drag onto another monitor becomes that monitor's float (it rides
+along with that monitor's workspace switches, and `move-to-monitor` reasons
+from there). Dragging a tile towards a neighbouring monitor does not scroll
+the strip you came from, and releasing it over the other monitor returns it
+to its own strip.
+
 ### `focus-monitor <left|right|up|down>`
 
 Make the monitor in that direction (by screen geometry) the active one and
-focus the window you last used there. `focus left` / `focus right` at the edge
-of a strip does the same hop, so you can walk across monitors with the plain
-focus keys.
+focus the window you last used there (else the first tile, else the top
+float). On an empty monitor the focus is cleared and keystrokes go to the
+desktop, so the next command cannot act on the window you left. `focus left`
+/ `focus right` at the edge of a strip does the same hop, so you can walk
+across monitors with the plain focus keys.
 
 ```powershell
 flow dispatch focus-monitor left

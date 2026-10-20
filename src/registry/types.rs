@@ -186,6 +186,19 @@ pub struct Window {
     /// query-relevant state.
     #[serde(skip)]
     pub border: Option<Border>,
+
+    /// Index (into the daemon's monitor list) of the monitor whose workspace
+    /// last owned this window — the *owning monitor memory*.
+    ///
+    /// Recorded whenever the daemon seats the window in a monitor's
+    /// scrolling or floating space (creation, move-to-monitor, float
+    /// re-home, loadout restore). Consulted first when a minimized / hidden /
+    /// maximized window comes back: a window parked beyond the virtual
+    /// screen has an on-screen rect that says nothing about its monitor, so
+    /// the rect alone would re-home it to the active monitor. `None` until
+    /// the window has been seated once.
+    #[serde(default)]
+    pub monitor: Option<usize>,
 }
 
 // SAFETY: `Window` contains `HWND` (a raw pointer), but we treat it as an
@@ -241,6 +254,7 @@ impl Window {
             tiled_rect: None,
             invisible_bounds,
             border: None,
+            monitor: None,
         }
     }
 }

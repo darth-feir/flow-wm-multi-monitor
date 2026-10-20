@@ -45,10 +45,10 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetCursorPos, GetForegroundWindow,
     GetShellWindow, GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, PostMessageW,
-    SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
-    WS_THICKFRAME,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
+    PostMessageW, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow,
+    SetWindowPos, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WS_CAPTION, WS_EX_APPWINDOW,
+    WS_EX_TOOLWINDOW, WS_THICKFRAME,
 };
 use windows::core::PWSTR;
 
@@ -443,6 +443,19 @@ pub fn get_foreground_window() -> Option<isize> {
     } else {
         Some(hwnd.0 as isize)
     }
+}
+
+/// Returns `true` when `hwnd_val` still identifies a live window.
+///
+/// Wraps `IsWindow()`. A handle whose window has been destroyed (or that was
+/// never a window) returns `false`; such a handle must never be passed to
+/// `SetForegroundWindow`, which fails with `ERROR_INVALID_HANDLE`.
+#[must_use]
+pub fn is_window(hwnd_val: isize) -> bool {
+    if hwnd_val == 0 {
+        return false;
+    }
+    unsafe { IsWindow(Some(HWND(hwnd_val as *mut _))) }.as_bool()
 }
 
 /// Returns the shell (desktop / "Progman") window handle, or `None`.

@@ -12,10 +12,19 @@ impl FlowWM {
     /// Return all tracked windows as JSON.
     ///
     /// The viewport offset from the virtual layout is included so clients
-    /// can determine which windows are currently visible on screen.
+    /// can determine which windows are currently visible on screen. Each
+    /// window entry carries a `monitor` field: the index of the monitor
+    /// whose workspace holds it (else the remembered owning monitor), or
+    /// `null` for a window seated nowhere (ignored, minimized, hidden and
+    /// never seated).
     pub(super) fn query_windows_all(&self) -> SocketResponse {
         let viewport_offset = self.active_scrolling().virtual_layout().viewport_offset;
         let mut payload = self.registry.to_json_value(viewport_offset);
+        annotate_windows_with_monitor(&mut payload, |hwnd| {
+            let wid = crate::common::WindowId(hwnd);
+            self.monitor_index_containing(wid)
+                .or_else(|| self.remembered_monitor(wid))
+        });
         if let serde_json::Value::Object(map) = &mut payload {
             let monitors: Vec<serde_json::Value> = self
                 .monitors
@@ -114,9 +123,69 @@ impl FlowWM {
     }
 }
 
+/// Add a `monitor` field to every entry of `payload["windows"]`, using
+/// `monitor_of(hwnd)` — `None` serialises as `null`. Entries without a
+/// numeric `hwnd` are left untouched; a payload without a `windows` array is
+/// a no-op.
+pub(super) fn annotate_windows_with_monitor(
+    payload: &mut serde_json::Value,
+    monitor_of: impl Fn(isize) -> Option<usize>,
+) {
+    let Some(windows) = payload
+        .get_mut("windows")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for entry in windows {
+        let Some(hwnd) = entry.get("hwnd").and_then(serde_json::Value::as_i64) else {
+            continue;
+        };
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert(
+                "monitor".into(),
+                serde_json::json!(monitor_of(hwnd as isize)),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every window entry gains a `monitor` index from the lookup; windows
+    /// seated nowhere get `null`.
+    #[test]
+    fn windows_payload_is_annotated_with_monitor() {
+        let mut payload = serde_json::json!({
+            "windows": [
+                { "hwnd": 10, "exe": "a.exe" },
+                { "hwnd": 20, "exe": "b.exe" },
+                { "hwnd": 30, "exe": "c.exe" },
+            ],
+            "count": 3,
+        });
+        annotate_windows_with_monitor(&mut payload, |hwnd| match hwnd {
+            10 => Some(0),
+            20 => Some(1),
+            _ => None,
+        });
+        assert_eq!(payload["windows"][0]["monitor"], 0);
+        assert_eq!(payload["windows"][1]["monitor"], 1);
+        assert_eq!(payload["windows"][2]["monitor"], serde_json::Value::Null);
+        // Other fields are untouched.
+        assert_eq!(payload["windows"][0]["exe"], "a.exe");
+        assert_eq!(payload["count"], 3);
+    }
+
+    /// A payload without a `windows` array is left as it is.
+    #[test]
+    fn annotate_without_windows_is_a_noop() {
+        let mut payload = serde_json::json!({ "count": 0 });
+        annotate_windows_with_monitor(&mut payload, |_| Some(0));
+        assert_eq!(payload, serde_json::json!({ "count": 0 }));
+    }
 
     /// Verify that query methods exist and have the correct return type.
     ///

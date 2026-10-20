@@ -27,22 +27,28 @@
 //! 3. **Phase B (resolve, no mutation):** for each loadout slot, pop its
 //!    stored `HWND` from the live set. If any slot's `HWND` is not live →
 //!    abort with a diagnostic error naming `exe`/`title`, zero state touched.
-//! 4. **Phase D (apply):** per-workspace `set_layout` + `replace_all`, then
-//!    sync registry slots/rects.
-//! 5. Leftover tiling windows (still live but unreferenced by the loadout)
-//!    are appended as new columns on the active workspace.
+//! 4. **Purge:** every window the file references is removed from every
+//!    workspace on every monitor, so a window can never end up seated in two
+//!    spaces when the file and the live desktop disagree about monitors.
+//! 5. **Phase D (apply):** per-workspace `set_layout` + float adds, then
+//!    sync registry slots/rects and the owning-monitor memory. A snapshot
+//!    whose monitor index is beyond the attached monitors is *merged* into
+//!    the fallback monitor's workspace (columns appended, floats clamped into
+//!    its work area) instead of overwriting it.
+//! 6. Leftover tiling windows (still live but unreferenced by the loadout
+//!    and seated nowhere) are appended as new columns on the active workspace.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::common::{Rect, WindowId};
 use crate::ipc::message::SocketResponse;
+use crate::layout::types::VirtualLayout;
 use crate::layout::types::{ActualLayout, AppliedLayout};
 use crate::loadout::{
     ColumnSnapshot, FloatingEntry, LoadoutFile, RectJson, RowSnapshot, ScrollingSnapshot,
     WindowRef, WorkspaceSnapshot,
 };
-use crate::registry::hooks::set_float_hwnds;
 use crate::registry::types::{FloatingState, WindowState};
 use crate::workspace::{Workspace, WorkspaceId, workspace_y_offset};
 use windows::Win32::Foundation::HWND;
@@ -82,6 +88,72 @@ fn resolve_hwnd(live: &mut HashSet<isize>, window: &WindowRef) -> Result<WindowI
             "window not currently open: \"{}\" ({}, hwnd {:#x}) — aborting load (no-partial)",
             window.title, window.exe, window.hwnd as u64
         ))
+    }
+}
+
+/// One column in the `(width_px, rows)` form
+/// [`ScrollingSpace::set_layout`](crate::workspace::ScrollingSpace::set_layout)
+/// consumes.
+type ColumnSpec = (u32, Vec<WindowId>);
+
+/// The columns of `vl` as [`ColumnSpec`]s, so an existing layout can be
+/// re-submitted with more columns appended.
+#[must_use]
+fn columns_of(vl: &VirtualLayout) -> Vec<ColumnSpec> {
+    vl.columns
+        .iter()
+        .map(|c| {
+            (
+                u32::try_from(c.width_px).unwrap_or_default(),
+                c.rows.iter().map(|r| r.window_id).collect(),
+            )
+        })
+        .collect()
+}
+
+/// What to apply to a workspace: the outcome of [`merge_plan`], or the
+/// snapshot as-is when its monitor is attached.
+#[derive(Debug, PartialEq, Eq)]
+struct WorkspacePlan {
+    /// Columns for `set_layout`, in strip order.
+    columns: Vec<ColumnSpec>,
+    /// The strip's focus cursor after the apply.
+    focus: Option<WindowId>,
+    /// Viewport offset for `set_layout`.
+    viewport_offset: i32,
+    /// Floats to add to the workspace's floating space.
+    floats: Vec<(WindowId, Rect)>,
+}
+
+/// Plan for merging a snapshot into a workspace that already has content —
+/// used when the snapshot's monitor is not attached (B4).
+///
+/// The snapshot's columns are appended after the existing ones (the live
+/// strip keeps its order and viewport), the existing focus cursor wins over
+/// the snapshot's, and each incoming float rect is clamped into
+/// `work_area` so a float saved on a detached display cannot be restored
+/// off-screen.
+#[must_use]
+fn merge_plan(
+    existing: Vec<ColumnSpec>,
+    existing_focus: Option<WindowId>,
+    existing_viewport: i32,
+    incoming: Vec<ColumnSpec>,
+    incoming_focus: Option<WindowId>,
+    incoming_floats: Vec<(WindowId, Rect)>,
+    work_area: Rect,
+) -> WorkspacePlan {
+    let mut columns = existing;
+    columns.extend(incoming);
+    let floats = incoming_floats
+        .into_iter()
+        .map(|(wid, rect)| (wid, rect.clamped_into(work_area)))
+        .collect();
+    WorkspacePlan {
+        columns,
+        focus: existing_focus.or(incoming_focus),
+        viewport_offset: existing_viewport,
+        floats,
     }
 }
 
@@ -405,76 +477,128 @@ impl FlowWM {
         // (a slide across a neighbouring monitor).
         let prev_rects = self.snapshot_prev_rects();
 
+        // 4b. Purge: every window the file references leaves every workspace
+        //     on every monitor before any snapshot is applied, so a window
+        //     cannot end up in two spaces when the file's monitor layout and
+        //     the live one disagree (a one-monitor file on a two-monitor
+        //     desktop used to leave monitor 1's copy in place).
+        let referenced: Vec<WindowId> = resolved_workspaces
+            .iter()
+            .flat_map(|rw| {
+                rw.columns
+                    .iter()
+                    .flat_map(|(_, rows)| rows.iter().copied())
+                    .chain(rw.floating.iter().map(|(wid, _)| *wid))
+            })
+            .collect();
+        self.purge_windows_from_all_spaces(&referenced);
+
         // 5. Phase D: apply per-workspace
+        let mut merged_snapshots = 0usize;
         for rw in resolved_workspaces {
             let ws_id = WorkspaceId(rw.workspace_id);
-            // Find which monitor owns this workspace, and get its index.
-            let (monitor_idx, ws_idx) = {
-                // Workspace ids repeat per monitor (1..=10 on each), so the
-                // snapshot's monitor index disambiguates. A file from a
-                // desktop with fewer monitors falls back to the first match.
-                let mut found = self
-                    .monitors
-                    .get(rw.monitor as usize)
-                    .and_then(|m| m.find_workspace_index(ws_id))
-                    .map(|wsi| (rw.monitor as usize, wsi));
-                if found.is_none() {
-                    for (mi, monitor) in self.monitors.iter().enumerate() {
-                        if let Some(wsi) = monitor.find_workspace_index(ws_id) {
-                            found = Some((mi, wsi));
-                            break;
-                        }
-                    }
-                }
-                match found {
-                    Some(pair) => pair,
-                    None => {
-                        log::warn!(
-                            "loadout load: workspace {} not found on any monitor, skipping",
-                            rw.workspace_id
-                        );
-                        continue;
-                    }
-                }
+            // Workspace ids repeat per monitor (1..=10 on each), so the
+            // snapshot's monitor index disambiguates. A snapshot from a
+            // monitor that is not attached is MERGED into the first monitor
+            // that has the workspace instead of overwriting it.
+            let in_range = (rw.monitor as usize) < self.monitors.len();
+            let found = if in_range {
+                self.monitors[rw.monitor as usize]
+                    .find_workspace_index(ws_id)
+                    .map(|wsi| (rw.monitor as usize, wsi))
+            } else {
+                self.monitors.iter().enumerate().find_map(|(mi, monitor)| {
+                    monitor.find_workspace_index(ws_id).map(|wsi| (mi, wsi))
+                })
             };
+            let Some((monitor_idx, ws_idx)) = found else {
+                log::warn!(
+                    "loadout load: workspace {} (monitor {}) not found on any monitor, skipping",
+                    rw.workspace_id,
+                    rw.monitor
+                );
+                continue;
+            };
+            let merge = !in_range;
+            if merge {
+                merged_snapshots += 1;
+            }
+            let work_area = self.monitors[monitor_idx].work_area();
 
             // We need &mut access to both the workspace (for set_layout +
-            // replace_all) and the registry (for slot/rect sync). Use index-
+            // float adds) and the registry (for slot/rect sync). Use index-
             // based access with a temporary scope so the ws borrow is dropped
             // before we touch the registry.
-            // Collect the canonical (wid, rect) pairs from the workspace's own
-            // FloatingSpace AFTER replace_all so we sync exactly what was stored.
             let (app, floats_to_sync): (AppliedLayout, Vec<(WindowId, Rect)>) = {
                 let ws = &mut self.monitors[monitor_idx].workspaces_mut()[ws_idx];
+                let plan = if merge {
+                    let vl = ws.scrolling.virtual_layout();
+                    merge_plan(
+                        columns_of(vl),
+                        ws.scrolling.last_focused_window(),
+                        vl.viewport_offset,
+                        rw.columns,
+                        rw.focus,
+                        rw.floating,
+                        work_area,
+                    )
+                } else {
+                    WorkspacePlan {
+                        columns: rw.columns,
+                        focus: rw.focus,
+                        viewport_offset: rw.viewport_offset,
+                        floats: rw.floating,
+                    }
+                };
                 let app = ws
                     .scrolling
-                    .set_layout(rw.columns, rw.focus, rw.viewport_offset);
-                ws.floating.replace_all(rw.floating);
-                let floats_to_sync = ws
-                    .floating
-                    .windows()
-                    .iter()
-                    .map(|entry| (entry.window_id, entry.rect))
-                    .collect();
-                (app, floats_to_sync)
+                    .set_layout(plan.columns, plan.focus, plan.viewport_offset);
+                // Floats are added, not swapped in wholesale: the purge above
+                // already removed every referenced float, and a float this
+                // workspace holds that the file does not mention stays put.
+                for (wid, rect) in &plan.floats {
+                    ws.floating.add(*wid, *rect);
+                }
+                (app, plan.floats)
             };
 
             // ws borrow dropped — safe to touch the registry now.
             self.registry
                 .update_tiling_slots_from_layout(&app.virtual_layout);
             self.registry.update_tiled_rects(&app.actual_layout);
+            for col in &app.virtual_layout.columns {
+                for row in &col.rows {
+                    self.remember_monitor(row.window_id, monitor_idx);
+                }
+            }
             // Mirror each float placement into the registry so border color and
             // float-location tracking are correct (mirrors register_float).
             for (wid, rect) in &floats_to_sync {
                 if let Some(window) = self.registry.get_window_mut(HWND(wid.0 as *mut _)) {
                     window.state = WindowState::Floating(FloatingState::Active { rect: *rect });
                 }
+                self.remember_monitor(*wid, monitor_idx);
             }
         }
+        if merged_snapshots > 0 {
+            log::warn!(
+                "loadout load: {merged_snapshots} workspace snapshot(s) were saved on a monitor that is not attached ({} attached); merged into the first monitor's matching workspaces",
+                self.monitors.len()
+            );
+        }
 
-        // 6. Leftover tiling windows: append as columns on the active workspace
+        // 6. Leftover tiling windows: append as columns on the active
+        //    workspace — but only those seated nowhere. A window the file does
+        //    not mention that still sits in a workspace the file did not
+        //    touch (e.g. monitor 1 when restoring a one-monitor file) stays
+        //    where it is instead of being seated twice.
+        let active_idx = self.active_monitor;
         for wid in leftovers {
+            if self.monitor_index_containing(wid).is_some() {
+                continue;
+            }
             let applied = self.active_scrolling_mut().add_window(wid);
+            self.remember_monitor(wid, active_idx);
             // Sync registry for the added window.
             self.registry
                 .update_tiling_slots_from_layout(&applied.virtual_layout);
@@ -495,7 +619,6 @@ impl FlowWM {
         // Seat every monitor: each picks its own target workspace (the one
         // holding the foreground window if it lives there, else the one the
         // file marks active) and parks its other workspaces vertically.
-        let mut all_target_floats: Vec<isize> = Vec::new();
         let window_gap = self.active_scrolling().padding().window_gap;
         for mi in 0..self.monitors.len() {
             let fg_here = foreground
@@ -515,14 +638,6 @@ impl FlowWM {
                 );
                 continue;
             }
-            all_target_floats.extend(
-                self.monitors[mi]
-                    .active_workspace()
-                    .floating
-                    .windows()
-                    .iter()
-                    .map(|entry| entry.window_id.0),
-            );
             let monitor_height = self.monitors[mi].screen_rect().height;
             let batches = build_seating_batches(
                 self.monitors[mi].workspaces(),
@@ -532,9 +647,25 @@ impl FlowWM {
             );
             self.animate_workspaces_on(mi, &batches, PrevRects::Snapshot(&prev_rects));
         }
-        set_float_hwnds(&all_target_floats);
+        self.rebuild_float_hwnds();
         log::info!("loadout load: restored layout from {resolved:?}");
         Ok(())
+    }
+
+    /// Remove every window in `ids` from every workspace (strip and floating
+    /// space) on every monitor. The layouts re-project immediately; the
+    /// caller animates the result (the loadout seating pass does).
+    pub(super) fn purge_windows_from_all_spaces(&mut self, ids: &[WindowId]) {
+        for monitor in &mut self.monitors {
+            for ws in monitor.workspaces_mut() {
+                for &wid in ids {
+                    if ws.scrolling.virtual_layout().find_window(wid).is_some() {
+                        let _ = ws.scrolling.remove_window(wid);
+                    }
+                    ws.floating.remove(wid);
+                }
+            }
+        }
     }
 
     // ── Save implementation detail ────────────────────────────────────
@@ -1053,5 +1184,368 @@ mod tests {
             focus: None,
             columns: vec![],
         }
+    }
+
+    // ── merge_plan (B4) ─────────────────────────────────────────────────
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rect {
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn merge_plan_appends_columns_keeps_focus_and_viewport_and_clamps_floats() {
+        let wa = rect(0, 0, 1920, 1080);
+        let plan = merge_plan(
+            vec![(960, vec![WindowId(1)])],
+            Some(WindowId(1)),
+            -300,
+            vec![(640, vec![WindowId(2), WindowId(3)])],
+            Some(WindowId(2)),
+            vec![(WindowId(9), rect(5000, 5000, 400, 300))],
+            wa,
+        );
+        assert_eq!(
+            plan,
+            WorkspacePlan {
+                columns: vec![
+                    (960, vec![WindowId(1)]),
+                    (640, vec![WindowId(2), WindowId(3)])
+                ],
+                focus: Some(WindowId(1)),
+                viewport_offset: -300,
+                floats: vec![(WindowId(9), rect(1520, 780, 400, 300))],
+            }
+        );
+    }
+
+    #[test]
+    fn merge_plan_takes_the_snapshot_focus_when_the_strip_has_none() {
+        let plan = merge_plan(
+            vec![],
+            None,
+            0,
+            vec![(960, vec![WindowId(2)])],
+            Some(WindowId(2)),
+            vec![],
+            rect(0, 0, 1920, 1080),
+        );
+        assert_eq!(plan.focus, Some(WindowId(2)));
+    }
+
+    #[test]
+    fn columns_of_round_trips_a_layout() {
+        // set_layout quantises widths to the slot ladder, so round-trip the
+        // ids and compare widths against what the layout actually holds.
+        let mut scrolling = make_scrolling();
+        let _ = scrolling.set_layout(
+            vec![
+                (960, vec![WindowId(1), WindowId(2)]),
+                (960, vec![WindowId(3)]),
+            ],
+            None,
+            0,
+        );
+        let vl = scrolling.virtual_layout();
+        let expected: Vec<ColumnSpec> = vec![
+            (
+                vl.columns[0].width_px as u32,
+                vec![WindowId(1), WindowId(2)],
+            ),
+            (vl.columns[1].width_px as u32, vec![WindowId(3)]),
+        ];
+        let got = columns_of(vl);
+        assert_eq!(got, expected);
+        // And feeding it back reproduces the same layout.
+        let _ = scrolling.set_layout(got, None, 0);
+        assert_eq!(columns_of(scrolling.virtual_layout()), expected);
+    }
+
+    // ── apply_loadout end-to-end: purge + merge + clamp ─────────────────
+
+    use crate::config::types::WindowRulesConfig;
+    use crate::registry::WindowRegistry;
+    use crate::registry::types::{TilingState, WindowState};
+    use crate::workspace::Monitor;
+    use windows::Win32::Foundation::HWND;
+
+    /// Register a fake window in `state` (no Win32).
+    fn fake_window(registry: &mut WindowRegistry, hwnd: isize, state: WindowState) {
+        let info = crate::registry::win32::WindowInfo {
+            hwnd: HWND(hwnd as *mut _),
+            title: format!("win{hwnd}"),
+            class: "C".into(),
+            rect: rect(0, 0, 800, 600),
+            exe: "app.exe".into(),
+            process_path: "C:\\app.exe".into(),
+            is_visible: true,
+            is_maximized: false,
+            is_fullscreen: false,
+        };
+        registry.register_window_from_info(&info);
+        if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {
+            w.state = state;
+        }
+    }
+
+    /// A monitor at `x` with workspaces 1 and 2, workspace 1 active.
+    fn monitor_at(x: i32) -> Monitor {
+        let screen = rect(x, 0, 1920, 1080);
+        let ws = |id: u32| {
+            Workspace::new(
+                WorkspaceId(id),
+                ScrollingSpace::new(
+                    MonitorInfo::single(screen),
+                    960,
+                    320,
+                    100,
+                    100,
+                    Padding {
+                        window_gap: GAP,
+                        up: 0,
+                        down: 0,
+                    },
+                    4,
+                ),
+            )
+        };
+        Monitor::new(screen, screen, vec![ws(1), ws(2)], 0)
+    }
+
+    fn window_ref(hwnd: isize) -> WindowRef {
+        WindowRef {
+            hwnd,
+            exe: "app.exe".into(),
+            title: format!("win{hwnd}"),
+        }
+    }
+
+    fn tiled_column(hwnd: isize) -> ColumnSnapshot {
+        ColumnSnapshot {
+            width_px: 960,
+            rows: vec![RowSnapshot {
+                window: window_ref(hwnd),
+                height_px: 1000,
+            }],
+        }
+    }
+
+    /// A two-monitor daemon: A tiled on monitor 0, B tiled and F floating
+    /// on monitor 1 (all on workspace 1).
+    fn two_monitor_flow() -> FlowWM {
+        const A: isize = 0xA;
+        const B: isize = 0xB;
+        const F: isize = 0xF;
+        let rules = WindowRulesConfig::default();
+        let mut registry = WindowRegistry::new(&rules, &rules);
+        let tile = || WindowState::Tiling(TilingState::Active { col: 0, row: 0 });
+        fake_window(&mut registry, A, tile());
+        fake_window(&mut registry, B, tile());
+        fake_window(
+            &mut registry,
+            F,
+            WindowState::Floating(FloatingState::Active {
+                rect: rect(2100, 100, 400, 300),
+            }),
+        );
+        let mut m0 = monitor_at(0);
+        let mut m1 = monitor_at(1920);
+        m0.active_scrolling_mut().add_window(WindowId(A));
+        m1.active_scrolling_mut().add_window(WindowId(B));
+        m1.active_workspace_mut()
+            .floating
+            .add(WindowId(F), rect(2100, 100, 400, 300));
+        let mut flow = FlowWM::new_for_test(registry, vec![m0, m1]);
+        flow.remember_monitor(WindowId(A), 0);
+        flow.remember_monitor(WindowId(B), 1);
+        flow.remember_monitor(WindowId(F), 1);
+        flow
+    }
+
+    fn write_loadout(file: &LoadoutFile) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "flowwm-loadout-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, serde_json::to_string(file).expect("serialise"))
+            .expect("write loadout");
+        path
+    }
+
+    /// A file saved on a three-monitor desktop puts B and F on monitor 2,
+    /// which is not attached: they are purged from monitor 1 and merged into
+    /// monitor 0's workspace 1 after A, with F clamped into the work area.
+    #[test]
+    fn apply_merges_out_of_range_monitor_and_purges_the_old_seat() {
+        let mut flow = two_monitor_flow();
+        let file = LoadoutFile {
+            version: LoadoutFile::CURRENT_VERSION,
+            workspaces: vec![
+                WorkspaceSnapshot {
+                    monitor: 0,
+                    workspace_id: 1,
+                    active: true,
+                    scrolling: ScrollingSnapshot {
+                        viewport_offset: 0,
+                        focus: Some(window_ref(0xA)),
+                        columns: vec![tiled_column(0xA)],
+                    },
+                    floating: vec![],
+                },
+                WorkspaceSnapshot {
+                    monitor: 2,
+                    workspace_id: 1,
+                    active: true,
+                    scrolling: ScrollingSnapshot {
+                        viewport_offset: 0,
+                        focus: Some(window_ref(0xB)),
+                        columns: vec![tiled_column(0xB)],
+                    },
+                    floating: vec![FloatingEntry {
+                        window: window_ref(0xF),
+                        rect: RectJson {
+                            x: 6000,
+                            y: 50,
+                            w: 400,
+                            h: 300,
+                        },
+                    }],
+                },
+            ],
+        };
+        let path = write_loadout(&file);
+        let result = flow.apply_loadout(Some(path.clone()));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(result, Ok(()));
+
+        // Monitor 1 no longer holds B or F anywhere.
+        assert!(
+            flow.monitors[1]
+                .find_workspace_containing(WindowId(0xB))
+                .is_none()
+        );
+        assert!(
+            flow.monitors[1]
+                .find_workspace_containing(WindowId(0xF))
+                .is_none()
+        );
+        // Monitor 0 workspace 1: A then B (merged, not overwritten).
+        let vl = flow.monitors[0].active_scrolling().virtual_layout();
+        let order: Vec<WindowId> = vl
+            .columns
+            .iter()
+            .flat_map(|c| c.rows.iter().map(|r| r.window_id))
+            .collect();
+        assert_eq!(order, vec![WindowId(0xA), WindowId(0xB)]);
+        assert_eq!(flow.monitor_index_containing(WindowId(0xB)), Some(0));
+        // F lives on monitor 0, clamped into its work area.
+        let floats = flow.monitors[0].active_workspace().floating.windows();
+        assert_eq!(floats.len(), 1);
+        assert_eq!(floats[0].window_id, WindowId(0xF));
+        assert_eq!(floats[0].rect, rect(1520, 50, 400, 300));
+        // Owning-monitor memory follows the merge.
+        assert_eq!(flow.registry.remembered_monitor(0xB), Some(0));
+        assert_eq!(flow.registry.remembered_monitor(0xF), Some(0));
+        // Exactly one seat per window.
+        let seats = |wid: WindowId| {
+            flow.monitors
+                .iter()
+                .flat_map(|m| m.workspaces())
+                .filter(|ws| {
+                    ws.scrolling.virtual_layout().find_window(wid).is_some()
+                        || ws.floating.contains(wid)
+                })
+                .count()
+        };
+        assert_eq!(seats(WindowId(0xA)), 1);
+        assert_eq!(seats(WindowId(0xB)), 1);
+        assert_eq!(seats(WindowId(0xF)), 1);
+    }
+
+    /// A one-monitor file on a two-monitor desktop: monitor 1's unreferenced
+    /// windows stay where they are (not re-seated as leftovers on monitor 0).
+    #[test]
+    fn apply_leaves_unreferenced_windows_on_their_monitor() {
+        let mut flow = two_monitor_flow();
+        let file = LoadoutFile {
+            version: LoadoutFile::CURRENT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                monitor: 0,
+                workspace_id: 1,
+                active: true,
+                scrolling: ScrollingSnapshot {
+                    viewport_offset: 0,
+                    focus: Some(window_ref(0xA)),
+                    columns: vec![tiled_column(0xA)],
+                },
+                floating: vec![],
+            }],
+        };
+        let path = write_loadout(&file);
+        let result = flow.apply_loadout(Some(path.clone()));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(result, Ok(()));
+
+        assert_eq!(flow.monitor_index_containing(WindowId(0xA)), Some(0));
+        assert_eq!(flow.monitor_index_containing(WindowId(0xB)), Some(1));
+        assert_eq!(flow.monitor_index_containing(WindowId(0xF)), Some(1));
+        assert_eq!(
+            flow.monitors[0]
+                .active_scrolling()
+                .virtual_layout()
+                .window_count(),
+            1
+        );
+        assert_eq!(
+            flow.monitors[1]
+                .active_scrolling()
+                .virtual_layout()
+                .window_count(),
+            1
+        );
+    }
+
+    /// A file that moves B from monitor 1 to monitor 0 (both attached) also
+    /// removes it from monitor 1 — the purge is unconditional.
+    #[test]
+    fn apply_purges_a_window_that_changed_monitor() {
+        let mut flow = two_monitor_flow();
+        let file = LoadoutFile {
+            version: LoadoutFile::CURRENT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                monitor: 0,
+                workspace_id: 2,
+                active: true,
+                scrolling: ScrollingSnapshot {
+                    viewport_offset: 0,
+                    focus: Some(window_ref(0xB)),
+                    columns: vec![tiled_column(0xB)],
+                },
+                floating: vec![],
+            }],
+        };
+        let path = write_loadout(&file);
+        let result = flow.apply_loadout(Some(path.clone()));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(result, Ok(()));
+
+        assert_eq!(
+            flow.monitors[0].find_workspace_containing(WindowId(0xB)),
+            Some(WorkspaceId(2))
+        );
+        assert!(
+            flow.monitors[1]
+                .find_workspace_containing(WindowId(0xB))
+                .is_none()
+        );
+        assert_eq!(flow.registry.remembered_monitor(0xB), Some(0));
     }
 }

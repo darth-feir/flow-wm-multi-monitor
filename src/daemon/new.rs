@@ -238,6 +238,9 @@ impl FlowWM {
             let idx = geometries.iter().position(|g| g.hmonitor == h).unwrap_or(0);
             per_monitor_windows[idx].0.push(wid);
             per_monitor_windows[idx].1.push(width);
+            // Owning-monitor memory: a window minimized from here later
+            // comes back to this monitor, not to wherever it was parked.
+            registry.set_monitor(wid.0, idx);
         }
 
         let fg_hwnd = registry_win32::get_foreground_window();

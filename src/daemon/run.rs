@@ -393,8 +393,19 @@ impl FlowWM {
                                 return RunExit::Stop;
                             }
                         }
-                        Err(_) => {
-                            // Client disconnected or read error — not fatal.
+                        Err(e) => {
+                            // A line we could not decode (a newer CLI?) gets
+                            // an error reply so the client does not just see
+                            // a closed pipe; a disconnect or I/O error has
+                            // nobody to answer. Either way the session ends.
+                            if let Some(reply) =
+                                crate::ipc::transport::unrecognised_message_response(&e)
+                            {
+                                log::warn!("flowd: {e}");
+                                if let Err(w) = self.server.write_response(&reply) {
+                                    log::warn!("flowd: failed to write error response: {w}");
+                                }
+                            }
                             break;
                         }
                     }

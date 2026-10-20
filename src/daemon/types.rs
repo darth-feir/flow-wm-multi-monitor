@@ -316,22 +316,89 @@ impl FlowWM {
             .position(|m| m.find_workspace_containing(window).is_some())
     }
 
+    /// Index of the monitor whose workspaces contain `window`, else the
+    /// monitor the registry remembers as its owner, else the active monitor.
+    ///
+    /// The fallback chain for every "which monitor does this window belong
+    /// to" question that must produce an answer: a window that was just
+    /// removed from its space (minimized, hidden) is no longer *contained*
+    /// anywhere, but its owning-monitor memory still says where it lived.
+    #[must_use]
+    pub(super) fn monitor_index_for_window(&self, window: crate::common::WindowId) -> usize {
+        self.monitor_index_containing(window)
+            .or_else(|| self.remembered_monitor(window))
+            .unwrap_or(self.active_monitor)
+    }
+
+    /// The registry's owning-monitor memory for `window`, validated against
+    /// the current monitor count (a stale index from a display that has
+    /// since been unplugged is treated as unknown).
+    #[must_use]
+    pub(super) fn remembered_monitor(&self, window: crate::common::WindowId) -> Option<usize> {
+        self.registry
+            .remembered_monitor(window.0)
+            .filter(|&i| i < self.monitors.len())
+    }
+
+    /// Record `idx` as the owning monitor of `window` in the registry. Called
+    /// wherever a window is seated in a monitor's scrolling or floating
+    /// space so the memory never drifts from the spaces.
+    pub(super) fn remember_monitor(&mut self, window: crate::common::WindowId, idx: usize) {
+        self.registry.set_monitor(window.0, idx);
+    }
+
     /// Index of the monitor whose screen rect overlaps `rect`, preferring the
     /// one containing the rect's centre. Falls back to the active monitor.
     #[must_use]
     pub(super) fn monitor_index_for_rect(&self, rect: crate::common::Rect) -> usize {
-        let cx = rect.x + rect.width / 2;
-        let cy = rect.y + rect.height / 2;
-        if let Some(i) = self.monitors.iter().position(|m| {
-            let s = m.screen_rect();
-            cx >= s.x && cx < s.right() && cy >= s.y && cy < s.bottom()
-        }) {
-            return i;
-        }
-        self.monitors
-            .iter()
-            .position(|m| m.screen_rect().overlaps(rect))
+        self.monitor_index_for_rect_opt(rect)
             .unwrap_or(self.active_monitor)
+    }
+
+    /// Index of the monitor whose screen rect contains `rect`'s centre, else
+    /// the first one `rect` overlaps; `None` when `rect` touches no monitor
+    /// (a window parked beyond the virtual screen).
+    #[must_use]
+    pub(super) fn monitor_index_for_rect_opt(&self, rect: crate::common::Rect) -> Option<usize> {
+        let rects: Vec<crate::common::Rect> =
+            self.monitors.iter().map(|m| m.screen_rect()).collect();
+        monitor_index_for_rect_in(&rects, rect)
+    }
+
+    /// Index of the monitor whose `HMONITOR` is the one Windows reports for
+    /// `hwnd` (`MonitorFromWindow`), or `None` when no monitor carries that
+    /// handle (tests, or a display that appeared after startup).
+    #[must_use]
+    pub(super) fn monitor_index_for_hmonitor_of(&self, hwnd: isize) -> Option<usize> {
+        let h = crate::registry::win32::monitor_handle_for_window(
+            windows::Win32::Foundation::HWND(hwnd as *mut _),
+        );
+        if h == 0 {
+            return None;
+        }
+        self.monitors.iter().position(|m| m.hmonitor() == h)
+    }
+
+    /// The monitor a window should be (re-)seated on: the remembered owner,
+    /// then the monitor Windows reports for it, then the one its rect lies
+    /// on, then the active monitor. See [`resolve_home_monitor`] for the
+    /// rule and why the rect comes last.
+    #[must_use]
+    pub(super) fn home_monitor_for_hwnd(&self, hwnd: isize) -> usize {
+        let remembered = self.remembered_monitor(crate::common::WindowId(hwnd));
+        let by_handle = self.monitor_index_for_hmonitor_of(hwnd);
+        let by_rect = crate::registry::win32::get_window_rect(windows::Win32::Foundation::HWND(
+            hwnd as *mut _,
+        ))
+        .ok()
+        .and_then(|r| self.monitor_index_for_rect_opt(r));
+        resolve_home_monitor(
+            remembered,
+            by_handle,
+            by_rect,
+            self.active_monitor,
+            self.monitors.len(),
+        )
     }
 
     /// Index of the nearest monitor lying beyond `from`'s edge in `dir`, or
@@ -367,12 +434,14 @@ impl FlowWM {
     /// by default. Workspace-switching commands (`switch-workspace`,
     /// `move-to-workspace`) reassign the active index before animating.
     #[must_use]
+    #[allow(dead_code)] // API surface: float paths now resolve the owning monitor explicitly.
     pub(super) fn active_workspace(&self) -> &Workspace {
         self.active_monitor().active_workspace()
     }
 
     /// Mutably borrow the active workspace of the active monitor.
     #[must_use]
+    #[allow(dead_code)] // API surface: float paths now resolve the owning monitor explicitly.
     pub(super) fn active_workspace_mut(&mut self) -> &mut Workspace {
         self.active_monitor_mut().active_workspace_mut()
     }
@@ -407,6 +476,53 @@ impl FlowWM {
     pub(super) fn active_floating_mut(&mut self) -> &mut FloatingSpace {
         self.active_monitor_mut().active_floating_mut()
     }
+}
+
+/// Pure rule behind [`FlowWM::home_monitor_for_hwnd`]: which monitor a
+/// window that is coming back into a layout belongs to.
+///
+/// Order of trust:
+/// 1. `remembered` — the owning-monitor memory recorded when the window was
+///    last seated. Survives minimize/hide, during which the window may have
+///    been parked beyond the virtual screen.
+/// 2. `by_handle` — `MonitorFromWindow` matched to a known `HMONITOR`.
+///    Authoritative for a window the daemon has never seated, but for a
+///    parked window it is merely the *nearest* monitor to a far-off rect.
+/// 3. `by_rect` — the monitor whose bounds contain the window's rect centre.
+/// 4. `active` — the monitor that owns keyboard focus.
+///
+/// Each candidate is only used when it is a valid index below
+/// `monitor_count`.
+#[must_use]
+pub(super) fn resolve_home_monitor(
+    remembered: Option<usize>,
+    by_handle: Option<usize>,
+    by_rect: Option<usize>,
+    active: usize,
+    monitor_count: usize,
+) -> usize {
+    let valid = |i: usize| i < monitor_count;
+    remembered
+        .filter(|&i| valid(i))
+        .or_else(|| by_handle.filter(|&i| valid(i)))
+        .or_else(|| by_rect.filter(|&i| valid(i)))
+        .unwrap_or(active)
+}
+
+/// Pure geometry behind [`FlowWM::monitor_index_for_rect_opt`]: the monitor
+/// (by index into `screens`) containing `rect`'s centre, else the first one
+/// `rect` overlaps, else `None`.
+#[must_use]
+pub(super) fn monitor_index_for_rect_in(
+    screens: &[crate::common::Rect],
+    rect: crate::common::Rect,
+) -> Option<usize> {
+    let cx = rect.x + rect.width / 2;
+    let cy = rect.y + rect.height / 2;
+    screens
+        .iter()
+        .position(|s| cx >= s.x && cx < s.right() && cy >= s.y && cy < s.bottom())
+        .or_else(|| screens.iter().position(|s| s.overlaps(rect)))
 }
 
 /// Pure geometry behind [`FlowWM::monitor_in_direction`].
@@ -528,5 +644,79 @@ mod monitor_direction_tests {
     fn out_of_range_from_is_none() {
         let rects = [r(0, 0, 1920, 1080)];
         assert_eq!(monitor_in_direction(&rects, 5, Direction::Left), None);
+    }
+}
+
+#[cfg(test)]
+mod home_monitor_tests {
+    use super::{monitor_index_for_rect_in, resolve_home_monitor};
+    use crate::common::Rect;
+
+    fn r(x: i32, y: i32, w: i32, h: i32) -> Rect {
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn remembered_monitor_wins_over_handle_and_rect() {
+        // A window minimized while parked beyond the virtual screen: the
+        // rect says "nowhere", MonitorFromWindow says "nearest" (0), but the
+        // memory says it lived on monitor 1.
+        assert_eq!(resolve_home_monitor(Some(1), Some(0), None, 0, 2), 1);
+        assert_eq!(resolve_home_monitor(Some(1), Some(0), Some(0), 0, 2), 1);
+    }
+
+    #[test]
+    fn handle_beats_rect_when_nothing_is_remembered() {
+        assert_eq!(resolve_home_monitor(None, Some(1), Some(0), 0, 2), 1);
+    }
+
+    #[test]
+    fn rect_is_used_when_handle_is_unknown() {
+        assert_eq!(resolve_home_monitor(None, None, Some(1), 0, 2), 1);
+    }
+
+    #[test]
+    fn falls_back_to_the_active_monitor() {
+        assert_eq!(resolve_home_monitor(None, None, None, 1, 2), 1);
+    }
+
+    #[test]
+    fn stale_indices_are_skipped() {
+        // Memory from a three-monitor session on a now two-monitor desktop.
+        assert_eq!(resolve_home_monitor(Some(2), Some(1), None, 0, 2), 1);
+        assert_eq!(resolve_home_monitor(Some(2), Some(5), Some(7), 0, 2), 0);
+    }
+
+    #[test]
+    fn rect_centre_picks_the_monitor() {
+        let screens = [r(0, 0, 1920, 1080), r(-1920, 0, 1920, 1080)];
+        assert_eq!(
+            monitor_index_for_rect_in(&screens, r(-1000, 100, 400, 300)),
+            Some(1)
+        );
+        assert_eq!(
+            monitor_index_for_rect_in(&screens, r(100, 100, 400, 300)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn rect_overlap_is_the_second_choice_and_parked_rects_are_none() {
+        let screens = [r(0, 0, 1920, 1080), r(-1920, 0, 1920, 1080)];
+        // Centre off both monitors (below), but the top edge overlaps 0.
+        assert_eq!(
+            monitor_index_for_rect_in(&screens, r(100, 1000, 400, 400)),
+            Some(0)
+        );
+        // Parked far below the virtual screen: no monitor at all.
+        assert_eq!(
+            monitor_index_for_rect_in(&screens, r(100, 5000, 400, 300)),
+            None
+        );
     }
 }

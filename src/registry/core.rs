@@ -372,6 +372,25 @@ impl WindowRegistry {
         }
     }
 
+    /// Record `monitor` as the owning monitor of `hwnd_val` (the index of the
+    /// monitor whose workspace now holds the window). Ignored for untracked
+    /// windows. See [`Window::monitor`].
+    pub fn set_monitor(&mut self, hwnd_val: isize, monitor: usize) {
+        if let Some(window) = self.windows.get_mut(&hwnd_val) {
+            if window.monitor != Some(monitor) {
+                log::debug!("owning monitor: isize={hwnd_val} -> {monitor}");
+            }
+            window.monitor = Some(monitor);
+        }
+    }
+
+    /// The remembered owning monitor of `hwnd_val`, if the window is tracked
+    /// and has been seated on a monitor before. See [`Window::monitor`].
+    #[must_use]
+    pub fn remembered_monitor(&self, hwnd_val: isize) -> Option<usize> {
+        self.windows.get(&hwnd_val).and_then(|w| w.monitor)
+    }
+
     /// Replace the classification pipeline's learned-rules layer.
     ///
     /// See (`docs/src/dev-guide/classification.md`).

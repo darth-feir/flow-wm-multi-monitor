@@ -427,7 +427,12 @@ impl PipeServer {
     /// # Errors
     ///
     /// Returns an error on I/O failure or if the connection is closed
-    /// without sending a message.
+    /// without sending a message. A line that arrives intact but does not
+    /// decode as a [`SocketMessage`] fails with
+    /// [`io::ErrorKind::InvalidData`]; the daemon answers that one with
+    /// [`unrecognised_message_response`] before disconnecting, so a newer
+    /// `flow` CLI talking to an older daemon gets a reply instead of a
+    /// closed pipe.
     pub fn read_message(&self) -> io::Result<SocketMessage> {
         let line = read_line(self.pipe())?;
         message::decode_message(&line).ok_or_else(|| {
@@ -748,6 +753,18 @@ fn read_line_overlapped(handle: HANDLE, deadline: Instant) -> io::Result<String>
     })
 }
 
+/// The reply the daemon writes when a client's line did not decode as a
+/// [`SocketMessage`] — typically a `flow` CLI newer than the daemon sending a
+/// command this daemon does not know. Produced for a read error of kind
+/// [`io::ErrorKind::InvalidData`]; any other read error (disconnect, I/O)
+/// has no client to answer and returns `None`.
+#[must_use]
+pub fn unrecognised_message_response(err: &io::Error) -> Option<SocketResponse> {
+    (err.kind() == io::ErrorKind::InvalidData).then(|| SocketResponse::Error {
+        message: "unrecognised message (client newer than daemon?)".to_owned(),
+    })
+}
+
 /// Connect to the daemon's named pipe, send a message, and read the response.
 ///
 /// This is the primary function used by the `flow` CLI to communicate with
@@ -894,6 +911,39 @@ impl PipeServer {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// A line that does not decode (a newer CLI's command) is answered with
+    /// a recognisable `Error`; a plain disconnect / I/O failure is not.
+    #[test]
+    fn unparseable_message_gets_an_error_response() {
+        let bad = io::Error::new(io::ErrorKind::InvalidData, "failed to parse message");
+        assert_eq!(
+            unrecognised_message_response(&bad),
+            Some(SocketResponse::Error {
+                message: "unrecognised message (client newer than daemon?)".to_owned(),
+            })
+        );
+        let gone = io::Error::new(io::ErrorKind::BrokenPipe, "client went away");
+        assert_eq!(unrecognised_message_response(&gone), None);
+        let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "closed");
+        assert_eq!(unrecognised_message_response(&eof), None);
+    }
+
+    /// `read_message`'s own decode failure is the `InvalidData` kind the
+    /// daemon loop keys on.
+    #[test]
+    fn decode_failure_is_invalid_data() {
+        let line = "{\"type\":\"teleport_to_mars\"}";
+        let err = message::decode_message::<SocketMessage>(line)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to parse message: {line:?}"),
+                )
+            })
+            .expect_err("unknown command must not decode");
+        assert!(unrecognised_message_response(&err).is_some());
+    }
 
     /// A pipe name unique to this test process and test, so parallel tests
     /// (and a real daemon on `\\.\pipe\flow`) never collide.

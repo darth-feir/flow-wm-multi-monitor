@@ -1,9 +1,10 @@
 //! Floating-window location synchronization.
 //!
-//! Handles `EVENT_OBJECT_LOCATIONCHANGE` for active-workspace float windows:
-//! reads the window's current screen rect, translates it back into
-//! [`FloatingSpace`]'s visible-rect space, and writes it into both the active
-//! workspace's [`FloatingSpace`] and the registry's
+//! Handles `EVENT_OBJECT_LOCATIONCHANGE` for the floats on every monitor's
+//! active workspace: reads the window's current screen rect, translates it
+//! back into [`FloatingSpace`]'s visible-rect space, and writes it into both
+//! the owning monitor's active-workspace [`FloatingSpace`] (re-homing the
+//! float when it was dragged onto another monitor) and the registry's
 //! [`FloatingState::Active`](crate::registry::types::FloatingState::Active)
 //! mirror.
 //!
@@ -15,12 +16,14 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
 
-use crate::common::WindowId;
+use crate::common::{Rect, WindowId};
 use crate::registry::hooks::{
-    float_hwnds_snapshot, float_tracking_active, is_float_hwnd, set_float_tracking_active,
+    float_hwnds_snapshot, float_tracking_active, is_float_hwnd, set_float_hwnds,
+    set_float_tracking_active,
 };
 use crate::registry::types::{FloatingState, WindowState};
 use crate::registry::win32 as registry_win32;
+use crate::workspace::Monitor;
 
 use super::borders::float_border_rect;
 use super::types::FlowWM;
@@ -62,7 +65,9 @@ impl FlowWM {
     /// flag is intentionally off (poll-then-enable ordering).
     ///
     /// Skips silently if `hwnd` is untracked, not an active float, or not in
-    /// the active workspace's `FloatingSpace`.
+    /// any monitor's active-workspace `FloatingSpace` (see
+    /// [`relocate_float`](Self::relocate_float), which also re-homes a float
+    /// dragged onto another monitor).
     pub(super) fn store_float_rect(&mut self, hwnd: isize) {
         let hwnd_handle = HWND(hwnd as *mut _);
 
@@ -104,13 +109,14 @@ impl FlowWM {
             self.config.borders.overlap,
         );
 
-        // FLOAT_HWNS holds only active-workspace floats, so the window must be
-        // in the active workspace's FloatingSpace. Guard the upsert with
-        // contains() so a stray event can never append a bogus entry.
-        if !self.active_workspace().floating.contains(wid) {
+        // FLOAT_HWNS holds the active-workspace floats of every monitor, so
+        // the window must be in SOME monitor's active-workspace FloatingSpace.
+        // Guard the upsert so a stray event can never append a bogus entry,
+        // and re-home the float when the user dragged it onto another
+        // monitor.
+        if !self.relocate_float(wid, visible_rect) {
             return;
         }
-        self.active_workspace_mut().floating.add(wid, visible_rect);
 
         // Mirror into the registry so the two copies never drift.
         if let Some(win) = self.registry.get_window_mut(hwnd_handle) {
@@ -133,6 +139,64 @@ impl FlowWM {
             visible_rect.width,
             visible_rect.height
         );
+    }
+
+    /// Store `visible_rect` as `wid`'s float position, re-homing the float to
+    /// the monitor its centre now lies on.
+    ///
+    /// The float must be in the active workspace's [`FloatingSpace`] of the
+    /// monitor that owns it (see
+    /// [`monitor_index_containing`](Self::monitor_index_containing)); a
+    /// window that is not — untracked, tiled, or on a parked workspace —
+    /// is left alone and `false` is returned. When the rect's centre lies on
+    /// a different monitor than the owner (the user dragged it across), the
+    /// entry moves to that monitor's active workspace, the owning-monitor
+    /// memory is updated and the float set is rebuilt, so `move-to-monitor`
+    /// and the next workspace switch reason from the right monitor (B9).
+    ///
+    /// Pure bookkeeping (no Win32): the caller reads the rect.
+    pub(super) fn relocate_float(&mut self, wid: WindowId, visible_rect: Rect) -> bool {
+        let Some(owner) = self.monitor_index_containing(wid) else {
+            return false;
+        };
+        if !self.monitors[owner]
+            .active_workspace()
+            .floating
+            .contains(wid)
+        {
+            return false;
+        }
+        let target = self
+            .monitor_index_for_rect_opt(visible_rect)
+            .unwrap_or(owner);
+        if target != owner {
+            log::debug!(
+                "float {}: re-homed from monitor {owner} to monitor {target}",
+                wid.0
+            );
+            self.monitors[owner]
+                .active_workspace_mut()
+                .floating
+                .remove(wid);
+        }
+        self.monitors[target]
+            .active_workspace_mut()
+            .floating
+            .add(wid, visible_rect);
+        self.remember_monitor(wid, target);
+        if target != owner {
+            self.rebuild_float_hwnds();
+        }
+        true
+    }
+
+    /// Replace the float-tracking set with the floats of every monitor's
+    /// active workspace (see [`float_hwnds_union`]). Called whenever a
+    /// workspace becomes active on any monitor, after a loadout restore and
+    /// after a float changes monitor, so that floats visible on the other
+    /// monitors never drop out of tracking (B8).
+    pub(super) fn rebuild_float_hwnds(&self) {
+        set_float_hwnds(&float_hwnds_union(&self.monitors));
     }
 
     /// Suppress float-location tracking for the duration of one flow-initiated
@@ -190,5 +254,173 @@ impl FlowWM {
         set_float_tracking_active(true);
         self.float_resume_deadline = None;
         log::debug!("float tracking resumed");
+    }
+}
+
+/// The HWNDs of every float on the *active* workspace of every monitor —
+/// the contents of the float-tracking set. Parked workspaces' floats are
+/// excluded (they are off-screen and can never be dragged).
+#[must_use]
+pub(super) fn float_hwnds_union(monitors: &[Monitor]) -> Vec<isize> {
+    monitors
+        .iter()
+        .flat_map(|m| m.active_workspace().floating.windows().iter())
+        .map(|e| e.window_id.0)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::types::WindowRulesConfig;
+    use crate::layout::types::{MonitorInfo, Padding};
+    use crate::registry::WindowRegistry;
+    use crate::workspace::{ScrollingSpace, Workspace, WorkspaceId};
+    use windows::Win32::Foundation::HWND;
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rect {
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    /// A monitor at `x` with two workspaces (ids 1 and 2), workspace 1 active.
+    fn monitor_at(x: i32) -> Monitor {
+        let screen = rect(x, 0, 1920, 1080);
+        let padding = Padding {
+            window_gap: 4,
+            up: 0,
+            down: 0,
+        };
+        let ws = |id: u32| {
+            Workspace::new(
+                WorkspaceId(id),
+                ScrollingSpace::new(MonitorInfo::single(screen), 960, 320, 100, 100, padding, 4),
+            )
+        };
+        Monitor::new(screen, screen, vec![ws(1), ws(2)], 0)
+    }
+
+    /// Register `hwnd` as an active float in the registry (no Win32).
+    fn float_window(registry: &mut WindowRegistry, hwnd: isize, r: Rect) {
+        let info = registry_win32::WindowInfo {
+            hwnd: HWND(hwnd as *mut _),
+            title: "Float".into(),
+            class: "FloatClass".into(),
+            rect: r,
+            exe: "float.exe".into(),
+            process_path: "C:\\float.exe".into(),
+            is_visible: true,
+            is_maximized: false,
+            is_fullscreen: false,
+        };
+        registry.register_window_from_info(&info);
+        if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {
+            w.state = WindowState::Floating(FloatingState::Active { rect: r });
+        }
+    }
+
+    #[test]
+    fn union_covers_every_monitors_active_workspace_only() {
+        let mut m0 = monitor_at(0);
+        let mut m1 = monitor_at(1920);
+        m0.active_workspace_mut()
+            .floating
+            .add(WindowId(1), rect(0, 0, 10, 10));
+        m1.active_workspace_mut()
+            .floating
+            .add(WindowId(2), rect(2000, 0, 10, 10));
+        // Parked workspace float on monitor 0: never tracked.
+        m0.workspace_mut(WorkspaceId(2))
+            .expect("ws 2")
+            .floating
+            .add(WindowId(3), rect(0, 0, 10, 10));
+
+        let mut union = float_hwnds_union(&[m0, m1]);
+        union.sort_unstable();
+        assert_eq!(union, vec![1, 2]);
+    }
+
+    #[test]
+    fn union_of_no_floats_is_empty() {
+        assert!(float_hwnds_union(&[monitor_at(0), monitor_at(1920)]).is_empty());
+    }
+
+    #[test]
+    fn relocate_within_the_owning_monitor_updates_the_rect() {
+        let rules = WindowRulesConfig::default();
+        let mut registry = WindowRegistry::new(&rules, &rules);
+        float_window(&mut registry, 0x11, rect(100, 100, 400, 300));
+        let mut flow = FlowWM::new_for_test(registry, vec![monitor_at(0), monitor_at(1920)]);
+        flow.monitors[0]
+            .active_workspace_mut()
+            .floating
+            .add(WindowId(0x11), rect(100, 100, 400, 300));
+
+        assert!(flow.relocate_float(WindowId(0x11), rect(300, 300, 400, 300)));
+        let entry = &flow.monitors[0].active_workspace().floating.windows()[0];
+        assert_eq!(entry.rect, rect(300, 300, 400, 300));
+        assert_eq!(flow.monitor_index_containing(WindowId(0x11)), Some(0));
+        assert_eq!(flow.registry.remembered_monitor(0x11), Some(0));
+    }
+
+    #[test]
+    fn relocate_across_monitors_rehomes_the_float() {
+        let rules = WindowRulesConfig::default();
+        let mut registry = WindowRegistry::new(&rules, &rules);
+        float_window(&mut registry, 0x11, rect(100, 100, 400, 300));
+        let mut flow = FlowWM::new_for_test(registry, vec![monitor_at(0), monitor_at(1920)]);
+        flow.monitors[0]
+            .active_workspace_mut()
+            .floating
+            .add(WindowId(0x11), rect(100, 100, 400, 300));
+        flow.remember_monitor(WindowId(0x11), 0);
+
+        // Dragged so its centre is on monitor 1.
+        let moved = rect(2500, 100, 400, 300);
+        assert!(flow.relocate_float(WindowId(0x11), moved));
+        assert!(flow.monitors[0].active_workspace().floating.is_empty());
+        let entry = &flow.monitors[1].active_workspace().floating.windows()[0];
+        assert_eq!(entry.window_id, WindowId(0x11));
+        assert_eq!(entry.rect, moved);
+        assert_eq!(flow.monitor_index_containing(WindowId(0x11)), Some(1));
+        assert_eq!(flow.registry.remembered_monitor(0x11), Some(1));
+    }
+
+    #[test]
+    fn relocate_ignores_windows_that_are_not_active_floats() {
+        let rules = WindowRulesConfig::default();
+        let mut registry = WindowRegistry::new(&rules, &rules);
+        float_window(&mut registry, 0x11, rect(100, 100, 400, 300));
+        let mut flow = FlowWM::new_for_test(registry, vec![monitor_at(0), monitor_at(1920)]);
+        // Not in any FloatingSpace at all.
+        assert!(!flow.relocate_float(WindowId(0x11), rect(300, 300, 400, 300)));
+        // On a parked workspace: left alone.
+        flow.monitors[0]
+            .workspace_mut(WorkspaceId(2))
+            .expect("ws 2")
+            .floating
+            .add(WindowId(0x11), rect(100, 100, 400, 300));
+        assert!(!flow.relocate_float(WindowId(0x11), rect(2500, 300, 400, 300)));
+        assert_eq!(flow.monitor_index_containing(WindowId(0x11)), Some(0));
+    }
+
+    #[test]
+    fn relocate_with_a_parked_rect_keeps_the_owner() {
+        let rules = WindowRulesConfig::default();
+        let mut registry = WindowRegistry::new(&rules, &rules);
+        float_window(&mut registry, 0x11, rect(100, 100, 400, 300));
+        let mut flow = FlowWM::new_for_test(registry, vec![monitor_at(0), monitor_at(1920)]);
+        flow.monitors[1]
+            .active_workspace_mut()
+            .floating
+            .add(WindowId(0x11), rect(2100, 100, 400, 300));
+        // A rect beyond every monitor (mid-animation parking) must not move
+        // the float to the active monitor.
+        assert!(flow.relocate_float(WindowId(0x11), rect(100, 9000, 400, 300)));
+        assert_eq!(flow.monitor_index_containing(WindowId(0x11)), Some(1));
     }
 }

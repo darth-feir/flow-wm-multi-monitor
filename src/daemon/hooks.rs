@@ -87,11 +87,13 @@ impl FlowWM {
         // tiling window.
         if let Some(window_id) = self.registry.handle_created(hwnd) {
             // Tile on the monitor the OS placed the window on, not blindly
-            // on the active one.
-            let idx = self.monitor_index_for_hwnd(hwnd);
+            // on the active one (a fresh window has no owning-monitor memory,
+            // so this resolves to MonitorFromWindow, then the rect).
+            let idx = self.home_monitor_for_hwnd(hwnd);
             let applied = self.monitors[idx]
                 .active_scrolling_mut()
                 .insert_window(window_id);
+            self.remember_monitor(window_id, idx);
             self.animate_layout_on(idx, &applied);
             self.reconcile_new_window_focus(hwnd);
             return true;
@@ -181,8 +183,11 @@ impl FlowWM {
         }
 
         // A destroyed float must leave the tracking set so the LOCATIONCHANGE
-        // callback stops forwarding it. Harmless no-op for tiled/ignored windows.
+        // callback stops forwarding it, and leave its FloatingSpace so a later
+        // reuse of the HWND value cannot resurrect a stale entry. Harmless
+        // no-op for tiled/ignored windows.
         remove_float_hwnd(hwnd);
+        self.remove_float_from_all_spaces(WindowId(hwnd));
 
         self.registry.remove_window(hwnd);
         // Border overlay: cleaned up automatically — `remove_window` drops the
@@ -267,18 +272,30 @@ impl FlowWM {
     /// foreground window to the OS — if focus is unchanged, the OS focus is
     /// already correct and we avoid a redundant (and potentially disruptive)
     /// `SetForegroundWindow` call.
+    ///
+    /// # Non-active monitors
+    ///
+    /// A window closing on a monitor the user is *not* working on must not
+    /// drag the foreground over there: the successor is only pushed when the
+    /// removed window held the user's focus (registry focus or OS foreground)
+    /// or lived on the active monitor — see [`should_refocus_after_removal`].
+    /// Otherwise the strip's bookkeeping is updated and nothing else moves.
     fn remove_from_layout_and_refocus(&mut self, window: WindowId) {
-        let idx = self
-            .monitor_index_containing(window)
-            .unwrap_or(self.active_monitor);
+        let idx = self.monitor_index_for_window(window);
         let prev_focus = self.monitors[idx].active_scrolling().last_focused_window();
         let applied = self.monitors[idx]
             .active_scrolling_mut()
             .remove_window(window);
         let new_focus = self.monitors[idx].active_scrolling().last_focused_window();
 
-        if new_focus != prev_focus
-            && let Some(id) = new_focus
+        let held_focus = self.registry.focused() == Some(window)
+            || registry_win32::get_foreground_window() == Some(window.0);
+        if should_refocus_after_removal(
+            prev_focus,
+            new_focus,
+            held_focus,
+            idx == self.active_monitor,
+        ) && let Some(id) = new_focus
         {
             let target = id.0;
             if !registry_win32::set_foreground_window(target) {
@@ -292,6 +309,17 @@ impl FlowWM {
         self.animate_layout_on(idx, &applied);
     }
 
+    /// Drop `window` from the floating space of every workspace on every
+    /// monitor. Used when a float leaves the desktop (destroyed) so no stale
+    /// entry survives in a parked workspace.
+    pub(super) fn remove_float_from_all_spaces(&mut self, window: WindowId) {
+        for m in &mut self.monitors {
+            for ws in m.workspaces_mut() {
+                ws.floating.remove(window);
+            }
+        }
+    }
+
     /// Handle a window restore (un-minimize) event.
     ///
     /// Pipeline:
@@ -302,13 +330,11 @@ impl FlowWM {
     pub(super) fn on_window_restored(&mut self, hwnd: isize) {
         self.registry.restore_window(hwnd);
 
-        // After restore, check if the window is now tiling-active.
+        // After restore, check if the window is now tiling-active. It goes
+        // back to the monitor it was minimized from (owning-monitor memory),
+        // not to wherever its parked rect happens to be nearest.
         if self.registry.is_tiling(hwnd) {
-            let idx = self.monitor_index_for_hwnd(hwnd);
-            let applied = self.monitors[idx]
-                .active_scrolling_mut()
-                .add_window(WindowId(hwnd));
-            self.animate_layout_on(idx, &applied);
+            self.readd_tile_to_home_monitor(hwnd);
         }
         // Border overlay: registry now records Active ⇒ refresh re-attaches.
         self.refresh_border_for(hwnd);
@@ -389,11 +415,7 @@ impl FlowWM {
         // Re-show path: a tracked window returning from hidden (Hidden → Active).
         let change = self.registry.reconcile_visibility(hwnd);
         if change == VisibilityChange::Shown && self.registry.is_tiling_active(hwnd) {
-            let idx = self.monitor_index_for_hwnd(hwnd);
-            let applied = self.monitors[idx]
-                .active_scrolling_mut()
-                .add_window(WindowId(hwnd));
-            self.animate_layout_on(idx, &applied);
+            self.readd_tile_to_home_monitor(hwnd);
         }
         // Border overlay: registry now records Active ⇒ refresh re-attaches.
         // (The untracked-recovery branch above early-returns after
@@ -536,15 +558,29 @@ impl FlowWM {
     pub(super) fn on_window_state_change(&mut self, hwnd: isize) {
         let outcome = self.registry.reclassify_os_state(hwnd);
         if let ReclassifyResult::Recovered { now_tiling: true } = outcome {
-            let idx = self.monitor_index_for_hwnd(hwnd);
-            let applied = self.monitors[idx]
-                .active_scrolling_mut()
-                .add_window(WindowId(hwnd));
-            self.animate_layout_on(idx, &applied);
+            self.readd_tile_to_home_monitor(hwnd);
         }
         // Border overlay: covers all transitions — Ignored→Tiling (attach),
         // Tiling→Ignored (detach), and no-op cases.
         self.refresh_border_for(hwnd);
+    }
+
+    /// Append a returning tiled window (restored, re-shown, or recovered
+    /// from maximized) to the strip of its home monitor and animate it in.
+    ///
+    /// The home monitor is resolved by
+    /// [`home_monitor_for_hwnd`](Self::home_monitor_for_hwnd): the owning
+    /// monitor remembered when the window was last seated, then
+    /// `MonitorFromWindow`, then the rect, then the active monitor. A window
+    /// that was parked beyond the virtual screen when it was minimized has a
+    /// rect that points nowhere useful, which is why the memory comes first.
+    fn readd_tile_to_home_monitor(&mut self, hwnd: isize) {
+        let idx = self.home_monitor_for_hwnd(hwnd);
+        let applied = self.monitors[idx]
+            .active_scrolling_mut()
+            .add_window(WindowId(hwnd));
+        self.remember_monitor(WindowId(hwnd), idx);
+        self.animate_layout_on(idx, &applied);
     }
 
     /// Handle `EVENT_OBJECT_NAMECHANGE` — Option A recovery for windows whose
@@ -589,6 +625,64 @@ impl FlowWM {
         // NAMECHANGE event), so handle_created's title-empty gate should pass.
         // If it still returns false, we simply wait for the next NAMECHANGE.
         self.on_window_created(hwnd);
+    }
+}
+
+/// Pure decision behind [`FlowWM::remove_from_layout_and_refocus`]: whether
+/// removing a window from a strip should push the OS foreground to the
+/// strip's successor.
+///
+/// `prev_focus` / `new_focus` are the strip's last-focused window before and
+/// after the removal — they differ only when the removed window was the
+/// strip's focus cursor. `held_focus` says the removed window was the user's
+/// focus (registry focus or OS foreground); `on_active_monitor` says it lived
+/// on the monitor that owns keyboard focus. Without either, the user is
+/// working elsewhere and the successor must not steal the foreground (B6).
+#[must_use]
+pub(super) fn should_refocus_after_removal(
+    prev_focus: Option<WindowId>,
+    new_focus: Option<WindowId>,
+    held_focus: bool,
+    on_active_monitor: bool,
+) -> bool {
+    new_focus != prev_focus && new_focus.is_some() && (held_focus || on_active_monitor)
+}
+
+#[cfg(test)]
+mod refocus_tests {
+    use super::should_refocus_after_removal;
+    use crate::common::WindowId;
+
+    const A: Option<WindowId> = Some(WindowId(1));
+    const B: Option<WindowId> = Some(WindowId(2));
+
+    #[test]
+    fn focused_window_closing_refocuses_the_successor() {
+        assert!(should_refocus_after_removal(A, B, true, true));
+        // Held the OS foreground even though its monitor is not active.
+        assert!(should_refocus_after_removal(A, B, true, false));
+    }
+
+    #[test]
+    fn closing_on_the_active_monitor_refocuses_even_without_held_focus() {
+        assert!(should_refocus_after_removal(A, B, false, true));
+    }
+
+    #[test]
+    fn closing_on_a_background_monitor_never_steals_focus() {
+        // The B6 scenario: strip focus cursor moved, but the user is on
+        // another monitor and this window was not their focus.
+        assert!(!should_refocus_after_removal(A, B, false, false));
+    }
+
+    #[test]
+    fn unchanged_strip_focus_never_pushes() {
+        assert!(!should_refocus_after_removal(A, A, true, true));
+    }
+
+    #[test]
+    fn empty_strip_after_removal_never_pushes() {
+        assert!(!should_refocus_after_removal(A, None, true, true));
     }
 }
 

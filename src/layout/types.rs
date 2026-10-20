@@ -278,9 +278,14 @@ pub struct MonitorInfo {
 }
 
 impl MonitorInfo {
-    /// Monitor info for a single-monitor desktop: the virtual screen is the
-    /// work area itself and there are no neighbours. Used by tests and by the
-    /// single-monitor code paths.
+    /// Monitor info for a lone monitor with **no taskbar**: the virtual
+    /// screen is taken to be `work_area` itself and there are no neighbours.
+    ///
+    /// This is a test and doc-example convenience only. The daemon always
+    /// builds its monitors with [`in_desktop`](Self::in_desktop), because on
+    /// a real display the virtual screen is the full screen rect (taskbar
+    /// included), which is larger than the work area; using this constructor
+    /// there would park off-viewport columns inside the taskbar strip.
     #[must_use]
     pub fn single(work_area: Rect) -> Self {
         Self {

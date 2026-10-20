@@ -257,6 +257,12 @@ fn build_visible_column_rects(applied: &AppliedLayout, wa: &Rect) -> Vec<(usize,
 ///
 /// Map: edge scroll, column-edge band, column body
 /// ((n+1) equal row regions). See (`docs/src/dev-guide/tile-drag.md`).
+///
+/// The scroll bands are bounded on both sides: the cursor must be inside the
+/// work area horizontally (`wa.x <= mx < wa.right()`) for either band to
+/// match. A cursor that has crossed onto a neighbouring monitor is therefore
+/// never "in the edge band" of this strip, so the strip does not auto-scroll
+/// while the user hovers the other display.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn resolve_drop_zone(
@@ -278,12 +284,15 @@ pub fn resolve_drop_zone(
         return None;
     }
 
-    // Step 1: Edge scroll (checked first).
+    // Step 1: Edge scroll (checked first). Both bands require the cursor to
+    // be inside this monitor's work area horizontally: beyond either edge
+    // the cursor is on another monitor (or off-screen), not in the band.
     let wa_right = wa.x + wa.width;
-    if mx <= wa.x + edge_band && can_scroll_left(vl) {
+    let inside_h = mx >= wa.x && mx < wa_right;
+    if inside_h && mx <= wa.x + edge_band && can_scroll_left(vl) {
         return Some(DropZone::ScrollLeft);
     }
-    if mx >= wa_right - edge_band && can_scroll_right(vl, wa.width, &vis_cols) {
+    if inside_h && mx >= wa_right - edge_band && can_scroll_right(vl, wa.width, &vis_cols) {
         return Some(DropZone::ScrollRight);
     }
 
@@ -1607,6 +1616,140 @@ mod tests {
         assert_eq!(
             resolve_drop_zone(&layout, &rdz_monitor(), WindowId(99), 100, 5, 30, 0.18, 72),
             Some(DropZone::Row { col: 0, row: 0 }),
+        );
+    }
+
+    // -- scroll bands are bounded by the work area (B10) --
+
+    /// A layout with content off-screen on both sides, so both scroll bands
+    /// are live: 3 cols of 490 (gap 10) on a 1000-wide monitor, viewport
+    /// scrolled 500 right.
+    fn rdz_scrollable_both_ways() -> AppliedLayout {
+        make_rdz_applied(
+            vec![
+                Column::with_row(490, Row::new(WindowId(1), 1000)),
+                Column::with_row(490, Row::new(WindowId(2), 1000)),
+                Column::with_row(490, Row::new(WindowId(3), 1000)),
+                Column::with_row(490, Row::new(WindowId(4), 1000)),
+            ],
+            500,
+            10,
+        )
+    }
+
+    #[test]
+    fn rdz_cursor_left_of_the_work_area_is_not_a_scroll_band() {
+        let layout = rdz_scrollable_both_ways();
+        // Inside the band: scrolls.
+        assert_eq!(
+            resolve_drop_zone(&layout, &rdz_monitor(), WindowId(99), 0, 500, 30, 0.18, 72),
+            Some(DropZone::ScrollLeft),
+        );
+        // One pixel onto the monitor to the left: not this strip's band.
+        assert_ne!(
+            resolve_drop_zone(&layout, &rdz_monitor(), WindowId(99), -1, 500, 30, 0.18, 72),
+            Some(DropZone::ScrollLeft),
+        );
+        assert_ne!(
+            resolve_drop_zone(
+                &layout,
+                &rdz_monitor(),
+                WindowId(99),
+                -800,
+                500,
+                30,
+                0.18,
+                72
+            ),
+            Some(DropZone::ScrollLeft),
+        );
+    }
+
+    #[test]
+    fn rdz_cursor_right_of_the_work_area_is_not_a_scroll_band() {
+        let layout = rdz_scrollable_both_ways();
+        assert_eq!(
+            resolve_drop_zone(
+                &layout,
+                &rdz_monitor(),
+                WindowId(99),
+                999,
+                500,
+                30,
+                0.18,
+                72
+            ),
+            Some(DropZone::ScrollRight),
+        );
+        // wa.right() itself is the first pixel of the neighbour.
+        assert_ne!(
+            resolve_drop_zone(
+                &layout,
+                &rdz_monitor(),
+                WindowId(99),
+                1000,
+                500,
+                30,
+                0.18,
+                72
+            ),
+            Some(DropZone::ScrollRight),
+        );
+        assert_ne!(
+            resolve_drop_zone(
+                &layout,
+                &rdz_monitor(),
+                WindowId(99),
+                1500,
+                500,
+                30,
+                0.18,
+                72
+            ),
+            Some(DropZone::ScrollRight),
+        );
+    }
+
+    #[test]
+    fn rdz_bands_follow_a_monitor_with_a_nonzero_origin() {
+        // The same strip on a monitor whose work area starts at x = -1000
+        // (a display left of the primary).
+        let monitor = MonitorInfo::single(Rect {
+            x: -1000,
+            y: 0,
+            width: 1000,
+            height: 1000,
+        });
+        let vl = VirtualLayout::with_columns(
+            vec![
+                Column::with_row(490, Row::new(WindowId(1), 1000)),
+                Column::with_row(490, Row::new(WindowId(2), 1000)),
+                Column::with_row(490, Row::new(WindowId(3), 1000)),
+                Column::with_row(490, Row::new(WindowId(4), 1000)),
+            ],
+            500,
+        );
+        let actual = projection::project(&vl, &monitor, &rdz_padding(10));
+        let layout = AppliedLayout {
+            virtual_layout: vl,
+            actual_layout: actual,
+        };
+        assert_eq!(
+            resolve_drop_zone(&layout, &monitor, WindowId(99), -995, 500, 30, 0.18, 72),
+            Some(DropZone::ScrollLeft),
+        );
+        assert_eq!(
+            resolve_drop_zone(&layout, &monitor, WindowId(99), -5, 500, 30, 0.18, 72),
+            Some(DropZone::ScrollRight),
+        );
+        // On the primary monitor (x >= 0): neither band.
+        let on_primary = resolve_drop_zone(&layout, &monitor, WindowId(99), 5, 500, 30, 0.18, 72);
+        assert!(
+            !matches!(
+                on_primary,
+                Some(DropZone::ScrollLeft | DropZone::ScrollRight)
+            ),
+            "got {on_primary:?}"
         );
     }
 

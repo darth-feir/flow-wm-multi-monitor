@@ -292,10 +292,10 @@ impl FlowWM {
     /// dragged window is omitted from the target list by [`submit_animation`]'s
     /// active-drag exclusion filter, so it keeps following the mouse via the
     /// direct `border.set_geometry` calls in `on_drag_move`.
-    /// (`docs/src/dev-guide/tile-drag.md`)
-    pub(super) fn animate_preview(&mut self, preview: &AppliedLayout) {
-        let idx = self.active_monitor;
-        self.submit_animation(preview, idx);
+    /// (`docs/src/dev-guide/tile-drag.md`) `monitor_idx` is the monitor
+    /// whose strip the preview was projected for.
+    pub(super) fn animate_preview_on(&mut self, monitor_idx: usize, preview: &AppliedLayout) {
+        self.submit_animation(preview, monitor_idx);
     }
 
     /// Submit a single combined animation batch spanning multiple workspaces.
@@ -525,7 +525,7 @@ impl FlowWM {
     /// so its width already tracks the cursor, overshoot and all). This mirrors
     /// [`teleport_workspaces`](Self::teleport_workspaces) but operates on a
     /// single active-workspace [`AppliedLayout`] and honors the drag-exclusion
-    /// filter — the resize analog of [`animate_preview`](Self::animate_preview),
+    /// filter — the resize analog of [`animate_preview_on`](Self::animate_preview_on),
     /// except it bypasses the animator (Teleport, not animation) per ADR-0004.
     pub(super) fn teleport_preview(&self, preview: &AppliedLayout) {
         let border_thickness = self.config.borders.thickness as i32;
