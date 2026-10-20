@@ -1479,4 +1479,76 @@ mod tests {
         assert_eq!(flow.monitors.len(), 2);
         assert_eq!(column_order(&flow, 0, 1), vec![WindowId(A), WindowId(C)]);
     }
+
+    /// Stacked columns: tiling off brings the rows parked by a column's row
+    /// viewport on screen like every other tile; tiling on parks them again
+    /// with the focused row visible.
+    #[test]
+    fn pause_unparks_stacked_rows_and_resume_restores_the_viewport() {
+        let mut flow = fixture();
+        for ws in flow.monitors[0].workspaces_mut() {
+            let _ = ws.scrolling.set_row_limits(2, 0);
+        }
+        // Workspace 1: C joins A's column, then two more tiles: [A, C, P, Q].
+        const P: isize = 0x21;
+        const Q: isize = 0x22;
+        for hwnd in [P, Q] {
+            fake_window(&mut flow.registry, hwnd, tile());
+            flow.registry.set_monitor(hwnd, 0);
+        }
+        {
+            let strip = flow.monitors[0].active_scrolling_mut();
+            let _ = strip.merge_column(WindowId(C), crate::common::Direction::Left);
+            strip.set_focus(WindowId(C));
+            for hwnd in [P, Q] {
+                strip
+                    .add_window_to_focused_column(WindowId(hwnd))
+                    .expect("stack");
+            }
+            // Focus the top row: P and Q are parked below.
+            strip.set_focus(WindowId(A));
+            let _ = strip.ensure_focused_visible();
+        }
+        let info = *flow.monitors[0].active_scrolling().monitor();
+        let parked_in_strip = |flow: &FlowWM, hwnd: isize| {
+            let rect = flow.monitors[0]
+                .active_scrolling()
+                .actual_layout()
+                .find(WindowId(hwnd))
+                .expect("tiled")
+                .rect;
+            info.is_parked(rect)
+        };
+        assert!(parked_in_strip(&flow, P) && parked_in_strip(&flow, Q));
+        assert!(!parked_in_strip(&flow, A) && !parked_in_strip(&flow, C));
+        let before = strip(&flow, 0, 1);
+        assert_eq!(before.columns[0].row_offset, 0);
+
+        // Off: every parked row lands inside the work area.
+        let targets = flow.pause_targets();
+        for hwnd in [P, Q] {
+            let r = submitted_for(&targets, hwnd).expect("moved on-screen");
+            assert!(
+                r.x >= 0 && r.right() <= 1920 && r.y >= 0 && r.bottom() <= 1080,
+                "{hwnd:#x} not on screen: {r:?}"
+            );
+        }
+        let probe = desktop();
+        let paused = flow.pause_tiling_with(&probe);
+        assert_eq!(paused.tiles, 5, "A, C, P, Q and the parked B");
+
+        // On: the strip is the same, the rows are parked again, A visible.
+        let resumed = flow.resume_tiling_with(&probe);
+        assert!(!resumed.already_tiling);
+        assert_eq!(strip(&flow, 0, 1), before);
+        assert!(parked_in_strip(&flow, P) && parked_in_strip(&flow, Q));
+        assert!(!parked_in_strip(&flow, A));
+        let p_layout = flow.monitors[0]
+            .active_scrolling()
+            .actual_layout()
+            .find(WindowId(P))
+            .expect("P tiled")
+            .rect;
+        assert_eq!(flow.last_submitted_rect(P), Some(p_layout));
+    }
 }

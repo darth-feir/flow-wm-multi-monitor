@@ -4,11 +4,47 @@
 //! match arms into dedicated methods. Each method returns a [`SocketResponse`]
 //! with JSON data.
 
+use crate::common::WindowId;
 use crate::ipc::message::SocketResponse;
+use crate::layout::types::VirtualLayout;
 
 use super::types::FlowWM;
 
+/// `flow query all` / `query layout virtual` view of one strip's columns:
+/// index, width, row count, the row viewport offset and how many rows the
+/// viewport shows (`visible_rows`, `0` = all).
+fn columns_json(vl: &VirtualLayout, visible_rows: u32) -> Vec<serde_json::Value> {
+    vl.columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            serde_json::json!({
+                "index": i,
+                "width_px": col.width_px,
+                "row_count": col.rows.len(),
+                "row_offset": col.row_offset,
+                "visible_rows": col.slots(visible_rows),
+            })
+        })
+        .collect()
+}
+
 impl FlowWM {
+    /// Whether tiled window `wid` is currently parked inside its column
+    /// (outside the column's row viewport): `Some(true)` parked, `Some(false)`
+    /// visible in its column, `None` for a window seated in no strip.
+    #[must_use]
+    pub(super) fn parked_row(&self, wid: WindowId) -> Option<bool> {
+        self.monitors.iter().find_map(|m| {
+            m.workspaces().iter().find_map(|ws| {
+                let vl = ws.scrolling.virtual_layout();
+                let (col, row) = vl.find_window(wid)?;
+                let visible_rows = ws.scrolling.config().visible_rows;
+                Some(!vl.columns[col].row_visible(row, visible_rows))
+            })
+        })
+    }
+
     /// Return all tracked windows as JSON.
     ///
     /// The viewport offset from the virtual layout is included so clients
@@ -18,7 +54,11 @@ impl FlowWM {
     /// `null` for a window seated nowhere (ignored, minimized, hidden and
     /// never seated) — and a `mode` field: `"tiled"`, `"floating"`,
     /// `"fullscreen"` (a `set-window fullscreen` window, which the `state`
-    /// records as a float), `"minimized"`, `"hidden"` or `"ignored"`.
+    /// records as a float), `"minimized"`, `"hidden"` or `"ignored"`. A
+    /// `parked_row` field says whether a tile is hidden inside its column by
+    /// the row viewport (`[columns] visible_rows`); `null` for a window in
+    /// no strip. Each monitor lists its active strip's `columns` with their
+    /// `row_count`, `row_offset` and `visible_rows`.
     pub(super) fn query_windows_all(&self) -> SocketResponse {
         let viewport_offset = self.active_scrolling().virtual_layout().viewport_offset;
         let mut payload = self.registry.to_json_value(viewport_offset);
@@ -28,6 +68,9 @@ impl FlowWM {
                 .or_else(|| self.remembered_monitor(wid))
         });
         annotate_windows_with_mode(&mut payload, |hwnd| self.window_mode(hwnd));
+        annotate_windows_with(&mut payload, "parked_row", |hwnd| {
+            serde_json::json!(self.parked_row(WindowId(hwnd)))
+        });
         if let serde_json::Value::Object(map) = &mut payload {
             let monitors: Vec<serde_json::Value> = self
                 .monitors
@@ -52,6 +95,12 @@ impl FlowWM {
                         "active_workspace": m.active_workspace_id().0,
                         "viewport_offset": m.active_scrolling().virtual_layout().viewport_offset,
                         "tiled_windows": m.active_scrolling().virtual_layout().window_count(),
+                        "visible_rows": m.active_scrolling().config().visible_rows,
+                        "max_rows": m.active_scrolling().config().max_rows,
+                        "columns": columns_json(
+                            m.active_scrolling().virtual_layout(),
+                            m.active_scrolling().config().visible_rows,
+                        ),
                     })
                 })
                 .collect();
@@ -75,21 +124,27 @@ impl FlowWM {
     /// positions (the projection layer derives positions via prefix-sum).
     pub(super) fn query_layout_virtual(&self) -> SocketResponse {
         let vl = self.active_scrolling().virtual_layout();
-        let columns_json: Vec<serde_json::Value> = vl
-            .columns
-            .iter()
-            .enumerate()
-            .map(|(i, col)| {
+        let visible_rows = self.active_scrolling().config().visible_rows;
+        let columns_json: Vec<serde_json::Value> = columns_json(vl, visible_rows)
+            .into_iter()
+            .zip(&vl.columns)
+            .map(|(mut json, col)| {
                 let rows: Vec<serde_json::Value> = col
                     .rows
                     .iter()
-                    .map(|row| serde_json::json!({ "window_id": row.window_id.0, "height_px": row.height }))
+                    .enumerate()
+                    .map(|(r, row)| {
+                        serde_json::json!({
+                            "window_id": row.window_id.0,
+                            "height_px": row.height,
+                            "parked_row": !col.row_visible(r, visible_rows),
+                        })
+                    })
                     .collect();
-                serde_json::json!({
-                    "index": i,
-                    "width_px": col.width_px,
-                    "rows": rows,
-                })
+                if let Some(obj) = json.as_object_mut() {
+                    obj.insert("rows".into(), serde_json::Value::Array(rows));
+                }
+                json
             })
             .collect();
         SocketResponse::Data {
@@ -140,6 +195,17 @@ pub(super) fn annotate_windows_with_mode(
     payload: &mut serde_json::Value,
     mode_of: impl Fn(isize) -> &'static str,
 ) {
+    annotate_windows_with(payload, "mode", |hwnd| serde_json::json!(mode_of(hwnd)));
+}
+
+/// Add field `key` to every entry of `payload["windows"]` from
+/// `value_of(hwnd)`. Entries without a numeric `hwnd` are left untouched; a
+/// payload without a `windows` array is a no-op.
+pub(super) fn annotate_windows_with(
+    payload: &mut serde_json::Value,
+    key: &str,
+    value_of: impl Fn(isize) -> serde_json::Value,
+) {
     let Some(windows) = payload
         .get_mut("windows")
         .and_then(serde_json::Value::as_array_mut)
@@ -151,7 +217,7 @@ pub(super) fn annotate_windows_with_mode(
             continue;
         };
         if let Some(obj) = entry.as_object_mut() {
-            obj.insert("mode".into(), serde_json::json!(mode_of(hwnd as isize)));
+            obj.insert(key.to_owned(), value_of(hwnd as isize));
         }
     }
 }
@@ -325,5 +391,31 @@ mod tests {
         assert_eq!(json["viewport_offset"], 0);
         assert_eq!(json["entry_count"], 0);
         assert!(json["entries"].as_array().unwrap().is_empty());
+    }
+
+    /// Columns report their row count and row viewport; rows say whether
+    /// they are parked by it.
+    #[test]
+    fn columns_json_reports_row_counts_and_viewports() {
+        use crate::common::WindowId;
+        use crate::layout::types::{Column, Row};
+        let vl = VirtualLayout::with_columns(
+            vec![
+                Column::with_rows(960, (1..=4).map(|i| Row::new(WindowId(i), 100)).collect())
+                    .with_row_offset(1),
+                Column::with_row(960, Row::new(WindowId(9), 1072)),
+            ],
+            0,
+        );
+        let cols = columns_json(&vl, 2);
+        assert_eq!(cols[0]["row_count"], 4);
+        assert_eq!(cols[0]["row_offset"], 1);
+        assert_eq!(cols[0]["visible_rows"], 2);
+        assert_eq!(cols[1]["row_count"], 1);
+        assert_eq!(cols[1]["visible_rows"], 1);
+        assert!(vl.columns[0].row_visible(1, 2) && vl.columns[0].row_visible(2, 2));
+        assert!(!vl.columns[0].row_visible(0, 2) && !vl.columns[0].row_visible(3, 2));
+        // Without a viewport every row is visible.
+        assert_eq!(columns_json(&vl, 0)[0]["visible_rows"], 4);
     }
 }

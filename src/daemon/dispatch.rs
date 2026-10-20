@@ -3027,4 +3027,208 @@ mod tests {
         assert_eq!(scrolling.last_focused_window(), None);
         assert_eq!(focus_candidate(&scrolling, &floating), Some(WindowId(3)));
     }
+
+    // ── Stacked columns: row viewports and the row cap ───────────────
+
+    /// Register `hwnd` as an active tile in the registry (no Win32).
+    fn register_tile(flow: &mut FlowWM, hwnd: isize) {
+        let info = registry_win32::WindowInfo {
+            hwnd: HWND(hwnd as *mut _),
+            title: format!("win{hwnd}"),
+            class: "TestClass".into(),
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+            exe: "test.exe".into(),
+            process_path: "C:\\test.exe".into(),
+            is_visible: true,
+            is_maximized: false,
+            is_fullscreen: false,
+        };
+        flow.registry.register_window_from_info(&info);
+        if let Some(win) = flow.registry.get_window_mut(HWND(hwnd as *mut _)) {
+            win.state = WindowState::Tiling(TilingState::Active { col: 0, row: 0 });
+        }
+    }
+
+    fn row_offset(flow: &FlowWM, col: usize) -> usize {
+        flow.active_scrolling().virtual_layout().columns[col].row_offset
+    }
+
+    fn is_parked(flow: &FlowWM, hwnd: isize) -> bool {
+        let strip = flow.active_scrolling();
+        let rect = strip
+            .actual_layout()
+            .find(WindowId(hwnd))
+            .expect("window projected")
+            .rect;
+        strip.monitor().is_parked(rect)
+    }
+
+    /// A daemon whose active strip is one column `[TEST_HWND, B, C, D]`
+    /// with a two-row viewport (`visible_rows = 2`), focus on TEST_HWND.
+    fn flow_with_a_stack(visible_rows: u32, max_rows: u32) -> (FlowWM, [isize; 3]) {
+        let mut flow =
+            flow_with_focused_state(WindowState::Tiling(TilingState::Active { col: 0, row: 0 }));
+        flow.config.borders.enabled = false;
+        let others = [0x10002, 0x10003, 0x10004];
+        for ws in flow.monitors[0].workspaces_mut() {
+            let _ = ws.scrolling.set_row_limits(visible_rows, max_rows);
+        }
+        for hwnd in others {
+            register_tile(&mut flow, hwnd);
+            flow.active_scrolling_mut()
+                .add_window_to_focused_column(WindowId(hwnd))
+                .expect("stacked");
+        }
+        flow.active_scrolling_mut().set_focus(WindowId(TEST_HWND));
+        let _ = flow.active_scrolling_mut().ensure_focused_visible();
+        (flow, others)
+    }
+
+    /// `focus down` walks a stacked column one row at a time, scrolling the
+    /// row viewport when the next row is parked, and errors at the bottom.
+    #[test]
+    fn focus_down_scrolls_a_stacked_column_and_errors_at_the_last_row() {
+        let (mut flow, [b, c, d]) = flow_with_a_stack(2, 0);
+        assert_eq!(row_offset(&flow, 0), 0);
+        assert!(!is_parked(&flow, TEST_HWND) && !is_parked(&flow, b));
+        assert!(is_parked(&flow, c) && is_parked(&flow, d));
+
+        // TEST_HWND → B: B is already visible, nothing moves.
+        assert_eq!(flow.dispatch_focus(Direction::Down), SocketResponse::Ok);
+        assert_eq!(
+            flow.active_scrolling().last_focused_window(),
+            Some(WindowId(b))
+        );
+        assert_eq!(row_offset(&flow, 0), 0);
+
+        // B → C: C was parked, the viewport scrolls by one row.
+        flow.registry.set_focused(b);
+        assert_eq!(flow.dispatch_focus(Direction::Down), SocketResponse::Ok);
+        assert_eq!(
+            flow.active_scrolling().last_focused_window(),
+            Some(WindowId(c))
+        );
+        assert_eq!(row_offset(&flow, 0), 1);
+        assert!(is_parked(&flow, TEST_HWND) && !is_parked(&flow, b) && !is_parked(&flow, c));
+
+        // C → D, then the bottom.
+        flow.registry.set_focused(c);
+        assert_eq!(flow.dispatch_focus(Direction::Down), SocketResponse::Ok);
+        assert_eq!(row_offset(&flow, 0), 2);
+        flow.registry.set_focused(d);
+        assert!(matches!(
+            flow.dispatch_focus(Direction::Down),
+            SocketResponse::Error { .. }
+        ));
+        assert_eq!(row_offset(&flow, 0), 2);
+
+        // And back up to the top: the viewport follows.
+        assert_eq!(flow.dispatch_focus(Direction::Up), SocketResponse::Ok);
+        flow.registry.set_focused(c);
+        assert_eq!(flow.dispatch_focus(Direction::Up), SocketResponse::Ok);
+        flow.registry.set_focused(b);
+        assert_eq!(flow.dispatch_focus(Direction::Up), SocketResponse::Ok);
+        assert_eq!(row_offset(&flow, 0), 0);
+        flow.registry.set_focused(TEST_HWND);
+        assert!(matches!(
+            flow.dispatch_focus(Direction::Up),
+            SocketResponse::Error { .. }
+        ));
+    }
+
+    /// `move-window down` swaps rows and the viewport follows the window.
+    #[test]
+    fn move_window_down_in_a_stack_keeps_the_moved_window_visible() {
+        let (mut flow, [b, c, d]) = flow_with_a_stack(2, 0);
+        assert_eq!(
+            flow.dispatch_move_window(Direction::Down),
+            SocketResponse::Ok
+        );
+        assert_eq!(
+            flow.dispatch_move_window(Direction::Down),
+            SocketResponse::Ok
+        );
+        let strip = flow.active_scrolling().virtual_layout();
+        let order: Vec<isize> = strip.columns[0]
+            .rows
+            .iter()
+            .map(|r| r.window_id.0)
+            .collect();
+        assert_eq!(order, vec![b, c, TEST_HWND, d]);
+        assert_eq!(strip.columns[0].row_offset, 1);
+        assert!(!is_parked(&flow, TEST_HWND) && is_parked(&flow, b));
+    }
+
+    /// A mouse focus (foreground hook) landing on a parked row scrolls it
+    /// into view like a keyboard focus does.
+    #[test]
+    fn foreground_change_to_a_parked_row_reveals_it() {
+        let (mut flow, [_, _, d]) = flow_with_a_stack(2, 0);
+        assert!(is_parked(&flow, d));
+        flow.on_focus_changed(d);
+        assert_eq!(row_offset(&flow, 0), 2);
+        assert!(!is_parked(&flow, d));
+    }
+
+    /// `merge-column` / `consume-or-expel` into a column that already holds
+    /// `max_rows` rows walk the window past it instead of refusing.
+    #[test]
+    fn merging_into_a_full_column_moves_the_window_past_it() {
+        let (mut flow, [b, c, d]) = flow_with_a_stack(2, 0);
+        // Pull D out into its own column on the left, then cap columns at 3
+        // rows: [D] [TEST, B, C] with the stack full.
+        flow.registry.set_focused(d);
+        assert_eq!(
+            flow.dispatch_promote_window(Direction::Left),
+            SocketResponse::Ok
+        );
+        for ws in flow.monitors[0].workspaces_mut() {
+            let _ = ws.scrolling.set_row_limits(2, 3);
+        }
+        let order = |flow: &FlowWM| -> Vec<Vec<isize>> {
+            flow.active_scrolling()
+                .virtual_layout()
+                .columns
+                .iter()
+                .map(|col| col.rows.iter().map(|r| r.window_id.0).collect())
+                .collect()
+        };
+        assert_eq!(order(&flow), vec![vec![d], vec![TEST_HWND, b, c]]);
+
+        // merge-column right from D: the stack is full, D swaps past it.
+        assert_eq!(
+            flow.dispatch_merge_column(Direction::Right),
+            SocketResponse::Ok
+        );
+        assert_eq!(order(&flow), vec![vec![TEST_HWND, b, c], vec![d]]);
+        // consume-or-expel left: same rule, back past the stack.
+        assert_eq!(
+            flow.dispatch_consume_or_expel(Direction::Left),
+            SocketResponse::Ok
+        );
+        assert_eq!(order(&flow), vec![vec![d], vec![TEST_HWND, b, c]]);
+        // At the strip's end there is nothing to walk past: still an error.
+        assert!(matches!(
+            flow.dispatch_consume_or_expel(Direction::Left),
+            SocketResponse::Error { .. }
+        ));
+
+        // With room in the stack the consume stacks as usual and the row
+        // viewport scrolls down to the new bottom row.
+        for ws in flow.monitors[0].workspaces_mut() {
+            let _ = ws.scrolling.set_row_limits(2, 4);
+        }
+        assert_eq!(
+            flow.dispatch_consume_or_expel(Direction::Right),
+            SocketResponse::Ok
+        );
+        assert_eq!(order(&flow), vec![vec![TEST_HWND, b, c, d]]);
+        assert_eq!(row_offset(&flow, 0), 2);
+        assert!(!is_parked(&flow, d) && is_parked(&flow, TEST_HWND));
+    }
 }

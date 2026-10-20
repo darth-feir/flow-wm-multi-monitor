@@ -60,7 +60,12 @@ Move focus to the neighbouring window.
 - `focus left` / `focus right` — move focus to the **adjacent column** (or to the
   first/last window when at the canvas edge).
 - `focus up` / `focus down` — move focus to the **window above/below** within the
-  current column.
+  current column. In a stacked column taller than `[columns] visible_rows`,
+  focusing a row that is parked off-screen scrolls the column's row viewport
+  by one row so the focused window is visible (see
+  [Stacked columns](./config-reference.md#stacked-columns-visible_rows-and-max_rows)).
+  At the first/last row there is no window to focus and the command reports
+  that.
 
 At the end of a strip, `focus` hops to the monitor in that direction when
 there is one (see [Monitors](#monitors)); set `[navigation] edge_hop = false`
@@ -82,7 +87,8 @@ window's state and the direction:
 
 - tiled, **left/right** → swap the focused column with its neighbour;
 - tiled, **up/down** → swap the focused window with the one above/below inside the
-  same column;
+  same column — in a stacked column with a row viewport the viewport follows
+  the moved window;
 - floating → pixel nudge (deferred).
 
 At the end of a strip, `move-window left/right` carries the window to the
@@ -115,6 +121,14 @@ as a new **bottom row** of the adjacent column, then redistribute both columns'
 row heights. This is how you stack several windows into one column — the niri /
 Hyprland move that makes scrolling feel better than a fixed grid.
 
+With `[columns] max_rows` set, a neighbour that already holds that many rows
+is not refused: the window **moves past** it — a window alone in its column
+swaps columns with it (exactly `move-window <direction>`), one that shares
+its column is pulled out into a new column on the far side of it — so
+repeated presses walk the window along the strip. With `visible_rows` set,
+the merged window becomes the bottom row and the destination's row viewport
+scrolls down to it.
+
 ```powershell
 flow dispatch merge-column right
 ```
@@ -143,7 +157,9 @@ it twice therefore toggles a window in and out of a stack. `direction` is `left`
 or `right`.
 
 It is an error when there is no neighbouring column to consume into (the
-window is alone at the end of the strip), or when the expel is refused.
+window is alone at the end of the strip), or when the expel is refused. A
+neighbouring column that is full (`[columns] max_rows`) is walked past, as
+with [`merge-column`](#merge-column-direction).
 
 ```powershell
 flow dispatch consume-or-expel left
