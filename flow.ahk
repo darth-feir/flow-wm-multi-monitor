@@ -49,7 +49,7 @@
 ;                                             (+Ctrl+Shift = promote to new column)
 ;   , .      shrink / expand focused column
 ;   c        center viewport on focused column
-;   t        cycle window float <-> tile
+;   t        cycle window float <-> tile       (+Shift = tiling on/off)
 ;   q        close focused window
 ;   p        stop the daemon (then this script exits too)
 ;   1..9,0   switch to workspace 1..10        (+Shift = send window there)
@@ -198,6 +198,16 @@ Act_Up(*) {       ; k
         FlowDispatch("focus up")
 }
 
+Act_Tile(*) {     ; t
+    ; Shift: pause / resume tiling without stopping the daemon (every window
+    ; is put back on-screen while it is off; this script keeps running, so
+    ; the same chord turns it back on). Plain: float <-> tile the window.
+    if GetKeyState("Shift")
+        FlowDispatch("tiling toggle")
+    else
+        FlowDispatch("set-window cycle")
+}
+
 Act_MonitorLeft(*) {   ; [
     if GetKeyState("Shift")
         FlowDispatch("move-to-monitor left")
@@ -234,7 +244,7 @@ Hotkey(ModKey " & k", Act_Up)
 Hotkey(ModKey " & ,", (*) => FlowDispatch("shrink-column"))
 Hotkey(ModKey " & .", (*) => FlowDispatch("expand-column"))
 Hotkey(ModKey " & c", (*) => FlowDispatch("center"))
-Hotkey(ModKey " & t", (*) => FlowDispatch("set-window cycle"))
+Hotkey(ModKey " & t", Act_Tile)
 Hotkey(ModKey " & q", (*) => FlowDispatch("close-window"))
 Hotkey(ModKey " & 1", (*) => WorkspaceAction(1))
 Hotkey(ModKey " & 2", (*) => WorkspaceAction(2))

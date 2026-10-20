@@ -254,6 +254,46 @@ pub enum StartupState {
     Stopped,
 }
 
+/// Whether a ready daemon is tiling, as recorded in the status file.
+///
+/// `flow dispatch tiling off` pauses tiling without stopping the daemon
+/// (the hotkey script stays alive): the file keeps `state: ready` and this
+/// field flips to `off` so `flow start` and a human can tell the two apart.
+/// It is runtime state only — a restart always starts tiling `on`, and a
+/// file written by a daemon that predates the toggle reads as `on`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TilingStatus {
+    /// The daemon is tiling (the default).
+    #[default]
+    On,
+    /// Tiling is paused (`flow dispatch tiling off`).
+    Off,
+}
+
+impl TilingStatus {
+    /// `On` for `true`, `Off` for `false`.
+    #[must_use]
+    pub fn from_enabled(enabled: bool) -> Self {
+        if enabled { Self::On } else { Self::Off }
+    }
+
+    /// `"on"` / `"off"`, as `flow ping` prints it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl fmt::Display for TilingStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Contents of `<config_dir>/flowd.status`.
 ///
 /// Rewritten after every stage. Readers must compare `pid` with the process
@@ -274,6 +314,10 @@ pub struct StartupStatus {
     /// stderr only).
     #[serde(default)]
     pub log_path: Option<PathBuf>,
+    /// Whether a ready daemon is tiling; only meaningful with `state: ready`.
+    /// Missing (older daemon) reads as `on`.
+    #[serde(default)]
+    pub tiling: TilingStatus,
 }
 
 /// Path of the status file inside `config_dir`.
@@ -332,6 +376,7 @@ pub fn panic_status(
         state: StartupState::Error,
         reason: panic_reason(location, message),
         log_path,
+        tiling: TilingStatus::On,
     }
 }
 
@@ -391,7 +436,10 @@ pub fn fail_at_from_env() -> Option<StartupStage> {
 ///
 /// Call [`begin`](Self::begin) before running a stage (it is where fault
 /// injection takes effect), [`ok`](Self::ok) after it succeeds, and
-/// [`fail`](Self::fail) once on the way out when a stage has failed.
+/// [`fail`](Self::fail) once on the way out when a stage has failed. The
+/// daemon keeps a clone to record runtime changes that `flow start` and a
+/// human should see without a restart ([`tiling_changed`](Self::tiling_changed)).
+#[derive(Debug, Clone)]
 pub struct StartupReporter {
     config_dir: PathBuf,
     log_path: Option<PathBuf>,
@@ -438,6 +486,7 @@ impl StartupReporter {
             StartupStage::Runtime,
             StartupState::Error,
             reason.to_owned(),
+            TilingStatus::On,
         );
     }
 
@@ -445,7 +494,25 @@ impl StartupReporter {
     /// `state: stopped` so a later reader does not mistake a stopped daemon
     /// for a ready one.
     pub fn stopped(&self) {
-        self.write(StartupStage::Runtime, StartupState::Stopped, String::new());
+        self.write(
+            StartupStage::Runtime,
+            StartupState::Stopped,
+            String::new(),
+            TilingStatus::On,
+        );
+    }
+
+    /// Record that a ready daemon paused or resumed tiling (`flow dispatch
+    /// tiling off|on`): the file stays `stage: ready, state: ready` and only
+    /// its `tiling` field changes. Never persisted across a restart — the
+    /// next boot rewrites the file stage by stage with `tiling: on`.
+    pub fn tiling_changed(&self, enabled: bool) {
+        self.write(
+            StartupStage::Ready,
+            StartupState::Ready,
+            String::new(),
+            TilingStatus::from_enabled(enabled),
+        );
     }
 
     /// Check for an injected failure before running `stage`.
@@ -478,14 +545,19 @@ impl StartupReporter {
         } else {
             StartupState::Starting
         };
-        self.write(stage, state, String::new());
+        self.write(stage, state, String::new(), TilingStatus::On);
     }
 
     /// Record a failure: log `startup: FAILED at <stage>: <reason>` and
     /// rewrite the status file with `state: error`.
     pub fn fail(&self, err: &StartupError) {
         log::error!("startup: FAILED at {}: {}", err.stage, err.reason);
-        self.write(err.stage, StartupState::Error, err.reason.clone());
+        self.write(
+            err.stage,
+            StartupState::Error,
+            err.reason.clone(),
+            TilingStatus::On,
+        );
     }
 
     /// Write the status document, retrying up to [`STATUS_WRITE_ATTEMPTS`]
@@ -496,13 +568,20 @@ impl StartupReporter {
     /// sharing violation for a few milliseconds. A missed write would leave
     /// a stale `starting`/`ready` behind, which `flow stop` would then wait
     /// on, so it is worth a couple of retries.
-    fn write(&self, stage: StartupStage, state: StartupState, reason: String) {
+    fn write(
+        &self,
+        stage: StartupStage,
+        state: StartupState,
+        reason: String,
+        tiling: TilingStatus,
+    ) {
         let status = StartupStatus {
             pid: self.pid,
             stage,
             state,
             reason,
             log_path: self.log_path.clone(),
+            tiling,
         };
         let mut last_err = None;
         for attempt in 1..=STATUS_WRITE_ATTEMPTS {
@@ -620,6 +699,38 @@ mod tests {
     }
 
     #[test]
+    fn reporter_records_tiling_toggle_while_ready() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reporter = StartupReporter::new(dir.path().to_path_buf(), None, None);
+        reporter.ok(StartupStage::Ready);
+        let s = read_status(dir.path()).unwrap();
+        assert_eq!(s.tiling, TilingStatus::On);
+
+        // Pausing keeps the daemon `ready` and flips only the tiling field.
+        reporter.tiling_changed(false);
+        let s = read_status(dir.path()).unwrap();
+        assert_eq!(s.stage, StartupStage::Ready);
+        assert_eq!(s.state, StartupState::Ready);
+        assert_eq!(s.tiling, TilingStatus::Off);
+        let text = std::fs::read_to_string(status_file_path_in(dir.path())).unwrap();
+        assert!(text.contains("\"tiling\": \"off\""), "{text}");
+
+        reporter.tiling_changed(true);
+        assert_eq!(read_status(dir.path()).unwrap().tiling, TilingStatus::On);
+
+        // A file from a daemon that predates the field reads as tiling on.
+        std::fs::write(
+            status_file_path_in(dir.path()),
+            r#"{"pid":1,"stage":"ready","state":"ready"}"#,
+        )
+        .unwrap();
+        let s = read_status(dir.path()).unwrap();
+        assert_eq!(s.tiling, TilingStatus::On);
+        assert_eq!(TilingStatus::from_enabled(false).to_string(), "off");
+        assert_eq!(TilingStatus::from_enabled(true).as_str(), "on");
+    }
+
+    #[test]
     fn stage_exit_codes_are_base_plus_index() {
         assert_eq!(StartupStage::Logging.exit_code(), 10);
         assert_eq!(StartupStage::Config.exit_code(), 11);
@@ -671,6 +782,7 @@ mod tests {
             state: StartupState::Error,
             reason: "injected failure (FLOW_FAIL_AT)".to_owned(),
             log_path: Some(dir.path().join("logs").join("flowd-2026-10-19.log")),
+            tiling: TilingStatus::On,
         };
         write_status(dir.path(), &status).expect("write");
         assert!(status_file_path_in(dir.path()).exists());
@@ -688,6 +800,7 @@ mod tests {
             state: StartupState::Ready,
             reason: String::new(),
             log_path: None,
+            tiling: TilingStatus::On,
         };
         write_status(dir.path(), &ready).expect("rewrite");
         assert_eq!(read_status(dir.path()), Some(ready));

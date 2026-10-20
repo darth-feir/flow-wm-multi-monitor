@@ -77,6 +77,14 @@ impl FlowWM {
     /// [`ScrollingSpace::insert_window`](crate::workspace::ScrollingSpace::insert_window)
     /// for the full algorithm.
     pub(super) fn on_window_created(&mut self, hwnd: isize) -> bool {
+        // Tiling off: classify and register only, so the window is known
+        // when tiling resumes (`daemon::tiling` seats it then). No seat, no
+        // move, no focus push, no border.
+        if self.tiling_paused {
+            let _ = self.registry.handle_created(hwnd);
+            return self.registry.is_tracked(hwnd);
+        }
+
         // `was_tracked` distinguishes a FRESH registration (this call just
         // classified the window) from a de-duplicated duplicate CREATE for an
         // already-managed window. handle_created early-returns None on its
@@ -178,6 +186,16 @@ impl FlowWM {
     /// The tiling check happens before removal because `remove_window`
     /// deletes the entry from the registry.
     pub(super) fn on_window_destroyed(&mut self, hwnd: isize) {
+        // Tiling off: bookkeeping only — out of every strip and floating
+        // space (no animation, no successor focus) and out of the registry.
+        if self.tiling_paused {
+            self.purge_windows_from_all_spaces(&[WindowId(hwnd)]);
+            remove_float_hwnd(hwnd);
+            self.forget_submitted(hwnd);
+            self.registry.remove_window(hwnd);
+            return;
+        }
+
         let was_tiling = self.registry.is_tiling(hwnd);
 
         if was_tiling {
@@ -206,6 +224,14 @@ impl FlowWM {
     ///    [`remove_from_layout_and_refocus`] — removes from layout, pushes
     ///    focus to the successor, and animates remaining windows filling the gap.
     pub(super) fn on_window_minimized(&mut self, hwnd: isize) {
+        // Tiling off: registry only. The strip keeps the window as the
+        // memory of its seat; the resume drops it if it is still minimized
+        // then, and the later restore hook re-adds it as usual.
+        if self.tiling_paused {
+            self.registry.minimize_window(hwnd);
+            return;
+        }
+
         let was_tiling = self.registry.is_tiling(hwnd);
         self.registry.minimize_window(hwnd);
 
@@ -243,6 +269,12 @@ impl FlowWM {
     /// or hide) removes the window, and the second event sees `is_tiling_active`
     /// as `false` and is a no-op.
     pub(super) fn on_window_hidden(&mut self, hwnd: isize) {
+        // Tiling off: registry only (see `on_window_minimized`).
+        if self.tiling_paused {
+            let _ = self.registry.reconcile_visibility(hwnd);
+            return;
+        }
+
         let was_active_tiling = self.registry.is_tiling_active(hwnd);
         let change = self.registry.reconcile_visibility(hwnd);
         if change == VisibilityChange::Hidden && was_active_tiling {
@@ -403,6 +435,12 @@ impl FlowWM {
     pub(super) fn on_window_restored(&mut self, hwnd: isize) {
         self.registry.restore_window(hwnd);
 
+        // Tiling off: registry only. A window still in its strip's memory
+        // keeps that seat for the resume; one that is not gets appended then.
+        if self.tiling_paused {
+            return;
+        }
+
         // After restore, check if the window is now tiling-active. It goes
         // back to the monitor it was minimized from (owning-monitor memory),
         // not to wherever its parked rect happens to be nearest.
@@ -487,6 +525,10 @@ impl FlowWM {
 
         // Re-show path: a tracked window returning from hidden (Hidden → Active).
         let change = self.registry.reconcile_visibility(hwnd);
+        // Tiling off: the registry transition above is all that happens.
+        if self.tiling_paused {
+            return;
+        }
         if change == VisibilityChange::Shown && self.registry.is_tiling_active(hwnd) {
             self.readd_tile_to_home_monitor(hwnd);
         }
@@ -504,6 +546,14 @@ impl FlowWM {
     /// natural no-op: the focused column is already visible, so
     /// `ensure_focused_visible` returns `None`.
     pub(super) fn on_focus_changed(&mut self, hwnd: isize) {
+        // Tiling off: track the focus (the resume reads it to pick the
+        // active monitor and workspace) but never switch a workspace,
+        // scroll a strip or recolour a border — there are none.
+        if self.tiling_paused {
+            self.registry.set_focused(hwnd);
+            return;
+        }
+
         // Capture the previous focus BEFORE set_focused mutates it: only the
         // previously-focused and newly-focused windows can change border
         // color on a focus switch, so we refresh just those two instead of
@@ -630,6 +680,11 @@ impl FlowWM {
     /// almost nothing when nothing is recoverable.
     pub(super) fn on_window_state_change(&mut self, hwnd: isize) {
         let outcome = self.registry.reclassify_os_state(hwnd);
+        // Tiling off: the registry re-classification is all that happens; a
+        // recovered window is seated by the resume.
+        if self.tiling_paused {
+            return;
+        }
         if let ReclassifyResult::Recovered { now_tiling: true } = outcome {
             self.readd_tile_to_home_monitor(hwnd);
         }

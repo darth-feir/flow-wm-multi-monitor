@@ -89,6 +89,16 @@ impl FlowWM {
             return SocketResponse::Busy;
         }
 
+        // Tiling off (`flow dispatch tiling off`): the desktop is Windows'
+        // to arrange, so nothing that would move a window or push focus is
+        // accepted — only the way back on, queries, `Ping`, `Stop` and the
+        // loadout save. See `daemon::tiling`.
+        if self.tiling_paused && msg.is_rejected_while_tiling_paused() {
+            return SocketResponse::Error {
+                message: super::tiling::TILING_OFF_MESSAGE.to_owned(),
+            };
+        }
+
         match msg {
             // --- Shutdown ---
             SocketMessage::Stop => {
@@ -107,7 +117,12 @@ impl FlowWM {
                 monitors: self.monitors.len(),
                 hooks_registered: self.hook_handle.registered_hooks(),
                 ahk_pid: self.ahk_pid(),
+                tiling_enabled: !self.tiling_paused,
             },
+
+            // --- Tiling on/off ---
+            SocketMessage::SetTiling { enabled } => self.dispatch_set_tiling(*enabled),
+            SocketMessage::ToggleTiling => self.dispatch_set_tiling(self.tiling_paused),
 
             // --- Focus ---
             SocketMessage::FocusLeft => self.dispatch_focus(Direction::Left),
@@ -1608,6 +1623,16 @@ impl FlowWM {
     /// Registry state is set to `Tiling(Active { col, row })` via direct field
     /// write, with `col`/`row` sourced from the destination virtual layout.
     fn set_window_to_tile(&mut self, focused: WindowId) -> SocketResponse {
+        // The rect it is being tiled from is its pre-tiling anchor (unless
+        // an earlier tiling of this run already recorded one): `flow
+        // dispatch tiling off` puts the window back there.
+        if let Some(w) = self.registry.get_window(HWND(focused.0 as *mut _))
+            && let WindowState::Floating(FloatingState::Active { rect }) = w.state
+        {
+            let anchor = w.invisible_bounds.visible_to_window(rect);
+            self.registry.note_pre_tiling_rect(focused.0, anchor);
+        }
+
         // a) Remove from floating space.
         // The float may be registered on any monitor's active workspace;
         // drop it from wherever it is.

@@ -55,6 +55,10 @@ impl FlowWM {
                 serde_json::json!(self.active_monitor),
             );
             map.insert("monitors".into(), serde_json::Value::Array(monitors));
+            map.insert(
+                "tiling_enabled".into(),
+                serde_json::json!(!self.tiling_paused),
+            );
         }
         SocketResponse::Data { payload }
     }

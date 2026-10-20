@@ -89,7 +89,8 @@ format with a `"type"` field and snake_case variant names.
 | Group | Variants | Description |
 |-------|----------|-------------|
 | Control | `Stop`, `ReloadConfig`, `CheckConfig` | Daemon lifecycle and config |
-| Liveness | `Ping` | Answered with `Pong` (version, pid, monitor count, registered hooks); not layout-mutating, so it works mid-drag. Used by `flow start` and `flow ping` |
+| Liveness | `Ping` | Answered with `Pong` (version, pid, monitor count, registered hooks, tiling on/off); not layout-mutating, so it works mid-drag. Used by `flow start` and `flow ping` |
+| Tiling on/off | `SetTiling { enabled }`, `ToggleTiling` | Pause / resume tiling without stopping the daemon (see [Tiling on/off](#tiling-onoff-pause-and-resume)); layout-mutating (rejected mid-drag) but the only mutating commands accepted while tiling is off. Answered with `Data { "tiling_enabled": bool }` — the resulting state |
 | Focus | `FocusLeft/Right/Up/Down` | Move focus between windows |
 | Swap (per-window) | `SwapLeft/Right/Up/Down` | Swap focused window with neighbour |
 | Swap (column) | `SwapColumn { direction }` | Swap entire focused column |
@@ -123,7 +124,7 @@ undecided.
 | `Error` | `message: String` | Command failed |
 | `Data` | `payload: serde_json::Value` | Response to a query command |
 | `Busy` | -- | A tile drag is in progress; layout-mutating commands are rejected for now |
-| `Pong` | `version: String`, `pid: u32`, `monitors: usize`, `hooks_registered: usize`, `ahk_pid: Option<u32>` | Reply to `Ping` — identity and health (including the pid of the hotkey script the daemon launched, if still running), never touches layout |
+| `Pong` | `version: String`, `pid: u32`, `monitors: usize`, `hooks_registered: usize`, `ahk_pid: Option<u32>`, `tiling_enabled: bool` | Reply to `Ping` — identity and health (including the pid of the hotkey script the daemon launched, if still running, and whether tiling is on; `tiling_enabled` defaults to `true` when an older daemon omits it), never touches layout |
 
 A line the daemon cannot decode as a `SocketMessage` — typically a newer
 `flow` CLI sending a command an older daemon does not know — is answered with
@@ -152,7 +153,7 @@ a command arrives.
 | `flow start [--config <dir>] [--log-file <path>] [--ahk] [--no-restore] [--verbose] [--log-level <lvl>]` | Run the daemon-less rescue (below), spawn `flowd.exe` detached, wait until it reports `ready` **and** answers `Ping`; `--ahk` is forwarded to the daemon, which launches `flow.ahk` inside a kill-on-close job object |
 | `flow stop` | Send `Stop` via named pipe; wait (≤ 5 s) for the daemon's status file to leave `ready` (the daemon kills its own hotkey script during fail-back); then terminate a still-live AutoHotkey process recorded in `flow.ahk.pid`, if any (`--ahk` is still accepted and ignored) |
 | `flow rescue [--force]` | Without a daemon: move every off-screen top-level window back onto a monitor and print the titles. Refuses while a daemon answers unless `--force` |
-| `flow ping` | Send `Ping`; print the daemon's version, pid, monitor count, registered-hook count and the hotkey script's pid. Non-zero exit if nothing answers |
+| `flow ping` | Send `Ping`; print the daemon's version, pid, monitor count, registered-hook count, the hotkey script's pid and `tiling on` / `tiling off`. Non-zero exit if nothing answers |
 
 `flow start` locates `flowd.exe` next to the current executable, spawns it with
 `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW` (falling back to plain `spawn()`
@@ -226,7 +227,8 @@ After every stage the daemon rewrites `<config_dir>/flowd.status`:
   "stage": "hooks",
   "state": "error",
   "reason": "mandatory WinEvent hook(s) failed to register: FOREGROUND (SetWinEventHook returned NULL)",
-  "log_path": "C:\\Users\\me\\.config\\flow\\logs\\flowd-2026-10-19.log"
+  "log_path": "C:\\Users\\me\\.config\\flow\\logs\\flowd-2026-10-19.log",
+  "tiling": "on"
 }
 ```
 
@@ -237,7 +239,11 @@ writes `{"stage": "runtime", "state": "error", "reason": "..."}` (the panic
 hook writes `panic at <file>:<line>:<col>: <message>`), and a clean stop
 writes `{"stage": "runtime", "state": "stopped"}` — so a stale `ready` can
 never be mistaken for a live daemon. Readers must compare `pid` with the
-process they spawned.
+process they spawned. `tiling` is `on` or `off` (`flow dispatch tiling
+off` rewrites the file with `state: ready, tiling: off`, see
+[Tiling on/off](#tiling-onoff-pause-and-resume)); it is runtime state only
+— a restart always starts with `on`, `flow start` ignores it, and a file
+from an older daemon that lacks the field reads as `on`.
 
 **Fault injection (test-only).** Setting `FLOW_FAIL_AT=<stage name>` (e.g.
 `FLOW_FAIL_AT=hooks`, `FLOW_FAIL_AT=loadout_restore`) makes the daemon fail at
@@ -350,6 +356,8 @@ owning monitor the registry remembers for a minimized or hidden window), or
 | `flow dispatch move-to-workspace <id>` | `MoveWindowToWorkspace` |
 | `flow dispatch focus-monitor left/right/up/down` | `FocusMonitor` |
 | `flow dispatch move-to-monitor left/right/up/down` | `MoveWindowToMonitor` |
+| `flow dispatch tiling on/off` | `SetTiling { enabled }` — prints `flow: tiling on` / `flow: tiling off` |
+| `flow dispatch tiling toggle` | `ToggleTiling` — prints the state it landed in |
 
 The dispatch commands that change layout flow through the daemon's 3-stage
 pipeline (mutate, project, animate) as described in
@@ -357,6 +365,110 @@ pipeline (mutate, project, animate) as described in
 it only queues `WM_CLOSE` and lets the `EVENT_OBJECT_DESTROY` hook handle the
 actual layout removal, avoiding a race between the synchronous IPC response
 and the asynchronous window destruction.
+
+## Tiling on/off (pause and resume)
+
+The user's requirement: *a toggle to turn tiling on and off; when it is off
+the desktop goes back to the normal Windows window manager and the apps are
+moved back on screen.* The hotkey script owns the toggle key and must keep
+running, so this is **not** a stop: it is a pause inside the daemon
+([`src/daemon/tiling.rs`](../../src/daemon/tiling.rs)), reached through
+`SetTiling { enabled }` / `ToggleTiling` (`flow dispatch tiling
+on|off|toggle`, `Alt + Shift + t` in the bundled keymap). Both directions are
+idempotent, and the state is never persisted: a restart always starts
+tiling, and `flow start` after a crash is unaffected.
+
+**Pause** (`FlowWM::pause_tiling`):
+
+1. `animator.cancel_and_wait()` — no tween may land after the windows have
+   been put back.
+2. Every **tiled** window of every workspace of every monitor — parked
+   workspaces and parked columns included, they are the "apps moved on
+   screen" case — gets one **instant** target: the window rect it had when
+   it was first tiled this run (`Window::pre_tiling_rect`, recorded by
+   `update_tiling_slots_from_layout` from `pre_manage_rect` the first time
+   a window is seated, or by `set-window tile` from the float rect; never
+   refreshed by later float/tile cycles) when the registry has one, clamped
+   into the work area of the monitor whose screen holds its centre, else
+   its workspace-local layout rect clamped into its owning monitor's work
+   area — so a visible tile stays put and a parked one comes to the nearest
+   edge (`pause_target`). A **float** is left alone unless it sits off the
+   virtual screen (a float of a parked workspace), then it is brought into
+   its monitor's work area at its workspace-local rect. The batch has no
+   border inset: the overlays are about to go.
+3. Minimized windows get the stage-7B placement rescue
+   (`rescue_minimized_placement`): a restore position parked beyond the
+   screen is rewritten so the window comes back on-screen when restored.
+4. Every border overlay is dropped (`detach_all_borders`).
+5. `tiling_paused` is set, the status file flips to `tiling: off`, one
+   summary line is logged:
+
+   ```text
+   tiling: off — 7 tile(s) moved on-screen (5 to their pre-tiling rect), 1 float(s) clamped, 1 minimized placement(s) fixed, 8 border(s) dropped; layout-mutating commands are refused until `flow dispatch tiling on`
+   ```
+
+   Nothing else is destroyed: monitors, workspaces, strips and floating
+   spaces stay exactly as they were — they are the memory the resume
+   rebuilds from.
+
+**While paused** the daemon is inert but awake. Hook events only keep the
+registry consistent: `CREATE` / `NAMECHANGE` / `SHOW` of an unknown window
+classify and register it (no seat, no move, no focus push, no border);
+`DESTROY` forgets it (registry and every space); minimize / restore / hide /
+show / `STATECHANGE` are registry transitions only (the strip keeps the
+window as the memory of its seat; the resume drops it if it is still
+minimized then); `FOREGROUND` only updates the tracked focus (no workspace
+switch, no scroll). Drag handling never starts, edge-scroll and the
+float-location sync are no-ops. `dispatch` answers every command for which
+`SocketMessage::is_rejected_while_tiling_paused` is true — every
+layout-mutating one, `LoadoutLoad` included — with
+`Error { "tiling is off (flow dispatch tiling on)" }`; `SetTiling` /
+`ToggleTiling`, `Ping`, the queries, `Stop` and `LoadoutSave` keep working.
+A display-topology change is **deferred**: `poll_topology_change` remembers
+it (keeping the first report's instant for the casualty rule) and leaves the
+geometry alone — a re-seat would move windows that are Windows' to arrange
+— and the resume reconciles it first.
+
+**Resume** (`FlowWM::resume_tiling`) rebuilds from the live desktop the way
+startup does:
+
+1. A deferred display change runs `reconcile_monitors` first.
+2. The top-level windows are re-scanned (`scan_existing_windows`), so
+   windows created during the pause are classified through the rules;
+   windows that no longer exist (`IsWindow`) are dropped from the registry
+   and every space; the minimized state is re-synced with `IsIconic`.
+3. Every strip keeps its windows that are still live `Tiling(Active)` in
+   their remembered (monitor, workspace, column, row) seats — column widths
+   and row heights included — and drops the rest (`remove_window`, so the
+   neighbours' heights survive). A float of an active workspace has its
+   rect re-read from the desktop (the user may have dragged it); a float
+   that is no longer an active float leaves its space.
+4. The foreground window becomes the tracked focus; its monitor becomes
+   active and, if it lives on a parked workspace, that workspace becomes
+   the monitor's active one.
+5. Windows seated nowhere — new ones, or ones restored from a state that
+   had emptied their seat — are appended to the active workspace of the
+   monitor `MonitorFromWindow` reports for them (else their remembered
+   monitor, else the active one); unseated floats are seated there at their
+   current rect, clamped into the work area. Step 4 runs first so a window
+   that appeared during the pause lands on the workspace that is about to
+   be visible.
+6. Every monitor is re-projected and seated as one **instant** batch
+   (`seat_all_monitors_instantly`, shared with the hotplug reconcile), the
+   float-tracking set is rebuilt, the borders are reattached, the status
+   file flips back to `tiling: on`, and one summary line is logged:
+
+   ```text
+   tiling: on — 2 monitor(s), 6 tile(s) kept their seat, 1 appended, 0 float(s) seated or refreshed, 1 vanished window(s) dropped, 9 target(s) seated
+   ```
+
+The Win32 questions both passes ask (`IsWindow`, `IsIconic`,
+`GetWindowRect`, `GetForegroundWindow`, `MonitorFromWindow`, the re-scan,
+the placement rescue) are behind the `TilingProbe` trait, so the pause
+targets, the refusal gate, the registry-only hooks, the remembered-seat
+re-seat with a newly discovered window, the off/on round trip and the
+deferred display change are unit-tested against a mock desktop; the CLI
+wiring is covered by `tests/cli/tiling.rs`.
 
 ## Fail-back: every exit goes through one teardown
 

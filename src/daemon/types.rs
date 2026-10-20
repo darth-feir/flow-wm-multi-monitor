@@ -269,6 +269,27 @@ pub struct FlowWM {
     /// entry is dropped when the window leaves the layout (destroyed,
     /// minimized, hidden).
     pub(super) submitted_rects: std::collections::HashMap<isize, crate::common::Rect>,
+
+    /// `true` while tiling is paused (`flow dispatch tiling off`, see
+    /// `daemon::tiling`). The daemon then never moves a window: hook events
+    /// only keep the registry consistent, drag / float-sync / edge-scroll
+    /// are no-ops, and every layout-mutating command is refused. The
+    /// monitors, workspaces and strips are kept untouched as the memory
+    /// [`resume_tiling`](FlowWM::resume_tiling) rebuilds from. Never
+    /// persisted: a restart always starts tiling.
+    pub(super) tiling_paused: bool,
+
+    /// A display-topology change (`WM_DISPLAYCHANGE` / `SPI_SETWORKAREA`)
+    /// was reported while tiling was paused and its reconcile deferred:
+    /// [`resume_tiling`](FlowWM::resume_tiling) runs
+    /// [`reconcile_monitors`](FlowWM::reconcile_monitors) first. While
+    /// paused the geometry is deliberately not touched — the windows are
+    /// Windows' to arrange, and a re-seat would move them.
+    pub(super) topology_deferred: bool,
+
+    /// The startup reporter, kept so runtime changes reach the status file
+    /// (`tiling: on|off`). `None` in unit tests.
+    pub(super) status_reporter: Option<super::startup::StartupReporter>,
 }
 
 impl FlowWM {

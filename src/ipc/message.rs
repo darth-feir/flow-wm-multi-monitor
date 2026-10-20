@@ -71,6 +71,30 @@ pub enum SocketMessage {
     /// Validate the current config file without applying it.
     CheckConfig,
 
+    // --- Tiling on/off ---
+    /// Turn tiling on or off without stopping the daemon.
+    ///
+    /// `enabled: false` **pauses** tiling: every tiled window (active and
+    /// parked workspaces alike) is moved back on-screen — to the rect it had
+    /// when it was first tiled where known, else clamped into its monitor's
+    /// work area — the border overlays are dropped, and the daemon stops
+    /// moving windows until tiling is turned on again. Hook events keep the
+    /// registry consistent meanwhile, and every layout-mutating command is
+    /// answered with an error. `enabled: true` **resumes**: the desktop is
+    /// re-scanned, tiled windows go back to their remembered
+    /// (monitor, workspace, column, row) seats, newly discovered windows are
+    /// appended, and the borders come back. Both directions are idempotent.
+    /// Answered with [`SocketResponse::Data`] carrying
+    /// `{"tiling_enabled": bool}` (the state after the command).
+    SetTiling {
+        /// `true` to resume tiling, `false` to pause it.
+        enabled: bool,
+    },
+    /// Flip tiling between on and off — [`SetTiling`](Self::SetTiling) with
+    /// the opposite of the current state. Answered like `SetTiling`, so the
+    /// client learns which state it landed in.
+    ToggleTiling,
+
     // --- Focus ---
     /// Move focus left.
     FocusLeft,
@@ -344,7 +368,19 @@ impl SocketMessage {
                 | Self::MoveWindowToMonitor { .. }
                 | Self::ReloadConfig
                 | Self::CloseWindow
+                | Self::LoadoutLoad { .. }
+                | Self::SetTiling { .. }
+                | Self::ToggleTiling
         )
+    }
+
+    /// Whether this command is refused while tiling is paused (`flow
+    /// dispatch tiling off`): every layout-mutating command except the two
+    /// that turn tiling back on. Queries, `Ping`, `Stop` and the loadout
+    /// save keep working.
+    #[must_use]
+    pub fn is_rejected_while_tiling_paused(&self) -> bool {
+        self.is_layout_mutating() && !matches!(self, Self::SetTiling { .. } | Self::ToggleTiling)
     }
 }
 
@@ -382,7 +418,18 @@ pub enum SocketResponse {
         /// that is still running; `None` when not launched or gone.
         #[serde(default)]
         ahk_pid: Option<u32>,
+        /// Whether the daemon is currently tiling (`false` after `flow
+        /// dispatch tiling off`). Defaults to `true` when an older daemon
+        /// omits the field.
+        #[serde(default = "default_tiling_enabled")]
+        tiling_enabled: bool,
     },
+}
+
+/// Serde default for [`SocketResponse::Pong`]'s `tiling_enabled`: a daemon
+/// that predates the toggle is always tiling.
+fn default_tiling_enabled() -> bool {
+    true
 }
 
 /// Serialise a message as a single line of JSON terminated by `\\n`.
@@ -623,16 +670,70 @@ mod tests {
             monitors: 2,
             hooks_registered: 8,
             ahk_pid: Some(4321),
+            tiling_enabled: false,
         };
         let wire = encode_message(&resp).unwrap();
         assert!(wire.contains("\"status\":\"pong\""), "{wire}");
         assert!(wire.contains("\"hooks_registered\":8"), "{wire}");
         assert!(wire.contains("\"ahk_pid\":4321"), "{wire}");
+        assert!(wire.contains("\"tiling_enabled\":false"), "{wire}");
         let parsed: SocketResponse = decode_message(&wire).unwrap();
         assert_eq!(parsed, resp);
         // A response never parses as a message.
         let as_msg: Option<SocketMessage> = decode_message(&wire);
         assert!(as_msg.is_none());
+    }
+
+    // Positive: a Pong from a daemon that predates the tiling toggle (no
+    // `tiling_enabled` field) reads as tiling on.
+    #[test]
+    fn pong_without_tiling_field_defaults_to_enabled() {
+        let wire =
+            r#"{"status":"pong","version":"0.2.0","pid":1,"monitors":1,"hooks_registered":8}"#;
+        let parsed: SocketResponse = decode_message(wire).unwrap();
+        assert!(matches!(
+            parsed,
+            SocketResponse::Pong {
+                tiling_enabled: true,
+                ahk_pid: None,
+                ..
+            }
+        ));
+    }
+
+    // Positive: the tiling toggle messages use snake_case tags, round-trip,
+    // and are layout-mutating (rejected mid-drag) but never rejected while
+    // tiling is paused — they are the way back on.
+    #[test]
+    fn roundtrip_tiling_toggle_messages() {
+        let off = SocketMessage::SetTiling { enabled: false };
+        let json = serde_json::to_string(&off).unwrap();
+        assert_eq!(json, r#"{"type":"set_tiling","enabled":false}"#);
+        let parsed: SocketMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, off);
+
+        let on = SocketMessage::SetTiling { enabled: true };
+        let wire = encode_message(&on).unwrap();
+        assert_eq!(wire, "{\"type\":\"set_tiling\",\"enabled\":true}\n");
+        assert_eq!(decode_message::<SocketMessage>(&wire), Some(on.clone()));
+
+        let toggle = SocketMessage::ToggleTiling;
+        let wire = encode_message(&toggle).unwrap();
+        assert_eq!(wire, "{\"type\":\"toggle_tiling\"}\n");
+        assert_eq!(decode_message::<SocketMessage>(&wire), Some(toggle.clone()));
+
+        for msg in [&off, &on, &toggle] {
+            assert!(msg.is_layout_mutating(), "{msg:?}");
+            assert!(!msg.is_rejected_while_tiling_paused(), "{msg:?}");
+        }
+        // Everything else that mutates layout is refused while paused;
+        // read-only traffic is not.
+        assert!(SocketMessage::FocusLeft.is_rejected_while_tiling_paused());
+        assert!(SocketMessage::LoadoutLoad { path: None }.is_rejected_while_tiling_paused());
+        assert!(!SocketMessage::Ping.is_rejected_while_tiling_paused());
+        assert!(!SocketMessage::QueryWindowsAll.is_rejected_while_tiling_paused());
+        assert!(!SocketMessage::LoadoutSave { path: None }.is_rejected_while_tiling_paused());
+        assert!(!SocketMessage::Stop.is_rejected_while_tiling_paused());
     }
 
     // Positive: round-trip ForgetApp variant (has string field)
@@ -1118,6 +1219,11 @@ mod tests {
             SocketMessage::ReloadConfig,
             // Close (async WM_CLOSE → destroy hook → layout reflow)
             SocketMessage::CloseWindow,
+            // Loadout restore re-seats every workspace
+            SocketMessage::LoadoutLoad { path: None },
+            // Tiling on/off moves every tiled window
+            SocketMessage::SetTiling { enabled: false },
+            SocketMessage::ToggleTiling,
         ];
 
         for msg in &mutating {

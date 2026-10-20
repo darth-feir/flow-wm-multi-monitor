@@ -44,6 +44,10 @@
 //!   the phase-1 logoff rescue)
 //! - [`startup`] — staged startup reporting ([`StartupStage`],
 //!   [`StartupError`], the `flowd.status` file, `FLOW_FAIL_AT` injection)
+//! - `tiling` — the tiling on/off toggle: pause (every tile back
+//!   on-screen, borders dropped, daemon inert) and resume (rebuild from the
+//!   live desktop) without stopping the daemon
+//!   ([`FlowWM::pause_tiling`], [`FlowWM::resume_tiling`])
 //!
 //! The threading model, the hook/IPC event pipelines, and per-event behavior
 //! tables are documented with sequence diagrams in the developer guide
@@ -65,6 +69,7 @@ mod run;
 pub mod session;
 pub(crate) mod shutdown;
 pub mod startup;
+mod tiling;
 mod types;
 
 pub use startup::{StartupError, StartupReporter, StartupStage};

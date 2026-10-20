@@ -382,6 +382,9 @@ impl FlowWM {
             topology_first_report: None,
             topology_retries: 0,
             submitted_rects: std::collections::HashMap::new(),
+            tiling_paused: false,
+            topology_deferred: false,
+            status_reporter: Some(reporter.clone()),
         };
         // Adopt pre-existing float-classified windows (found during the init
         // scan) into workspace 1's FloatingSpace, at their current on-screen
@@ -491,6 +494,9 @@ impl FlowWM {
             topology_first_report: None,
             topology_retries: 0,
             submitted_rects: std::collections::HashMap::new(),
+            tiling_paused: false,
+            topology_deferred: false,
+            status_reporter: None,
         }
     }
 }

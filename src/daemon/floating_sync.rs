@@ -69,6 +69,11 @@ impl FlowWM {
     /// [`relocate_float`](Self::relocate_float), which also re-homes a float
     /// dragged onto another monitor).
     pub(super) fn store_float_rect(&mut self, hwnd: isize) {
+        // Tiling off: floats are Windows' to place; the bookkeeping rect is
+        // refreshed from the desktop when tiling resumes (`daemon::tiling`).
+        if self.tiling_paused {
+            return;
+        }
         let hwnd_handle = HWND(hwnd as *mut _);
 
         // Read the window-rect (full, including invisible borders).

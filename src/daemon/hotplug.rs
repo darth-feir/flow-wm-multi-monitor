@@ -428,6 +428,21 @@ impl FlowWM {
         if reported && self.topology_first_report.is_none() {
             self.topology_first_report = Some(now);
         }
+        if self.tiling_paused {
+            // Tiling is off: the desktop is Windows' to arrange, so nothing
+            // is re-seated now. The change is remembered (and the first
+            // report's instant kept for the casualty rule) and reconciled
+            // when tiling resumes — see `daemon::tiling`.
+            if (reported || self.topology_deadline.is_some()) && !self.topology_deferred {
+                log::info!(
+                    "hotplug: display change while tiling is off; reconcile deferred until tiling resumes"
+                );
+            }
+            self.topology_deferred |= reported || self.topology_deadline.is_some();
+            self.topology_deadline = None;
+            self.topology_retries = 0;
+            return;
+        }
         self.topology_deadline = settle_deadline(self.topology_deadline, reported, now);
         if !settle_due(self.topology_deadline, now) {
             return;
@@ -862,19 +877,21 @@ impl FlowWM {
     /// Submit [`instant_seating_targets`](Self::instant_seating_targets),
     /// record them as every window's last submitted rect, and sync the
     /// registry's tiling slots and (workspace-local) tiled rects from every
-    /// workspace.
-    fn seat_all_monitors_instantly(&mut self) {
+    /// workspace. Shared by the hotplug reconcile and the tiling resume.
+    /// Returns the number of targets submitted.
+    pub(super) fn seat_all_monitors_instantly(&mut self) -> usize {
         let WorkspaceTargets {
             targets, submitted, ..
         } = self.instant_seating_targets();
+        let count = targets.len();
         if !targets.is_empty() {
             log::debug!(
-                "hotplug: re-seating {} target(s) instantly across {} monitor(s)",
+                "re-seating {} target(s) instantly across {} monitor(s)",
                 targets.len(),
                 self.monitors.len()
             );
             if let Err(e) = self.animator.animate(targets) {
-                log::warn!("hotplug: re-seat animation error: {e}");
+                log::warn!("re-seat animation error: {e}");
             }
         }
         self.record_submitted(&submitted);
@@ -886,6 +903,7 @@ impl FlowWM {
                     .update_tiled_rects(ws.scrolling.actual_layout());
             }
         }
+        count
     }
 }
 

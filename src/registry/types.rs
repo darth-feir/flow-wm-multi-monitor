@@ -207,6 +207,21 @@ pub struct Window {
     /// the window has been seated once.
     #[serde(default)]
     pub monitor: Option<usize>,
+
+    /// The window rect (full `GetWindowRect` space, like `pre_manage_rect`)
+    /// the window had the **first time it entered a tiled layout** this
+    /// run; `None` until then.
+    ///
+    /// Recorded once by
+    /// [`WindowRegistry::update_tiling_slots_from_layout`](super::core::WindowRegistry::update_tiling_slots_from_layout)
+    /// (from `pre_manage_rect`, for a window that was tiled from the start)
+    /// or by [`note_pre_tiling_rect`](super::core::WindowRegistry::note_pre_tiling_rect)
+    /// (from the float rect, for a `set-window tile`), and never refreshed
+    /// afterwards: a float → tile → float → tile cycle keeps the first
+    /// anchor. `flow dispatch tiling off` moves each tile back here, so the
+    /// desktop looks like it did before FlowWM tiled it.
+    #[serde(default)]
+    pub pre_tiling_rect: Option<Rect>,
 }
 
 // SAFETY: `Window` contains `HWND` (a raw pointer), but we treat it as an
@@ -264,6 +279,7 @@ impl Window {
             invisible_bounds,
             border: None,
             monitor: None,
+            pre_tiling_rect: None,
         }
     }
 }

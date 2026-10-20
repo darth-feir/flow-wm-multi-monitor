@@ -373,6 +373,31 @@ enum DispatchCommands {
         #[command(subcommand)]
         direction: FocusDirection,
     },
+    /// Turn tiling off (hand the desktop back to Windows, every window
+    /// moved back on-screen), on again, or toggle it — without stopping
+    /// the daemon or the hotkey script.
+    ///
+    /// Maps to [`SocketMessage::SetTiling`] / [`SocketMessage::ToggleTiling`].
+    /// While tiling is off the daemon never moves a window and every
+    /// layout command is refused with `tiling is off`; `flow ping` and
+    /// `flow query all` report the state. Prints `flow: tiling on` or
+    /// `flow: tiling off` — the state after the command, so `toggle` tells
+    /// you where it landed.
+    Tiling {
+        #[command(subcommand)]
+        state: TilingSwitch,
+    },
+}
+
+/// Target state for `flow dispatch tiling <on|off|toggle>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+enum TilingSwitch {
+    /// Resume tiling: rebuild the layout from the live desktop.
+    On,
+    /// Pause tiling: put every window back on-screen and go inert.
+    Off,
+    /// Flip between on and off.
+    Toggle,
 }
 
 /// Cardinal direction for `flow dispatch focus <dir>`.
@@ -695,13 +720,15 @@ fn cmd_ping() -> Result<(), String> {
             monitors,
             hooks_registered,
             ahk_pid,
+            tiling_enabled,
         } => {
             let ahk = match ahk_pid {
                 Some(p) => format!(", flow.ahk pid {p}"),
                 None => String::new(),
             };
+            let tiling = startup::TilingStatus::from_enabled(tiling_enabled);
             println!(
-                "flow: pong from flowd {version} (pid {pid}, {monitors} monitor(s), {hooks_registered} hook(s) registered{ahk})"
+                "flow: pong from flowd {version} (pid {pid}, {monitors} monitor(s), {hooks_registered} hook(s) registered{ahk}, tiling {tiling})"
             );
             Ok(())
         }
@@ -1197,6 +1224,40 @@ fn cmd_dispatch(command: DispatchCommands) -> Result<(), String> {
             SocketMessage::MoveWindowToWorkspace { workspace_id },
             "window moved to workspace",
         ),
+        DispatchCommands::Tiling { state } => cmd_dispatch_tiling(state),
+    }
+}
+
+/// Send a tiling on/off/toggle command and print the state it landed in.
+///
+/// Maps `flow dispatch tiling on|off` to [`SocketMessage::SetTiling`] and
+/// `toggle` to [`SocketMessage::ToggleTiling`]. The daemon answers with
+/// `{"tiling_enabled": bool}`, which is what gets printed (`flow: tiling
+/// on` / `flow: tiling off`), so a toggle reports the resulting state.
+fn cmd_dispatch_tiling(state: TilingSwitch) -> Result<(), String> {
+    let msg = match state {
+        TilingSwitch::On => SocketMessage::SetTiling { enabled: true },
+        TilingSwitch::Off => SocketMessage::SetTiling { enabled: false },
+        TilingSwitch::Toggle => SocketMessage::ToggleTiling,
+    };
+    grant_foreground_permission();
+    let response =
+        transport::send_message(&msg).map_err(|e| format!("failed to send command: {e}"))?;
+    match response {
+        SocketResponse::Data { payload } => {
+            let enabled = payload
+                .get("tiling_enabled")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| format!("malformed reply to tiling command: {payload}"))?;
+            println!(
+                "flow: tiling {}",
+                startup::TilingStatus::from_enabled(enabled)
+            );
+            Ok(())
+        }
+        SocketResponse::Error { message } => Err(format!("daemon error: {message}")),
+        SocketResponse::Busy => Err("daemon is busy (drag in progress), retry shortly".to_string()),
+        other => Err(format!("unexpected reply to tiling command: {other:?}")),
     }
 }
 
@@ -1783,6 +1844,7 @@ mod tests {
             state: StartupState::Ready,
             reason: String::new(),
             log_path: None,
+            tiling: startup::TilingStatus::On,
         };
         startup::write_status(dir.path(), &st).unwrap();
         let t0 = std::time::Instant::now();
@@ -1839,6 +1901,7 @@ mod tests {
             state: StartupState::Ready,
             reason: String::new(),
             log_path: None,
+            tiling: startup::TilingStatus::On,
         };
         startup::write_status(dir.path(), &stale).unwrap();
         assert!(own_status(dir.path(), 2).is_none());
@@ -2757,6 +2820,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_dispatch_tiling() {
+        // Positive: the three switches parse to their variants.
+        for (word, state) in [
+            ("on", TilingSwitch::On),
+            ("off", TilingSwitch::Off),
+            ("toggle", TilingSwitch::Toggle),
+        ] {
+            let cli = Cli::try_parse_from(["flow", "dispatch", "tiling", word]).unwrap();
+            match cli.command {
+                Commands::Dispatch {
+                    command: DispatchCommands::Tiling { state: parsed },
+                } => assert_eq!(parsed, state, "{word}"),
+                other => panic!("expected Dispatch::Tiling({word}), got: {other:?}"),
+            }
+        }
+        // Negative: the switch is mandatory and must be one of the three.
+        assert!(Cli::try_parse_from(["flow", "dispatch", "tiling"]).is_err());
+        assert!(Cli::try_parse_from(["flow", "dispatch", "tiling", "maybe"]).is_err());
+    }
+
+    #[test]
     fn parse_dispatch_swap_workspace() {
         // Positive: `flow dispatch swap-workspace 7` parses with workspace_id = 7.
         let cli = Cli::try_parse_from(["flow", "dispatch", "swap-workspace", "7"]).unwrap();
@@ -2981,6 +3065,7 @@ mod tests {
             state: StartupState::Error,
             reason: "injected failure (FLOW_FAIL_AT)".to_owned(),
             log_path: Some(dir.path().join("daemon-chosen.log")),
+            tiling: startup::TilingStatus::On,
         };
         startup::write_status(dir.path(), &status).unwrap();
         let err = wait_for_daemon(&mut child, dir.path(), &log).unwrap_err();

@@ -901,8 +901,25 @@ impl WindowRegistry {
                         col: col_idx,
                         row: row_idx,
                     });
+                    // First time in a tiled layout: remember where the
+                    // window was, so `tiling off` can put it back there.
+                    if window.pre_tiling_rect.is_none() {
+                        window.pre_tiling_rect = Some(window.pre_manage_rect);
+                    }
                 }
             }
+        }
+    }
+
+    /// Record `rect` (window-rect space) as the position `hwnd_val` had just
+    /// before it was tiled, unless one is already recorded — see
+    /// [`Window::pre_tiling_rect`]. Used by `set-window tile` for a window
+    /// that was floating first, whose `pre_manage_rect` may be long stale.
+    pub fn note_pre_tiling_rect(&mut self, hwnd_val: isize, rect: Rect) {
+        if let Some(window) = self.windows.get_mut(&hwnd_val)
+            && window.pre_tiling_rect.is_none()
+        {
+            window.pre_tiling_rect = Some(rect);
         }
     }
 

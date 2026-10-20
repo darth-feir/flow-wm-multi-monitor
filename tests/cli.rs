@@ -38,6 +38,9 @@ mod registry;
 #[path = "cli/test_desktop.rs"]
 mod test_desktop;
 #[cfg(debug_assertions)]
+#[path = "cli/tiling.rs"]
+mod tiling;
+#[cfg(debug_assertions)]
 #[path = "cli/window_creation.rs"]
 mod window_creation;
 #[cfg(debug_assertions)]

@@ -218,6 +218,12 @@ impl FlowWM {
     ///
     /// No-op if the window is not found or is not an active tile.
     pub(super) fn on_drag_start(&mut self, hwnd: isize) {
+        // Tiling off: a drag is a plain Windows drag, nothing to classify
+        // or preview (and `drag_state` stays `None`, so edge-scroll and the
+        // dragged-window routing stay inert too).
+        if self.tiling_paused {
+            return;
+        }
         let hwnd_handle = HWND(hwnd as *mut _);
         let Some(window) = self.registry.get_window(hwnd_handle) else {
             return;
