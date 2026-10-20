@@ -123,7 +123,7 @@ undecided.
 | `Error` | `message: String` | Command failed |
 | `Data` | `payload: serde_json::Value` | Response to a query command |
 | `Busy` | -- | A tile drag is in progress; layout-mutating commands are rejected for now |
-| `Pong` | `version: String`, `pid: u32`, `monitors: usize`, `hooks_registered: usize` | Reply to `Ping` — identity and health, never touches layout |
+| `Pong` | `version: String`, `pid: u32`, `monitors: usize`, `hooks_registered: usize`, `ahk_pid: Option<u32>` | Reply to `Ping` — identity and health (including the pid of the hotkey script the daemon launched, if still running), never touches layout |
 
 Responses use a `"status"` tag (`"ok"`, `"error"`, `"data"`, `"busy"`,
 `"pong"`), distinct from the message `"type"` tag. A response-shaped JSON will not parse as a `SocketMessage`
@@ -143,9 +143,10 @@ a command arrives.
 
 | Command | Action |
 |---------|--------|
-| `flow start [--config <dir>] [--log-file <path>] [--ahk] [--no-restore] [--verbose] [--log-level <lvl>]` | Spawn `flowd.exe` detached, wait until it reports `ready` **and** answers `Ping`; with `--ahk`, also launch `flow.ahk` via its shell association |
-| `flow stop [--ahk]` | Send `Stop` via named pipe; with `--ahk`, also terminate the AutoHotkey process launched by `start --ahk` |
-| `flow ping` | Send `Ping`; print the daemon's version, pid, monitor count and registered-hook count. Non-zero exit if nothing answers |
+| `flow start [--config <dir>] [--log-file <path>] [--ahk] [--no-restore] [--verbose] [--log-level <lvl>]` | Run the daemon-less rescue (below), spawn `flowd.exe` detached, wait until it reports `ready` **and** answers `Ping`; `--ahk` is forwarded to the daemon, which launches `flow.ahk` inside a kill-on-close job object |
+| `flow stop` | Send `Stop` via named pipe; wait (≤ 5 s) for the daemon's status file to leave `ready` (the daemon kills its own hotkey script during fail-back); then terminate a still-live AutoHotkey process recorded in `flow.ahk.pid`, if any (`--ahk` is still accepted and ignored) |
+| `flow rescue [--force]` | Without a daemon: move every off-screen top-level window back onto a monitor and print the titles. Refuses while a daemon answers unless `--force` |
+| `flow ping` | Send `Ping`; print the daemon's version, pid, monitor count, registered-hook count and the hotkey script's pid. Non-zero exit if nothing answers |
 
 `flow start` locates `flowd.exe` next to the current executable, spawns it with
 `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW` (falling back to plain `spawn()`
@@ -200,7 +201,9 @@ daemon already moved, and exits with `10 + index`:
 | 9 | `loadout_restore` | 19 | Last loadout restored (skipped with `--no-restore`, still reported) |
 | 10 | `ready` | 20 | Status file flips to `ready`; the event loop starts |
 
-Exit code `0` is a clean `flow stop`; `1` is a generic client-side error.
+Exit code `0` is a clean stop (`flow stop`, logoff, console signal); `1` is a
+generic client-side error; **`2`** is a runtime failure after which the daemon
+has failed back (see [Fail-back](#fail-back-every-exit-goes-through-one-teardown)).
 
 `pipe` and `hooks` deliberately run **before** `initial_layout`: they are the
 likeliest failures, and until the initial layout runs no window has been
@@ -221,9 +224,14 @@ After every stage the daemon rewrites `<config_dir>/flowd.status`:
 }
 ```
 
-`state` is `starting` (last completed stage in `stage`), `ready`, or `error`
-(failing stage in `stage`). Readers must compare `pid` with the process they
-spawned.
+`state` is `starting` (last completed stage in `stage`), `ready`, `error`
+(failing stage in `stage`), or `stopped`. After boot the file keeps tracking
+the daemon's life under the pseudo-stage **`runtime`**: a panic or fail-back
+writes `{"stage": "runtime", "state": "error", "reason": "..."}` (the panic
+hook writes `panic at <file>:<line>:<col>: <message>`), and a clean stop
+writes `{"stage": "runtime", "state": "stopped"}` — so a stale `ready` can
+never be mistaken for a live daemon. Readers must compare `pid` with the
+process they spawned.
 
 **Fault injection (test-only).** Setting `FLOW_FAIL_AT=<stage name>` (e.g.
 `FLOW_FAIL_AT=hooks`, `FLOW_FAIL_AT=loadout_restore`) makes the daemon fail at
@@ -232,20 +240,45 @@ running the step. It is honoured in release builds too (it is only an
 environment variable) so the VM test-bed can prove that every stage reports
 and rescues correctly; an unknown value is ignored with a warning. `flow
 start` forwards the environment, so `FLOW_FAIL_AT=borders flow start` exercises
-the client-side failure line end to end. Never set it in a real session.
+the client-side failure line end to end. `FLOW_FAIL_AT=runtime` is different:
+the daemon boots normally, reports `ready`, and then **panics** inside the
+event loop, which exercises the panic hook, `catch_unwind`, the fail-back
+and exit code `2`. Never set it in a real session.
 
 **Log level.** `flow start --verbose` (or `-v`) runs the daemon at `debug`
 (the release default is `info`); `--log-level <filter>` passes an explicit
 `env_logger` filter such as `trace` or `flow_wm::registry=trace`. Both beat
 `RUST_LOG`. The log directory honours `--config` / `FLOW_CONFIG_DIR`.
 
-The `--ahk` flag launches the user's `flow.ahk` **after** the daemon is ready, so
-the first hotkey always reaches a listening daemon. AutoHotkey is resolved via
-`ShellExecuteExW` on the `.ahk` file (Windows' shell association handles
-interpreter lookup); the launched PID is written to `flow.ahk.pid` in the config
-directory so `flow stop --ahk` can terminate exactly that process. `stop --ahk`
-runs **after** the daemon has stopped, so a live daemon never loses its
-keybindings mid-dispatch.
+#### The hotkey script is tied to the daemon
+
+`flow start --ahk` checks that `flow.ahk` exists and forwards `--ahk` to
+`flowd`. The **daemon** launches the script once it has reported `ready`
+(so the first hotkey reaches a listening daemon), inside a **Job Object**
+created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+([`src/job.rs`](../../src/job.rs), [`autostart::launch_ahk_in_job`](../../src/autostart.rs)):
+
+1. The AutoHotkey v2 interpreter is resolved directly — `InstallDir` from
+   `HKCU`/`HKLM\Software\AutoHotkey`, then
+   `%LOCALAPPDATA%\Programs\AutoHotkey`, `%ProgramFiles%\AutoHotkey`
+   (`v2\AutoHotkey64.exe` preferred, then `v2\AutoHotkey32.exe`, then the
+   root `AutoHotkey64.exe` / `AutoHotkey.exe` launcher), then `PATH`.
+2. It is started with `CreateProcessW(CREATE_SUSPENDED)`, assigned to the
+   job with `AssignProcessToJobObject`, then resumed — so it is a job member
+   from its first instruction, and every child it spawns inherits the job.
+3. Only if no interpreter is found does the launch fall back to the `.ahk`
+   shell association (`ShellExecuteExW`), with the returned process assigned
+   to the job after the fact; a warning says the tie-in may not be in
+   effect (a launcher that re-executes the real interpreter and exits may
+   leave the child outside the job).
+
+The job handle lives in `FlowWM` and is never closed explicitly: process
+teardown closes it — clean stop, panic, `abort`, `taskkill /f` — and the
+kernel terminates the script, releasing the Win key. The pid is also written
+to `<config_dir>/flow.ahk.pid` and reported in `Pong.ahk_pid`; `flow stop`
+and the daemon's own fail-back kill it explicitly and remove the pidfile.
+The AHK-side liveness timer in the shipped keymap remains as defence in
+depth.
 
 ### Autostart
 
@@ -304,10 +337,78 @@ it only queues `WM_CLOSE` and lets the `EVENT_OBJECT_DESTROY` hook handle the
 actual layout removal, avoiding a race between the synchronous IPC response
 and the asynchronous window destruction.
 
+## Fail-back: every exit goes through one teardown
+
+The user's requirement is simple: *if a part fails, default to the normal
+Windows desktop instead of a half-broken state — especially with the Win key
+overrides.* `FlowWM::fail_back`
+([`src/daemon/shutdown.rs`](../../src/daemon/shutdown.rs)) is the single
+teardown every exit path runs, in this fixed order:
+
+| # | Step | Why this position |
+|---|------|-------------------|
+| 1 | `animator.cancel_and_wait()` | Sends `Cancel` and **blocks** (≤ 500 ms) for the worker's acknowledgement, so no `SetWindowPos` from a still-running tween can land after step 2. The asynchronous `cancel()` was observed to let the initial-layout tween overwrite a rescue in the VM. |
+| 2 | `rescue_stranded_windows()` | Bring parked / packed windows back (rules below). |
+| 3 | Drop every border overlay | `DestroyWindow` on each; nothing of the daemon stays on screen. |
+| 4 | Stop the hook thread | `WM_QUIT`; it unhooks and exits. |
+| 5 | Kill the hotkey script, remove `flow.ahk.pid` | The Win key is free before the function returns; the job object is the backstop for exits that never get here. An already-exited pid (the job or `flow stop` got there first) is the normal case and only logged at `debug`. |
+| 6 | `PipeServer::shutdown()` — cancel the pending accept, join its thread (≤ 1 s) | `CloseHandle` on a pipe whose accept thread is blocked in a **synchronous** `ConnectNamedPipe` does not cancel it — it blocks until a client connects. Without this step every exit that did not come through IPC kept `flowd` alive until the next `flow` invocation touched the pipe. The accept thread is freed with `CancelSynchronousIo` (re-issued until it exits), with a throwaway self-connect as fallback; if it still will not exit the handle is leaked rather than closed. |
+
+`main` then rewrites the status file (`stopped` or `error`/`runtime`),
+drops the `FlowWM`, and leaves through an explicit `std::process::exit(code)`
+— never relying on destructors or helper threads winding down. The paths
+that reach it:
+
+| Trigger | `RunExit` | Status | Exit code |
+|---------|-----------|--------|-----------|
+| `flow stop` | `Stop` | `stopped` | 0 |
+| `WM_CLOSE` / `WM_QUERYENDSESSION` / `WM_ENDSESSION` on the session-sink window or a border overlay; `CTRL_C` / `CTRL_BREAK` / `CTRL_CLOSE` / `CTRL_LOGOFF` / `CTRL_SHUTDOWN` on a console run | `ShutdownRequested` | `stopped` | 0 |
+| Animator worker thread died (`WindowAnimator::is_alive()` false — its loop runs under `catch_unwind`) | `FailBack("animator thread died")` | `error` / `runtime` | 2 |
+| Hook thread exited (`HookThreadHandle::is_alive()` polls its thread handle; e.g. `GetMessageW` returned −1) | `FailBack("hook thread exited")` | `error` / `runtime` | 2 |
+| `MsgWaitForMultipleObjects` failed | `FailBack(...)` | `error` / `runtime` | 2 |
+| Panic on the main thread (`flow.run()` is under `catch_unwind`) | — | `error` / `runtime` (written by the panic hook first) | 2 |
+
+The event loop checks the shutdown flag and both thread liveness flags on
+every wake, and again right after pumping window messages (which is where a
+`WM_ENDSESSION` is dispatched), so a logoff reaches the rescue within one
+loop iteration. The fail-back itself runs under `catch_unwind` too: a second
+panic cannot skip the status write or the exit code.
+
+**Signals.** The daemon's only windows are the border overlays, which exist
+only while there are windows to decorate — and message-only windows never
+receive session broadcasts. So the `hooks` stage also creates an invisible
+top-level **session-sink** window ([`src/daemon/session.rs`](../../src/daemon/session.rs))
+on the main thread; its window procedure (and the overlay's) turns
+`WM_CLOSE`, `WM_QUERYENDSESSION` (answered `TRUE`, never vetoing a logoff) and
+`WM_ENDSESSION` into `registry::hooks::request_shutdown()`, which sets a
+static flag and signals the hook event to wake the main loop.
+`SetConsoleCtrlHandler` does the same for console runs; for the events after
+which Windows kills the process on return (close, logoff, shutdown) the
+handler blocks up to 4 s for the fail-back to finish.
+
+**Panics.** `flowd` installs a panic hook that logs
+`panic at <file>:<line>:<col>: <message>` and rewrites `flowd.status` with
+`stage: runtime, state: error` before unwinding — on any thread. A panic in
+a Win32 callback (`extern "system"`, the hook thread) still aborts the
+process after the hook has run; the job object then kills the hotkey script.
+
+**Daemon-less rescue.** When none of the above could run (power loss,
+`taskkill /f`, an older build), `flow rescue`
+([`src/rescue.rs`](../../src/rescue.rs)) brings every off-screen top-level
+window back without a daemon: it enumerates the windows the daemon's scan
+would consider (visible, titled, Alt-Tab-visible, unowned), strips the
+invisible borders, and clamps any window whose visible content does not
+overlap the virtual screen into the work area of its home monitor — the one
+sharing the most of the window's horizontal or vertical band (a window parked
+left/right keeps its monitor's y-range, one parked above/below keeps its
+x-range), nearest-by-centre as the tie-breaker. `flow start` runs the same
+pass before spawning the daemon so a crashed previous run is cleaned up on
+the next start.
+
 ## Graceful-Shutdown Window Rescue
 
-`flow stop` sends the `Stop` command, the event loop exits, and then -- before the
-daemon process tears down -- [`FlowWM::rescue_stranded_windows`]
+`flow stop` sends the `Stop` command, the event loop exits, and then -- as
+step 2 of the fail-back above -- [`FlowWM::rescue_stranded_windows`]
 runs once. Its job is to bring windows that became **physically inaccessible**
 during this flow session back onto the screen, without disturbing anything the
 user can currently see.
@@ -395,17 +496,19 @@ before the very first flow run in history. Consequences:
   registration-time anchor.
 
 The unclean-shutdown case -- where the daemon process is gone and cannot run the
-rescue pass -- is what the planned watchdog process is for: restoring from an
-on-disk snapshot without needing the daemon alive (see the
+rescue pass -- is covered by `flow rescue` (and the pre-start pass in `flow
+start`), which needs no daemon state: it only looks at where windows are now.
+A watchdog that restores from an on-disk snapshot is still planned (see the
 [Roadmap](./roadmap.md)).
 
 ### Code path
 
 | Step | Location |
 |------|----------|
-| Wired after the event loop exits | [`src/main.rs`](../../src/main.rs) -- `flow.run()` then `flow.rescue_stranded_windows()` |
-| Wired on startup failure after windows moved | [`src/daemon/new.rs`](../../src/daemon/new.rs) (free function `rescue_stranded_windows_with`, before `FlowWM` exists) and `main.rs` (`loadout_restore` / `ready` stages) |
-| The rescue loop | [`src/daemon/shutdown.rs`](../../src/daemon/shutdown.rs) -- `rescue_stranded_windows_with`; `FlowWM::rescue_stranded_windows` is a thin wrapper |
+| Wired after the event loop exits | [`src/main.rs`](../../src/main.rs) -- `flow.run()` under `catch_unwind`, then `flow.fail_back(reason, clean)` |
+| Wired on startup failure after windows moved | [`src/daemon/new.rs`](../../src/daemon/new.rs) (free function `rescue_stranded_windows_with`, before `FlowWM` exists) and `main.rs` (`loadout_restore` / `ready` stages, via `fail_back`) |
+| The rescue loop | [`src/daemon/shutdown.rs`](../../src/daemon/shutdown.rs) -- `rescue_stranded_windows_with`; `FlowWM::rescue_stranded_windows` cancels the animator synchronously and wraps it; `FlowWM::fail_back` is the full teardown |
+| Daemon-less rescue | [`src/rescue.rs`](../../src/rescue.rs) -- `rescue_target` (pure geometry) and `rescue_offscreen_windows` (`flow rescue`, `flow start`) |
 | Which windows are controlled | `WindowRegistry::restorable_windows` in [`src/registry/core.rs`](../../src/registry/core.rs) |
 | Clamp geometry | `Rect::clamped_into` in [`src/common/types.rs`](../../src/common/types.rs) |
 

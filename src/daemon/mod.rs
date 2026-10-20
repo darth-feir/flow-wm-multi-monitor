@@ -35,8 +35,9 @@
 //! - [`edge_scroll`] — pure, clock-injectable edge-scroll auto-repeat scheduler
 //! - [`animation`] — animation bridge ([`FlowWM::animate_layout`])
 //! - [`config_derive`] — configuration derivation helpers and tests
-//! - [`shutdown`] — graceful-shutdown window rescue
-//!   ([`FlowWM::rescue_stranded_windows`])
+//! - [`shutdown`] — graceful-shutdown window rescue and fail-back
+//!   ([`FlowWM::rescue_stranded_windows`], [`FlowWM::fail_back`])
+//! - [`session`] — session-end / console-control signals ([`session::SessionSink`])
 //! - [`startup`] — staged startup reporting ([`StartupStage`],
 //!   [`StartupError`], the `flowd.status` file, `FLOW_FAIL_AT` injection)
 //!
@@ -56,9 +57,11 @@ mod loadout;
 mod new;
 mod query;
 mod run;
+pub mod session;
 pub mod shutdown;
 pub mod startup;
 mod types;
 
+pub use run::RunExit;
 pub use startup::{StartupError, StartupReporter, StartupStage};
 pub use types::FlowWM;

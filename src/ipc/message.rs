@@ -378,6 +378,10 @@ pub enum SocketResponse {
         monitors: usize,
         /// Number of WinEvent hooks the hook thread registered.
         hooks_registered: usize,
+        /// Pid of the hotkey script (`flow.ahk`) the daemon launched and
+        /// that is still running; `None` when not launched or gone.
+        #[serde(default)]
+        ahk_pid: Option<u32>,
     },
 }
 
@@ -618,10 +622,12 @@ mod tests {
             pid: 1234,
             monitors: 2,
             hooks_registered: 8,
+            ahk_pid: Some(4321),
         };
         let wire = encode_message(&resp).unwrap();
         assert!(wire.contains("\"status\":\"pong\""), "{wire}");
         assert!(wire.contains("\"hooks_registered\":8"), "{wire}");
+        assert!(wire.contains("\"ahk_pid\":4321"), "{wire}");
         let parsed: SocketResponse = decode_message(&wire).unwrap();
         assert_eq!(parsed, resp);
         // A response never parses as a message.

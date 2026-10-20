@@ -105,6 +105,7 @@ impl FlowWM {
                 pid: std::process::id(),
                 monitors: self.monitors.len(),
                 hooks_registered: self.hook_handle.registered_hooks(),
+                ahk_pid: self.ahk_pid(),
             },
 
             // --- Focus ---

@@ -780,6 +780,22 @@ impl WindowRegistry {
         entries.into_iter().map(|(id, _, w)| (id, w)).collect()
     }
 
+    /// Drop every window's border overlay (`DestroyWindow` on each).
+    ///
+    /// Part of the daemon's fail-back: overlays are top-level windows owned
+    /// by the main thread, and a daemon that is exiting must not leave
+    /// orphaned click-through rings on screen. Returns how many were
+    /// detached. Idempotent.
+    pub fn detach_all_borders(&mut self) -> usize {
+        let mut detached = 0;
+        for w in self.windows.values_mut() {
+            if w.border.take().is_some() {
+                detached += 1;
+            }
+        }
+        detached
+    }
+
     /// Returns `(hwnd_key, pre_manage_rect, invisible_bounds)` for every window
     /// flow is actively positioning — those in a `Tiling(Active)` or
     /// `Floating(Active)` state.
@@ -1206,7 +1222,7 @@ fn state_to_json(state: &WindowState) -> serde_json::Value {
 /// (those with a parent via [`has_parent`]) — see [`has_parent`].
 ///
 /// See the Window Registry chapter (`docs/src/dev-guide/window-registry.md`).
-fn has_owner(hwnd: HWND) -> bool {
+pub(crate) fn has_owner(hwnd: HWND) -> bool {
     match unsafe { GetWindow(hwnd, GW_OWNER) } {
         Ok(owner) => !owner.is_invalid(),
         Err(_) => false,
@@ -1221,7 +1237,7 @@ fn has_owner(hwnd: HWND) -> bool {
 /// owned top-level windows. Distinct from [`has_owner`] (owner relation).
 ///
 /// See the Window Registry chapter (`docs/src/dev-guide/window-registry.md`).
-fn has_parent(hwnd: HWND) -> bool {
+pub(crate) fn has_parent(hwnd: HWND) -> bool {
     let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) };
     let style = WINDOW_STYLE(style as u32);
     style & WS_CHILD != WINDOW_STYLE(0)
@@ -1246,7 +1262,7 @@ fn has_parent(hwnd: HWND) -> bool {
 /// The `LPARAM` carries a raw pointer to a `Vec<HWND>` allocated on the
 /// caller's stack. The callback dereferences this pointer — the caller must
 /// ensure the `Vec` outlives the enumeration.
-fn enum_toplevel_windows() -> Result<Vec<HWND>, String> {
+pub(crate) fn enum_toplevel_windows() -> Result<Vec<HWND>, String> {
     let mut collected: Vec<HWND> = Vec::new();
     let ptr = &mut collected as *mut Vec<HWND>;
 

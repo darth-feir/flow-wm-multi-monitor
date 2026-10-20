@@ -33,19 +33,39 @@
 //! | 19 | `loadout_restore` |
 //! | 20 | `ready` |
 //!
-//! Exit code `0` means a clean stop (`flow stop`). `FLOW_FAIL_AT=<stage>`
-//! injects a failure at that stage for testing (see
-//! [`flow_wm::daemon::startup`]).
+//! Exit code `0` means a clean stop (`flow stop`, logoff, console signal).
+//! Exit code **`2`** means a runtime failure — a panic on any thread, a dead
+//! animator or hook thread — after which the daemon has already **failed
+//! back** (see [`FlowWM::fail_back`]): rescued windows, dropped its border
+//! overlays, stopped the hook thread and killed the hotkey script, so the
+//! user is left with a plain Windows desktop rather than a half-managed
+//! one. `FLOW_FAIL_AT=<stage>` injects a failure at that stage for testing
+//! (see [`flow_wm::daemon::startup`]); `FLOW_FAIL_AT=runtime` injects a
+//! panic in the event loop to exercise the fail-back path.
+//!
+//! # Panics
+//!
+//! A process-wide panic hook logs the panic location and message and
+//! rewrites `flowd.status` with `stage: runtime`, `state: error` before
+//! unwinding starts. `flow.run()` runs under `catch_unwind`, so a
+//! main-thread panic still reaches `fail_back`; a panic on the animator
+//! worker marks it dead and the event loop fails back on its next wake. A
+//! panic inside a Win32 callback (hook thread) aborts the process after the
+//! hook has run — the kill-on-close job object then takes the hotkey script
+//! down with it.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
+use flow_wm::animation::panic_payload_message;
 use flow_wm::config::{
     WindowRulesConfig, dirs, init_config_dir, load_app_config, load_default_rules,
     load_rules_config,
 };
-use flow_wm::daemon::startup::{self, AtStage};
+use flow_wm::daemon::session;
+use flow_wm::daemon::startup::{self, AtStage, EXIT_CODE_RUNTIME};
 use flow_wm::daemon::{FlowWM, StartupError, StartupReporter, StartupStage};
 use flow_wm::logging;
 
@@ -89,6 +109,12 @@ struct Args {
     #[arg(long)]
     no_restore: bool,
 
+    /// Launch `<config_dir>/flow.ahk` once the daemon is ready, inside a
+    /// kill-on-close job object so the script dies with the daemon.
+    /// Forwarded by `flow start --ahk`.
+    #[arg(long)]
+    ahk: bool,
+
     /// Desktop name for test mode (opens and switches to this desktop).
     /// Only available in debug builds.
     #[cfg(debug_assertions)]
@@ -110,8 +136,9 @@ impl Args {
 
 /// Daemon entry point.
 ///
-/// Exits `0` on a clean stop and `10 + stage index` when startup fails at a
-/// [`StartupStage`] (see the module docs for the table).
+/// Exits `0` on a clean stop, `10 + stage index` when startup fails at a
+/// [`StartupStage`] (see the module docs for the table), and
+/// [`EXIT_CODE_RUNTIME`] (`2`) after a runtime failure / panic.
 fn main() {
     // Parse CLI arguments first so the `--log-file` / level overrides are
     // available to the logger. Clap handles `--help`/`--version` and usage
@@ -133,13 +160,82 @@ fn main() {
     );
     log::info!("using config directory: {}", config_dir.display());
 
-    let reporter = StartupReporter::new(config_dir.clone(), log_path, startup::fail_at_from_env());
+    let reporter = StartupReporter::new(
+        config_dir.clone(),
+        log_path.clone(),
+        startup::fail_at_from_env(),
+    );
 
-    if let Err(err) = run(args, config_dir, &reporter) {
-        reporter.fail(&err);
-        log::error!("flowd: fatal error: {err}");
-        std::process::exit(err.exit_code());
+    // From here on every panic — on any thread — is logged and recorded in
+    // the status file before unwinding, so `flow start` and a human reading
+    // flowd.status both learn what happened even if the process then dies.
+    install_panic_hook(config_dir.clone(), log_path);
+
+    // Console runs: Ctrl-C / console close / logoff / shutdown become a
+    // graceful stop. Harmless when detached (no console → never fires).
+    if let Err(e) = session::install_console_ctrl_handler() {
+        log::warn!("flowd: {e}; console signals will not trigger a graceful stop");
     }
+
+    // Always leave through an explicit exit: the status file has been written
+    // by now, and nothing below may depend on destructors or on helper
+    // threads (accept, animator, hooks) winding down on their own.
+    let code = match run(args, config_dir, &reporter) {
+        Ok(RunOutcome::Clean) => 0,
+        Ok(RunOutcome::FailedBack) => EXIT_CODE_RUNTIME,
+        Err(err) => {
+            reporter.fail(&err);
+            log::error!("flowd: fatal error: {err}");
+            err.exit_code()
+        }
+    };
+    log::info!("flowd: exiting with code {code}");
+    std::process::exit(code);
+}
+
+/// How the event loop ended, once the teardown has run.
+#[derive(Debug, PartialEq, Eq)]
+enum RunOutcome {
+    /// Clean stop; exit `0`.
+    Clean,
+    /// Runtime failure (panic, dead thread); fail-back has run; exit `2`.
+    FailedBack,
+}
+
+/// Install the process-wide panic hook.
+///
+/// The hook logs `panic at <file>:<line>:<col>: <message>` at `error`,
+/// rewrites `<config_dir>/flowd.status` with [`startup::panic_status`]
+/// (`stage: runtime`, `state: error`), and then defers to the default hook
+/// (which prints the panic to stderr). It never panics itself: a failed
+/// status write is logged and ignored.
+fn install_panic_hook(config_dir: PathBuf, log_path: Option<PathBuf>) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
+        let message = panic_payload_message(info.payload());
+        let thread = std::thread::current();
+        let reason = startup::panic_reason(location.as_deref(), &message);
+        log::error!(
+            "flowd: {reason} (thread {:?})",
+            thread.name().unwrap_or("<unnamed>")
+        );
+        let status = startup::panic_status(
+            std::process::id(),
+            log_path.clone(),
+            location.as_deref(),
+            &message,
+        );
+        if let Err(e) = startup::write_status(&config_dir, &status) {
+            log::warn!(
+                "flowd: could not write {} from the panic hook: {e}",
+                startup::status_file_path_in(&config_dir).display()
+            );
+        }
+        default_hook(info);
+    }));
 }
 
 /// Run the daemon: load config, build flow, run event loop.
@@ -160,9 +256,15 @@ fn main() {
 /// 5. `ready` — the status file flips to `ready`, then `flow.run()` enters
 ///    the IPC event loop.
 ///
-/// Returns `Ok` on `Stop`; `Err` names the failing stage. Once a `FlowWM`
-/// exists, every error path rescues stranded windows before returning.
-fn run(args: Args, config_dir: PathBuf, reporter: &StartupReporter) -> Result<(), StartupError> {
+/// Returns `Ok(Clean)` on a clean stop, `Ok(FailedBack)` after a runtime
+/// failure (the fail-back has run; the caller exits `2`), and `Err` naming
+/// the failing startup stage. Once a `FlowWM` exists, every error path
+/// rescues stranded windows before returning.
+fn run(
+    args: Args,
+    config_dir: PathBuf,
+    reporter: &StartupReporter,
+) -> Result<RunOutcome, StartupError> {
     use StartupStage as S;
 
     // 1. Logging is up (main). Report it so the status file exists from
@@ -223,17 +325,63 @@ fn run(args: Args, config_dir: PathBuf, reporter: &StartupReporter) -> Result<()
     // 4./5. Loadout restore + ready. Windows have been moved by now, so any
     //       failure here must rescue them before the process exits.
     if let Err(err) = finish_startup(&mut flow, args.no_restore, reporter) {
-        flow.rescue_stranded_windows();
+        flow.fail_back(&err.to_string(), false);
         return Err(err);
     }
 
-    flow.run();
+    // 6. Hotkey script — only once the daemon is listening, so the first
+    //    hotkey lands. Tied to this process by a kill-on-close job object.
+    if args.ahk {
+        match flow.launch_ahk() {
+            Some(pid) => log::info!("startup: flow.ahk launched (pid {pid})"),
+            None => log::warn!("startup: flow.ahk was not launched; hotkeys are unavailable"),
+        }
+    }
 
-    // Graceful exit (Stop command or fatal wait error): rescue any windows
-    // stranded off-screen before tearing down. See `daemon::shutdown`.
-    flow.rescue_stranded_windows();
+    // 7. Event loop, under catch_unwind so a main-thread panic still reaches
+    //    the fail-back below. `FLOW_FAIL_AT=runtime` panics here on purpose.
+    let inject_runtime_panic = reporter.fail_at() == Some(S::Runtime);
+    let exit = catch_unwind(AssertUnwindSafe(|| {
+        if inject_runtime_panic {
+            panic!("injected panic ({}=runtime)", startup::FAIL_AT_ENV);
+        }
+        flow.run()
+    }));
 
-    Ok(())
+    // 8. Teardown — one path for every exit. Itself guarded: a second panic
+    //    must not skip the status file and exit code.
+    let (reason, clean) = match &exit {
+        Ok(run_exit) => (run_exit.reason(), run_exit.is_clean()),
+        Err(payload) => (
+            format!(
+                "panic in event loop: {}",
+                panic_payload_message(payload.as_ref())
+            ),
+            false,
+        ),
+    };
+    let teardown = catch_unwind(AssertUnwindSafe(|| flow.fail_back(&reason, clean)));
+    if let Err(payload) = teardown {
+        log::error!(
+            "flowd: fail-back itself panicked: {}",
+            panic_payload_message(payload.as_ref())
+        );
+    }
+
+    let outcome = if clean {
+        reporter.stopped();
+        RunOutcome::Clean
+    } else {
+        // A panic already wrote an error status from the hook; rewrite it
+        // with the final reason either way so the file reflects the exit.
+        reporter.runtime_failure(&reason);
+        RunOutcome::FailedBack
+    };
+    // Explicit, so a blocking destructor can never keep the process alive
+    // after the teardown has run (the accept thread is already stopped by
+    // `fail_back`; this is the belt to that suspender).
+    drop(flow);
+    Ok(outcome)
 }
 
 /// The post-construction stages: `loadout_restore` and `ready`.

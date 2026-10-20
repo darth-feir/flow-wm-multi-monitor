@@ -68,7 +68,7 @@
 //! [`pending_creations`](super::types::FlowWM::pending_creations).
 //! On every `process_hook_events` call, pending windows are retried. When the
 //! list is non-empty, `MsgWaitForMultipleObjects` uses a finite timeout (100 ms)
-//! instead of `INFINITE`, ensuring retries happen even without new hook events.
+//! instead of the idle liveness tick, ensuring retries happen even without new hook events.
 //!
 //! This approach is event-driven by default (zero CPU while idle) with a
 //! bounded timer fallback only when windows are pending classification.
@@ -81,8 +81,43 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::registry::HookEvent;
+use crate::registry::hooks;
 
 use super::types::FlowWM;
+
+/// Why [`FlowWM::run`] returned. `main` maps it to the teardown reason, the
+/// status file state and the exit code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunExit {
+    /// The `Stop` IPC command was received (`flow stop`). Clean.
+    Stop,
+    /// A graceful shutdown was requested from outside IPC: `WM_CLOSE` /
+    /// `WM_QUERYENDSESSION` / `WM_ENDSESSION` on one of the daemon's
+    /// windows, or a console control event. Clean.
+    ShutdownRequested,
+    /// The daemon can no longer do its job and must fail back: the reason
+    /// names the dead part (`animator thread died`, `hook thread exited`,
+    /// `MsgWaitForMultipleObjects failed`).
+    FailBack(String),
+}
+
+impl RunExit {
+    /// `true` for the two clean exits.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        !matches!(self, RunExit::FailBack(_))
+    }
+
+    /// Human-readable reason for the log and the status file.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        match self {
+            RunExit::Stop => "stop command received".to_owned(),
+            RunExit::ShutdownRequested => "shutdown requested (session end or signal)".to_owned(),
+            RunExit::FailBack(reason) => reason.clone(),
+        }
+    }
+}
 
 /// Maximum retry attempts for a pending window creation.
 ///
@@ -92,28 +127,51 @@ use super::types::FlowWM;
 /// screen, or other non-tiling window).
 const MAX_PENDING_RETRIES: u8 = 5;
 
+/// Longest the main loop sleeps with nothing scheduled (milliseconds).
+///
+/// A dead animator worker sets no event, so without a periodic wake the
+/// liveness check in [`FlowWM::run`] would only run on the next hook, IPC
+/// or foreground-sync wake. One wake per second is the cost of noticing a
+/// dead helper thread even when `foreground_sync_interval_ms = 0`.
+const LIVENESS_TICK_MS: u32 = 1_000;
+
 /// Timeout (milliseconds) for `WaitForMultipleObjects` when there are pending
 /// window creations to retry.
 ///
-/// When `pending_creations` is empty, `u32::MAX` (`INFINITE`) is used instead.
+/// When `pending_creations` is empty, the next due deadline (capped at
+/// [`LIVENESS_TICK_MS`]) is used instead.
 /// 100 ms is fast enough for interactive use but slow enough that the window
 /// has time to finish initializing (set title, become visible, finalize styles).
 const PENDING_RETRY_TIMEOUT_MS: u32 = 100;
 
 impl FlowWM {
     /// Run the event-driven main loop. Blocks until the `Stop` command is
-    /// received or a fatal error occurs.
+    /// received, a shutdown is requested, or a fatal error occurs; the
+    /// returned [`RunExit`] says which. The caller then runs
+    /// [`fail_back`](FlowWM::fail_back).
+    ///
+    /// # Liveness
+    ///
+    /// On every wake the loop also checks that the two helper threads are
+    /// still alive — the animator worker
+    /// ([`is_alive`](crate::animation::WindowAnimator::is_alive)) and the
+    /// hook thread ([`is_alive`](crate::registry::hooks::HookThreadHandle::is_alive))
+    /// — and whether [`request_shutdown`](crate::registry::hooks::request_shutdown)
+    /// has fired. A dead thread means the daemon is deaf or cannot move
+    /// windows, so it returns [`RunExit::FailBack`] rather than running
+    /// half-broken.
     ///
     /// # Loop Structure
     ///
     /// ```text
     /// start_accept()                          // Spawn background accept thread
     /// loop {
+    ///     if shutdown requested / a helper thread died: return
     ///     resume float tracking if its deadline arrived
     ///     reconcile foreground against GetForegroundWindow()
     ///     timeout = soonest(pending_creations?100ms, float_resume_deadline,
     ///                       foreground_sync_interval, edge_scroll_deadline,
-    ///                       INFINITE)
+    ///                       LIVENESS_TICK_MS)
     ///     MsgWaitForMultipleObjects(          // Sleep until something happens
     ///         [hook_signal, connected_event],
     ///         timeout,
@@ -183,7 +241,7 @@ impl FlowWM {
     /// overlay windows. Without a pump, those calls would deadlock and so
     /// would every border operation (and, eventually, every IPC dispatch).
     /// See `docs/src/dev-guide/borders.md`.
-    pub fn run(&mut self) {
+    pub fn run(&mut self) -> RunExit {
         log::info!("flowd: daemon started, event-driven loop on named pipe");
 
         // Start the first background accept — spawns a thread that blocks in
@@ -199,6 +257,13 @@ impl FlowWM {
         let wait_handles = [hook_handle, connect_handle];
 
         loop {
+            // Graceful-exit and liveness checks first, on every wake. A
+            // session end or console signal is handled like `Stop`; a dead
+            // helper thread is a fail-back.
+            if let Some(exit) = self.check_exit_conditions() {
+                return exit;
+            }
+
             // Resume float tracking if its suppression deadline has arrived.
             // Runs before computing the timeout so a due deadline is handled
             // now instead of scheduling a 1 ms re-wake.
@@ -237,7 +302,7 @@ impl FlowWM {
             // Check for WAIT_FAILED (0xFFFFFFFF).
             if wait_result.0 == u32::MAX {
                 log::error!("flowd: MsgWaitForMultipleObjects failed");
-                break;
+                return RunExit::FailBack("MsgWaitForMultipleObjects failed".to_owned());
             }
 
             // The raw wait code — index of the first signaled handle, or
@@ -250,6 +315,13 @@ impl FlowWM {
             // `SendMessage` calls to overlay windows complete promptly.
             // Without this, border operations (and eventually IPC) deadlock.
             self.pump_messages();
+
+            // The pump may just have dispatched WM_ENDSESSION / WM_CLOSE to
+            // the session sink or an overlay: leave now so the rescue runs
+            // before Windows ends the session.
+            if let Some(exit) = self.check_exit_conditions() {
+                return exit;
+            }
 
             // Always reset hook signal FIRST (race-free pattern), then drain.
             // Any event pushed between ResetEvent and try_recv is caught by
@@ -318,7 +390,7 @@ impl FlowWM {
 
                             if is_stop {
                                 log::info!("flowd: shutting down");
-                                return;
+                                return RunExit::Stop;
                             }
                         }
                         Err(_) => {
@@ -337,6 +409,21 @@ impl FlowWM {
                 self.server.start_accept();
             }
         }
+    }
+
+    /// The exit checks run on every wake: an external shutdown request, a
+    /// dead animator worker, a dead hook thread. `None` means keep going.
+    fn check_exit_conditions(&self) -> Option<RunExit> {
+        if hooks::shutdown_requested() {
+            return Some(RunExit::ShutdownRequested);
+        }
+        if !self.animator.is_alive() {
+            return Some(RunExit::FailBack("animator thread died".to_owned()));
+        }
+        if !self.hook_handle.is_alive() {
+            return Some(RunExit::FailBack("hook thread exited".to_owned()));
+        }
+        None
     }
 
     /// Drain ALL pending Win32 window messages from this thread's queue.
@@ -525,7 +612,7 @@ impl FlowWM {
 ///   (floored to 1 so a due deadline re-wakes the loop instead of busy-looping
 ///   on 0).
 ///
-/// Returns `u32::MAX` (`INFINITE`) when no source is active. Extracted
+/// Returns [`LIVENESS_TICK_MS`] when no sooner source is active. Extracted
 /// to a free function so the branching is unit-testable without constructing
 /// a full [`FlowWM`] (which needs Win32 + a hook thread).
 ///
@@ -562,7 +649,7 @@ fn compute_wait_timeout_inner(
         let ms = ms.max(1);
         best = Some(best.map_or(ms, |b| b.min(ms)));
     }
-    best.unwrap_or(u32::MAX)
+    best.map_or(LIVENESS_TICK_MS, |b| b.min(LIVENESS_TICK_MS))
 }
 
 #[cfg(test)]
@@ -571,11 +658,17 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn wait_timeout_infinite_when_idle() {
+    fn wait_timeout_is_liveness_tick_when_idle() {
         let now = Instant::now();
         assert_eq!(
             compute_wait_timeout_inner(false, None, None, None, now),
-            u32::MAX
+            LIVENESS_TICK_MS
+        );
+        // A deadline farther out than the tick is capped at the tick.
+        let far = now + Duration::from_secs(30);
+        assert_eq!(
+            compute_wait_timeout_inner(false, Some(far), None, None, now),
+            LIVENESS_TICK_MS
         );
     }
 

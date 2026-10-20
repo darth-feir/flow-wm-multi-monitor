@@ -128,7 +128,22 @@ you built from source, see
 
 Two things have to be running: `flowd` (the daemon) *and* `flow.ahk` (the
 hotkey script). `flow start --ahk` starts both; `flow start` alone starts only
-the daemon. Check both processes are alive in Task Manager.
+the daemon. `flow ping` shows whether the daemon is up and, if it launched
+the script, the script's pid. Note that the script is tied to the daemon: when
+the daemon stops or dies, the script is stopped with it (so the Win key goes
+back to Windows), and `flow stop` always stops both.
+
+### Windows are stuck off-screen
+
+If a daemon died without cleaning up (crash, `taskkill`), windows it had
+parked beyond the screen edge stay there. Run
+
+```powershell
+flow rescue
+```
+
+to move them back onto a monitor (no daemon needed). `flow start` runs the
+same pass automatically before launching a new daemon.
 
 If you changed `ModKey` in `flow.ahk`, make sure the key you chose is one
 AutoHotkey recognises — see the

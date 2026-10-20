@@ -22,6 +22,8 @@
 //! - [`ipc`] — named-pipe server and message protocol
 //! - [`config`] — TOML config (code is the single source of truth)
 //! - [`common`] — shared bridge types (`WindowId`, `Rect`, `Direction`)
+//! - [`job`] — Win32 Job Objects (ties the hotkey script's life to the daemon's)
+//! - [`rescue`] — daemon-less off-screen window rescue (`flow rescue`)
 //!
 //! Every layout change flows through a pure three-stage pipeline —
 //! **mutate → project → animate** — and all subsystems take `&mut self` (no
@@ -42,9 +44,11 @@ pub mod common;
 pub mod config;
 pub mod daemon;
 pub mod ipc;
+pub mod job;
 pub mod layout;
 pub mod loadout;
 pub mod logging;
 pub mod registry;
+pub mod rescue;
 pub mod updater;
 pub mod workspace;

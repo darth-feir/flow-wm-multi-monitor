@@ -1,10 +1,31 @@
-//! Graceful-shutdown window rescue.
+//! Graceful-shutdown window rescue and fail-back.
 //!
 //! When the daemon stops, windows stranded off-screen (parked in non-active
 //! workspaces at ±1 monitor height, or scrolled into the packing region)
 //! would become unreachable. This module brings them back into the active
 //! monitor's [`work_area`](crate::workspace::Monitor::work_area) without
 //! disturbing windows the user can currently see.
+//!
+//! [`FlowWM::fail_back`] is the one teardown every exit path goes through —
+//! clean `flow stop`, session end, a dead worker thread, a panic — and it
+//! hands the desktop back to plain Windows in a fixed order:
+//!
+//! 1. `animator.cancel_and_wait()` — no further `SetWindowPos` from the
+//!    worker, so step 2 cannot be overwritten by a still-running tween.
+//! 2. [`rescue_stranded_windows`](FlowWM::rescue_stranded_windows).
+//! 3. Drop every border overlay (`DestroyWindow`).
+//! 4. Stop the hook thread (`WM_QUIT`).
+//! 5. Kill the hotkey script and remove its pidfile, releasing the Win key.
+//!    (The kill-on-close job object is the backstop for the exits that never
+//!    reach this function.)
+//! 6. Stop the IPC server's pending accept
+//!    ([`PipeServer::shutdown`](crate::ipc::transport::PipeServer::shutdown)):
+//!    a synchronous `ConnectNamedPipe` left pending would make closing the
+//!    pipe handle block until the next client connected, keeping the process
+//!    alive after the teardown.
+//!
+//! The status file is rewritten by `main` afterwards (`stopped` or
+//! `error`/`runtime`), which also owns the exit code.
 //!
 //! See `docs/src/dev-guide/ipc-and-watchdog.md` for the design rationale
 //! (why visible windows are left untouched, and the "pre-this-run" contract
@@ -125,7 +146,10 @@ impl FlowWM {
     ///
     /// Failures (window vanished mid-loop, `SetWindowPos` rejected) are logged
     /// at `warn` and skipped: one bad window must not abort the rescue pass.
-    pub fn rescue_stranded_windows(&self) {
+    pub fn rescue_stranded_windows(&mut self) -> usize {
+        // Stop the worker first: a tween still in flight would otherwise
+        // re-apply its interpolated rects over the rescued positions.
+        self.animator.cancel_and_wait();
         // "Stranded" means off every monitor, not merely off the active one:
         // a window parked beyond the virtual screen must come back, a window
         // that lives on another monitor must be left alone.
@@ -144,7 +168,76 @@ impl FlowWM {
             &monitors,
             self.active_monitor,
             |wid| self.monitor_index_containing(wid),
+        )
+    }
+
+    /// Hand the desktop back to plain Windows: the single teardown used by
+    /// every exit path (see the [module docs](self) for the order and why).
+    ///
+    /// `reason` is logged (at `info` for a clean stop, `error` otherwise)
+    /// and is what the status file will carry. Every step is best-effort
+    /// and independent: a failure in one is logged and the next still runs.
+    /// Calling it twice is harmless (the second call finds nothing to do).
+    pub fn fail_back(&mut self, reason: &str, clean: bool) {
+        if clean {
+            log::info!("shutdown: {reason}");
+        } else {
+            log::error!("fail-back: {reason}");
+        }
+        self.shutting_down = true;
+
+        // 1 + 2. Stop the animator and bring stranded windows back.
+        let rescued = self.rescue_stranded_windows();
+
+        // 3. Borders: overlays are our windows; destroy them so nothing of
+        //    the daemon stays on screen.
+        let borders = self.registry.detach_all_borders();
+
+        // 4. Hook thread: post WM_QUIT; it unhooks and exits on its own.
+        self.hook_handle.stop();
+
+        // 5. Hotkey script: explicit kill (orderly) + pidfile removal. The
+        //    job object would also kill it when the process exits; doing it
+        //    here means the Win key is free before we return.
+        let ahk = match self.ahk.take() {
+            Some(proc) => {
+                let pid = proc.pid();
+                if proc.stop() {
+                    log::info!("fail-back: stopped flow.ahk (pid {pid})");
+                    Some(pid)
+                } else {
+                    log::info!("fail-back: flow.ahk (pid {pid}) was already gone");
+                    None
+                }
+            }
+            None => {
+                // Not launched by this daemon (or already stopped): still
+                // honour a pidfile left by an older `flow start --ahk`.
+                match crate::autostart::stop_ahk_script_in(&self.config_dir) {
+                    Ok(true) => {
+                        log::info!("fail-back: stopped a flow.ahk recorded in the pidfile");
+                    }
+                    Ok(false) => {}
+                    Err(e) => log::warn!("fail-back: stopping flow.ahk: {e}"),
+                }
+                None
+            }
+        };
+
+        // 6. IPC: cancel the pending accept and join its thread so dropping
+        //    the server (and exiting) cannot block on the pipe handle.
+        let accept_stopped = self.server.shutdown();
+
+        log::info!(
+            "fail-back complete: {rescued} window(s) rescued, {borders} border(s) dropped ({} tracked), hook thread stopped, ahk {}, ipc accept {}",
+            self.registry.windows().count(),
+            match ahk {
+                Some(pid) => format!("pid {pid} killed"),
+                None => "not running".to_owned(),
+            },
+            if accept_stopped { "stopped" } else { "LEAKED" }
         );
+        crate::registry::hooks::mark_shutdown_complete();
     }
 }
 

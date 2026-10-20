@@ -2,10 +2,17 @@
 //!
 //! Two related concerns live here:
 //!
-//! - **AHK lifecycle** — `flow start --ahk` launches the user's `flow.ahk`
-//!   keybinding script via the shell's `.ahk` file association, and `flow stop
-//!   --ahk` terminates it. A pidfile records the launched PID so `stop` can
-//!   kill exactly that process.
+//! - **AHK lifecycle** — the **daemon** launches the user's `flow.ahk`
+//!   keybinding script (`flowd --ahk`, forwarded by `flow start --ahk`) once
+//!   it is ready, inside a kill-on-close [`JobObject`] so the kernel
+//!   terminates the script whenever the daemon dies — however it dies. The
+//!   AutoHotkey v2 interpreter is resolved directly
+//!   ([`resolve_ahk_interpreter`]) and started suspended so it is a job
+//!   member before its first instruction; only if no interpreter can be
+//!   found does the launch fall back to the `.ahk` shell association (with
+//!   a best-effort job assignment after the fact). A pidfile records the
+//!   launched PID so `flow stop` (and the daemon's own fail-back) can kill
+//!   exactly that process.
 //! - **Login autostart** — `flow enable-autostart [--ahk]` writes a single
 //!   `flow.lnk` into the user's `shell:startup` folder whose target is
 //!   `flow.exe start [--ahk]`. Login therefore reuses the interactive startup
@@ -20,13 +27,17 @@ use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     CoUninitialize, IPersistFile,
 };
+use windows::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW,
+};
 use windows::Win32::System::Threading::{
-    GetProcessId, OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+    GetProcessId, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+    WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{
     IShellLinkW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW, ShellLink,
@@ -35,9 +46,13 @@ use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 use windows::core::{Interface, PCWSTR};
 
 use crate::config::dirs::config_dir;
+use crate::job::{JobChild, JobObject};
 
 /// Filename of the autostart shortcut inside the `shell:startup` folder.
 const FLOW_LNK: &str = "flow.lnk";
+
+/// Filename of the pidfile recording the launched AutoHotkey PID.
+pub const AHK_PIDFILE: &str = "flow.ahk.pid";
 
 /// Resolve the user's `shell:startup` folder.
 ///
@@ -123,13 +138,359 @@ pub fn disable_autostart() -> Result<AutostartReport, String> {
     }
 }
 
-/// Launch the user's `flow.ahk` via the shell's `.ahk` file association.
+// ── AHK: daemon-owned launch inside a job object ──────────────────────────
+
+/// The running hotkey script, as launched by [`launch_ahk_in_job`].
+///
+/// Owns the [`JobObject`] whose closing kills the script. The daemon keeps
+/// this inside `FlowWM` for its whole life and never closes it explicitly;
+/// process teardown (clean or not) closes the handle and the kernel does the
+/// rest. [`AhkProcess::stop`] is the explicit, orderly kill used by
+/// fail-back and `flow stop`.
+#[derive(Debug)]
+pub struct AhkProcess {
+    /// Kill-on-close job the script lives in.
+    _job: JobObject,
+    /// The script process (or the launcher that started it, on the
+    /// fallback path).
+    child: AhkChild,
+    /// Process id recorded in the pidfile.
+    pid: u32,
+    /// Where the pidfile was written.
+    pidfile: PathBuf,
+    /// `true` when the process was created directly inside the job
+    /// (`CreateProcess` suspended → assign → resume); `false` on the
+    /// shell-association fallback, where only a best-effort late assignment
+    /// was possible.
+    job_tied: bool,
+}
+
+/// Process handle holder for the two launch paths.
+#[derive(Debug)]
+enum AhkChild {
+    /// Spawned by [`JobObject::spawn`].
+    Job(JobChild),
+    /// Launched via `ShellExecuteExW`; we hold the `hProcess` it returned.
+    Shell(HANDLE),
+}
+
+impl AhkChild {
+    fn is_running(&self) -> bool {
+        match self {
+            AhkChild::Job(c) => c.is_running(),
+            // SAFETY: valid process handle from ShellExecuteExW.
+            AhkChild::Shell(h) => unsafe { WaitForSingleObject(*h, 0) != WAIT_OBJECT_0 },
+        }
+    }
+}
+
+impl Drop for AhkChild {
+    fn drop(&mut self) {
+        if let AhkChild::Shell(h) = self {
+            // SAFETY: we own the handle lent by ShellExecuteExW.
+            let _ = unsafe { CloseHandle(*h) };
+        }
+    }
+}
+
+impl AhkProcess {
+    /// Process id of the launched script.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// `true` while the launched process is still running.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.child.is_running()
+    }
+
+    /// `true` when the script was created directly inside the job (the
+    /// kernel will kill it with the daemon); `false` on the fallback path.
+    #[must_use]
+    pub fn is_job_tied(&self) -> bool {
+        self.job_tied
+    }
+
+    /// Terminate the script now and remove the pidfile.
+    ///
+    /// Kills by pid (the same path `flow stop` uses) and then drops the job,
+    /// which also terminates anything the script spawned. Returns `true` if
+    /// a process was terminated.
+    pub fn stop(self) -> bool {
+        let killed = match kill_process(self.pid) {
+            Ok(k) => k,
+            Err(e) => {
+                log::warn!("stopping flow.ahk (pid {}): {e}", self.pid);
+                false
+            }
+        };
+        if let Err(e) = fs::remove_file(&self.pidfile)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            log::warn!(
+                "failed to remove AHK pidfile {}: {e}",
+                self.pidfile.display()
+            );
+        }
+        // `self` (and the job handle) drops here.
+        killed
+    }
+}
+
+/// Launch `<config_dir>/flow.ahk` inside a kill-on-close job object.
+///
+/// Resolution order:
+///
+/// 1. [`resolve_ahk_interpreter`] finds an AutoHotkey v2 executable → it is
+///    started with [`JobObject::spawn`] (suspended, assigned, resumed), so
+///    the script is a job member from its first instruction and every child
+///    it creates inherits the job.
+/// 2. No interpreter found → the `.ahk` shell association is used (see
+///    [`spawn_ahk_script_in`]) and the returned process is assigned to the
+///    job **after** creation. A warning is logged, because if the
+///    association points at a launcher that re-executes the real interpreter
+///    and exits, that child may not be inside the job.
+///
+/// The pid is written to `<config_dir>/flow.ahk.pid` on both paths.
+///
+/// # Errors
+///
+/// Returns a string if `flow.ahk` is missing, the job cannot be created, or
+/// both launch paths fail.
+pub fn launch_ahk_in_job(config_dir: &Path) -> Result<AhkProcess, String> {
+    let script = flow_ahk_path_in(config_dir);
+    if !script.exists() {
+        return Err(format!(
+            "flow.ahk not found at {}; run `flow config init --ahk` to create it",
+            script.display()
+        ));
+    }
+    let job = JobObject::kill_on_close()?;
+    let pidfile = ahk_pidfile_path_in(config_dir);
+
+    let process = match resolve_ahk_interpreter() {
+        Some(exe) => {
+            let child = job.spawn(&exe, &[script.as_os_str()], false)?;
+            let pid = child.pid();
+            log::info!(
+                "launched flow.ahk with {} (pid {pid}) inside a kill-on-close job",
+                exe.display()
+            );
+            AhkProcess {
+                _job: job,
+                child: AhkChild::Job(child),
+                pid,
+                pidfile: pidfile.clone(),
+                job_tied: true,
+            }
+        }
+        None => {
+            log::warn!(
+                "no AutoHotkey v2 interpreter found (registry InstallDir, %LOCALAPPDATA%\\Programs\\AutoHotkey, %ProgramFiles%\\AutoHotkey, PATH); \
+                 falling back to the .ahk shell association — the job tie-in may not be in effect"
+            );
+            let (pid, handle) = shell_execute_ahk(&script)?;
+            let job_tied = match job.assign(handle) {
+                Ok(()) => {
+                    log::info!(
+                        "launched flow.ahk via shell association (pid {pid}); assigned to the job after creation"
+                    );
+                    true
+                }
+                Err(e) => {
+                    log::warn!(
+                        "launched flow.ahk via shell association (pid {pid}) but could not assign it to the job: {e}"
+                    );
+                    false
+                }
+            };
+            AhkProcess {
+                _job: job,
+                child: AhkChild::Shell(handle),
+                pid,
+                pidfile: pidfile.clone(),
+                job_tied,
+            }
+        }
+    };
+
+    if let Err(e) = fs::write(&pidfile, process.pid.to_string()) {
+        log::warn!("failed to write AHK pidfile {}: {e}", pidfile.display());
+    }
+    Ok(process)
+}
+
+/// Candidate AutoHotkey v2 executables, in preference order, built from
+/// the places an install can live. Pure: nothing is checked for existence.
+///
+/// * `install_dirs` — `InstallDir` values from `HKCU`/`HKLM`
+///   `Software\AutoHotkey` (either order the caller prefers).
+/// * `local_appdata` — `%LOCALAPPDATA%` (per-user installs live under
+///   `Programs\AutoHotkey`).
+/// * `program_files` — `%ProgramFiles%` (machine-wide installs).
+///
+/// Within each root the 64-bit v2 interpreter is preferred, then the 32-bit
+/// one, then the root-level `AutoHotkey.exe` (the v2 launcher, which still
+/// ends up in the job because children inherit it).
+#[must_use]
+pub fn ahk_interpreter_candidates(
+    install_dirs: &[PathBuf],
+    local_appdata: Option<&Path>,
+    program_files: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = install_dirs.to_vec();
+    if let Some(l) = local_appdata {
+        roots.push(l.join("Programs").join("AutoHotkey"));
+    }
+    if let Some(p) = program_files {
+        roots.push(p.join("AutoHotkey"));
+    }
+    let mut out = Vec::with_capacity(roots.len() * 3);
+    for root in roots {
+        let v2 = root.join("v2");
+        for candidate in [
+            v2.join("AutoHotkey64.exe"),
+            v2.join("AutoHotkey32.exe"),
+            root.join("AutoHotkey64.exe"),
+            root.join("AutoHotkey.exe"),
+        ] {
+            if !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        }
+    }
+    out
+}
+
+/// Find an AutoHotkey v2 interpreter on this machine.
+///
+/// Checks, in order, the registry `InstallDir` (`HKCU` then `HKLM`
+/// `Software\AutoHotkey`), `%LOCALAPPDATA%\Programs\AutoHotkey`,
+/// `%ProgramFiles%\AutoHotkey` (see [`ahk_interpreter_candidates`]), and
+/// finally `AutoHotkey64.exe` / `AutoHotkey.exe` on `PATH`. Returns the
+/// first candidate that exists.
+#[must_use]
+pub fn resolve_ahk_interpreter() -> Option<PathBuf> {
+    let install_dirs: Vec<PathBuf> = [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE]
+        .into_iter()
+        .filter_map(|root| registry_string(root, "Software\\AutoHotkey", "InstallDir"))
+        .map(PathBuf::from)
+        .collect();
+    let local_appdata = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from);
+    if let Some(found) = ahk_interpreter_candidates(
+        &install_dirs,
+        local_appdata.as_deref(),
+        program_files.as_deref(),
+    )
+    .into_iter()
+    .find(|p| p.is_file())
+    {
+        return Some(found);
+    }
+    // PATH search.
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .flat_map(|dir| [dir.join("AutoHotkey64.exe"), dir.join("AutoHotkey.exe")])
+        .find(|p| p.is_file())
+}
+
+/// Read a `REG_SZ` value, or `None` if the key/value is absent.
+fn registry_string(root: HKEY, subkey: &str, value: &str) -> Option<String> {
+    let subkey_w = Wide::from_str(subkey);
+    let value_w = Wide::from_str(value);
+    let mut size: u32 = 0;
+    // SAFETY: querying the size with a null buffer is the documented
+    // two-step protocol.
+    let rc = unsafe {
+        RegGetValueW(
+            root,
+            subkey_w.pcwstr(),
+            value_w.pcwstr(),
+            RRF_RT_REG_SZ,
+            None,
+            None,
+            Some(&mut size),
+        )
+    };
+    if rc.is_err() || size == 0 {
+        return None;
+    }
+    let mut buf: Vec<u16> = vec![0; (size as usize).div_ceil(2)];
+    // SAFETY: buffer sized from the first call; `size` is in bytes.
+    let rc = unsafe {
+        RegGetValueW(
+            root,
+            subkey_w.pcwstr(),
+            value_w.pcwstr(),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+            Some(&mut size),
+        )
+    };
+    if rc.is_err() {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let s = String::from_utf16_lossy(&buf[..len]);
+    (!s.trim().is_empty()).then(|| s.trim().to_owned())
+}
+
+/// Launch `script` via the `.ahk` shell association; returns the pid and
+/// the process handle (`SEE_MASK_NOCLOSEPROCESS`), which the caller owns.
+fn shell_execute_ahk(script: &Path) -> Result<(u32, HANDLE), String> {
+    let script_w = Wide::from_os(script.as_os_str());
+    let verb_w = Wide::from_str("open");
+
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: verb_w.pcwstr(),
+        lpFile: script_w.pcwstr(),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+
+    // SAFETY: ShellExecuteExW fills info.hProcess on success.
+    unsafe {
+        ShellExecuteExW(&mut info).map_err(|e| format!("ShellExecuteExW failed: {e}"))?;
+    }
+    if info.hProcess.is_invalid() {
+        return Err(
+            "ShellExecuteExW returned no process handle (is AutoHotkey installed?)".to_string(),
+        );
+    }
+    // SAFETY: hProcess is valid (checked above) and owned by us until closed.
+    let pid = unsafe { GetProcessId(info.hProcess) };
+    if pid == 0 {
+        // SAFETY: release the handle; we are returning an error.
+        let _ = unsafe { CloseHandle(info.hProcess) };
+        return Err("GetProcessId returned 0 after launching flow.ahk".to_string());
+    }
+    Ok((pid, info.hProcess))
+}
+
+/// Launch the user's `flow.ahk` via the shell's `.ahk` file association
+/// (default config directory). See [`spawn_ahk_script_in`].
+///
+/// # Errors
+///
+/// See [`spawn_ahk_script_in`].
+pub fn spawn_ahk_script() -> Result<u32, String> {
+    spawn_ahk_script_in(&config_dir())
+}
+
+/// Launch `<config_dir>/flow.ahk` via the shell's `.ahk` file association.
 ///
 /// Uses `ShellExecuteExW` with verb `"open"` so Windows resolves the installed
 /// AutoHotkey interpreter — no install-path probing. The launched process
 /// handle is read (via `SEE_MASK_NOCLOSEPROCESS`) and converted to a PID with
 /// [`GetProcessId`], then written to a pidfile so [`stop_ahk_script`] can
-/// terminate exactly this process later.
+/// terminate exactly this process later. This is the legacy, untied launch;
+/// the daemon uses [`launch_ahk_in_job`].
 ///
 /// # Returns
 ///
@@ -140,8 +501,8 @@ pub fn disable_autostart() -> Result<AutostartReport, String> {
 /// Returns an error string if:
 /// - `flow.ahk` does not exist in the config directory.
 /// - The shell association launch fails (e.g. AutoHotkey is not installed).
-pub fn spawn_ahk_script() -> Result<u32, String> {
-    let script = flow_ahk_path();
+pub fn spawn_ahk_script_in(config_dir: &Path) -> Result<u32, String> {
+    let script = flow_ahk_path_in(config_dir);
     if !script.exists() {
         return Err(format!(
             "flow.ahk not found at {}; run `flow config init --ahk` to create it",
@@ -182,17 +543,29 @@ pub fn spawn_ahk_script() -> Result<u32, String> {
         return Err("GetProcessId returned 0 after launching flow.ahk".to_string());
     }
 
-    let pidfile = ahk_pidfile_path();
+    let pidfile = ahk_pidfile_path_in(config_dir);
     if let Err(e) = fs::write(&pidfile, pid.to_string()) {
         log::warn!("failed to write AHK pidfile {}: {e}", pidfile.display());
     }
     Ok(pid)
 }
 
-/// Terminate the AutoHotkey process launched by [`spawn_ahk_script`].
+/// Terminate the AutoHotkey process recorded in the default config
+/// directory's pidfile. See [`stop_ahk_script_in`].
+///
+/// # Errors
+///
+/// See [`stop_ahk_script_in`].
+pub fn stop_ahk_script() -> Result<bool, String> {
+    stop_ahk_script_in(&config_dir())
+}
+
+/// Terminate the AutoHotkey process recorded in `<config_dir>/flow.ahk.pid`.
 ///
 /// Reads the PID from the pidfile, kills that process via
 /// [`TerminateProcess`], and removes the pidfile regardless of outcome.
+/// Used by `flow stop` (always, no flag needed) and by the daemon's own
+/// fail-back.
 ///
 /// # Returns
 ///
@@ -203,8 +576,8 @@ pub fn spawn_ahk_script() -> Result<u32, String> {
 ///
 /// Returns an error string on filesystem errors reading the pidfile other
 /// than `NotFound`, or on `TerminateProcess` failure.
-pub fn stop_ahk_script() -> Result<bool, String> {
-    let pidfile = ahk_pidfile_path();
+pub fn stop_ahk_script_in(config_dir: &Path) -> Result<bool, String> {
+    let pidfile = ahk_pidfile_path_in(config_dir);
     let pid_str = match fs::read_to_string(&pidfile) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -245,14 +618,21 @@ fn flow_exe_path() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| format!("cannot determine current executable: {e}"))
 }
 
-/// Path to the user's `flow.ahk` inside the config directory.
+/// Path to the user's `flow.ahk` inside the default config directory.
 fn flow_ahk_path() -> PathBuf {
-    config_dir().join("flow.ahk")
+    flow_ahk_path_in(&config_dir())
 }
 
-/// Path to the pidfile recording the launched AutoHotkey PID.
-fn ahk_pidfile_path() -> PathBuf {
-    config_dir().join("flow.ahk.pid")
+/// Path to `flow.ahk` inside `config_dir`.
+#[must_use]
+pub fn flow_ahk_path_in(config_dir: &Path) -> PathBuf {
+    config_dir.join("flow.ahk")
+}
+
+/// Path to the AHK pidfile inside `config_dir`.
+#[must_use]
+pub fn ahk_pidfile_path_in(config_dir: &Path) -> PathBuf {
+    config_dir.join(AHK_PIDFILE)
 }
 
 // ── Win32: process kill ────────────────────────────────────────────────────
@@ -262,7 +642,11 @@ fn ahk_pidfile_path() -> PathBuf {
 /// # Returns
 ///
 /// `Ok(true)` if the process was terminated, `Ok(false)` if the PID does not
-/// refer to a running process (stale pidfile).
+/// refer to a running process (stale pidfile) **or** the process has already
+/// exited — e.g. the daemon's fail-back and `flow stop` both reaching for the
+/// same hotkey script, or the job object having killed it first. That is
+/// the normal case, not an error: `TerminateProcess` on an exited process
+/// fails with `Access is denied`, so liveness is checked first.
 ///
 /// # Errors
 ///
@@ -270,11 +654,20 @@ fn ahk_pidfile_path() -> PathBuf {
 fn kill_process(pid: u32) -> Result<bool, String> {
     // SAFETY: OpenProcess with PROCESS_TERMINATE only queries/terminates the
     // named PID; a stale PID either fails (Ok(false)) or targets a process the
-    // user already has permission to terminate.
-    let handle = match unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) } {
+    // user already has permission to terminate. SYNCHRONIZE lets us poll
+    // whether it has already exited.
+    let handle = match unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid) } {
         Ok(h) => h,
         Err(_) => return Ok(false), // Process not running (stale pidfile).
     };
+
+    // SAFETY: valid process handle; zero timeout → non-blocking poll.
+    if unsafe { WaitForSingleObject(handle, 0) } == WAIT_OBJECT_0 {
+        log::debug!("kill_process: pid {pid} has already exited");
+        // SAFETY: release the handle.
+        let _ = unsafe { CloseHandle(handle) };
+        return Ok(false);
+    }
 
     let result = unsafe { TerminateProcess(handle, 1) }
         .map(|()| true)
@@ -486,7 +879,7 @@ mod tests {
         let _env = EnvGuard::capture();
         let (_tmp, _startup, cfg) = make_startup_tree();
 
-        let path = ahk_pidfile_path();
+        let path = ahk_pidfile_path_in(&config_dir());
         assert_eq!(path, cfg.join("flow.ahk.pid"));
     }
 
@@ -503,6 +896,60 @@ mod tests {
     #[test]
     fn shortcut_filename_is_stable() {
         assert_eq!(FLOW_LNK, "flow.lnk");
+        assert_eq!(AHK_PIDFILE, "flow.ahk.pid");
+    }
+
+    #[test]
+    fn interpreter_candidates_prefer_v2_64bit_then_32bit_then_launcher() {
+        let reg = PathBuf::from("C:\\Program Files\\AutoHotkey");
+        let local = PathBuf::from("C:\\Users\\me\\AppData\\Local");
+        let pf = PathBuf::from("C:\\Program Files");
+        let c = ahk_interpreter_candidates(std::slice::from_ref(&reg), Some(&local), Some(&pf));
+        assert_eq!(c[0], reg.join("v2").join("AutoHotkey64.exe"));
+        assert_eq!(c[1], reg.join("v2").join("AutoHotkey32.exe"));
+        assert_eq!(c[2], reg.join("AutoHotkey64.exe"));
+        assert_eq!(c[3], reg.join("AutoHotkey.exe"));
+        // The per-user root comes after the registry root.
+        let user_root = local.join("Programs").join("AutoHotkey");
+        assert_eq!(c[4], user_root.join("v2").join("AutoHotkey64.exe"));
+        // The ProgramFiles root is the same as the registry root here, so
+        // its entries are deduplicated rather than repeated.
+        assert_eq!(c.len(), 8, "{c:?}");
+        // No roots at all → no candidates.
+        assert!(ahk_interpreter_candidates(&[], None, None).is_empty());
+    }
+
+    #[test]
+    fn stop_ahk_script_in_uses_the_given_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(!stop_ahk_script_in(tmp.path()).expect("no pidfile is a no-op"));
+        fs::write(ahk_pidfile_path_in(tmp.path()), "garbage").unwrap();
+        assert!(!stop_ahk_script_in(tmp.path()).expect("corrupt pidfile is a no-op"));
+        assert!(!ahk_pidfile_path_in(tmp.path()).exists());
+    }
+
+    #[test]
+    fn kill_process_treats_exited_process_as_nothing_to_do() {
+        // Spawn a child that exits immediately, wait for it, then "kill" it:
+        // the pid is gone (or recycled only in theory), so this must be
+        // Ok(false), never an Access-denied error.
+        let child = std::process::Command::new("cmd")
+            .args(["/c", "exit", "0"])
+            .output()
+            .expect("spawn cmd");
+        assert!(child.status.success());
+        // Our own pid is alive; opening it works, but we must not kill it —
+        // so only exercise the exited path with a definitely-dead pid: 0 is
+        // the idle process and cannot be opened → Ok(false) as well.
+        assert_eq!(kill_process(0), Ok(false));
+    }
+
+    #[test]
+    fn launch_ahk_in_job_errors_when_script_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let err = launch_ahk_in_job(tmp.path()).expect_err("no flow.ahk");
+        assert!(err.contains("flow.ahk not found"), "{err}");
+        assert!(!ahk_pidfile_path_in(tmp.path()).exists());
     }
 
     // ── disable_autostart ──────────────────────────────────────────────────

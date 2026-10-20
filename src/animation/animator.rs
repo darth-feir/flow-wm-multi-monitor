@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::animation::backend::WindowBackend;
 use crate::animation::batch::{AnimationBatch, build_tweens};
@@ -26,8 +27,12 @@ enum AnimatorCmd {
         targets: Vec<WindowTarget>,
         config: AnimatorConfig,
     },
-    /// Cancel any in-flight animation and clear the queue.
-    Cancel,
+    /// Cancel any in-flight animation and clear the queue. When `ack` is
+    /// `Some`, the worker sends `()` on it once the cancel has taken effect
+    /// (see [`WindowAnimator::cancel_and_wait`]).
+    Cancel {
+        ack: Option<crossbeam_channel::Sender<()>>,
+    },
     /// Replace the config for future animations.
     UpdateConfig(AnimatorConfig),
     /// Ask the worker to exit cleanly.
@@ -52,6 +57,12 @@ struct PendingBatch {
     targets: Vec<WindowTarget>,
     config: AnimatorConfig,
 }
+
+/// How long [`WindowAnimator::cancel_and_wait`] waits for the worker to
+/// acknowledge a cancel before giving up. One frame is ~16 ms, so a healthy
+/// worker answers well within this; the bound only matters when a backend
+/// call (`SetWindowPos` to a hung window) is wedged.
+pub const CANCEL_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// All mutable state owned exclusively by the worker thread.
 struct WorkerState {
@@ -88,6 +99,9 @@ pub struct WindowAnimator {
     animating: Arc<AtomicBool>,
     /// Monotonically-increasing counter used to generate [`AnimationHandle`] IDs.
     next_id: Arc<AtomicU64>,
+    /// `true` while the worker thread is running; cleared by the worker on
+    /// the way out — whether it exited cleanly or panicked.
+    alive: Arc<AtomicBool>,
     /// Worker thread handle. Kept for its drop behaviour (detaches thread on drop).
     _worker: std::thread::JoinHandle<()>,
 }
@@ -101,8 +115,10 @@ impl WindowAnimator {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AnimatorCmd>();
         let animating = Arc::new(AtomicBool::new(false));
         let next_id = Arc::new(AtomicU64::new(1));
+        let alive = Arc::new(AtomicBool::new(true));
 
         let animating_worker = Arc::clone(&animating);
+        let alive_worker = Arc::clone(&alive);
         let initial_config = config.clone();
 
         // SAFETY / rationale: thread spawn can fail only if the OS has
@@ -111,7 +127,22 @@ impl WindowAnimator {
         let _worker = std::thread::Builder::new()
             .name("window-animation-worker".into())
             .spawn(move || {
-                run_worker(Box::new(backend), cmd_rx, animating_worker, initial_config);
+                // A panic inside the frame loop must not vanish silently: the
+                // process-wide panic hook (if any) has already logged it by
+                // the time we get here; we additionally mark the worker dead
+                // so the daemon's event loop can notice and fail back. The
+                // channel receiver is dropped on unwind, so any later
+                // `animate()` also fails with `WorkerDead`.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_worker(Box::new(backend), cmd_rx, animating_worker, initial_config);
+                }));
+                alive_worker.store(false, Ordering::Release);
+                if let Err(payload) = result {
+                    log::error!(
+                        "animation worker thread panicked: {}",
+                        panic_payload_message(payload.as_ref())
+                    );
+                }
             })
             .expect("failed to spawn animation worker thread");
 
@@ -120,6 +151,7 @@ impl WindowAnimator {
             cmd_tx,
             animating,
             next_id,
+            alive,
             _worker,
         }
     }
@@ -169,9 +201,71 @@ impl WindowAnimator {
     }
 
     /// Cancel any in-flight animation immediately and clear the pending queue.
+    ///
+    /// Asynchronous: the worker may still be inside the frame it was
+    /// applying when this returns. Use [`cancel_and_wait`](Self::cancel_and_wait)
+    /// when the caller is about to move windows itself (the shutdown rescue).
     pub fn cancel(&mut self) {
         // Best-effort: ignore send error if the worker has already exited.
-        let _ = self.cmd_tx.send(AnimatorCmd::Cancel);
+        let _ = self.cmd_tx.send(AnimatorCmd::Cancel { ack: None });
+    }
+
+    /// Cancel any in-flight animation and **block** until the worker has
+    /// acknowledged it (bounded by [`CANCEL_ACK_TIMEOUT`]).
+    ///
+    /// Once this returns `true`, the worker has cleared its active batch and
+    /// is parked on the command channel: it will issue no further
+    /// `apply_batch` (`SetWindowPos`) calls unless a new `animate()` is
+    /// submitted. The daemon calls this before the shutdown rescue so a
+    /// still-running tween cannot overwrite the rescued positions.
+    ///
+    /// Returns `false` if the worker did not answer in time (it is wedged in
+    /// a backend call or has died); the caller should proceed anyway — a dead
+    /// worker cannot move windows, and a wedged one is logged at `warn`.
+    pub fn cancel_and_wait(&mut self) -> bool {
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded::<()>(1);
+        if self
+            .cmd_tx
+            .send(AnimatorCmd::Cancel { ack: Some(ack_tx) })
+            .is_err()
+        {
+            // Worker gone: nothing can be animating, so the guarantee holds
+            // trivially. Report it honestly though — the caller may want to
+            // know the thread is dead.
+            log::warn!("cancel_and_wait: animation worker is not running");
+            return false;
+        }
+        match ack_rx.recv_timeout(CANCEL_ACK_TIMEOUT) {
+            Ok(()) => true,
+            Err(_) => {
+                log::warn!(
+                    "cancel_and_wait: animation worker did not acknowledge within {:?}",
+                    CANCEL_ACK_TIMEOUT
+                );
+                false
+            }
+        }
+    }
+
+    /// `true` while the worker thread is running.
+    ///
+    /// Becomes `false` when the worker exits — on `Drop`/shutdown, or
+    /// because its frame loop panicked. The daemon polls this from its event
+    /// loop and fails back when the worker dies underneath it.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+}
+
+/// Best-effort text of a panic payload (`&str` or `String`), else a fixed
+/// placeholder.
+pub fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_owned()
     }
 }
 
@@ -219,10 +313,17 @@ fn run_worker(
         if let Some(cmd) = cmd_opt {
             match cmd {
                 AnimatorCmd::Shutdown => break 'main,
-                AnimatorCmd::Cancel => {
+                AnimatorCmd::Cancel { ack } => {
                     state.active = None;
                     state.queue.clear();
                     animating.store(false, Ordering::Release);
+                    // Acknowledge only after the batch is gone: with `active`
+                    // cleared, the tick below is skipped and the next
+                    // iteration blocks on `recv()`, so no `apply_batch` can
+                    // follow this send.
+                    if let Some(ack) = ack {
+                        let _ = ack.send(());
+                    }
                 }
                 AnimatorCmd::UpdateConfig(cfg) => {
                     state.config = cfg;
@@ -504,6 +605,120 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test 4: cancel stops the animation
     // -----------------------------------------------------------------------
+
+    /// Number of `ApplyBatch` calls recorded so far.
+    fn applied_count(state: &Arc<Mutex<MockState>>) -> usize {
+        state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::ApplyBatch(_)))
+            .count()
+    }
+
+    #[test]
+    fn cancel_and_wait_blocks_until_no_more_apply_batch() {
+        // Arrange: a long batch whose frames are paced by a slow mock
+        // DwmFlush, so the worker is reliably mid-flight when we cancel.
+        let state = Arc::new(Mutex::new(MockState {
+            rects: [(WindowRef(1), Rect::new(0, 0, 100, 100))].into(),
+            dwm_flush_delay_ms: 5,
+            ..MockState::default()
+        }));
+        let backend = MockBackend::with_state(Arc::clone(&state));
+        let config = AnimatorConfig {
+            duration: Duration::from_millis(2_000),
+            ..AnimatorConfig::default()
+        };
+        let mut animator = WindowAnimator::new(backend, config);
+        animator.animate(target_w1()).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(animator.is_animating(), "batch should be in flight");
+        assert!(
+            applied_count(&state) > 0,
+            "worker should have applied frames"
+        );
+
+        // Act.
+        assert!(animator.cancel_and_wait(), "worker must acknowledge");
+        let applied_at_return = applied_count(&state);
+
+        // Assert: nothing else is applied after the call returned, even
+        // after giving the worker ample time to (wrongly) tick again.
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            applied_at_return,
+            applied_count(&state),
+            "no apply_batch may follow cancel_and_wait"
+        );
+        assert!(!animator.is_animating());
+        assert!(animator.is_alive());
+    }
+
+    #[test]
+    fn cancel_and_wait_on_idle_worker_returns_true() {
+        let (mut animator, _state) = make_animator_with_mock();
+        assert!(animator.cancel_and_wait());
+        // Repeatable.
+        assert!(animator.cancel_and_wait());
+    }
+
+    /// A backend whose `apply_batch` panics, to exercise the worker's
+    /// panic guard.
+    struct PanickingBackend;
+
+    impl crate::animation::backend::WindowBackend for PanickingBackend {
+        fn get_window_rect(&self, _window: WindowRef) -> crate::animation::types::Result<Rect> {
+            Ok(Rect::new(0, 0, 10, 10))
+        }
+        fn apply_batch(
+            &self,
+            _updates: &[(WindowRef, Rect)],
+        ) -> crate::animation::types::Result<()> {
+            panic!("injected backend panic");
+        }
+        fn dwm_flush(&self) -> crate::animation::types::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn worker_panic_marks_animator_dead() {
+        // The default panic hook prints the injected panic to stderr; that
+        // output is expected for this test.
+        let mut animator = WindowAnimator::new(PanickingBackend, AnimatorConfig::default());
+        assert!(animator.is_alive());
+        animator.animate(target_w1()).unwrap();
+        // The worker panics on the first frame; wait for it to die.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while animator.is_alive() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!animator.is_alive(), "worker should be marked dead");
+        // Later submissions report the dead worker instead of hanging.
+        assert!(matches!(
+            animator.animate(target_w1()),
+            Err(AnimationError::WorkerDead)
+        ));
+        // cancel_and_wait must not block on a dead worker.
+        let t0 = std::time::Instant::now();
+        assert!(!animator.cancel_and_wait());
+        assert!(t0.elapsed() < CANCEL_ACK_TIMEOUT);
+    }
+
+    #[test]
+    fn panic_payload_message_extracts_str_and_string() {
+        let boxed: Box<dyn std::any::Any + Send> = Box::new("static text");
+        assert_eq!(panic_payload_message(boxed.as_ref()), "static text");
+        let boxed: Box<dyn std::any::Any + Send> = Box::new(String::from("owned text"));
+        assert_eq!(panic_payload_message(boxed.as_ref()), "owned text");
+        let boxed: Box<dyn std::any::Any + Send> = Box::new(42_u8);
+        assert_eq!(
+            panic_payload_message(boxed.as_ref()),
+            "<non-string panic payload>"
+        );
+    }
 
     #[test]
     fn cancel_stops_animation() {

@@ -80,9 +80,12 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WPARAM};
-use windows::Win32::System::Threading::{CreateEventW, GetCurrentThreadId, SetEvent};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WPARAM};
+use windows::Win32::System::Threading::{
+    CreateEventW, GetCurrentThreadId, SetEvent, WaitForSingleObject,
+};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, MSG, PostThreadMessageW, WM_QUIT};
 
@@ -309,6 +312,73 @@ static HOOK_SENDER: OnceLock<Sender<HookEvent>> = OnceLock::new();
 /// drop; this global is purely for read-only access from the callback.
 static HOOK_SIGNAL: OnceLock<isize> = OnceLock::new();
 
+// ── Shutdown request (signals, session end, console control) ─────────
+
+/// Set by [`request_shutdown`] when something outside the IPC path wants the
+/// daemon to stop: `WM_CLOSE` / `WM_QUERYENDSESSION` / `WM_ENDSESSION` on one
+/// of the daemon's windows, or a console control event (Ctrl-C, console
+/// close, logoff, shutdown). The main loop polls it on every wake and treats
+/// it like a `Stop` command (rescue, then exit).
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Set by [`mark_shutdown_complete`] once the fail-back / rescue has run.
+/// A console control handler waits on it (bounded) before returning, because
+/// Windows kills the process as soon as the handler returns for
+/// `CTRL_CLOSE_EVENT` / `CTRL_LOGOFF_EVENT` / `CTRL_SHUTDOWN_EVENT`.
+static SHUTDOWN_COMPLETE: AtomicBool = AtomicBool::new(false);
+
+/// Ask the daemon to shut down gracefully.
+///
+/// Sets the shutdown flag and wakes the main loop by signalling the hook
+/// event (the same event the hook callback uses). Safe to call from any
+/// thread, from a window procedure, or from a console control handler;
+/// calling it repeatedly is harmless. Before the hook thread has started
+/// (no signal event yet) only the flag is set, which the main loop still
+/// picks up on its first iteration.
+pub fn request_shutdown() {
+    if !SHUTDOWN_REQUESTED.swap(true, Ordering::AcqRel) {
+        log::info!("shutdown requested");
+    }
+    if let Some(&raw) = HOOK_SIGNAL.get() {
+        // SAFETY: the raw value is the signal event created in
+        // `start_hook_thread`; it lives for the daemon's lifetime.
+        let _ = unsafe { SetEvent(HANDLE(raw as *mut core::ffi::c_void)) };
+    }
+}
+
+/// `true` once [`request_shutdown`] has been called.
+#[must_use]
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+}
+
+/// Record that the daemon has finished its rescue / teardown, releasing any
+/// console control handler blocked in [`wait_shutdown_complete`].
+pub fn mark_shutdown_complete() {
+    SHUTDOWN_COMPLETE.store(true, Ordering::Release);
+}
+
+/// Block until [`mark_shutdown_complete`] has been called or `timeout`
+/// elapses. Returns `true` if the teardown completed in time.
+pub fn wait_shutdown_complete(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !SHUTDOWN_COMPLETE.load(Ordering::Acquire) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
+/// Test-only: clear both shutdown flags so tests can start from a known
+/// state. Never called by the daemon.
+#[cfg(test)]
+pub(crate) fn reset_shutdown_flags_for_test() {
+    SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+    SHUTDOWN_COMPLETE.store(false, Ordering::Release);
+}
+
 // ── Floating-location tracking (shared with the hook callback) ───────
 
 /// HWND values of the active workspace's floating windows.
@@ -456,6 +526,10 @@ pub struct HookThreadHandle {
     os_thread_id: u32,
     /// Names of the hooks the thread registered (see [`HOOK_NAMES`]).
     registered: Vec<&'static str>,
+    /// The spawned thread, kept so its kernel handle can be polled for
+    /// liveness (`None` for test dummies). Dropping a `JoinHandle` detaches
+    /// the thread; it does not join.
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl HookThreadHandle {
@@ -466,6 +540,25 @@ impl HookThreadHandle {
         unsafe {
             let _ = PostThreadMessageW(self.os_thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
         }
+    }
+
+    /// `true` while the hook thread is still running.
+    ///
+    /// Polls the thread's kernel handle with a zero timeout, so it costs a
+    /// syscall and never blocks. The daemon's event loop checks this every
+    /// wake: a hook thread that exited (e.g. `GetMessageW` returned `-1`)
+    /// means no more window events, so the daemon fails back instead of
+    /// running deaf. A test dummy (no thread) always reports alive.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        let Some(thread) = &self.thread else {
+            return true;
+        };
+        let raw = HANDLE(thread.as_raw_handle());
+        // SAFETY: the JoinHandle keeps the thread handle open for as long as
+        // it (and therefore `self`) lives; zero timeout → non-blocking poll.
+        unsafe { WaitForSingleObject(raw, 0) != WAIT_OBJECT_0 }
     }
 
     /// OS thread id of the hook thread.
@@ -607,6 +700,7 @@ impl HookThreadHandle {
         Self {
             os_thread_id: 0,
             registered: Vec::new(),
+            thread: None,
         }
     }
 }
@@ -703,30 +797,33 @@ pub fn start_hook_thread(
 
     let hook_signal = HookSignal(signal_event);
 
-    std::thread::spawn(move || {
-        // Switch to test desktop before any User32/GDI calls (debug builds only).
-        #[cfg(debug_assertions)]
-        if let Some(ref name) = desktop_name
-            && let Err(e) = super::desktop::switch_to_desktop(name)
-        {
-            log::error!("hook thread: {e}");
-            return;
-        }
+    let thread = std::thread::Builder::new()
+        .name("winevent-hook-thread".into())
+        .spawn(move || {
+            // Switch to test desktop before any User32/GDI calls (debug builds only).
+            #[cfg(debug_assertions)]
+            if let Some(ref name) = desktop_name
+                && let Err(e) = super::desktop::switch_to_desktop(name)
+            {
+                log::error!("hook thread: {e}");
+                return;
+            }
 
-        // Suppress unused-variable warning in release builds.
-        #[cfg(not(debug_assertions))]
-        let _ = desktop_name;
+            // Suppress unused-variable warning in release builds.
+            #[cfg(not(debug_assertions))]
+            let _ = desktop_name;
 
-        let os_thread_id = unsafe { GetCurrentThreadId() };
-        run_hook_loop(|registered| {
-            // Report back only after the hooks are registered, so the caller
-            // can verify the mandatory set rather than trusting a bare tid.
-            let _ = report_tx.send(HookStartReport {
-                os_thread_id,
-                registered,
+            let os_thread_id = unsafe { GetCurrentThreadId() };
+            run_hook_loop(|registered| {
+                // Report back only after the hooks are registered, so the caller
+                // can verify the mandatory set rather than trusting a bare tid.
+                let _ = report_tx.send(HookStartReport {
+                    os_thread_id,
+                    registered,
+                });
             });
-        });
-    });
+        })
+        .map_err(|e| format!("failed to spawn hook thread: {e}"))?;
 
     // Wait for the thread to report which hooks registered.
     let HookStartReport {
@@ -739,6 +836,7 @@ pub fn start_hook_thread(
     let handle = HookThreadHandle {
         os_thread_id,
         registered,
+        thread: Some(thread),
     };
 
     if let Err(missing) = missing_mandatory_hooks(handle.registered_hook_names()) {
@@ -1102,6 +1200,52 @@ unsafe extern "system" fn hook_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_request_sets_flag_and_complete_releases_waiter() {
+        // Serialised against nothing else: these flags are only touched by
+        // this test in the test binary.
+        reset_shutdown_flags_for_test();
+        assert!(!shutdown_requested());
+        request_shutdown();
+        assert!(shutdown_requested());
+        // Idempotent.
+        request_shutdown();
+        assert!(shutdown_requested());
+
+        // Nobody has completed yet: the wait times out.
+        assert!(!wait_shutdown_complete(Duration::from_millis(30)));
+        mark_shutdown_complete();
+        assert!(wait_shutdown_complete(Duration::from_millis(30)));
+        reset_shutdown_flags_for_test();
+    }
+
+    #[test]
+    fn test_dummy_hook_thread_handle_is_alive() {
+        assert!(HookThreadHandle::test_dummy().is_alive());
+    }
+
+    #[test]
+    fn real_thread_handle_reports_exit() {
+        // A handle over a thread that returns immediately reads as dead
+        // once the OS has reaped it; one that blocks reads as alive.
+        let (tx, rx) = mpsc::channel::<()>();
+        let blocking = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        let h = HookThreadHandle {
+            os_thread_id: 0,
+            registered: Vec::new(),
+            thread: Some(blocking),
+        };
+        assert!(h.is_alive());
+        drop(tx);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while h.is_alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!h.is_alive(), "exited thread must read as dead");
+    }
 
     #[test]
     fn hook_event_shown_carries_hwnd() {

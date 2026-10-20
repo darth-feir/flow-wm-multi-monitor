@@ -15,6 +15,18 @@
 //!    (see [`StartupStage::exit_code`]), so a supervisor or script can tell
 //!    stages apart without parsing output.
 //!
+//! # After boot: the `runtime` pseudo-stage
+//!
+//! Once `ready` has been reported the status file keeps describing the
+//! daemon's life: a panic or a fail-back (animator or hook thread died,
+//! session ending) rewrites it with `stage: "runtime"`, `state: "error"` and
+//! the reason, and the process exits with [`EXIT_CODE_RUNTIME`] (`2`). A
+//! clean `flow stop` leaves `stage: "runtime"`, `state: "stopped"`.
+//! [`StartupStage::Runtime`] is not a boot stage: it is never announced as
+//! `[n/N]`, and `FLOW_FAIL_AT=runtime` injects a **panic** in the event
+//! loop instead of a startup failure, so the fail-back path can be exercised
+//! end to end in the VM.
+//!
 //! # Fault injection (test-only)
 //!
 //! Setting the environment variable `FLOW_FAIL_AT` to a stage name (e.g.
@@ -39,6 +51,11 @@ pub const STATUS_FILE_NAME: &str = "flowd.status";
 /// Exit code of the daemon when startup fails at stage index 0; each later
 /// stage adds its index (see [`StartupStage::exit_code`]).
 pub const EXIT_CODE_BASE: i32 = 10;
+
+/// Exit code of the daemon after a runtime failure: a panic (any thread), a
+/// dead animator or hook thread, or a wait failure in the event loop. The
+/// fail-back (rescue, borders, hooks, hotkey script) has run by then.
+pub const EXIT_CODE_RUNTIME: i32 = 2;
 
 /// A step of the daemon's startup sequence, in execution order.
 ///
@@ -88,6 +105,10 @@ pub enum StartupStage {
     LoadoutRestore,
     /// Everything done; the event loop is about to start.
     Ready,
+    /// Not a boot stage: the daemon was past `ready` when the status was
+    /// written (runtime failure, fail-back or clean stop). Reads as index
+    /// `ALL.len()` and exit code [`EXIT_CODE_RUNTIME`].
+    Runtime,
 }
 
 impl StartupStage {
@@ -106,20 +127,27 @@ impl StartupStage {
         StartupStage::Ready,
     ];
 
-    /// Zero-based position of this stage in [`Self::ALL`].
+    /// Zero-based position of this stage in [`Self::ALL`]; `ALL.len()` for
+    /// the [`Runtime`](Self::Runtime) pseudo-stage (one past the last boot
+    /// stage).
     #[must_use]
     pub fn index(self) -> usize {
         Self::ALL
             .iter()
             .position(|s| *s == self)
-            .expect("every StartupStage is listed in ALL")
+            .unwrap_or(Self::ALL.len())
     }
 
     /// Process exit code the daemon uses when this stage fails:
-    /// [`EXIT_CODE_BASE`] plus [`index`](Self::index).
+    /// [`EXIT_CODE_BASE`] plus [`index`](Self::index), or
+    /// [`EXIT_CODE_RUNTIME`] for [`Runtime`](Self::Runtime).
     #[must_use]
     pub fn exit_code(self) -> i32 {
-        EXIT_CODE_BASE + self.index() as i32
+        if self == Self::Runtime {
+            EXIT_CODE_RUNTIME
+        } else {
+            EXIT_CODE_BASE + self.index() as i32
+        }
     }
 
     /// Snake-case name as used in logs, the status file and `FLOW_FAIL_AT`.
@@ -137,15 +165,20 @@ impl StartupStage {
             StartupStage::Borders => "borders",
             StartupStage::LoadoutRestore => "loadout_restore",
             StartupStage::Ready => "ready",
+            StartupStage::Runtime => "runtime",
         }
     }
 
     /// Parse a snake-case stage name (the inverse of [`name`](Self::name)).
     /// Matching is case-insensitive and tolerates surrounding whitespace.
+    /// `"runtime"` parses to the pseudo-stage (for `FLOW_FAIL_AT=runtime`).
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         let wanted = name.trim().to_ascii_lowercase();
-        Self::ALL.into_iter().find(|s| s.name() == wanted)
+        Self::ALL
+            .into_iter()
+            .chain(std::iter::once(Self::Runtime))
+            .find(|s| s.name() == wanted)
     }
 }
 
@@ -212,8 +245,13 @@ pub enum StartupState {
     Starting,
     /// Boot finished; the daemon is serving the pipe.
     Ready,
-    /// Boot failed at `stage`; `reason` says why. The process is exiting.
+    /// Boot failed at `stage`; `reason` says why — or, with `stage ==
+    /// runtime`, the daemon failed after boot (panic, dead thread) and has
+    /// failed back. The process is exiting.
     Error,
+    /// The daemon stopped cleanly (`flow stop`, session end) after running
+    /// its rescue; `stage` is `runtime`.
+    Stopped,
 }
 
 /// Contents of `<config_dir>/flowd.status`.
@@ -244,6 +282,21 @@ pub fn status_file_path_in(config_dir: &Path) -> PathBuf {
     config_dir.join(STATUS_FILE_NAME)
 }
 
+/// Serialise `status` as the pretty JSON document the status file holds
+/// and write it to `w`. Pure over the writer, so the panic hook's output
+/// can be tested without touching the filesystem.
+///
+/// # Errors
+///
+/// Returns the serialisation or write error.
+pub fn write_status_to<W: std::io::Write>(
+    w: &mut W,
+    status: &StartupStatus,
+) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(status).map_err(std::io::Error::other)?;
+    w.write_all(json.as_bytes())
+}
+
 /// Write `status` atomically to `<config_dir>/flowd.status`.
 ///
 /// The JSON is written to a sibling temp file and renamed over the target so
@@ -255,9 +308,41 @@ pub fn status_file_path_in(config_dir: &Path) -> PathBuf {
 pub fn write_status(config_dir: &Path, status: &StartupStatus) -> std::io::Result<()> {
     let path = status_file_path_in(config_dir);
     let tmp = config_dir.join(format!("{STATUS_FILE_NAME}.{}.tmp", status.pid));
-    let json = serde_json::to_string_pretty(status).map_err(std::io::Error::other)?;
-    std::fs::write(&tmp, json)?;
+    let mut buf = Vec::new();
+    write_status_to(&mut buf, status)?;
+    std::fs::write(&tmp, buf)?;
     std::fs::rename(&tmp, &path)
+}
+
+/// The status document a panic hook writes: `stage: runtime`, `state:
+/// error`, and a reason of the form `panic at <location>: <message>`.
+///
+/// `location` is `file:line:col` (or `None` when the panic carries no
+/// location); `message` is the panic payload text.
+#[must_use]
+pub fn panic_status(
+    pid: u32,
+    log_path: Option<PathBuf>,
+    location: Option<&str>,
+    message: &str,
+) -> StartupStatus {
+    StartupStatus {
+        pid,
+        stage: StartupStage::Runtime,
+        state: StartupState::Error,
+        reason: panic_reason(location, message),
+        log_path,
+    }
+}
+
+/// `panic at <location>: <message>` (or `panic: <message>` without a
+/// location) — the reason string shared by the log line and the status file.
+#[must_use]
+pub fn panic_reason(location: Option<&str>, message: &str) -> String {
+    match location {
+        Some(loc) => format!("panic at {loc}: {message}"),
+        None => format!("panic: {message}"),
+    }
 }
 
 /// Read and parse `<config_dir>/flowd.status`.
@@ -339,6 +424,30 @@ impl StartupReporter {
         self.log_path.as_deref()
     }
 
+    /// The stage configured for fault injection, if any.
+    #[must_use]
+    pub fn fail_at(&self) -> Option<StartupStage> {
+        self.fail_at
+    }
+
+    /// Record a post-boot failure: log `runtime: FAILED: <reason>` and
+    /// rewrite the status file with `stage: runtime`, `state: error`.
+    pub fn runtime_failure(&self, reason: &str) {
+        log::error!("runtime: FAILED: {reason}");
+        self.write(
+            StartupStage::Runtime,
+            StartupState::Error,
+            reason.to_owned(),
+        );
+    }
+
+    /// Record a clean stop: rewrite the status file with `stage: runtime`,
+    /// `state: stopped` so a later reader does not mistake a stopped daemon
+    /// for a ready one.
+    pub fn stopped(&self) {
+        self.write(StartupStage::Runtime, StartupState::Stopped, String::new());
+    }
+
     /// Check for an injected failure before running `stage`.
     ///
     /// # Errors
@@ -413,6 +522,76 @@ mod tests {
             );
             assert_eq!(StartupStage::parse(name), Some(stage));
         }
+    }
+
+    #[test]
+    fn runtime_pseudo_stage_is_outside_the_boot_sequence() {
+        assert!(!StartupStage::ALL.contains(&StartupStage::Runtime));
+        assert_eq!(StartupStage::Runtime.index(), StartupStage::ALL.len());
+        assert_eq!(StartupStage::Runtime.exit_code(), EXIT_CODE_RUNTIME);
+        assert_eq!(StartupStage::Runtime.name(), "runtime");
+        assert_eq!(StartupStage::parse("runtime"), Some(StartupStage::Runtime));
+        assert_eq!(
+            fail_at_from_value(Some("runtime")),
+            Some(StartupStage::Runtime)
+        );
+        // Runtime's exit code never collides with a boot stage's.
+        assert!(
+            StartupStage::ALL
+                .iter()
+                .all(|s| s.exit_code() != EXIT_CODE_RUNTIME)
+        );
+    }
+
+    #[test]
+    fn panic_status_writes_runtime_error_document() {
+        let status = panic_status(
+            777,
+            Some(PathBuf::from("C:\\logs\\flowd.log")),
+            Some("src\\daemon\\run.rs:123:9"),
+            "index out of bounds",
+        );
+        assert_eq!(status.stage, StartupStage::Runtime);
+        assert_eq!(status.state, StartupState::Error);
+        assert_eq!(
+            status.reason,
+            "panic at src\\daemon\\run.rs:123:9: index out of bounds"
+        );
+
+        let mut buf = Vec::new();
+        write_status_to(&mut buf, &status).expect("write");
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("\"pid\": 777"), "{text}");
+        assert!(text.contains("\"stage\": \"runtime\""), "{text}");
+        assert!(text.contains("\"state\": \"error\""), "{text}");
+        assert!(text.contains("index out of bounds"), "{text}");
+        // The document round-trips through the reader's parser.
+        let parsed: StartupStatus = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed, status);
+
+        assert_eq!(panic_reason(None, "boom"), "panic: boom");
+    }
+
+    #[test]
+    fn reporter_records_runtime_failure_and_clean_stop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reporter = StartupReporter::new(dir.path().to_path_buf(), None, None);
+        reporter.ok(StartupStage::Ready);
+        assert_eq!(read_status(dir.path()).unwrap().state, StartupState::Ready);
+
+        reporter.runtime_failure("animator thread died");
+        let s = read_status(dir.path()).unwrap();
+        assert_eq!(s.stage, StartupStage::Runtime);
+        assert_eq!(s.state, StartupState::Error);
+        assert_eq!(s.reason, "animator thread died");
+
+        reporter.stopped();
+        let s = read_status(dir.path()).unwrap();
+        assert_eq!(s.stage, StartupStage::Runtime);
+        assert_eq!(s.state, StartupState::Stopped);
+        assert!(s.reason.is_empty());
+        let text = std::fs::read_to_string(status_file_path_in(dir.path())).unwrap();
+        assert!(text.contains("\"state\": \"stopped\""), "{text}");
     }
 
     #[test]

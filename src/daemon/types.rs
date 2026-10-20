@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
 use crate::animation::WindowAnimator;
+use crate::autostart::AhkProcess;
 use crate::config::history::HistoryStore;
 use crate::config::types::FlowConfig;
 use crate::ipc::transport::PipeServer;
@@ -152,6 +153,19 @@ pub struct FlowWM {
     /// RAII: closed automatically on drop via `HookSignal`'s `Drop` impl.
     pub(super) hook_signal: HookSignal,
 
+    /// The invisible top-level window that receives `WM_QUERYENDSESSION` /
+    /// `WM_ENDSESSION` / `WM_CLOSE` so logoff and shutdown always trigger
+    /// the rescue, even when no border overlay exists. Destroyed on drop.
+    #[allow(dead_code)] // RAII: held only so its Drop runs with the daemon's.
+    pub(super) session_sink: super::session::SessionSink,
+
+    /// The hotkey script launched by this daemon (`flowd --ahk`), living in
+    /// a kill-on-close job object. `None` when not requested, not found, or
+    /// already stopped. Never closed explicitly except by
+    /// [`fail_back`](FlowWM::fail_back): process exit closes the job
+    /// handle and the kernel kills the script.
+    pub(super) ahk: Option<AhkProcess>,
+
     /// Set to `true` when the `Stop` IPC command is received, causing
     /// the main event loop to exit on the next iteration.
     pub(super) shutting_down: bool,
@@ -215,6 +229,45 @@ pub struct FlowWM {
 }
 
 impl FlowWM {
+    /// Launch `<config_dir>/flow.ahk` inside a kill-on-close job object
+    /// (see [`crate::autostart::launch_ahk_in_job`]). Called by `main` once
+    /// the `ready` stage has been reported, so the first hotkey always
+    /// reaches a listening daemon. A failure is logged and leaves the daemon
+    /// running without hotkeys — the window manager itself is unaffected.
+    ///
+    /// Returns the script's pid on success.
+    pub fn launch_ahk(&mut self) -> Option<u32> {
+        if let Some(existing) = &self.ahk {
+            return Some(existing.pid());
+        }
+        match crate::autostart::launch_ahk_in_job(&self.config_dir) {
+            Ok(proc) => {
+                let pid = proc.pid();
+                if !proc.is_job_tied() {
+                    log::warn!(
+                        "flow.ahk (pid {pid}) is not tied to the daemon's job object; it will not be killed automatically if the daemon dies"
+                    );
+                }
+                self.ahk = Some(proc);
+                Some(pid)
+            }
+            Err(e) => {
+                log::error!("could not launch flow.ahk: {e}");
+                None
+            }
+        }
+    }
+
+    /// Pid of the hotkey script launched by this daemon, if it is still
+    /// running. Reported in the `Pong` reply.
+    #[must_use]
+    pub fn ahk_pid(&self) -> Option<u32> {
+        self.ahk
+            .as_ref()
+            .filter(|p| p.is_running())
+            .map(AhkProcess::pid)
+    }
+
     /// The index of the monitor that currently owns keyboard focus.
     #[must_use]
     #[allow(dead_code)] // API surface for the upcoming multi-monitor / workspace commands.

@@ -36,7 +36,7 @@ pub(crate) mod metrics;
 pub(crate) mod types;
 
 /// Re-export of the background-threaded animator that drives all window moves.
-pub use animator::WindowAnimator;
+pub use animator::{CANCEL_ACK_TIMEOUT, WindowAnimator, panic_payload_message};
 /// Re-export of the full animator configuration struct.
 pub use config::AnimatorConfig;
 /// Re-export of the frame-timing metrics summary produced after an animation run.

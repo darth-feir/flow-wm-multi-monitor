@@ -6,6 +6,8 @@
 use std::ffi::OsStr;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
@@ -14,7 +16,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
-use windows::Win32::System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::IO::{CancelIo, CancelSynchronousIo, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
@@ -153,14 +155,26 @@ unsafe impl Send for EventHandle {}
 /// events (window creation/removal) to be processed immediately even when no
 /// CLI client is connected.
 pub struct PipeServer {
-    handle: PipeHandle,
+    /// The server pipe instance. `None` only after [`shutdown`](Self::shutdown)
+    /// had to give up on a wedged accept thread and leaked the handle on
+    /// purpose (closing it would block — see `shutdown`).
+    handle: Option<PipeHandle>,
     /// Manual-reset event signaled when a client connects to the pipe.
     /// The main thread waits on this via `WaitForMultipleObjects`.
     connected_event: EventHandle,
     /// Background thread blocked in `ConnectNamedPipe`.
     /// `None` when no accept is pending.
     accept_thread: Option<std::thread::JoinHandle<()>>,
+    /// Set by [`shutdown`](Self::shutdown); the accept thread checks it after
+    /// every `ConnectNamedPipe` return and exits instead of retrying.
+    stopping: Arc<AtomicBool>,
+    /// The pipe path this server listens on (for the throwaway self-connect
+    /// in `shutdown`).
+    pipe_name: String,
 }
+
+/// Longest [`PipeServer::shutdown`] waits for the accept thread to exit.
+pub const ACCEPT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1_000);
 
 impl PipeServer {
     /// Create a new named pipe server instance.
@@ -174,7 +188,17 @@ impl PipeServer {
     /// Returns an error if the pipe cannot be created (e.g., another daemon is
     /// already running) or if the event object cannot be created.
     pub fn create() -> io::Result<Self> {
-        let name = wide(&message::pipe_name());
+        Self::create_named(&message::pipe_name())
+    }
+
+    /// Create a server on an explicit pipe path (see [`create`](Self::create)).
+    /// Lets tests use an isolated name without touching `FLOW_PIPE_NAME`.
+    ///
+    /// # Errors
+    ///
+    /// As [`create`](Self::create).
+    pub fn create_named(pipe_name: &str) -> io::Result<Self> {
+        let name = wide(pipe_name);
 
         // TODO(security): Create a SECURITY_ATTRIBUTES that restricts pipe
         // access to the current user session. Currently any local process can
@@ -203,10 +227,91 @@ impl PipeServer {
         let connected_event = EventHandle::new()?;
 
         Ok(Self {
-            handle: PipeHandle(handle),
+            handle: Some(PipeHandle(handle)),
             connected_event,
             accept_thread: None,
+            stopping: Arc::new(AtomicBool::new(false)),
+            pipe_name: pipe_name.to_owned(),
         })
+    }
+
+    /// The raw server pipe handle (invalid after a leaked shutdown).
+    fn pipe(&self) -> HANDLE {
+        self.handle
+            .as_ref()
+            .map_or(HANDLE::default(), PipeHandle::raw)
+    }
+
+    /// `true` while an accept thread is pending.
+    #[must_use]
+    pub fn accept_pending(&self) -> bool {
+        self.accept_thread
+            .as_ref()
+            .is_some_and(|t| !t.is_finished())
+    }
+
+    /// Stop accepting: cancel a pending `ConnectNamedPipe` and join the
+    /// accept thread, bounded by [`ACCEPT_SHUTDOWN_TIMEOUT`].
+    ///
+    /// **Why this exists.** `CloseHandle` on a pipe whose other thread is
+    /// blocked in a *synchronous* `ConnectNamedPipe` does not cancel that
+    /// I/O — it blocks until the connect completes. Dropping a `PipeServer`
+    /// with an accept pending therefore hung `flowd` on every exit path
+    /// where no client had just connected (session end, signals, a dead
+    /// thread) until the next client happened to connect. `flow stop` never
+    /// hit it because the stopping client *was* the last connection.
+    ///
+    /// Steps: set `stopping` (the thread exits instead of retrying), then
+    /// repeatedly `CancelSynchronousIo` the accept thread (re-issued every
+    /// 10 ms to cover the window before it enters `ConnectNamedPipe`), and
+    /// if that still has not freed it after a third of the budget, connect a
+    /// throwaway client to our own pipe so the accept returns normally.
+    /// Returns `true` if the thread was joined in time. If not, the pipe
+    /// handle is deliberately **leaked** (not closed) so that dropping the
+    /// server can no longer block; the process is exiting anyway.
+    pub fn shutdown(&mut self) -> bool {
+        self.stopping.store(true, Ordering::Release);
+        let Some(thread) = self.accept_thread.take() else {
+            return true;
+        };
+        if thread.is_finished() {
+            let _ = thread.join();
+            return true;
+        }
+        use std::os::windows::io::AsRawHandle;
+        let thread_handle = HANDLE(thread.as_raw_handle());
+        let start = Instant::now();
+        let deadline = start + ACCEPT_SHUTDOWN_TIMEOUT;
+        let mut self_connected = false;
+        while !thread.is_finished() {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            // SAFETY: the JoinHandle keeps the thread handle valid; cancelling
+            // another thread's synchronous I/O is the documented purpose.
+            let _ = unsafe { CancelSynchronousIo(thread_handle) };
+            if !self_connected && now - start >= ACCEPT_SHUTDOWN_TIMEOUT / 3 {
+                // Fallback: a real connection makes ConnectNamedPipe return.
+                self_connected = true;
+                let _ = connect_to_named_pipe(&self.pipe_name);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if thread.is_finished() {
+            let _ = thread.join();
+            true
+        } else {
+            log::error!(
+                "PipeServer: accept thread did not exit within {:?}; leaking the pipe handle so shutdown cannot block",
+                ACCEPT_SHUTDOWN_TIMEOUT
+            );
+            if let Some(h) = self.handle.take() {
+                std::mem::forget(h);
+            }
+            // The JoinHandle is dropped here, detaching the thread.
+            false
+        }
     }
 
     /// Start accepting the next client connection on a background thread.
@@ -234,8 +339,14 @@ impl PipeServer {
         // Reset the connected event before spawning a new accept thread.
         let _ = unsafe { ResetEvent(self.connected_event.raw()) };
 
-        let handle = self.handle.raw().0 as isize;
+        if self.stopping.load(Ordering::Acquire) {
+            // Shutting down: never start a new accept.
+            return;
+        }
+
+        let handle = self.pipe().0 as isize;
         let event = self.connected_event.raw().0 as isize;
+        let stopping = Arc::clone(&self.stopping);
 
         self.accept_thread = Some(std::thread::spawn(move || {
             // Block until a client connects. This runs on a background thread
@@ -266,6 +377,13 @@ impl PipeServer {
             // forever in practice.
             loop {
                 let result = unsafe { ConnectNamedPipe(pipe, None) };
+                // Shutdown: whether the connect was cancelled, failed or
+                // even succeeded (throwaway self-connect), leave without
+                // signalling — the main loop is no longer serving clients.
+                if stopping.load(Ordering::Acquire) {
+                    log::debug!("PipeServer accept thread: shutdown requested, exiting");
+                    return;
+                }
                 match result {
                     Ok(()) => break,
                     Err(e) if e.code() == ERROR_PIPE_CONNECTED_HRESULT => break,
@@ -296,6 +414,12 @@ impl PipeServer {
         self.connected_event.raw()
     }
 
+    /// The pipe path this server listens on.
+    #[must_use]
+    pub fn pipe_name(&self) -> &str {
+        &self.pipe_name
+    }
+
     /// Read a single newline-terminated JSON message from the client.
     ///
     /// Blocks until a full line (ending in `\n`) is received.
@@ -305,7 +429,7 @@ impl PipeServer {
     /// Returns an error on I/O failure or if the connection is closed
     /// without sending a message.
     pub fn read_message(&self) -> io::Result<SocketMessage> {
-        let line = read_line(self.handle.raw())?;
+        let line = read_line(self.pipe())?;
         message::decode_message(&line).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -321,7 +445,7 @@ impl PipeServer {
     /// Returns an error if serialisation or the write fails.
     pub fn write_response(&self, response: &SocketResponse) -> io::Result<()> {
         let wire = message::encode_message(response)?;
-        write_all(self.handle.raw(), wire.as_bytes())
+        write_all(self.pipe(), wire.as_bytes())
     }
 
     /// Disconnect the current client so a new one can connect.
@@ -330,8 +454,18 @@ impl PipeServer {
     ///
     /// Returns an error if the disconnect fails.
     pub fn disconnect(&self) -> io::Result<()> {
-        unsafe { DisconnectNamedPipe(self.handle.raw()) }
+        unsafe { DisconnectNamedPipe(self.pipe()) }
             .map_err(|e| io::Error::other(format!("DisconnectNamedPipe: {e}")))
+    }
+}
+
+impl Drop for PipeServer {
+    fn drop(&mut self) {
+        // Never let a drop block on a pending synchronous accept (see
+        // `shutdown`). Idempotent: a server already shut down returns at once.
+        if self.accept_pending() {
+            self.shutdown();
+        }
     }
 }
 
@@ -747,9 +881,11 @@ impl PipeServer {
                 .expect("CreateEventW should not fail in test_dummy")
         };
         Self {
-            handle: PipeHandle(dummy),
+            handle: Some(PipeHandle(dummy)),
             connected_event: EventHandle::new().expect("EventHandle::new in test_dummy"),
             accept_thread: None,
+            stopping: Arc::new(AtomicBool::new(false)),
+            pipe_name: String::new(),
         }
     }
 }
@@ -758,6 +894,77 @@ impl PipeServer {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// A pipe name unique to this test process and test, so parallel tests
+    /// (and a real daemon on `\\.\pipe\flow`) never collide.
+    fn isolated_pipe_name(tag: &str) -> String {
+        format!("\\\\.\\pipe\\flow-test-{}-{tag}", std::process::id())
+    }
+
+    #[test]
+    fn shutdown_cancels_pending_accept_and_joins_in_time() {
+        // The bug: a server dropped with an accept blocked in a synchronous
+        // ConnectNamedPipe hung on CloseHandle until a client connected.
+        let mut server = PipeServer::create_named(&isolated_pipe_name("cancel")).expect("pipe");
+        server.start_accept();
+        // Let the thread get into ConnectNamedPipe.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(server.accept_pending());
+
+        let t0 = Instant::now();
+        assert!(server.shutdown(), "accept thread must be joined");
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "shutdown took {:?}",
+            t0.elapsed()
+        );
+        assert!(!server.accept_pending());
+        // The connect event was not signalled: nobody connected.
+        assert_eq!(
+            unsafe { WaitForSingleObject(server.connected_event_handle(), 0) },
+            WAIT_TIMEOUT
+        );
+        // Dropping afterwards is instant too.
+        let t1 = Instant::now();
+        drop(server);
+        assert!(t1.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn shutdown_immediately_after_start_accept_does_not_hang() {
+        // Race variant: the thread may not have reached ConnectNamedPipe yet
+        // when shutdown is called; the re-issued CancelSynchronousIo (and the
+        // self-connect fallback) must still free it.
+        let mut server = PipeServer::create_named(&isolated_pipe_name("race")).expect("pipe");
+        server.start_accept();
+        let t0 = Instant::now();
+        assert!(server.shutdown());
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        // start_accept after shutdown is a no-op.
+        server.start_accept();
+        assert!(!server.accept_pending());
+    }
+
+    #[test]
+    fn drop_with_pending_accept_does_not_block() {
+        let mut server = PipeServer::create_named(&isolated_pipe_name("drop")).expect("pipe");
+        server.start_accept();
+        std::thread::sleep(Duration::from_millis(30));
+        let t0 = Instant::now();
+        drop(server);
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "drop took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn shutdown_without_accept_is_trivial() {
+        let mut server = PipeServer::create_named(&isolated_pipe_name("idle")).expect("pipe");
+        assert!(server.shutdown());
+        assert!(server.shutdown());
+    }
 
     // ── ms_until: deadline → milliseconds conversion for WaitForSingleObject ──
     //

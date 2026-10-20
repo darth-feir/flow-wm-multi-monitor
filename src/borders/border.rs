@@ -31,8 +31,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetWindowLongPtrW,
     GetWindowRect, RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOSENDCHANGING, SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos, ShowWindow, ULW_ALPHA,
-    UpdateLayeredWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_SIZE, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    UpdateLayeredWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_ENDSESSION,
+    WM_QUERYENDSESSION, WM_SIZE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::PCWSTR;
 use windows::core::w;
@@ -58,7 +59,15 @@ static OVERLAY_CLASS_ATOM: OnceLock<u16> = OnceLock::new();
 /// This makes the overlay self-sufficient: any caller that resizes the
 /// overlay via `SetWindowPos` (the animator, `set_geometry`, teleport)
 /// automatically gets a correctly-sized bitmap — no orchestrator-level
-/// special-casing needed. All other messages are passed through to
+/// special-casing needed.
+///
+/// `WM_CLOSE`, `WM_QUERYENDSESSION` and `WM_ENDSESSION` are the daemon's
+/// graceful-exit signals: each one calls
+/// [`request_shutdown`](crate::registry::hooks::request_shutdown) so the
+/// main loop runs the normal rescue path instead of letting logoff strand
+/// parked windows. `WM_QUERYENDSESSION` answers `TRUE` (we never veto a
+/// logoff); `WM_CLOSE` returns without destroying the overlay (the daemon
+/// drops it during fail-back). All other messages are passed through to
 /// `DefWindowProcW`.
 ///
 /// # Threading
@@ -94,6 +103,23 @@ unsafe extern "system" fn overlay_wnd_proc(
             border_inner.on_wm_size();
         }
         return LRESULT(0);
+    }
+    match msg {
+        WM_CLOSE => {
+            crate::registry::hooks::request_shutdown();
+            return LRESULT(0);
+        }
+        WM_QUERYENDSESSION => {
+            crate::registry::hooks::request_shutdown();
+            return LRESULT(1);
+        }
+        WM_ENDSESSION => {
+            if wparam.0 != 0 {
+                crate::registry::hooks::request_shutdown();
+            }
+            return LRESULT(0);
+        }
+        _ => {}
     }
     // SAFETY: DefWindowProcW is sound for arbitrary hwnd/msg/wparam/lparam;
     // we pass through unchanged. The unsafe block is required by edition 2024.

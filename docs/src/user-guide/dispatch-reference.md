@@ -283,9 +283,10 @@ A few other top-level commands are worth knowing:
 
 | Command | What it does |
 |---|---|
-| `flow start [--ahk] [--config <dir>] [--log-file <path>] [--no-restore] [--verbose] [--log-level <lvl>]` | Launch the daemon in the background and wait until it is really ready (it must report every startup step and answer a ping). Prints `flow: daemon started (pid N, M monitor(s), log: <path>)`. If a step fails you get `flow: FlowWM failed to start at step '<step>': <reason> (log: <path>)` and a non-zero exit — nothing is left half-tiled, windows are put back. `--ahk` also starts `flow.ahk` once the daemon is listening. `--verbose` (`-v`) logs at `debug`; `--log-level trace` goes further. |
-| `flow stop [--ahk]` | Stop the running daemon (and the AHK script, with `--ahk`). |
-| `flow ping` | Check the daemon is alive: prints its version, pid, monitor count and registered-hook count. |
+| `flow start [--ahk] [--config <dir>] [--log-file <path>] [--no-restore] [--verbose] [--log-level <lvl>]` | First puts back any windows a crashed previous run left off-screen, then launches the daemon in the background and waits until it is really ready (it must report every startup step and answer a ping). Prints `flow: daemon started (pid N, M monitor(s), log: <path>)`. If a step fails you get `flow: FlowWM failed to start at step '<step>': <reason> (log: <path>)` and a non-zero exit — nothing is left half-tiled, windows are put back. `--ahk` makes the daemon start `flow.ahk` once it is listening, **tied to the daemon**: if the daemon ever dies, the script dies with it and the Win key is yours again. `--verbose` (`-v`) logs at `debug`; `--log-level trace` goes further. |
+| `flow stop` | Stop the running daemon. It puts every window back on-screen, removes its borders and stops the hotkey script — `--ahk` is no longer needed (still accepted). |
+| `flow rescue [--force]` | No daemon needed: find every window parked off-screen (after a crash or a `taskkill`) and move it back onto its monitor; prints how many were moved and their titles. Refuses to run while a daemon is answering unless you pass `--force` (prefer `flow stop`, which rescues on exit). |
+| `flow ping` | Check the daemon is alive: prints its version, pid, monitor count, registered-hook count and the hotkey script's pid. |
 | `flow config init [--ahk]` | Write default `flow.toml` (and `flow.ahk`) into your config dir. Never overwrites existing files. |
 | `flow config reload` | Tell the running daemon to re-read config from disk. |
 | `flow config edit` | Open the config directory in your editor. |

@@ -10,8 +10,9 @@
 //!    rules (plus learned history) and scans existing windows.
 //! 3. **`pipe`** — creates the IPC named pipe server (fails fast if another
 //!    daemon owns it).
-//! 4. **`hooks`** — starts the WinEvent hook thread and verifies the
-//!    mandatory hooks registered.
+//! 4. **`hooks`** — starts the WinEvent hook thread, verifies the
+//!    mandatory hooks registered, and creates the session-sink window that
+//!    turns logoff / shutdown / close into a graceful stop.
 //! 5. **`animator`** — creates [`WindowAnimator`] with the Win32 backend and
 //!    the user's configured animation duration.
 //! 6. **`initial_layout`** — batch-initializes each monitor's layout from
@@ -50,6 +51,7 @@ use windows::Win32::Foundation::HWND;
 
 use super::animation::animate_layout_raw;
 use super::config_derive;
+use super::session::SessionSink;
 use super::shutdown::{RescueMonitor, rescue_stranded_windows_with};
 use super::startup::{AtStage, StartupError, StartupReporter, StartupStage};
 use super::types::FlowWM;
@@ -206,6 +208,10 @@ impl FlowWM {
         reporter.begin(S::Hooks)?;
         let (hook_receiver, hook_handle, hook_signal) =
             hooks::start_hook_thread(desktop_name).at(S::Hooks)?;
+        // The session sink is the daemon's permanent top-level window: it
+        // receives WM_QUERYENDSESSION / WM_ENDSESSION / WM_CLOSE even when no
+        // border overlay exists, so a logoff always runs the rescue.
+        let session_sink = SessionSink::create().at(S::Hooks)?;
         reporter.ok(S::Hooks);
 
         // ── 5. animator ──────────────────────────────────────────────
@@ -307,7 +313,9 @@ impl FlowWM {
         // through the free function (no workspace bookkeeping yet: owners
         // resolve by anchor rect).
         if let Err(err) = reporter.begin(S::Borders) {
-            animator.cancel();
+            // Synchronous: the initial-layout tween must be fully stopped
+            // before the rescue moves anything, or it overwrites the rescue.
+            animator.cancel_and_wait();
             rescue_stranded_windows_with(
                 &registry,
                 virtual_screen,
@@ -357,6 +365,8 @@ impl FlowWM {
             hook_receiver,
             hook_handle,
             hook_signal,
+            session_sink,
+            ahk: None,
             shutting_down: false,
             pending_creations: Vec::new(),
             float_resume_deadline: None,
@@ -460,6 +470,8 @@ impl FlowWM {
             hook_receiver,
             hook_handle: hooks::HookThreadHandle::test_dummy(),
             hook_signal: hooks::HookSignal::test_dummy(),
+            session_sink: SessionSink::test_dummy(),
+            ahk: None,
             shutting_down: false,
             pending_creations: Vec::new(),
             float_resume_deadline: None,

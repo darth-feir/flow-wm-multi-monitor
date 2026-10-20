@@ -44,6 +44,7 @@ use flow_wm::ipc::message::SocketResponse;
 use flow_wm::ipc::message::WindowMode;
 use flow_wm::ipc::transport;
 use flow_wm::logging;
+use flow_wm::rescue;
 
 /// Maximum time to wait for the daemon to become ready after spawning.
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -77,8 +78,10 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         log_file: Option<String>,
         /// Also launch the user's `flow.ahk` keybinding script once the daemon
-        /// is ready. The script is launched via its `.ahk` shell association
-        /// and its PID is tracked so `flow stop --ahk` can terminate it.
+        /// is ready. Forwarded to the daemon (`flowd --ahk`), which starts the
+        /// AutoHotkey v2 interpreter inside a kill-on-close job object: if the
+        /// daemon dies for any reason the script dies with it and the Win key
+        /// is released. `flow stop` always stops it.
         #[arg(long)]
         ahk: bool,
         /// Skip restoring the last saved loadout after the daemon starts.
@@ -99,11 +102,23 @@ enum Commands {
         #[arg(long, value_name = "LEVEL")]
         log_level: Option<String>,
     },
-    /// Stop the running flowd daemon.
+    /// Stop the running flowd daemon (and the hotkey script, if one is
+    /// recorded in `flow.ahk.pid`).
     Stop {
-        /// Also stop the AutoHotkey script launched by `flow start --ahk`.
-        #[arg(long)]
+        /// Accepted for compatibility; the hotkey script is always stopped.
+        #[arg(long, hide = true)]
         ahk: bool,
+    },
+    /// Bring every off-screen window back onto a monitor — without a daemon.
+    ///
+    /// Use it after a crash or `taskkill` left windows parked beyond the
+    /// screen edge. `flow start` runs the same pass before launching the
+    /// daemon. Refuses to run while a daemon is answering (it would fight
+    /// the daemon's own layout) unless `--force` is given.
+    Rescue {
+        /// Run even if a daemon is currently answering on the pipe.
+        #[arg(long)]
+        force: bool,
     },
     /// Check that the daemon is alive: prints its version, pid, monitor
     /// count and registered-hook count. Exits non-zero if it does not answer.
@@ -439,7 +454,8 @@ fn main() {
                 }
             }
         }
-        Commands::Stop { ahk } => cmd_stop(ahk),
+        Commands::Stop { ahk: _ } => cmd_stop(),
+        Commands::Rescue { force } => cmd_rescue(force),
         Commands::Ping => cmd_ping(),
         Commands::Loadout { command } => cmd_loadout(command),
         Commands::Config { command } => cmd_config(command),
@@ -463,7 +479,7 @@ struct StartOptions {
     config_override: Option<String>,
     /// `--log-file <path>`: forwarded to the daemon.
     log_file_override: Option<String>,
-    /// `--ahk`: launch `flow.ahk` once the daemon is ready.
+    /// `--ahk`: forwarded to the daemon, which launches `flow.ahk` once ready.
     ahk: bool,
     /// `--no-restore`: forwarded to the daemon.
     no_restore: bool,
@@ -517,6 +533,8 @@ struct StartSummary {
     monitors: usize,
     /// Registered WinEvent hook count reported by the daemon.
     hooks_registered: usize,
+    /// Pid of the hotkey script the daemon launched (`--ahk`), if running.
+    ahk_pid: Option<u32>,
 }
 
 /// Start the daemon and wait for it to become ready.
@@ -537,9 +555,15 @@ struct StartSummary {
 /// `flow: FlowWM failed to start at step '<stage>': <reason> (log: <path>)`
 /// is printed and the process exits with the daemon's stage exit code.
 ///
-/// When `ahk` is true, the user's `flow.ahk` is launched via
-/// [`autostart::spawn_ahk_script`] after the daemon is ready, so the daemon
-/// is already listening when the first hotkey fires.
+/// Before spawning, the daemon-less rescue ([`rescue::rescue_offscreen_windows`])
+/// runs so windows a crashed previous daemon left off-screen are brought
+/// back; a line is printed if it moved anything.
+///
+/// When `ahk` is true, `flow.ahk` must exist (checked here, so a missing
+/// script is reported before anything starts) and `--ahk` is forwarded to
+/// the daemon, which launches the script inside a kill-on-close job object
+/// once it is ready. The `Pong` reports the script's pid; if the daemon
+/// could not launch it a warning is printed.
 ///
 /// # Design Decision
 ///
@@ -557,7 +581,7 @@ struct StartSummary {
 /// - The daemon fails to spawn.
 /// - The daemon reports a failed startup stage or exits early.
 /// - The daemon does not become ready within [`DAEMON_START_TIMEOUT`].
-/// - `ahk` is true and `flow.ahk` cannot be launched.
+/// - `ahk` is true and `flow.ahk` does not exist.
 fn cmd_start(opts: StartOptions) -> Result<(), StartError> {
     // Set env var before any daemon interaction so the spawned child inherits it.
     if let Some(ref dir) = opts.config_override {
@@ -578,6 +602,31 @@ fn cmd_start(opts: StartOptions) -> Result<(), StartError> {
     let config_dir =
         config::dirs::resolve_config_dir(opts.config_override.as_deref().map(Path::new));
     let config = preflight_config_check(&config_dir)?;
+
+    if opts.ahk {
+        let script = autostart::flow_ahk_path_in(&config_dir);
+        if !script.exists() {
+            return Err(format!(
+                "flow.ahk not found at {}; run `flow config init --ahk` to create it",
+                script.display()
+            )
+            .into());
+        }
+    }
+
+    // A previous daemon that died without its shutdown rescue leaves windows
+    // parked beyond the screen. Clean that up before the new daemon scans
+    // them (it would otherwise adopt the parked rects as their anchors).
+    match rescue::rescue_offscreen_windows() {
+        Ok(report) if !report.moved.is_empty() => {
+            println!(
+                "flow: rescued {} off-screen window(s) left by a previous run",
+                report.moved.len()
+            );
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("flow: warning: pre-start rescue failed: {e}"),
+    }
 
     // Where the daemon will log, so a failure line can point at it even if
     // the daemon died before writing its status file.
@@ -607,9 +656,14 @@ fn cmd_start(opts: StartOptions) -> Result<(), StartError> {
     // happens here — this sidesteps the startup pipe race.
 
     if opts.ahk {
-        // Launch AHK after the daemon is listening so the first hotkey lands.
-        let pid = autostart::spawn_ahk_script()?;
-        println!("flow: launched flow.ahk (pid {pid})");
+        // The daemon launched the script itself (inside its job object)
+        // after reporting ready; the Pong tells us whether it is running.
+        match summary.ahk_pid {
+            Some(pid) => println!("flow: flow.ahk running (pid {pid}, tied to the daemon)"),
+            None => eprintln!(
+                "flow: warning: the daemon could not launch flow.ahk (see the log); hotkeys are unavailable"
+            ),
+        }
     }
 
     maybe_notify_update(&config);
@@ -632,9 +686,14 @@ fn cmd_ping() -> Result<(), String> {
             pid,
             monitors,
             hooks_registered,
+            ahk_pid,
         } => {
+            let ahk = match ahk_pid {
+                Some(p) => format!(", flow.ahk pid {p}"),
+                None => String::new(),
+            };
             println!(
-                "flow: pong from flowd {version} (pid {pid}, {monitors} monitor(s), {hooks_registered} hook(s) registered)"
+                "flow: pong from flowd {version} (pid {pid}, {monitors} monitor(s), {hooks_registered} hook(s) registered{ahk})"
             );
             Ok(())
         }
@@ -689,27 +748,106 @@ fn preflight_config_check(config_dir: &Path) -> Result<config::FlowConfig, Strin
     Ok(config)
 }
 
-/// Send a Stop message to the daemon.
+/// How long `flow stop` waits for the daemon to finish its fail-back (status
+/// file no longer `ready`) before cleaning up a leftover hotkey script.
+const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Send a Stop message to the daemon, wait for it to finish, then clean up
+/// a leftover hotkey script.
 ///
-/// When `ahk` is true, the AutoHotkey script launched by `flow start --ahk`
-/// is terminated via [`autostart::stop_ahk_script`] **after** the daemon has
-/// stopped, so a live daemon never loses its keybindings mid-dispatch.
+/// The daemon is the one that kills its script (during fail-back, which runs
+/// after it has acknowledged `Stop`). So this waits — up to
+/// [`DAEMON_STOP_TIMEOUT`] — for the daemon's status file to leave `ready`
+/// (it becomes `stopped`), and only then runs
+/// [`autostart::stop_ahk_script`]: that finds a pidfile only if the daemon
+/// did not launch the script itself (an older `flow start --ahk`) or died
+/// before removing it, and it treats an already-exited pid as nothing to do.
+/// Nothing is printed when there was nothing to stop.
 ///
 /// # Errors
 ///
-/// Returns an error string if the daemon cannot be reached, or if `ahk` is
-/// true and terminating the AHK process fails.
-fn cmd_stop(ahk: bool) -> Result<(), String> {
+/// Returns an error string if the daemon cannot be reached, or if
+/// terminating a still-live recorded AHK process fails.
+fn cmd_stop() -> Result<(), String> {
     send_command(SocketMessage::Stop, "daemon stopped")?;
-    if ahk {
-        let stopped = autostart::stop_ahk_script()?;
-        if stopped {
-            println!("flow: stopped flow.ahk");
-        } else {
-            println!("flow: no tracked flow.ahk to stop");
-        }
+    let config_dir = config::dirs::resolve_config_dir(None);
+    if !wait_for_daemon_stop(&config_dir, DAEMON_STOP_TIMEOUT) {
+        eprintln!("flow: warning: the daemon has not reported its stop yet; cleaning up anyway");
+    }
+    if autostart::stop_ahk_script()? {
+        println!("flow: stopped flow.ahk");
     }
     Ok(())
+}
+
+/// Poll the status file until it no longer says `ready`/`starting`, or the
+/// pipe has gone away, or `timeout` elapses. Returns `true` when the daemon
+/// is known to have finished.
+fn wait_for_daemon_stop(config_dir: &Path, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match startup::read_status(config_dir) {
+            // No status file at all: nothing to wait for.
+            None => return true,
+            Some(st) if daemon_finished(st.state) => return true,
+            Some(_) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(DAEMON_POLL_INTERVAL);
+    }
+}
+
+/// `true` for the status states a daemon writes once it is done.
+fn daemon_finished(state: StartupState) -> bool {
+    matches!(state, StartupState::Stopped | StartupState::Error)
+}
+
+/// `flow rescue [--force]`: daemon-less off-screen window rescue.
+///
+/// Prints how many windows were moved and their titles. Refuses to run
+/// while a daemon answers on the pipe unless `force` is set, because the
+/// daemon's layout would immediately disagree with the moved rects.
+///
+/// # Errors
+///
+/// Returns an error string if a daemon is running (without `--force`) or
+/// if windows / monitors cannot be enumerated.
+fn cmd_rescue(force: bool) -> Result<(), String> {
+    if !force && transport::is_daemon_running() {
+        return Err(
+            "a daemon is running; use `flow stop` (it rescues on exit) or `flow rescue --force`"
+                .to_owned(),
+        );
+    }
+    let report = rescue::rescue_offscreen_windows()?;
+    print!("{}", format_rescue_report(&report));
+    Ok(())
+}
+
+/// The lines `flow rescue` prints for a report.
+fn format_rescue_report(report: &rescue::RescueReport) -> String {
+    let mut out = String::new();
+    if report.moved.is_empty() {
+        out.push_str(&format!(
+            "flow: no off-screen windows ({} window(s) checked)\n",
+            report.scanned
+        ));
+        return out;
+    }
+    out.push_str(&format!(
+        "flow: moved {} off-screen window(s) back on-screen ({} checked):\n",
+        report.moved.len(),
+        report.scanned
+    ));
+    for w in &report.moved {
+        out.push_str(&format!(
+            "  {:?}  ({},{}) -> ({},{})\n",
+            w.title, w.from.x, w.from.y, w.to.x, w.to.y
+        ));
+    }
+    out
 }
 
 /// Create the login autostart shortcut in `shell:startup`.
@@ -1211,7 +1349,7 @@ fn spawn_daemon(opts: &StartOptions) -> Result<Child, String> {
 }
 
 /// Build the daemon [`Command`] with the forwarded flags applied
-/// (`--log-file`, `--no-restore`, `--verbose`, `--log-level`).
+/// (`--log-file`, `--no-restore`, `--verbose`, `--log-level`, `--ahk`).
 ///
 /// Factored out so [`spawn_daemon`] can construct an identical command for
 /// both the native detached spawn and the WSL fallback spawn — the forwarded
@@ -1244,6 +1382,9 @@ fn daemon_args(opts: &StartOptions) -> Vec<String> {
     if let Some(level) = &opts.log_level {
         args.push("--log-level".to_owned());
         args.push(level.clone());
+    }
+    if opts.ahk {
+        args.push("--ahk".to_owned());
     }
     args
 }
@@ -1340,6 +1481,7 @@ fn wait_for_daemon(
                         pid,
                         monitors,
                         hooks_registered,
+                        ahk_pid,
                         ..
                     }) = transport::send_message(&SocketMessage::Ping)
                         && pid == child_pid
@@ -1348,10 +1490,14 @@ fn wait_for_daemon(
                             pid,
                             monitors,
                             hooks_registered,
+                            ahk_pid,
                         });
                     }
                 }
                 StartupState::Starting => {}
+                // Our own pid says it already stopped: the next `try_wait`
+                // poll reports the exit with its code.
+                StartupState::Stopped => {}
             }
         }
 
@@ -1462,11 +1608,80 @@ mod tests {
                 "--verbose",
                 "--log-level",
                 "trace",
+                "--ahk",
             ]
             .map(String::from)
         );
-        // --config and --ahk are NOT daemon flags (env var / client-side).
+        // --config is NOT a daemon flag (it travels as an env var).
         assert_eq!(daemon_args(&StartOptions::default()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn rescue_report_formatting() {
+        use flow_wm::common::Rect;
+        let empty = rescue::RescueReport {
+            scanned: 3,
+            moved: vec![],
+        };
+        assert_eq!(
+            format_rescue_report(&empty),
+            "flow: no off-screen windows (3 window(s) checked)\n"
+        );
+        let r = |x, y| Rect {
+            x,
+            y,
+            width: 800,
+            height: 600,
+        };
+        let moved = rescue::RescueReport {
+            scanned: 4,
+            moved: vec![rescue::RescuedWindow {
+                title: "Notepad".to_owned(),
+                from: r(-960, 0),
+                to: r(0, 0),
+            }],
+        };
+        assert_eq!(
+            format_rescue_report(&moved),
+            "flow: moved 1 off-screen window(s) back on-screen (4 checked):\n  \"Notepad\"  (-960,0) -> (0,0)\n"
+        );
+    }
+
+    #[test]
+    fn stop_waits_for_the_status_file_to_leave_ready() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // No file: nothing to wait for.
+        assert!(wait_for_daemon_stop(dir.path(), Duration::from_millis(50)));
+        let mut st = StartupStatus {
+            pid: 1,
+            stage: flow_wm::daemon::StartupStage::Ready,
+            state: StartupState::Ready,
+            reason: String::new(),
+            log_path: None,
+        };
+        startup::write_status(dir.path(), &st).unwrap();
+        let t0 = std::time::Instant::now();
+        assert!(!wait_for_daemon_stop(
+            dir.path(),
+            Duration::from_millis(150)
+        ));
+        assert!(t0.elapsed() >= Duration::from_millis(150));
+        st.state = StartupState::Stopped;
+        st.stage = flow_wm::daemon::StartupStage::Runtime;
+        startup::write_status(dir.path(), &st).unwrap();
+        assert!(wait_for_daemon_stop(dir.path(), Duration::from_millis(50)));
+        assert!(daemon_finished(StartupState::Error));
+        assert!(!daemon_finished(StartupState::Starting));
+    }
+
+    #[test]
+    fn parse_rescue() {
+        let cli = Cli::try_parse_from(["flow", "rescue"]).unwrap();
+        assert!(matches!(cli.command, Commands::Rescue { force: false }));
+        let cli = Cli::try_parse_from(["flow", "rescue", "--force"]).unwrap();
+        assert!(matches!(cli.command, Commands::Rescue { force: true }));
+        // Negative: no positionals.
+        assert!(Cli::try_parse_from(["flow", "rescue", "now"]).is_err());
     }
 
     #[test]
@@ -1608,8 +1823,11 @@ mod tests {
 
     #[test]
     fn parse_stop() {
+        // `flow stop` needs no flag: the hotkey script is always stopped.
         let cli = Cli::try_parse_from(["flow", "stop"]).unwrap();
         assert!(matches!(cli.command, Commands::Stop { ahk: false }));
+        // Negative: no positionals.
+        assert!(Cli::try_parse_from(["flow", "stop", "now"]).is_err());
     }
 
     #[test]
@@ -1628,6 +1846,7 @@ mod tests {
 
     #[test]
     fn parse_stop_with_ahk_flag() {
+        // Still accepted (hidden) for scripts written against the old CLI.
         let cli = Cli::try_parse_from(["flow", "stop", "--ahk"]).unwrap();
         assert!(matches!(cli.command, Commands::Stop { ahk: true }));
     }
