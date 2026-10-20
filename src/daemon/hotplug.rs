@@ -61,7 +61,7 @@ use crate::common::{Rect, WindowId};
 use crate::layout::types::MonitorInfo;
 use crate::registry::hooks;
 use crate::registry::types::{FloatingState, TilingState, WindowState};
-use crate::registry::win32::{self as registry_win32, MonitorGeometry};
+use crate::registry::win32::{self as registry_win32, ForegroundPush, MonitorGeometry};
 use crate::workspace::{Monitor, ScrollingSpace, Workspace, WorkspaceId, WorkspaceParking};
 
 use super::animation::{PrevRects, WorkspaceTargets};
@@ -162,15 +162,27 @@ pub(super) trait TopologyProbe {
     /// `ShowWindow(hwnd, SW_SHOWNOACTIVATE)` — restore from minimized
     /// without activating; `true` when issued on a live window.
     fn restore_window(&self, hwnd: isize) -> bool;
-    /// `SetForegroundWindow(hwnd)`; `true` when the window took the
-    /// foreground.
-    fn focus_window(&self, hwnd: isize) -> bool;
+    /// `SetForegroundWindow(hwnd)`, with its failure classified
+    /// ([`ForegroundPush`]): an invalid handle is a dead window.
+    fn focus_window(&self, hwnd: isize) -> ForegroundPush;
+    /// `IsWindowVisible(hwnd) && !cloaked` — a hidden or cloaked window is
+    /// skipped as a focus candidate, not dropped.
+    fn is_visible(&self, hwnd: isize) -> bool;
+    /// `IsWindow(hwnd)` — whether the handle still names a window. Every
+    /// "focus the remembered window" path checks this before pushing the
+    /// foreground, so a window that died without its `DESTROY` reaching the
+    /// layout is purged instead of handed to `SetForegroundWindow`.
+    fn is_window(&self, hwnd: isize) -> bool;
 }
 
 /// The production [`TopologyProbe`]: plain Win32.
 pub(super) struct Win32Topology;
 
 impl TopologyProbe for Win32Topology {
+    fn is_window(&self, hwnd: isize) -> bool {
+        registry_win32::is_window(hwnd)
+    }
+
     fn snapshot(&self) -> Result<TopologySnapshot, String> {
         let geometries = registry_win32::enumerate_monitors()?;
         Ok(TopologySnapshot {
@@ -191,8 +203,12 @@ impl TopologyProbe for Win32Topology {
         registry_win32::show_window_restored(hwnd)
     }
 
-    fn focus_window(&self, hwnd: isize) -> bool {
-        registry_win32::set_foreground_window(hwnd)
+    fn focus_window(&self, hwnd: isize) -> ForegroundPush {
+        registry_win32::push_foreground_window(hwnd)
+    }
+
+    fn is_visible(&self, hwnd: isize) -> bool {
+        registry_win32::is_visible_uncloaked(hwnd)
     }
 }
 
@@ -815,12 +831,64 @@ impl FlowWM {
 
         // Restores never activate, but push the foreground once to where the
         // registry says it belongs so a restore cannot have left it elsewhere.
-        if restored > 0
-            && let Some(focused) = self.registry.focused()
-            && self.monitor_index_containing(focused).is_some()
-            && !probe.focus_window(focused.0)
-        {
-            log::debug!("hotplug: could not push focus back to {}", focused.0);
+        // The registry's focused window is used when it is still a window
+        // and seated; otherwise the active monitor's next live candidate is
+        // (dead ones purged on the way), like `focus_monitor`.
+        if restored > 0 {
+            let active = self.active_monitor;
+            let remembered = self.registry.focused().filter(|f| {
+                probe.is_window(f.0)
+                    && probe.is_visible(f.0)
+                    && self.monitor_index_containing(*f).is_some()
+            });
+            let pushed = match remembered {
+                Some(f) => match probe.focus_window(f.0) {
+                    ForegroundPush::Focused => true,
+                    ForegroundPush::InvalidHandle => {
+                        // Windows reports ERROR_INVALID_HANDLE for windows it
+                        // merely refuses to activate as well as for dead ones;
+                        // purge only when the window is really gone, otherwise
+                        // leave it seated and fall back to the next candidate.
+                        if probe.is_window(f.0) {
+                            log::debug!(
+                                "hotplug: SetForegroundWindow rejected live hwnd {} ({}); leaving it seated",
+                                f.0,
+                                self.describe_window(f.0)
+                            );
+                        } else {
+                            log::debug!(
+                                "hotplug: hwnd {} vanished during the focus push ({}); dropping it",
+                                f.0,
+                                self.describe_window(f.0)
+                            );
+                            self.purge_dead_window(active, f);
+                        }
+                        false
+                    }
+                    ForegroundPush::Failed(code) => {
+                        log::warn!(
+                            "hotplug: could not push focus back to hwnd {} (Win32 error {code:#x}; {})",
+                            f.0,
+                            self.describe_window(f.0)
+                        );
+                        true
+                    }
+                },
+                None => false,
+            };
+            if !pushed {
+                // The active monitor's next live, visible candidate — dead
+                // ones purged on the way — else nothing (logged at debug).
+                let picked = self.resolve_focus_target_with(
+                    active,
+                    |h| probe.is_window(h),
+                    |h| probe.is_visible(h),
+                    |h| probe.focus_window(h),
+                );
+                if let Some(id) = picked {
+                    self.registry.set_focused(id.0);
+                }
+            }
         }
 
         let summary = HotplugSummary {
@@ -1232,8 +1300,14 @@ mod tests {
             self.restored.borrow_mut().push(hwnd);
             true
         }
-        fn focus_window(&self, hwnd: isize) -> bool {
+        fn focus_window(&self, hwnd: isize) -> ForegroundPush {
             self.focused.borrow_mut().push(hwnd);
+            ForegroundPush::Focused
+        }
+        fn is_visible(&self, _hwnd: isize) -> bool {
+            true
+        }
+        fn is_window(&self, _hwnd: isize) -> bool {
             true
         }
     }

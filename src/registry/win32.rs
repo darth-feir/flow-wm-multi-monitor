@@ -543,19 +543,102 @@ pub fn get_shell_window() -> Option<isize> {
 /// ```
 #[must_use]
 pub fn set_foreground_window(hwnd_val: isize) -> bool {
+    push_foreground_window(hwnd_val) == ForegroundPush::Focused
+}
+
+/// `ERROR_INVALID_HANDLE`: what `SetForegroundWindow` reports for a handle
+/// that names no (longer a) window — typically a window of a process that
+/// is exiting, which `IsWindow` may still have answered `true` for a
+/// moment earlier.
+pub const ERROR_INVALID_HANDLE: u32 = 6;
+
+/// How a [`push_foreground_window`] call ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForegroundPush {
+    /// The window took the foreground.
+    Focused,
+    /// `SetForegroundWindow` failed with [`ERROR_INVALID_HANDLE`]: the
+    /// window is gone (or going). Callers treating a remembered candidate
+    /// drop it like a dead window and try the next one.
+    InvalidHandle,
+    /// `SetForegroundWindow` failed with any other Win32 error code (the
+    /// foreground lock, mostly). The window exists; the push was refused.
+    Failed(u32),
+}
+
+impl ForegroundPush {
+    /// `true` only for [`Focused`](Self::Focused).
+    #[must_use]
+    pub fn is_focused(self) -> bool {
+        self == Self::Focused
+    }
+
+    /// Classify a failed `SetForegroundWindow` by its `GetLastError` code.
+    #[must_use]
+    pub fn from_error(code: u32) -> Self {
+        if code == ERROR_INVALID_HANDLE {
+            Self::InvalidHandle
+        } else {
+            Self::Failed(code)
+        }
+    }
+}
+
+/// [`set_foreground_window`], reporting *how* a failure happened so the
+/// caller can tell a dead handle ([`ForegroundPush::InvalidHandle`]) from a
+/// refused push ([`ForegroundPush::Failed`]).
+#[must_use]
+pub fn push_foreground_window(hwnd_val: isize) -> ForegroundPush {
     set_foreground_window_impl(hwnd_val, false)
 }
 
-/// [`set_foreground_window`] with its failure logging at `debug` instead of
-/// `warn` when `quiet` — for callers that have a fallback and report the
-/// outcome themselves ([`clear_foreground_window`]).
-fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> bool {
+/// `IsWindowVisible(hwnd) && !cloaked` — whether the user could see the
+/// window if it were on-screen. A hidden or DWM-cloaked window (a tray-
+/// hidden app, a window of another virtual desktop, an AutoHotkey GUI that
+/// is not shown) cannot usefully take the foreground, but it may come
+/// back, so callers skip it rather than drop it.
+#[must_use]
+pub fn is_visible_uncloaked(hwnd_val: isize) -> bool {
+    let hwnd = HWND(hwnd_val as *mut _);
+    is_window_visible(hwnd) && !is_cloaked(hwnd)
+}
+
+/// `title=… class=…` of a window, straight from Win32 (`GetWindowText` /
+/// `GetClassName`), for log lines about windows the registry does not
+/// describe. A handle that answers neither reads as `title="" class=""`.
+#[must_use]
+pub fn window_description(hwnd_val: isize) -> String {
+    let hwnd = HWND(hwnd_val as *mut _);
+    format!(
+        "title={:?} class={:?}",
+        get_window_text(hwnd).unwrap_or_default(),
+        get_class_name(hwnd).unwrap_or_default()
+    )
+}
+
+/// [`push_foreground_window`] with its failure logging at `debug` instead
+/// of `warn` when `quiet` — for callers that have a fallback and report
+/// the outcome themselves ([`clear_foreground_window`]).
+fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> ForegroundPush {
     let target_hwnd = HWND(hwnd_val as *mut _);
     let report = |message: String| {
         if quiet {
             log::debug!("{message}");
         } else {
             log::warn!("{message}");
+        }
+    };
+    // A direct `SetForegroundWindow` (no foreground lock to defeat), with
+    // its error code classified.
+    let direct = |target: HWND| -> ForegroundPush {
+        if unsafe { SetForegroundWindow(target) }.as_bool() {
+            ForegroundPush::Focused
+        } else {
+            let code = unsafe { GetLastError() }.0;
+            report(format!(
+                "set_foreground_window: SetForegroundWindow failed for hwnd {hwnd_val} (Win32 error {code:#x})"
+            ));
+            ForegroundPush::from_error(code)
         }
     };
 
@@ -566,8 +649,7 @@ fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> bool {
     // direct call. Benign (happens at startup or with no app focused),
     // so no log here.
     if foreground_hwnd.0.is_null() {
-        let result = unsafe { SetForegroundWindow(target_hwnd) };
-        return result.as_bool();
+        return direct(target_hwnd);
     }
 
     // GetWindowThreadProcessId's RETURN value is the THREAD ID of the
@@ -585,8 +667,7 @@ fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> bool {
             foreground_hwnd,
             unsafe { GetLastError() }.0
         ));
-        let result = unsafe { SetForegroundWindow(target_hwnd) };
-        return result.as_bool();
+        return direct(target_hwnd);
     }
 
     let our_thread_id = unsafe { GetCurrentThreadId() };
@@ -605,14 +686,8 @@ fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> bool {
         ));
     }
 
-    // Compute success first, then detach in all paths.
-    let success = unsafe { SetForegroundWindow(target_hwnd) }.as_bool();
-    if !success {
-        report(format!(
-            "set_foreground_window: SetForegroundWindow failed for hwnd {hwnd_val} (Win32 error {:#x})",
-            unsafe { GetLastError() }.0
-        ));
-    }
+    // Compute the outcome first, then detach in all paths.
+    let outcome = direct(target_hwnd);
 
     // Bring the window to the top of the Z-order. Failure here is
     // non-fatal — the window still receives focus if SetForegroundWindow
@@ -633,7 +708,7 @@ fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> bool {
         }
     }
 
-    success
+    outcome
 }
 
 /// Remove the current foreground window by foregrounding the desktop.
@@ -669,7 +744,7 @@ pub fn clear_foreground_window() -> bool {
             log::debug!("clear_foreground_window: {name} window {hwnd} is not a live window");
             continue;
         }
-        if set_foreground_window_impl(hwnd, true) {
+        if set_foreground_window_impl(hwnd, true).is_focused() {
             return true;
         }
     }

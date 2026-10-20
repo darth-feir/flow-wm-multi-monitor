@@ -90,7 +90,7 @@ use crate::ipc::message::SocketResponse;
 use crate::registry::WindowRegistry;
 use crate::registry::hooks::remove_float_hwnd;
 use crate::registry::types::{FloatingState, TilingState, WindowState};
-use crate::registry::win32 as registry_win32;
+use crate::registry::win32::{self as registry_win32, ForegroundPush};
 use crate::workspace::WorkspaceParking;
 
 use super::hotplug::{TopologyProbe, TopologySnapshot, Win32Topology};
@@ -108,8 +108,6 @@ pub(super) trait TilingProbe: TopologyProbe {
     /// Re-scan the top-level windows into `registry`
     /// ([`WindowRegistry::scan_existing_windows`]).
     fn scan_windows(&self, registry: &mut WindowRegistry) -> Result<(), String>;
-    /// `IsWindow(hwnd)`.
-    fn is_window(&self, hwnd: isize) -> bool;
     /// `GetWindowRect(hwnd)` — the full window rect, or `None` when it
     /// cannot be read.
     fn window_rect(&self, hwnd: isize) -> Option<Rect>;
@@ -147,18 +145,22 @@ impl TopologyProbe for Win32Tiling {
         Win32Topology.restore_window(hwnd)
     }
 
-    fn focus_window(&self, hwnd: isize) -> bool {
+    fn focus_window(&self, hwnd: isize) -> ForegroundPush {
         Win32Topology.focus_window(hwnd)
+    }
+
+    fn is_visible(&self, hwnd: isize) -> bool {
+        Win32Topology.is_visible(hwnd)
+    }
+
+    fn is_window(&self, hwnd: isize) -> bool {
+        Win32Topology.is_window(hwnd)
     }
 }
 
 impl TilingProbe for Win32Tiling {
     fn scan_windows(&self, registry: &mut WindowRegistry) -> Result<(), String> {
         registry.scan_existing_windows()
-    }
-
-    fn is_window(&self, hwnd: isize) -> bool {
-        registry_win32::is_window(hwnd)
     }
 
     fn window_rect(&self, hwnd: isize) -> Option<Rect> {
@@ -601,7 +603,7 @@ impl FlowWM {
         //    that is about to be visible.
         let foreground = probe
             .foreground_window()
-            .filter(|&fg| self.registry.is_tracked(fg));
+            .filter(|&fg| self.registry.is_tracked(fg) && probe.is_window(fg));
         if let Some(fg) = foreground {
             self.focus_resume_target(fg);
         }
@@ -920,8 +922,14 @@ mod tests {
         fn restore_window(&self, _hwnd: isize) -> bool {
             true
         }
-        fn focus_window(&self, _hwnd: isize) -> bool {
+        fn focus_window(&self, _hwnd: isize) -> ForegroundPush {
+            ForegroundPush::Focused
+        }
+        fn is_visible(&self, _hwnd: isize) -> bool {
             true
+        }
+        fn is_window(&self, hwnd: isize) -> bool {
+            !self.dead.contains(&hwnd)
         }
     }
 
@@ -934,9 +942,6 @@ mod tests {
                 }
             }
             Ok(())
-        }
-        fn is_window(&self, hwnd: isize) -> bool {
-            !self.dead.contains(&hwnd)
         }
         fn window_rect(&self, hwnd: isize) -> Option<Rect> {
             self.rects.get(&hwnd).copied()

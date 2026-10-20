@@ -18,7 +18,7 @@ use crate::layout::projection;
 use crate::layout::types::{ActualLayout, AppliedLayout};
 use crate::registry::hooks::{add_float_hwnd, remove_float_hwnd};
 use crate::registry::types::{FloatingState, TilingState, WindowState};
-use crate::registry::win32 as registry_win32;
+use crate::registry::win32::{self as registry_win32, ForegroundPush};
 use crate::workspace::{FloatingSpace, WorkspaceId, WorkspaceParking};
 use windows::Win32::Foundation::HWND;
 
@@ -518,15 +518,14 @@ impl FlowWM {
         if target >= self.monitors.len() {
             return;
         }
-        let live = |hwnd: isize| registry_win32::is_window(hwnd);
-        match self.resolve_monitor_focus_target(target, live) {
+        let picked = self.resolve_focus_target_with(
+            target,
+            registry_win32::is_window,
+            registry_win32::is_visible_uncloaked,
+            registry_win32::push_foreground_window,
+        );
+        match picked {
             Some(id) => {
-                if !registry_win32::set_foreground_window(id.0) {
-                    log::warn!(
-                        "focus_monitor: SetForegroundWindow failed for hwnd {}",
-                        id.0
-                    );
-                }
                 let prev = self.registry.focused().map(|w| w.0);
                 self.registry.set_focused(id.0);
                 self.refresh_border_for(id.0);
@@ -545,40 +544,135 @@ impl FlowWM {
         }
     }
 
-    /// Make `target` active and pick the window to foreground there: the
-    /// strip's last-focused window, else the first window of the strip, else
-    /// the top float. A candidate that is not a live registry window (gone
-    /// from the registry, or `is_live(hwnd)` is false) is removed from the
-    /// strip / floating space and the search continues, so the caller never
-    /// hands a dead handle to `SetForegroundWindow`. Returns `None` when the
-    /// monitor's active workspace has no live window.
-    ///
-    /// `is_live` is injected so the purge-and-retry loop can be unit-tested
-    /// without a real desktop.
+    /// `title=… class=… exe=… state=…` of a window for log lines, from the
+    /// registry entry, else from Win32 (`GetWindowText` / `GetClassName`)
+    /// marked `(untracked)`.
+    #[must_use]
+    pub(super) fn describe_window(&self, hwnd: isize) -> String {
+        match self.registry.get_window(HWND(hwnd as *mut _)) {
+            Some(w) => format!(
+                "title={:?} class={:?} exe={:?} state={:?}",
+                w.title, w.class, w.exe, w.state
+            ),
+            None => format!("{} (untracked)", registry_win32::window_description(hwnd)),
+        }
+    }
+
+    /// Make `target` active and pick the window to foreground there — see
+    /// [`resolve_focus_target_with`](Self::resolve_focus_target_with) —
+    /// without pushing the foreground: every tracked, `is_live` candidate
+    /// is accepted. Kept for the callers and tests that only need the
+    /// purge-and-pick half.
+    #[cfg(test)]
     pub(super) fn resolve_monitor_focus_target(
         &mut self,
         target: usize,
         is_live: impl Fn(isize) -> bool,
     ) -> Option<WindowId> {
+        self.resolve_focus_target_with(target, is_live, |_| true, |_| ForegroundPush::Focused)
+    }
+
+    /// Make `target` active, then walk its active workspace's focus
+    /// candidates ([`focus_candidates`]: the strip's last-focused window,
+    /// then every tile in column/row order, then the floats top-most first)
+    /// and push the first one that takes the foreground:
+    ///
+    /// - a candidate that is not in the registry or for which `is_live`
+    ///   (`IsWindow`) is false is **purged** from the strip / floating space
+    ///   / float-tracking set and the walk continues;
+    /// - a candidate for which `is_visible` (`IsWindowVisible && !cloaked`)
+    ///   is false is **skipped without purging** — a tray-hidden or cloaked
+    ///   window may come back;
+    /// - `push` (`SetForegroundWindow`) answering
+    ///   [`ForegroundPush::InvalidHandle`] — a window of a process that was
+    ///   exiting, which `IsWindow` still vouched for a moment earlier — is
+    ///   treated exactly like a dead window: logged with the window's
+    ///   title, class and exe, purged, next candidate;
+    /// - any other push failure (the foreground lock) is logged the same
+    ///   way and the candidate is still returned: the window exists and is
+    ///   what the user should be on.
+    ///
+    /// Returns the window that was pushed (or kept after a refused push),
+    /// `None` when nothing live and visible is left — logged at `debug`,
+    /// never `warn`: an empty workspace is a normal state. The three
+    /// questions are injected so the loop is unit-testable without a
+    /// desktop; the caller owns the registry focus and the borders.
+    pub(super) fn resolve_focus_target_with(
+        &mut self,
+        target: usize,
+        is_live: impl Fn(isize) -> bool,
+        is_visible: impl Fn(isize) -> bool,
+        mut push: impl FnMut(isize) -> ForegroundPush,
+    ) -> Option<WindowId> {
         self.set_active_monitor(target);
+        let mut skipped: std::collections::HashSet<isize> = std::collections::HashSet::new();
         loop {
             let ws = self.monitors[target].active_workspace();
-            let candidate = focus_candidate(&ws.scrolling, &ws.floating)?;
-            if self.registry.is_tracked(candidate.0) && is_live(candidate.0) {
-                return Some(candidate);
+            let candidate = focus_candidates(&ws.scrolling, &ws.floating)
+                .into_iter()
+                .find(|c| !skipped.contains(&c.0));
+            let Some(candidate) = candidate else {
+                log::debug!(
+                    "focus_monitor: nothing live to focus on monitor {target} ({} hidden candidate(s) skipped)",
+                    skipped.len()
+                );
+                return None;
+            };
+            let hwnd = candidate.0;
+            if !self.registry.is_tracked(hwnd) || !is_live(hwnd) {
+                log::debug!(
+                    "focus_monitor: dropping dead window {hwnd} from monitor {target} ({})",
+                    self.describe_window(hwnd)
+                );
+                self.purge_dead_window(target, candidate);
+                continue;
             }
-            log::debug!(
-                "focus_monitor: dropping dead window {} from monitor {target}",
-                candidate.0
-            );
-            self.purge_dead_window(target, candidate);
+            if !is_visible(hwnd) {
+                log::debug!(
+                    "focus_monitor: skipping hidden or cloaked window {hwnd} on monitor {target} ({})",
+                    self.describe_window(hwnd)
+                );
+                skipped.insert(hwnd);
+                continue;
+            }
+            match push(hwnd) {
+                ForegroundPush::Focused => return Some(candidate),
+                ForegroundPush::InvalidHandle => {
+                    // Windows reports ERROR_INVALID_HANDLE loosely: a window
+                    // that is genuinely gone, but also a live window it simply
+                    // refuses to activate (seen right after Windows snapped
+                    // it). Only a window that fails the liveness check is
+                    // purged; a live one keeps its seat and merely does not
+                    // get the foreground this time.
+                    if is_live(hwnd) {
+                        log::debug!(
+                            "focus_monitor: SetForegroundWindow rejected live hwnd {hwnd} ({}); leaving it seated and trying the next window",
+                            self.describe_window(hwnd)
+                        );
+                        skipped.insert(hwnd);
+                    } else {
+                        log::debug!(
+                            "focus_monitor: hwnd {hwnd} vanished during the focus push ({}); dropping it",
+                            self.describe_window(hwnd)
+                        );
+                        self.purge_dead_window(target, candidate);
+                    }
+                }
+                ForegroundPush::Failed(code) => {
+                    log::warn!(
+                        "focus_monitor: SetForegroundWindow failed for hwnd {hwnd} (Win32 error {code:#x}; {})",
+                        self.describe_window(hwnd)
+                    );
+                    return Some(candidate);
+                }
+            }
         }
     }
 
     /// Remove a window that no longer exists from `idx`'s active workspace
     /// (strip and floating space) and from the float-tracking set, and
     /// animate the strip's resettle.
-    fn purge_dead_window(&mut self, idx: usize, window: WindowId) {
+    pub(super) fn purge_dead_window(&mut self, idx: usize, window: WindowId) {
         let ws = self.monitors[idx].active_workspace_mut();
         if ws.scrolling.virtual_layout().find_window(window).is_some() {
             let applied = ws.scrolling.remove_window(window);
@@ -1149,24 +1243,27 @@ impl FlowWM {
     /// (`on_focus_changed`) calls [`switch_workspace_layout`] directly — it
     /// must not re-push foreground because the OS already chose the window.
     ///
-    /// Like `dispatch_focus`, the non-empty path does **not** call
-    /// `set_focused`: the `EVENT_SYSTEM_FOREGROUND` fired by
-    /// `set_foreground_window` is consumed by `on_focus_changed` (the single
-    /// sink), which updates the registry focus and recolors the prev/new
-    /// borders. Setting focus eagerly here would poison `on_focus_changed`'s
-    /// previous-focus capture and leave the old workspace's focused border
-    /// stuck on the Focused color.
+    /// The foreground push is [`focus_monitor`](Self::focus_monitor) on the
+    /// (unchanged) active monitor, whose active workspace the destination
+    /// now is: the strip's remembered `last_focused_window` is used only if
+    /// it is still a tracked, live window (`IsWindow`); a remembered window
+    /// that died without its `DESTROY` reaching the layout — the VM log's
+    /// `SetForegroundWindow failed ... 0x6` on a workspace switch — is
+    /// purged from the strip / floating space / float-tracking set and the
+    /// next candidate is tried (focused column window, first tile, top
+    /// float), see [`resolve_monitor_focus_target`](Self::resolve_monitor_focus_target).
+    /// `focus_monitor` sets the registry focus and recolours the previous
+    /// and new borders itself, so the `EVENT_SYSTEM_FOREGROUND` that
+    /// `on_focus_changed` later consumes finds nothing left to change.
     ///
     /// # Empty destination
     ///
-    /// When the destination has no windows (`last_focused_window()` is
-    /// `None`), there is nothing to foreground. Pushing the OS foreground to
-    /// the desktop ("Progman") window — the Win32 idiom for clicking empty
-    /// desktop space — ensures keystrokes no longer reach the previous
-    /// workspace's window. The desktop is untracked, so `on_focus_changed`'s
-    /// `set_focused` ignores it and would leave the registry's `focused`
-    /// field (and the old window's border) stale; this path therefore calls
-    /// `clear_focused` and recolors the previous border explicitly.
+    /// When the destination has no live window there is nothing to
+    /// foreground: the tracked focus is dropped (previous border recoloured)
+    /// and the OS foreground goes to the desktop ("Progman") window — the
+    /// Win32 idiom for clicking empty desktop space — so keystrokes no
+    /// longer reach the previous workspace's window. Logged at `debug`, not
+    /// `warn`: nothing live to focus is a normal state, not a failure.
     fn switch_active_workspace(
         &mut self,
         target_id: WorkspaceId,
@@ -1175,32 +1272,7 @@ impl FlowWM {
         if !self.switch_workspace_layout(target_id, prev_active_id) {
             return false;
         }
-
-        // Re-establish OS foreground on the destination's last-focused window.
-        // The resulting EVENT_SYSTEM_FOREGROUND is handled by on_focus_changed
-        // (registry focus + border recolor). Do NOT set_focused here — see the
-        // doc comment above.
-        if let Some(target) = self.active_scrolling().last_focused_window() {
-            let target_hwnd = target.0;
-            if !registry_win32::set_foreground_window(target_hwnd) {
-                log::warn!(
-                    "switch_active_workspace: SetForegroundWindow failed for hwnd {target_hwnd}"
-                );
-            }
-        } else {
-            // Empty destination: no window to foreground. Clear the tracked
-            // focus and recolour the previous border to unfocused.
-            self.drop_tracked_focus();
-            // Push OS foreground to the desktop so keystrokes don't keep going
-            // to the previous workspace's window. The desktop is untracked, so
-            // on_focus_changed will early-return and cannot do this for us.
-            if !registry_win32::clear_foreground_window() {
-                log::debug!(
-                    "switch_active_workspace: clear_foreground_window failed (nothing to focus)"
-                );
-            }
-        }
-
+        self.focus_monitor(self.active_monitor);
         true
     }
 
@@ -1782,28 +1854,48 @@ impl FlowWM {
         SocketResponse::Ok
     }
 }
-/// Pure candidate rule behind [`FlowWM::resolve_monitor_focus_target`]: the
-/// window to foreground when landing on a monitor's active workspace.
+/// Pure candidate rule behind [`FlowWM::resolve_focus_target_with`]: the
+/// windows to try, in order, when landing on a monitor's active workspace.
 ///
 /// The strip's last-focused window first (what the user was using there),
-/// else the first window of the strip (left-most column, top row), else the
-/// top-most float. `None` when the workspace is empty.
+/// then every tile of the strip in column/row order (left-most column, top
+/// row first), then the floats top-most first; no window twice. Empty when
+/// the workspace is empty.
 #[must_use]
+pub(super) fn focus_candidates(
+    scrolling: &crate::workspace::ScrollingSpace,
+    floating: &FloatingSpace,
+) -> Vec<WindowId> {
+    let mut out: Vec<WindowId> = Vec::new();
+    let push = |id: WindowId, out: &mut Vec<WindowId>| {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    };
+    if let Some(last) = scrolling.last_focused_window() {
+        push(last, &mut out);
+    }
+    for column in &scrolling.virtual_layout().columns {
+        for row in &column.rows {
+            push(row.window_id, &mut out);
+        }
+    }
+    for entry in floating.windows().iter().rev() {
+        push(entry.window_id, &mut out);
+    }
+    out
+}
+
+/// The first of [`focus_candidates`]: the strip's last-focused window, else
+/// the first window of the strip, else the top-most float. `None` when the
+/// workspace is empty.
+#[must_use]
+#[cfg(test)]
 pub(super) fn focus_candidate(
     scrolling: &crate::workspace::ScrollingSpace,
     floating: &FloatingSpace,
 ) -> Option<WindowId> {
-    scrolling
-        .last_focused_window()
-        .or_else(|| {
-            scrolling
-                .virtual_layout()
-                .columns
-                .first()
-                .and_then(|c| c.rows.first())
-                .map(|r| r.window_id)
-        })
-        .or_else(|| floating.windows().last().map(|e| e.window_id))
+    focus_candidates(scrolling, floating).into_iter().next()
 }
 
 fn unimplemented_command(name: &str) -> SocketResponse {
@@ -2352,6 +2444,237 @@ mod tests {
                 .find_window(WindowId(TEST_HWND))
                 .is_some()
         );
+    }
+
+    /// Switching to a parked workspace whose remembered last-focused window
+    /// (and its only float) died without a `DESTROY`: the dead tile is
+    /// purged from the strip, the dead float from the floating space and
+    /// the float-tracking set, and the next live window is picked — the
+    /// VM log's `SetForegroundWindow failed ... 0x6` on a workspace switch.
+    #[test]
+    fn switching_to_a_parked_workspace_with_a_dead_remembered_window_picks_the_next_live_one() {
+        use crate::registry::hooks::{add_float_hwnd, is_float_hwnd};
+
+        const LIVE: isize = 0x30003;
+        const DEAD_TILE: isize = 0x30004;
+        const DEAD_FLOAT: isize = 0x30005;
+        let mut flow =
+            flow_with_focused_state(WindowState::Tiling(TilingState::Active { col: 0, row: 0 }));
+        for hwnd in [LIVE, DEAD_TILE, DEAD_FLOAT] {
+            let info = registry_win32::WindowInfo {
+                hwnd: HWND(hwnd as *mut _),
+                title: format!("win{hwnd}"),
+                class: "C".into(),
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 800,
+                    height: 600,
+                },
+                exe: "app.exe".into(),
+                process_path: "C:\\app.exe".into(),
+                is_visible: true,
+                is_maximized: false,
+                is_fullscreen: false,
+            };
+            flow.registry.register_window_from_info(&info);
+        }
+        // Workspace 2 (parked): LIVE then DEAD_TILE, so the dead one is the
+        // strip's remembered window; DEAD_FLOAT floats there.
+        let info = *flow.active_scrolling().monitor();
+        let padding = flow.active_scrolling().padding();
+        let mut ws2 = Workspace::new(
+            WorkspaceId(2),
+            ScrollingSpace::new(info, 960, 320, 100, 100, padding, 4),
+        );
+        ws2.scrolling.add_window(WindowId(LIVE));
+        ws2.scrolling.add_window(WindowId(DEAD_TILE));
+        ws2.floating.add(
+            WindowId(DEAD_FLOAT),
+            Rect {
+                x: 100,
+                y: 100,
+                width: 300,
+                height: 200,
+            },
+        );
+        add_float_hwnd(DEAD_FLOAT);
+        // Rebuild the monitor with workspace 1 (TEST_HWND) and workspace 2.
+        let screen = flow.monitors[0].screen_rect();
+        let mut ws1_scrolling = ScrollingSpace::new(info, 960, 320, 100, 100, padding, 4);
+        ws1_scrolling.add_window(WindowId(TEST_HWND));
+        flow.monitors = vec![Monitor::new(
+            screen,
+            screen,
+            vec![Workspace::new(WorkspaceId(1), ws1_scrolling), ws2],
+            0,
+        )];
+        assert_eq!(
+            flow.monitors[0]
+                .workspace(WorkspaceId(2))
+                .expect("ws 2")
+                .scrolling
+                .last_focused_window(),
+            Some(WindowId(DEAD_TILE))
+        );
+
+        // The switch's layout half, then the focus resolution with a desktop
+        // on which the two DEAD_* handles are no longer windows.
+        assert!(flow.switch_workspace_layout(WorkspaceId(2), WorkspaceId(1)));
+        assert_eq!(flow.monitors[0].active_workspace_id(), WorkspaceId(2));
+        let live = |h: isize| h != DEAD_TILE && h != DEAD_FLOAT;
+        let target = flow.resolve_monitor_focus_target(0, live);
+        assert_eq!(target, Some(WindowId(LIVE)));
+        let strip = flow.active_scrolling().virtual_layout();
+        assert!(strip.find_window(WindowId(DEAD_TILE)).is_none());
+        assert!(strip.find_window(WindowId(LIVE)).is_some());
+        assert_eq!(
+            flow.active_scrolling().last_focused_window(),
+            Some(WindowId(LIVE))
+        );
+
+        // With the live tile gone too, the dead float is the next candidate:
+        // purged from the floating space and the tracking set, nothing left.
+        flow.active_scrolling_mut().remove_window(WindowId(LIVE));
+        let target = flow.resolve_monitor_focus_target(0, live);
+        assert_eq!(target, None);
+        assert!(flow.active_floating().is_empty());
+        assert!(!is_float_hwnd(DEAD_FLOAT));
+        // Workspace 1 was never touched.
+        assert!(
+            flow.monitors[0]
+                .workspace(WorkspaceId(1))
+                .expect("ws 1")
+                .scrolling
+                .virtual_layout()
+                .find_window(WindowId(TEST_HWND))
+                .is_some()
+        );
+    }
+
+    /// The push itself is the last liveness check: a remembered candidate
+    /// that passes the registry and `IsWindow` checks but whose
+    /// `SetForegroundWindow` fails with `ERROR_INVALID_HANDLE` (a process
+    /// that was exiting) is purged like a dead window and the next live
+    /// candidate is pushed and returned. A hidden / cloaked candidate is
+    /// skipped — never pushed, never purged. A push refused for any other
+    /// reason (the foreground lock) keeps the candidate.
+    #[test]
+    fn invalid_handle_push_purges_the_candidate_and_focuses_the_next_one() {
+        use std::cell::RefCell;
+
+        const DYING: isize = 0x40004;
+        const HIDDEN: isize = 0x40005;
+        let mut flow =
+            flow_with_focused_state(WindowState::Tiling(TilingState::Active { col: 0, row: 0 }));
+        for hwnd in [DYING, HIDDEN] {
+            let info = registry_win32::WindowInfo {
+                hwnd: HWND(hwnd as *mut _),
+                title: format!("win{hwnd}"),
+                class: "C".into(),
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 800,
+                    height: 600,
+                },
+                exe: "app.exe".into(),
+                process_path: "C:\\app.exe".into(),
+                is_visible: true,
+                is_maximized: false,
+                is_fullscreen: false,
+            };
+            flow.registry.register_window_from_info(&info);
+        }
+        // Strip: TEST_HWND, HIDDEN, DYING — DYING is the remembered window,
+        // then the tiles in order: TEST_HWND (live), HIDDEN.
+        flow.active_scrolling_mut().add_window(WindowId(HIDDEN));
+        flow.active_scrolling_mut().add_window(WindowId(DYING));
+        assert_eq!(
+            flow.active_scrolling().last_focused_window(),
+            Some(WindowId(DYING))
+        );
+
+        // First pass: DYING is still alive when its push is rejected, so it
+        // keeps its seat and only loses the foreground to the next candidate.
+        let pushes: RefCell<Vec<isize>> = RefCell::new(Vec::new());
+        let push = |h: isize| {
+            pushes.borrow_mut().push(h);
+            if h == DYING {
+                ForegroundPush::InvalidHandle
+            } else {
+                ForegroundPush::Focused
+            }
+        };
+        let target = flow.resolve_focus_target_with(0, |_| true, |h: isize| h != HIDDEN, push);
+        assert_eq!(target, Some(WindowId(TEST_HWND)));
+        assert_eq!(*pushes.borrow(), vec![DYING, TEST_HWND]);
+        let strip = flow.active_scrolling().virtual_layout();
+        assert!(
+            strip.find_window(WindowId(DYING)).is_some(),
+            "a live window whose push was rejected must stay seated"
+        );
+        assert!(strip.find_window(WindowId(HIDDEN)).is_some());
+        assert!(strip.find_window(WindowId(TEST_HWND)).is_some());
+
+        // Second pass: DYING really dies during the push (the liveness check
+        // fails right after the rejection), so it is purged.
+        flow.active_scrolling_mut().set_focus(WindowId(DYING));
+        let gone: RefCell<bool> = RefCell::new(false);
+        let pushes: RefCell<Vec<isize>> = RefCell::new(Vec::new());
+        let target = flow.resolve_focus_target_with(
+            0,
+            |h: isize| h != DYING || !*gone.borrow(),
+            |h: isize| h != HIDDEN,
+            |h: isize| {
+                pushes.borrow_mut().push(h);
+                if h == DYING {
+                    *gone.borrow_mut() = true;
+                    ForegroundPush::InvalidHandle
+                } else {
+                    ForegroundPush::Focused
+                }
+            },
+        );
+        assert_eq!(target, Some(WindowId(TEST_HWND)));
+        assert_eq!(*pushes.borrow(), vec![DYING, TEST_HWND]);
+        let strip = flow.active_scrolling().virtual_layout();
+        assert!(strip.find_window(WindowId(DYING)).is_none());
+        assert!(strip.find_window(WindowId(HIDDEN)).is_some());
+        assert!(strip.find_window(WindowId(TEST_HWND)).is_some());
+
+        // Make HIDDEN the remembered window: it is skipped (not purged) and
+        // the live tile is picked.
+        flow.active_scrolling_mut().set_focus(WindowId(HIDDEN));
+        let target = flow.resolve_focus_target_with(
+            0,
+            |_| true,
+            |h: isize| h != HIDDEN,
+            |_| ForegroundPush::Focused,
+        );
+        assert_eq!(target, Some(WindowId(TEST_HWND)));
+        assert!(
+            flow.active_scrolling()
+                .virtual_layout()
+                .find_window(WindowId(HIDDEN))
+                .is_some()
+        );
+
+        // A refused push for another reason keeps the candidate.
+        let target =
+            flow.resolve_focus_target_with(0, |_| true, |_| true, |_| ForegroundPush::Failed(0x5));
+        assert_eq!(target, Some(WindowId(HIDDEN)));
+        assert_eq!(flow.active_scrolling().virtual_layout().window_count(), 2);
+
+        // Every remaining candidate hidden: nothing is pushed or purged.
+        let target = flow.resolve_focus_target_with(
+            0,
+            |_| true,
+            |_| false,
+            |_| -> ForegroundPush { panic!("a hidden candidate must never be pushed") },
+        );
+        assert_eq!(target, None);
+        assert_eq!(flow.active_scrolling().virtual_layout().window_count(), 2);
     }
 
     /// A tracked window whose handle is no longer a window is also purged.
