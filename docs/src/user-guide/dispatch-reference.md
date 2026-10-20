@@ -62,6 +62,10 @@ Move focus to the neighbouring window.
 - `focus up` / `focus down` — move focus to the **window above/below** within the
   current column.
 
+At the end of a strip, `focus` hops to the monitor in that direction when
+there is one (see [Monitors](#monitors)); set `[navigation] edge_hop = false`
+in `flow.toml` to make it stop at the edge instead.
+
 ```powershell
 flow dispatch focus right
 flow dispatch focus up
@@ -80,6 +84,10 @@ window's state and the direction:
 - tiled, **up/down** → swap the focused window with the one above/below inside the
   same column;
 - floating → pixel nudge (deferred).
+
+At the end of a strip, `move-window left/right` carries the window to the
+monitor in that direction when there is one (see [Monitors](#monitors)); with
+`[navigation] edge_hop = false` it stops at the edge.
 
 ```powershell
 flow dispatch move-window left
@@ -282,7 +290,9 @@ focus the window you last used there (else the first tile, else the top
 float). On an empty monitor the focus is cleared and keystrokes go to the
 desktop, so the next command cannot act on the window you left. `focus left`
 / `focus right` at the edge of a strip does the same hop, so you can walk
-across monitors with the plain focus keys.
+across monitors with the plain focus keys — unless `[navigation] edge_hop =
+false`, which confines `focus` and `move-window` to their strip (this command
+always crosses).
 
 ```powershell
 flow dispatch focus-monitor left
@@ -299,7 +309,8 @@ column width — its current [`width` preset](#width-presetnextprevcycle) when
 `[columns]` is configured, else the base width derived for that monitor; a
 float keeps its position relative to the work area. Focus follows the window.
 `move-window left` / `move-window right` at the edge of a strip does the same
-hop. The same rule applies to every other way a column arrives on a monitor:
+hop (unless `[navigation] edge_hop = false`; this command always crosses).
+The same rule applies to every other way a column arrives on a monitor:
 a window re-tiled from floating or fullscreen there, a column migrated by a
 display change, or a loadout column merged from a monitor that is no longer
 attached.

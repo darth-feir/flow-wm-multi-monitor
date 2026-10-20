@@ -163,6 +163,9 @@ pub struct FlowConfig {
     /// Loadout save/restore configuration.
     pub loadout: LoadoutConfig,
 
+    /// Navigation behaviour at the edges of a strip (`[navigation]`).
+    pub navigation: NavigationConfig,
+
     /// Column width presets (`[columns]`). `None` when the section is absent:
     /// columns are then sized from [`columns_per_screen`](Self::columns_per_screen)
     /// / [`column_width`](Self::column_width) as before. When present, every
@@ -202,6 +205,23 @@ impl Default for LoadoutConfig {
     }
 }
 
+/// Navigation behaviour at the edges of a strip.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct NavigationConfig {
+    /// Whether `focus <dir>` and `move-window <dir>` at the end of a strip
+    /// hop to the monitor in that direction (niri behaviour). `false` makes
+    /// them stop at the edge; `focus-monitor` and `move-to-monitor` still
+    /// cross monitors.
+    pub edge_hop: bool,
+}
+
+impl Default for NavigationConfig {
+    fn default() -> Self {
+        Self { edge_hop: true }
+    }
+}
+
 fn default_window_action() -> WindowAction {
     WindowAction::Float
 }
@@ -222,6 +242,7 @@ impl Default for FlowConfig {
             focus: FocusConfig::default(),
             drag: DragConfig::default(),
             loadout: LoadoutConfig::default(),
+            navigation: NavigationConfig::default(),
             columns: None,
             check_for_updates: true,
         }
@@ -1142,6 +1163,7 @@ strategy = "original_slot"
             loadout: LoadoutConfig {
                 default_path: "my-loadout.json".into(),
             },
+            navigation: NavigationConfig { edge_hop: false },
             columns: Some(
                 toml::from_str(
                     "presets = [\"1/3\", \"1/2\"]
@@ -1185,6 +1207,7 @@ default = \"1/2\"",
         assert_eq!(parsed.drag.edge_scroll_initial_delay_ms, 350);
         assert_eq!(parsed.drag.edge_scroll_repeat_interval_ms, 200);
         assert_eq!(parsed.loadout.default_path, "my-loadout.json");
+        assert!(!parsed.navigation.edge_hop);
         let columns = parsed.columns.as_ref().expect("columns round-trips");
         assert_eq!(columns.labels(), vec!["1/3", "1/2"]);
         assert_eq!(columns.default_index(), 1);

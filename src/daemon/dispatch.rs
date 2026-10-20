@@ -269,8 +269,9 @@ impl FlowWM {
             }
             None => {
                 // At the edge of this strip: hop to the monitor in that
-                // direction, if there is one (niri behaviour).
-                if let Some(target) = self.monitor_in_direction(self.active_monitor, dir) {
+                // direction, if there is one (niri behaviour) and
+                // `[navigation] edge_hop` allows it.
+                if let Some(target) = self.edge_hop_target(self.active_monitor, dir) {
                     self.focus_monitor(target);
                     return SocketResponse::Ok;
                 }
@@ -279,6 +280,18 @@ impl FlowWM {
                 }
             }
         }
+    }
+
+    /// The monitor an edge hop from `from` in `dir` lands on: the monitor in
+    /// that direction when `[navigation] edge_hop` is on, `None` when it is
+    /// off or there is no monitor there. `focus-monitor` / `move-to-monitor`
+    /// do not go through here — they always cross.
+    #[must_use]
+    pub(super) fn edge_hop_target(&self, from: usize, dir: Direction) -> Option<usize> {
+        edge_hop_target(
+            self.config.navigation.edge_hop,
+            self.monitor_in_direction(from, dir),
+        )
     }
 
     /// Close the OS-foreground window.
@@ -353,11 +366,12 @@ impl FlowWM {
             }
             None => {
                 // At the edge of this strip: carry the window over to the
-                // monitor in that direction, if there is one.
+                // monitor in that direction, if there is one and
+                // `[navigation] edge_hop` allows it.
                 let from = self
                     .monitor_index_containing(id)
                     .unwrap_or(self.active_monitor);
-                if let Some(target) = self.monitor_in_direction(from, dir) {
+                if let Some(target) = self.edge_hop_target(from, dir) {
                     return self.move_tiled_to_monitor(id, from, target, dir);
                 }
                 SocketResponse::Error {
@@ -1883,6 +1897,13 @@ pub(super) fn focus_candidate(
     focus_candidates(scrolling, floating).into_iter().next()
 }
 
+/// Pure rule behind [`FlowWM::edge_hop_target`]: an edge hop lands on the
+/// neighbouring monitor only when hops are enabled.
+#[must_use]
+fn edge_hop_target(edge_hop: bool, neighbour: Option<usize>) -> Option<usize> {
+    if edge_hop { neighbour } else { None }
+}
+
 fn unimplemented_command(name: &str) -> SocketResponse {
     SocketResponse::Error {
         message: format!("command '{name}' is not yet implemented"),
@@ -2333,6 +2354,62 @@ mod tests {
             matches!(resp, SocketResponse::Error { .. }),
             "expected Error (guard passed through to layout), got {resp:?}"
         );
+    }
+
+    // ── [navigation] edge_hop ─────────────────────────────────────────
+
+    #[test]
+    fn edge_hop_rule_only_crosses_when_enabled() {
+        assert_eq!(edge_hop_target(true, Some(1)), Some(1));
+        assert_eq!(edge_hop_target(true, None), None);
+        assert_eq!(edge_hop_target(false, Some(1)), None);
+        assert_eq!(edge_hop_target(false, None), None);
+    }
+
+    /// With `edge_hop = false`, `focus` and `move-window` at the end of the
+    /// strip do nothing even though a monitor lies in that direction: the
+    /// window stays, the active monitor stays, and the command reports the
+    /// edge like it does with no neighbour at all. `focus-monitor` and
+    /// `move-to-monitor` still cross.
+    #[test]
+    fn edge_hop_off_stops_focus_and_move_at_the_strip_edge() {
+        let mut flow =
+            flow_with_focused_state(WindowState::Tiling(TilingState::Active { col: 0, row: 0 }));
+        flow.monitors.push(empty_monitor_at(1920));
+        flow.config.borders.enabled = false;
+        flow.config.navigation.edge_hop = false;
+        assert_eq!(flow.monitor_in_direction(0, Direction::Right), Some(1));
+        assert_eq!(flow.edge_hop_target(0, Direction::Right), None);
+
+        assert!(matches!(
+            flow.dispatch_focus(Direction::Right),
+            SocketResponse::Error { .. }
+        ));
+        assert_eq!(flow.active_monitor, 0);
+
+        assert!(matches!(
+            flow.dispatch_move_window(Direction::Right),
+            SocketResponse::Error { .. }
+        ));
+        assert_eq!(flow.active_monitor, 0);
+        assert_eq!(flow.monitor_index_containing(WindowId(TEST_HWND)), Some(0));
+
+        // The explicit monitor commands are unaffected.
+        assert_eq!(
+            flow.dispatch_move_window_to_monitor(Direction::Right),
+            SocketResponse::Ok
+        );
+        assert_eq!(flow.monitor_index_containing(WindowId(TEST_HWND)), Some(1));
+        assert_eq!(flow.active_monitor, 1);
+
+        // With hops on, move-window at the edge crosses again.
+        flow.config.navigation.edge_hop = true;
+        assert_eq!(flow.edge_hop_target(1, Direction::Left), Some(0));
+        assert_eq!(
+            flow.dispatch_move_window(Direction::Left),
+            SocketResponse::Ok
+        );
+        assert_eq!(flow.monitor_index_containing(WindowId(TEST_HWND)), Some(0));
     }
 
     // ── focus-monitor (B7) ────────────────────────────────────────────

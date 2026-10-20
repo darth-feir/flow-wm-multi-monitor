@@ -52,6 +52,7 @@ Not every field can change at runtime. Reload applies **live** fields in place;
 | `column_width`, `min_column_width_px`, `min_window_height_px` | Update cached bounds; existing per-column widths preserved. |
 | `columns.presets`, `columns.default` | Each monitor's base width is re-derived from its preset (a monitor whose preset index no longer exists is clamped; a monitor that had no presets before starts on `default`). Existing per-column widths preserved. |
 | `animation.*` | New duration / easing / enabled flag applies to the next animation. |
+| `navigation.edge_hop` | Applies to the next `focus` / `move-window` at a strip edge. |
 | **Workspace count (10), monitor geometry** | **Structural** — not reloadable. Restart the daemon. |
 
 What is preserved across reload: the user's arranged layout (columns, rows,
@@ -198,6 +199,19 @@ Example:
 ```toml
 [minimize_restore]
 strategy = "original_slot"
+```
+
+### `[navigation]` — strip edges
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `edge_hop` | `bool` | `true` | Whether `focus left/right` and `move-window left/right` at the end of a strip hop to the monitor in that direction (and `up`/`down` to a stacked monitor). `false` makes them stop at the edge — the command reports that there is nothing further and nothing moves. `focus-monitor` and `move-to-monitor` always cross monitors regardless. |
+
+Example:
+
+```toml
+[navigation]
+edge_hop = true
 ```
 
 ### `[borders]` — window border overlays

@@ -149,6 +149,15 @@ col_edge_max_px = 120
 edge_scroll_initial_delay_ms = 500
 edge_scroll_repeat_interval_ms = 240
 
+# Navigation at the edges of a strip.
+#
+# - edge_hop: when true (the default), `focus left/right` and `move-window
+#   left/right` at the end of a strip hop to the monitor in that direction
+#   (and up/down to a stacked one). When false they stop at the edge;
+#   `focus-monitor` and `move-to-monitor` always cross monitors.
+[navigation]
+edge_hop = true
+
 # Loadout save/restore settings.
 #
 # - default_path:  file name (relative to config dir) used by
