@@ -283,8 +283,16 @@ teardown closes it — clean stop, panic, `abort`, `taskkill /f` — and the
 kernel terminates the script, releasing the Win key. The pid is also written
 to `<config_dir>/flow.ahk.pid` and reported in `Pong.ahk_pid`; `flow stop`
 and the daemon's own fail-back kill it explicitly and remove the pidfile.
-The AHK-side liveness timer in the shipped keymap remains as defence in
-depth.
+The AHK-side liveness gate in the shipped keymap remains as defence in
+depth: `flow.ahk` refuses to hook the modifier until the daemon's pipe
+answers (10 s at startup), re-checks it every 2 s with a 1 ms
+`WaitNamedPipe`, and registers every chord under `HotIf(DaemonUp)` so that
+the moment the pipe is gone the keys revert to stock Windows; after five
+missed polls the script exits. A pipe that is merely *busy*
+(`ERROR_SEM_TIMEOUT`, 121) counts as alive for at most five consecutive
+polls — a wedged daemon holds it busy forever — and a `flow dispatch` that
+exits non-zero triggers the check immediately, so a chord right after a
+daemon death already falls through.
 
 ### Autostart
 

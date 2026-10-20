@@ -4,7 +4,7 @@
 //!
 //! - **AHK lifecycle** — the **daemon** launches the user's `flow.ahk`
 //!   keybinding script (`flowd --ahk`, forwarded by `flow start --ahk`) once
-//!   it is ready, inside a kill-on-close [`JobObject`] so the kernel
+//!   it is ready, inside a kill-on-close `JobObject` so the kernel
 //!   terminates the script whenever the daemon dies — however it dies. The
 //!   AutoHotkey v2 interpreter is resolved directly
 //!   ([`resolve_ahk_interpreter`]) and started suspended so it is a job
@@ -26,6 +26,7 @@ use std::fs;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Com::{
@@ -36,14 +37,15 @@ use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW,
 };
 use windows::Win32::System::Threading::{
-    GetProcessId, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+    GetProcessId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess,
     WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{
     IShellLinkW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW, ShellLink,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
-use windows::core::{Interface, PCWSTR};
+use windows::core::{Interface, PCWSTR, PWSTR};
 
 use crate::config::dirs::config_dir;
 use crate::job::{JobChild, JobObject};
@@ -142,7 +144,7 @@ pub fn disable_autostart() -> Result<AutostartReport, String> {
 
 /// The running hotkey script, as launched by [`launch_ahk_in_job`].
 ///
-/// Owns the [`JobObject`] whose closing kills the script. The daemon keeps
+/// Owns the `JobObject` whose closing kills the script. The daemon keeps
 /// this inside `FlowWM` for its whole life and never closes it explicitly;
 /// process teardown (clean or not) closes the handle and the kernel does the
 /// rest. [`AhkProcess::stop`] is the explicit, orderly kill used by
@@ -168,7 +170,7 @@ pub struct AhkProcess {
 /// Process handle holder for the two launch paths.
 #[derive(Debug)]
 enum AhkChild {
-    /// Spawned by [`JobObject::spawn`].
+    /// Spawned by `JobObject::spawn`.
     Job(JobChild),
     /// Launched via `ShellExecuteExW`; we hold the `hProcess` it returned.
     Shell(HANDLE),
@@ -244,7 +246,7 @@ impl AhkProcess {
 /// Resolution order:
 ///
 /// 1. [`resolve_ahk_interpreter`] finds an AutoHotkey v2 executable → it is
-///    started with [`JobObject::spawn`] (suspended, assigned, resumed), so
+///    started with `JobObject::spawn` (suspended, assigned, resumed), so
 ///    the script is a job member from its first instruction and every child
 ///    it creates inherits the job.
 /// 2. No interpreter found → the `.ahk` shell association is used (see
@@ -269,6 +271,18 @@ pub fn launch_ahk_in_job(config_dir: &Path) -> Result<AhkProcess, String> {
     }
     let job = JobObject::kill_on_close()?;
     let pidfile = ahk_pidfile_path_in(config_dir);
+    // A pidfile that survived a previous run is stale by definition: its
+    // process was either killed by the job or is an orphan we never reach
+    // for (see `kill_process`). Drop it so nothing can mistake the old pid
+    // for this launch while the new one is being written.
+    match fs::remove_file(&pidfile) {
+        Ok(()) => log::info!("removed stale AHK pidfile {}", pidfile.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!(
+            "could not remove stale AHK pidfile {}: {e}",
+            pidfile.display()
+        ),
+    }
 
     let process = match resolve_ahk_interpreter() {
         Some(exe) => {
@@ -637,7 +651,41 @@ pub fn ahk_pidfile_path_in(config_dir: &Path) -> PathBuf {
 
 // ── Win32: process kill ────────────────────────────────────────────────────
 
-/// Terminate a process by PID.
+/// `true` when a process image path names an AutoHotkey interpreter
+/// (`AutoHotkey64.exe`, `AutoHotkey32.exe`, `AutoHotkeyUX.exe`, a
+/// `…\AutoHotkey\v2\…` install, …): the file name or any path component
+/// contains `autohotkey`, case-insensitively.
+///
+/// The pidfile only records a number, and Windows reuses process ids. A
+/// pid written by a daemon that died an hour ago may now belong to anything
+/// at all, so `kill_process` refuses to terminate a process whose image
+/// does not pass this predicate.
+#[must_use]
+pub fn is_autohotkey_image(image_path: &str) -> bool {
+    image_path.to_ascii_lowercase().contains("autohotkey")
+}
+
+/// Full image path of an open process (`QueryFullProcessImageNameW`), or
+/// `None` if it cannot be read (the handle needs
+/// `PROCESS_QUERY_LIMITED_INFORMATION`).
+fn process_image_path(handle: HANDLE) -> Option<String> {
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: `buf` holds `len` UTF-16 units and both outlive the call; the
+    // API writes at most `len` units and updates `len` to the count written.
+    unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .ok()?;
+    Some(String::from_utf16_lossy(&buf[..len as usize]))
+}
+
+/// Terminate the AutoHotkey process with this PID.
 ///
 /// # Returns
 ///
@@ -648,15 +696,28 @@ pub fn ahk_pidfile_path_in(config_dir: &Path) -> PathBuf {
 /// the normal case, not an error: `TerminateProcess` on an exited process
 /// fails with `Access is denied`, so liveness is checked first.
 ///
+/// Also `Ok(false)` — with an `info` log — when the pid is alive but its
+/// image is not an AutoHotkey interpreter ([`is_autohotkey_image`]): the
+/// pidfile outlived its process and Windows handed the number to someone
+/// else. Killing that process would be the one unforgivable outcome of a
+/// stale pidfile, so the pid is treated as stale instead.
+///
 /// # Errors
 ///
 /// Returns an error string if `TerminateProcess` fails for a live process.
 fn kill_process(pid: u32) -> Result<bool, String> {
-    // SAFETY: OpenProcess with PROCESS_TERMINATE only queries/terminates the
-    // named PID; a stale PID either fails (Ok(false)) or targets a process the
-    // user already has permission to terminate. SYNCHRONIZE lets us poll
-    // whether it has already exited.
-    let handle = match unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid) } {
+    // SAFETY: OpenProcess with these rights only queries/terminates the
+    // named PID; a stale PID either fails (Ok(false)) or targets a process
+    // the user already has permission to terminate. SYNCHRONIZE lets us
+    // poll whether it has already exited, QUERY_LIMITED_INFORMATION lets us
+    // read its image name.
+    let handle = match unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            pid,
+        )
+    } {
         Ok(h) => h,
         Err(_) => return Ok(false), // Process not running (stale pidfile).
     };
@@ -669,13 +730,51 @@ fn kill_process(pid: u32) -> Result<bool, String> {
         return Ok(false);
     }
 
+    // Pid reuse guard: only ever terminate an AutoHotkey interpreter.
+    let image = process_image_path(handle);
+    if !image.as_deref().is_some_and(is_autohotkey_image) {
+        log::info!(
+            "kill_process: pid {pid} is {} — the AHK pidfile is stale (pid reused); not terminating it",
+            image.as_deref().unwrap_or("<unreadable image name>")
+        );
+        // SAFETY: release the handle.
+        let _ = unsafe { CloseHandle(handle) };
+        return Ok(false);
+    }
+
+    // SAFETY: valid process handle with PROCESS_TERMINATE.
     let result = unsafe { TerminateProcess(handle, 1) }
         .map(|()| true)
         .map_err(|e| format!("TerminateProcess failed: {e}"));
 
     // Always release the handle regardless of the kill outcome.
+    // SAFETY: we own the handle.
     let _ = unsafe { CloseHandle(handle) };
     result
+}
+
+/// Block until the process with `pid` has exited, or `timeout` elapses.
+///
+/// Returns `true` when the process is gone (it exited, or no such process
+/// could be opened — already reaped), `false` on timeout. `flow stop` uses
+/// it after the daemon's status flips to `stopped` so that the process —
+/// and with it the named pipe — is really gone before `flow start` may
+/// run again.
+#[must_use]
+pub fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+    // SAFETY: SYNCHRONIZE grants only the right to wait on the process.
+    let handle = match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
+        Ok(h) => h,
+        // No such process (or no access, which for our own daemon means it
+        // is already gone).
+        Err(_) => return true,
+    };
+    let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+    // SAFETY: valid process handle; returns WAIT_OBJECT_0 once it exits.
+    let exited = unsafe { WaitForSingleObject(handle, ms) } == WAIT_OBJECT_0;
+    // SAFETY: we own the handle.
+    let _ = unsafe { CloseHandle(handle) };
+    exited
 }
 
 // ── Win32: COM shortcut creation ───────────────────────────────────────────
@@ -942,6 +1041,36 @@ mod tests {
         // so only exercise the exited path with a definitely-dead pid: 0 is
         // the idle process and cannot be opened → Ok(false) as well.
         assert_eq!(kill_process(0), Ok(false));
+    }
+
+    #[test]
+    fn autohotkey_image_predicate_is_case_insensitive_and_path_tolerant() {
+        assert!(is_autohotkey_image(
+            r"C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe"
+        ));
+        assert!(is_autohotkey_image(
+            r"c:\users\me\appdata\local\programs\autohotkey\v2\autohotkey32.exe"
+        ));
+        assert!(is_autohotkey_image("AUTOHOTKEYUX.EXE"));
+        // A reused pid now belonging to something else must never pass.
+        assert!(!is_autohotkey_image(r"C:\Windows\System32\svchost.exe"));
+        assert!(!is_autohotkey_image(
+            r"C:\Program Files\Mozilla Firefox\firefox.exe"
+        ));
+        assert!(!is_autohotkey_image(""));
+    }
+
+    #[test]
+    fn wait_for_process_exit_is_true_for_a_nonexistent_pid_and_false_for_self() {
+        // Pid 0 is the System Idle Process: OpenProcess fails → "gone".
+        assert!(wait_for_process_exit(0, Duration::from_millis(10)));
+        // Our own process is alive: the bounded wait must time out.
+        let t0 = std::time::Instant::now();
+        assert!(!wait_for_process_exit(
+            std::process::id(),
+            Duration::from_millis(50)
+        ));
+        assert!(t0.elapsed() >= Duration::from_millis(40));
     }
 
     #[test]

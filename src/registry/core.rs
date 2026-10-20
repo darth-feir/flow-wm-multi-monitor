@@ -825,10 +825,13 @@ impl WindowRegistry {
     /// flow is actively positioning — those in a `Tiling(Active)` or
     /// `Floating(Active)` state.
     ///
-    /// `Minimized`/`Hidden` windows are excluded: flow does not actively place
-    /// them, so their position is the OS's/user's concern and the rescue pass
-    /// leaves them alone. `Ignored` windows are excluded for the same reason.
-    /// The rescue pass uses `pre_manage_rect` as the on-screen anchor and
+    /// `Hidden` windows are excluded: flow does not actively place them, so
+    /// their position is the OS's/user's concern and the rescue pass leaves
+    /// them alone. `Ignored` windows are excluded for the same reason.
+    /// `Minimized` windows are excluded here too — `GetWindowRect` is
+    /// meaningless for them — and handled by the placement pass over
+    /// [`minimized_windows`](Self::minimized_windows) instead. The rescue
+    /// pass uses `pre_manage_rect` as the on-screen anchor and
     /// `invisible_bounds` to convert the window rect reported by `GetWindowRect`
     /// back to the visible-content rect used for the visibility test.
     ///
@@ -841,6 +844,28 @@ impl WindowRegistry {
                 WindowState::Tiling(TilingState::Active { .. })
                 | WindowState::Floating(FloatingState::Active { .. }) => {
                     Some((*key, w.pre_manage_rect, w.invisible_bounds))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns `(hwnd_key, invisible_bounds)` for every window flow tracks
+    /// in a `Minimized` state (tiling or floating).
+    ///
+    /// A window minimized while its column was parked keeps the off-screen
+    /// rect as the normal position of its `WINDOWPLACEMENT`, so the rescue
+    /// pass re-anchors those placements (see
+    /// `rescue::rescue_minimized_placement`)
+    /// rather than moving the iconic window itself.
+    #[must_use]
+    pub fn minimized_windows(&self) -> Vec<(isize, InvisibleBounds)> {
+        self.windows
+            .iter()
+            .filter_map(|(key, w)| match &w.state {
+                WindowState::Tiling(TilingState::Minimized)
+                | WindowState::Floating(FloatingState::Minimized) => {
+                    Some((*key, w.invisible_bounds))
                 }
                 _ => None,
             })

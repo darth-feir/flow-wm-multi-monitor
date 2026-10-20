@@ -1,6 +1,6 @@
 //! Win32 Job Objects: tie a child process's lifetime to this process.
 //!
-//! A [`JobObject`] created with [`JobObject::kill_on_close`] carries the
+//! A `JobObject` created with `JobObject::kill_on_close` carries the
 //! `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` limit: when the **last handle** to
 //! the job is closed, the kernel terminates every process in it. The daemon
 //! keeps the handle open for its whole life and never closes it explicitly,
@@ -25,15 +25,15 @@ use windows::Win32::System::JobObjects::{
     SetInformationJobObject,
 };
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, GetExitCodeProcess, PROCESS_CREATION_FLAGS,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, PROCESS_CREATION_FLAGS,
     PROCESS_INFORMATION, ResumeThread, STARTUPINFOW, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
 /// An owned job-object handle. Closing it (on drop) kills every member
-/// process when the job was created with [`JobObject::kill_on_close`].
+/// process when the job was created with `JobObject::kill_on_close`.
 #[derive(Debug)]
-pub struct JobObject(HANDLE);
+pub(crate) struct JobObject(HANDLE);
 
 // SAFETY: a kernel HANDLE is a process-wide identifier; using it from
 // another thread is fine. The daemon stores the job inside `FlowWM` on the
@@ -174,7 +174,7 @@ impl Drop for JobObject {
 /// handle (closed on drop — closing the handle does **not** kill the
 /// process; the job does that).
 #[derive(Debug)]
-pub struct JobChild {
+pub(crate) struct JobChild {
     process: HANDLE,
     pid: u32,
 }
@@ -197,9 +197,11 @@ impl JobChild {
     }
 
     /// Block up to `timeout_ms` for the process to exit; returns its exit
-    /// code, or `None` on timeout.
+    /// code, or `None` on timeout. (Only the spawn tests need it.)
+    #[cfg(test)]
     #[must_use]
     pub fn wait(&self, timeout_ms: u32) -> Option<u32> {
+        use windows::Win32::System::Threading::GetExitCodeProcess;
         // SAFETY: valid process handle.
         if unsafe { WaitForSingleObject(self.process, timeout_ms) } != WAIT_OBJECT_0 {
             return None;
@@ -223,7 +225,7 @@ impl Drop for JobChild {
 /// quoted and escaped per the MSVC CRT rules (`"` → `\"`, backslashes before
 /// a quote doubled).
 #[must_use]
-pub fn build_command_line(exe: &Path, args: &[&OsStr]) -> String {
+pub(crate) fn build_command_line(exe: &Path, args: &[&OsStr]) -> String {
     let mut line = quote_arg(&exe.to_string_lossy());
     for a in args {
         line.push(' ');

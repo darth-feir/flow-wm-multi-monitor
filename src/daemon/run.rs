@@ -147,7 +147,7 @@ const PENDING_RETRY_TIMEOUT_MS: u32 = 100;
 impl FlowWM {
     /// Run the event-driven main loop. Blocks until the `Stop` command is
     /// received, a shutdown is requested, or a fatal error occurs; the
-    /// returned [`RunExit`] says which. The caller then runs
+    /// returned `RunExit` says which. The caller then runs
     /// [`fail_back`](FlowWM::fail_back).
     ///
     /// # Liveness
@@ -158,7 +158,7 @@ impl FlowWM {
     /// hook thread ([`is_alive`](crate::registry::hooks::HookThreadHandle::is_alive))
     /// — and whether [`request_shutdown`](crate::registry::hooks::request_shutdown)
     /// has fired. A dead thread means the daemon is deaf or cannot move
-    /// windows, so it returns [`RunExit::FailBack`] rather than running
+    /// windows, so it returns `RunExit::FailBack` rather than running
     /// half-broken.
     ///
     /// # Loop Structure
@@ -383,7 +383,9 @@ impl FlowWM {
                     self.maybe_resume_float_tracking();
                     self.maybe_fire_edge_scroll();
 
-                    // Read next IPC message (blocking — but client is active).
+                    // Read next IPC message. Bounded: a client that connects
+                    // and then says nothing is dropped after
+                    // `SERVER_READ_TIMEOUT` so it cannot wedge the loop.
                     match self.server.read_message() {
                         Ok(msg) => {
                             let response = self.dispatch(&msg);
@@ -398,6 +400,15 @@ impl FlowWM {
                                 log::info!("flowd: shutting down");
                                 return RunExit::Stop;
                             }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                            // Silent client: logged once per client, then
+                            // disconnected below so the next one can connect.
+                            log::warn!(
+                                "flowd: client connected but sent nothing within {:?}; disconnecting it",
+                                crate::ipc::transport::SERVER_READ_TIMEOUT
+                            );
+                            break;
                         }
                         Err(e) => {
                             // A line we could not decode (a newer CLI?) gets
@@ -435,7 +446,13 @@ impl FlowWM {
             return Some(RunExit::ShutdownRequested);
         }
         if !self.animator.is_alive() {
-            return Some(RunExit::FailBack("animator thread died".to_owned()));
+            // Keep the panic message: the status file would otherwise lose
+            // the cause the panic hook already recorded.
+            let reason = match self.animator.death_reason() {
+                Some(why) => format!("animator thread died: {why}"),
+                None => "animator thread died".to_owned(),
+            };
+            return Some(RunExit::FailBack(reason));
         }
         if !self.hook_handle.is_alive() {
             return Some(RunExit::FailBack("hook thread exited".to_owned()));

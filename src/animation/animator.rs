@@ -5,8 +5,8 @@
 //! reads the [`AtomicBool`] flag to report animation status without locking.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::animation::backend::WindowBackend;
@@ -62,7 +62,36 @@ struct PendingBatch {
 /// acknowledge a cancel before giving up. One frame is ~16 ms, so a healthy
 /// worker answers well within this; the bound only matters when a backend
 /// call (`SetWindowPos` to a hung window) is wedged.
-pub const CANCEL_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+pub(crate) const CANCEL_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Process-wide emergency stop for every animator worker.
+///
+/// Set by [`request_emergency_stop`] from contexts that cannot reach the
+/// [`WindowAnimator`] — the session sink's `WM_QUERYENDSESSION` handler
+/// runs the daemon-less rescue on the main thread while the `FlowWM` is
+/// borrowed by the message pump. Every worker checks it before applying a
+/// frame and before starting a batch; once set, no `SetWindowPos` is issued
+/// again by any worker in this process. It is never cleared outside tests:
+/// the process is on its way out.
+static EMERGENCY_STOP: AtomicBool = AtomicBool::new(false);
+
+/// Stop every animation in this process, now and for good.
+///
+/// Workers drop their active batch and queue on their next poll (at most
+/// one frame away, or immediately if idle) and ignore every later
+/// `animate()`. Used by the logoff path before the synchronous rescue so a
+/// tween cannot overwrite the rescued rects; the regular
+/// [`WindowAnimator::cancel_and_wait`] that follows in `fail_back` then
+/// finds nothing left to cancel.
+pub fn request_emergency_stop() {
+    EMERGENCY_STOP.store(true, Ordering::Release);
+}
+
+/// `true` once [`request_emergency_stop`] has been called.
+#[must_use]
+pub fn emergency_stop_requested() -> bool {
+    EMERGENCY_STOP.load(Ordering::Acquire)
+}
 
 /// All mutable state owned exclusively by the worker thread.
 struct WorkerState {
@@ -102,6 +131,10 @@ pub struct WindowAnimator {
     /// `true` while the worker thread is running; cleared by the worker on
     /// the way out — whether it exited cleanly or panicked.
     alive: Arc<AtomicBool>,
+    /// The panic message if the worker died by panicking (`None` while it
+    /// runs or after a clean exit). Read by the daemon's exit check so the
+    /// status file names the actual failure, not just "thread died".
+    death_reason: Arc<Mutex<Option<String>>>,
     /// Worker thread handle. Kept for its drop behaviour (detaches thread on drop).
     _worker: std::thread::JoinHandle<()>,
 }
@@ -116,9 +149,11 @@ impl WindowAnimator {
         let animating = Arc::new(AtomicBool::new(false));
         let next_id = Arc::new(AtomicU64::new(1));
         let alive = Arc::new(AtomicBool::new(true));
+        let death_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let animating_worker = Arc::clone(&animating);
         let alive_worker = Arc::clone(&alive);
+        let death_reason_worker = Arc::clone(&death_reason);
         let initial_config = config.clone();
 
         // SAFETY / rationale: thread spawn can fail only if the OS has
@@ -136,13 +171,16 @@ impl WindowAnimator {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_worker(Box::new(backend), cmd_rx, animating_worker, initial_config);
                 }));
-                alive_worker.store(false, Ordering::Release);
                 if let Err(payload) = result {
-                    log::error!(
-                        "animation worker thread panicked: {}",
-                        panic_payload_message(payload.as_ref())
-                    );
+                    let message = panic_payload_message(payload.as_ref());
+                    log::error!("animation worker thread panicked: {message}");
+                    // Record before flipping `alive` so a reader that sees
+                    // the thread dead always finds the reason.
+                    *death_reason_worker
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message);
                 }
+                alive_worker.store(false, Ordering::Release);
             })
             .expect("failed to spawn animation worker thread");
 
@@ -152,6 +190,7 @@ impl WindowAnimator {
             animating,
             next_id,
             alive,
+            death_reason,
             _worker,
         }
     }
@@ -211,7 +250,7 @@ impl WindowAnimator {
     }
 
     /// Cancel any in-flight animation and **block** until the worker has
-    /// acknowledged it (bounded by [`CANCEL_ACK_TIMEOUT`]).
+    /// acknowledged it (bounded by `CANCEL_ACK_TIMEOUT`).
     ///
     /// Once this returns `true`, the worker has cleared its active batch and
     /// is parked on the command channel: it will issue no further
@@ -231,8 +270,8 @@ impl WindowAnimator {
         {
             // Worker gone: nothing can be animating, so the guarantee holds
             // trivially. Report it honestly though — the caller may want to
-            // know the thread is dead.
-            log::warn!("cancel_and_wait: animation worker is not running");
+            // know the thread is dead (`is_alive` / `death_reason` say why).
+            log::debug!("cancel_and_wait: animation worker is not running");
             return false;
         }
         match ack_rx.recv_timeout(CANCEL_ACK_TIMEOUT) {
@@ -254,6 +293,19 @@ impl WindowAnimator {
     /// loop and fails back when the worker dies underneath it.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    /// The panic message that killed the worker, if it died by panicking.
+    ///
+    /// `None` while the worker runs or after a clean exit. The daemon
+    /// appends it to its "animator thread died" fail-back reason so the
+    /// status file carries the actual cause.
+    #[must_use]
+    pub fn death_reason(&self) -> Option<String> {
+        self.death_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -309,6 +361,23 @@ fn run_worker(
                 Err(_) => break 'main, // channel disconnected — exit cleanly
             }
         };
+
+        // Emergency stop (logoff rescue in progress): drop everything and go
+        // idle. Checked before the tick so no frame is applied after the
+        // flag is set, and before the command so a queued `Animate` cannot
+        // start a batch.
+        if emergency_stop_requested() {
+            state.active = None;
+            state.queue.clear();
+            animating.store(false, Ordering::Release);
+            if matches!(cmd_opt, Some(AnimatorCmd::Shutdown)) {
+                break 'main;
+            }
+            if let Some(AnimatorCmd::Cancel { ack: Some(ack) }) = cmd_opt {
+                let _ = ack.send(());
+            }
+            continue 'main;
+        }
 
         if let Some(cmd) = cmd_opt {
             match cmd {
@@ -753,6 +822,11 @@ mod tests {
         let t0 = std::time::Instant::now();
         assert!(!animator.cancel_and_wait());
         assert!(t0.elapsed() < CANCEL_ACK_TIMEOUT);
+        // The reason survives for the daemon's status file.
+        assert_eq!(
+            animator.death_reason().as_deref(),
+            Some("injected backend panic")
+        );
     }
 
     #[test]

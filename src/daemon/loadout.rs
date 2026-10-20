@@ -676,7 +676,8 @@ impl FlowWM {
                 resolve_seating_target(self.monitors[mi].workspaces(), fg_here, &snaps_here);
             if self.monitors[mi].set_active_workspace(target_id).is_none() {
                 log::warn!(
-                    "loadout load: seating target workspace {} not found on monitor {mi};                      leaving its freshly-tiled layout in place",
+                    "loadout load: seating target workspace {} not found on monitor {mi}; \
+                     leaving its freshly-tiled layout in place",
                     target_id.0
                 );
                 continue;

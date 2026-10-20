@@ -46,11 +46,11 @@ use serde::{Deserialize, Serialize};
 pub const FAIL_AT_ENV: &str = "FLOW_FAIL_AT";
 
 /// Name of the status file written under the config directory.
-pub const STATUS_FILE_NAME: &str = "flowd.status";
+pub(crate) const STATUS_FILE_NAME: &str = "flowd.status";
 
 /// Exit code of the daemon when startup fails at stage index 0; each later
 /// stage adds its index (see [`StartupStage::exit_code`]).
-pub const EXIT_CODE_BASE: i32 = 10;
+pub(crate) const EXIT_CODE_BASE: i32 = 10;
 
 /// Exit code of the daemon after a runtime failure: a panic (any thread), a
 /// dead animator or hook thread, or a wait failure in the event loop. The
@@ -139,7 +139,7 @@ impl StartupStage {
     }
 
     /// Process exit code the daemon uses when this stage fails:
-    /// [`EXIT_CODE_BASE`] plus [`index`](Self::index), or
+    /// `EXIT_CODE_BASE` plus [`index`](Self::index), or
     /// [`EXIT_CODE_RUNTIME`] for [`Runtime`](Self::Runtime).
     #[must_use]
     pub fn exit_code(self) -> i32 {
@@ -289,7 +289,7 @@ pub fn status_file_path_in(config_dir: &Path) -> PathBuf {
 /// # Errors
 ///
 /// Returns the serialisation or write error.
-pub fn write_status_to<W: std::io::Write>(
+pub(crate) fn write_status_to<W: std::io::Write>(
     w: &mut W,
     status: &StartupStatus,
 ) -> std::io::Result<()> {
@@ -363,7 +363,7 @@ pub fn remove_status(config_dir: &Path) {
 /// Interpret a `FLOW_FAIL_AT` value: `Some(stage)` for a known stage name,
 /// `None` (with a warning) for anything else, `None` silently when unset.
 #[must_use]
-pub fn fail_at_from_value(value: Option<&str>) -> Option<StartupStage> {
+pub(crate) fn fail_at_from_value(value: Option<&str>) -> Option<StartupStage> {
     let raw = value?;
     if raw.trim().is_empty() {
         return None;
@@ -381,7 +381,7 @@ pub fn fail_at_from_value(value: Option<&str>) -> Option<StartupStage> {
 }
 
 /// Read [`FAIL_AT_ENV`] from the process environment (see
-/// [`fail_at_from_value`]).
+/// `fail_at_from_value`).
 #[must_use]
 pub fn fail_at_from_env() -> Option<StartupStage> {
     fail_at_from_value(std::env::var(FAIL_AT_ENV).ok().as_deref())
@@ -488,6 +488,14 @@ impl StartupReporter {
         self.write(err.stage, StartupState::Error, err.reason.clone());
     }
 
+    /// Write the status document, retrying up to [`STATUS_WRITE_ATTEMPTS`]
+    /// times [`STATUS_WRITE_RETRY_DELAY`] apart.
+    ///
+    /// `write_status` renames a temp file over `flowd.status`; while `flow
+    /// start` (or an editor) has the file open the rename can fail with a
+    /// sharing violation for a few milliseconds. A missed write would leave
+    /// a stale `starting`/`ready` behind, which `flow stop` would then wait
+    /// on, so it is worth a couple of retries.
     fn write(&self, stage: StartupStage, state: StartupState, reason: String) {
         let status = StartupStatus {
             pid: self.pid,
@@ -496,14 +504,31 @@ impl StartupReporter {
             reason,
             log_path: self.log_path.clone(),
         };
-        if let Err(e) = write_status(&self.config_dir, &status) {
-            log::warn!(
-                "startup: could not write {}: {e}",
-                status_file_path_in(&self.config_dir).display()
-            );
+        let mut last_err = None;
+        for attempt in 1..=STATUS_WRITE_ATTEMPTS {
+            match write_status(&self.config_dir, &status) {
+                Ok(()) => return,
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < STATUS_WRITE_ATTEMPTS {
+                        std::thread::sleep(STATUS_WRITE_RETRY_DELAY);
+                    }
+                }
+            }
         }
+        log::warn!(
+            "startup: could not write {} after {STATUS_WRITE_ATTEMPTS} attempts: {}",
+            status_file_path_in(&self.config_dir).display(),
+            last_err.map_or_else(String::new, |e| e.to_string())
+        );
     }
 }
+
+/// How many times [`StartupReporter`] tries to write the status file.
+const STATUS_WRITE_ATTEMPTS: u32 = 3;
+
+/// Pause between two attempts to write the status file.
+const STATUS_WRITE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
 
 #[cfg(test)]
 mod tests {

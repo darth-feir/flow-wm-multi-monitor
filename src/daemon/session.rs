@@ -7,9 +7,17 @@
 //! leave parked windows off-screen for the apps that persist their own
 //! rects. [`SessionSink`] is a permanent, invisible top-level window created
 //! on the main thread during the `hooks` stage; its window procedure turns
-//! those messages (and `WM_CLOSE`) into
-//! [`request_shutdown`](crate::registry::hooks::request_shutdown), which the
+//! those messages (and `WM_CLOSE`) into [`request_shutdown`], which the
 //! event loop treats like a `Stop` command.
+//!
+//! Logoff gets more than a flag. Windows delivers `WM_QUERYENDSESSION` to
+//! every top-level window first (phase 1) and only then `WM_ENDSESSION`, and
+//! apps that persist their own window rects read them on the latter, so the
+//! parked windows must be back on-screen *before* the handler returns.
+//! `rescue_on_session_end` therefore runs the daemon-less rescue
+//! synchronously inside the phase-1 handler, behind a shutdown block reason
+//! so the user sees why the logoff takes a moment. The normal fail-back
+//! still follows once the event loop sees the shutdown flag.
 //!
 //! A *message-only* window (`HWND_MESSAGE`) would not do: those are
 //! excluded from broadcasts and never receive session messages.
@@ -20,7 +28,9 @@
 //! the process the moment the handler returns, so the handler waits
 //! (bounded) for the main thread to finish its rescue first.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -29,6 +39,7 @@ use windows::Win32::System::Console::{
     SetConsoleCtrlHandler,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SPI_SETWORKAREA,
     WINDOW_EX_STYLE, WM_CLOSE, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_QUERYENDSESSION,
@@ -47,7 +58,11 @@ static SINK_CLASS_ATOM: OnceLock<u16> = OnceLock::new();
 /// Longest a console control handler blocks waiting for the main thread's
 /// rescue before letting Windows terminate the process anyway. Windows
 /// itself allows roughly five seconds for `CTRL_CLOSE_EVENT`.
-pub const CONSOLE_HANDLER_GRACE: Duration = Duration::from_millis(4_000);
+pub(crate) const CONSOLE_HANDLER_GRACE: Duration = Duration::from_millis(4_000);
+
+/// Set once the phase-1 logoff rescue has run, so the sink and every
+/// overlay (each receives its own `WM_QUERYENDSESSION`) do not repeat it.
+static SESSION_RESCUE_DONE: AtomicBool = AtomicBool::new(false);
 
 /// The invisible top-level window that receives session-end messages.
 ///
@@ -65,7 +80,7 @@ impl SessionSink {
     /// # Errors
     ///
     /// Returns a string if class registration or `CreateWindowExW` fails.
-    pub fn create() -> Result<Self, String> {
+    pub(crate) fn create() -> Result<Self, String> {
         ensure_class_registered()?;
         // SAFETY: GetModuleHandleW(NULL) is the current module; always valid.
         let hinstance = unsafe { GetModuleHandleW(PCWSTR::null()) }
@@ -98,12 +113,6 @@ impl SessionSink {
     #[cfg(test)]
     pub(crate) fn test_dummy() -> Self {
         Self(HWND::default())
-    }
-
-    /// The sink's window handle (null for a test dummy).
-    #[must_use]
-    pub fn hwnd(&self) -> HWND {
-        self.0
     }
 }
 
@@ -149,14 +158,20 @@ fn ensure_class_registered() -> Result<(), String> {
 /// Window procedure of the session sink.
 ///
 /// Every session-end path funnels into [`request_shutdown`]; the main loop
-/// then runs the rescue. `WM_QUERYENDSESSION` answers `TRUE` so a logoff is
-/// never vetoed, and `WM_ENDSESSION` with `wParam == TRUE` is the definitive
-/// "session is ending" notice. `WM_DISPLAYCHANGE` (a monitor attached,
-/// detached or re-configured) and `WM_SETTINGCHANGE` with `SPI_SETWORKAREA`
-/// (taskbar moved, resized or set to auto-hide) report a display-topology
-/// change through
+/// then runs the fail-back. `WM_QUERYENDSESSION` additionally runs the
+/// synchronous phase-1 rescue (`rescue_on_session_end`) and answers
+/// `TRUE` so a logoff is never vetoed; `WM_ENDSESSION` with
+/// `wParam == TRUE` is the definitive "session is ending" notice.
+/// `WM_DISPLAYCHANGE` (a monitor attached, detached or re-configured) and
+/// `WM_SETTINGCHANGE` with `SPI_SETWORKAREA` (taskbar moved, resized or set
+/// to auto-hide) report a display-topology change through
 /// [`request_topology_refresh`](crate::registry::hooks::request_topology_refresh);
 /// the main loop debounces and reconciles (see `daemon::hotplug`).
+///
+/// A panic in the body is caught ([`catch_unwind`]): unwinding out of an
+/// `extern "system"` callback would abort the process with no fail-back.
+/// It is logged, a shutdown is requested, and the message falls through to
+/// `DefWindowProcW`.
 ///
 /// # Safety
 ///
@@ -167,6 +182,24 @@ unsafe extern "system" fn sink_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    match catch_unwind(AssertUnwindSafe(|| {
+        sink_wnd_proc_body(hwnd, msg, wparam, lparam)
+    })) {
+        Ok(result) => result,
+        Err(payload) => {
+            log::error!(
+                "session sink: window procedure panicked on message {msg:#x}: {}; requesting shutdown",
+                crate::animation::panic_payload_message(payload.as_ref())
+            );
+            request_shutdown();
+            // SAFETY: pass-through with unchanged arguments.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+    }
+}
+
+/// The body of [`sink_wnd_proc`], free to panic.
+fn sink_wnd_proc_body(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_CLOSE => {
             log::info!("session sink: WM_CLOSE");
@@ -175,7 +208,7 @@ unsafe extern "system" fn sink_wnd_proc(
         }
         WM_QUERYENDSESSION => {
             log::info!("session sink: WM_QUERYENDSESSION (lparam={:#x})", lparam.0);
-            request_shutdown();
+            rescue_on_session_end(hwnd);
             LRESULT(1)
         }
         WM_ENDSESSION => {
@@ -203,6 +236,60 @@ unsafe extern "system" fn sink_wnd_proc(
         // SAFETY: pass-through with unchanged arguments.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+/// The phase-1 logoff rescue, run synchronously inside `WM_QUERYENDSESSION`.
+///
+/// Called by the session sink and by every border overlay (each top-level
+/// window gets the message); only the first call does the work, every call
+/// ends in [`request_shutdown`]. The order, and why:
+///
+/// 1. `ShutdownBlockReasonCreate(hwnd, "FlowWM is restoring window
+///    positions")` — Windows shows the reason if the logoff screen appears
+///    while we work, instead of a nameless "this app is preventing …".
+/// 2. [`request_emergency_stop`](crate::animation::request_emergency_stop)
+///    — every animator worker drops its batch before its next frame, so no
+///    tween can overwrite what step 3 does. (The regular
+///    `cancel_and_wait` in `fail_back` cannot be used here: the `FlowWM`
+///    is borrowed by the message pump this handler runs inside.)
+/// 3. [`rescue_offscreen_windows`](crate::rescue::rescue_offscreen_windows)
+///    — the daemon-less pass over every top-level window, minimized ones
+///    included, so the apps that persist their own rects in
+///    `WM_ENDSESSION` (phase 2) already see on-screen positions.
+/// 4. `ShutdownBlockReasonDestroy`.
+/// 5. [`request_shutdown`] — the event loop exits on its next wake and the
+///    normal `fail_back` runs (its own rescue then finds nothing to do),
+///    dropping the overlays, the hook thread and the hotkey script.
+///
+/// `hwnd` must be a window owned by the calling thread (the sink or an
+/// overlay).
+pub(crate) fn rescue_on_session_end(hwnd: HWND) {
+    if SESSION_RESCUE_DONE.swap(true, Ordering::AcqRel) {
+        request_shutdown();
+        return;
+    }
+    // SAFETY: `hwnd` is one of our own windows on this thread and the reason
+    // string is a static wide literal; both calls only read them.
+    let blocked =
+        unsafe { ShutdownBlockReasonCreate(hwnd, w!("FlowWM is restoring window positions")) };
+    if let Err(e) = &blocked {
+        log::debug!("session end: ShutdownBlockReasonCreate failed: {e}");
+    }
+    crate::animation::request_emergency_stop();
+    match crate::rescue::rescue_offscreen_windows() {
+        Ok(report) => log::info!(
+            "session end: phase-1 rescue moved {} window(s) and re-anchored {} minimized ({} scanned)",
+            report.moved.len(),
+            report.minimized.len(),
+            report.scanned
+        ),
+        Err(e) => log::warn!("session end: phase-1 rescue failed: {e}"),
+    }
+    if blocked.is_ok() {
+        // SAFETY: same window as above.
+        let _ = unsafe { ShutdownBlockReasonDestroy(hwnd) };
+    }
+    request_shutdown();
 }
 
 /// Console control handler: Ctrl-C / Ctrl-Break / console close / logoff /
@@ -247,23 +334,23 @@ unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
 /// (`wParam == SPI_SETWORKAREA`): the taskbar or an appbar moved, resized
 /// or toggled auto-hide, so every monitor's work area must be re-read.
 #[must_use]
-pub fn is_work_area_change(wparam: WPARAM) -> bool {
+pub(crate) fn is_work_area_change(wparam: WPARAM) -> bool {
     wparam.0 == SPI_SETWORKAREA.0 as usize
 }
 
 /// `true` for the console events after which Windows terminates the
 /// process as soon as the handler returns (close, logoff, shutdown).
 #[must_use]
-pub fn console_event_is_terminal(ctrl_type: u32) -> bool {
+pub(crate) fn console_event_is_terminal(ctrl_type: u32) -> bool {
     matches!(
         ctrl_type,
         CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
     )
 }
 
-/// Install [`console_ctrl_handler`] for this process. Harmless when the
-/// daemon has no console (detached by `flow start`): the handler simply
-/// never fires.
+/// Install the console control handler (`console_ctrl_handler`) for this
+/// process. Harmless when the daemon has no console (detached by `flow
+/// start`): the handler simply never fires.
 ///
 /// # Errors
 ///
@@ -298,7 +385,7 @@ mod tests {
     #[test]
     fn test_dummy_sink_has_no_window_and_drops_quietly() {
         let sink = SessionSink::test_dummy();
-        assert!(sink.hwnd().is_invalid());
+        assert!(sink.0.is_invalid());
         drop(sink);
     }
 }

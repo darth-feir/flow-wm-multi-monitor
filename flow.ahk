@@ -35,6 +35,14 @@
 ;                shortcut that runs `flow.exe start --ahk`; idempotent).
 ; Full dispatch: run `flow dispatch help` for every available command.
 ;
+; Fail-back: every binding below is only active while the flowd daemon's named
+; pipe exists. If the daemon dies, ModKey and all chords revert to stock
+; Windows within one poll (2 s) — or at once, because a chord whose dispatch
+; fails re-checks the daemon on the spot — and after ~10 s the script exits
+; itself. A pipe that stays busy for 5 consecutive polls (a wedged daemon)
+; counts as down too. At startup the script refuses to hook anything unless
+; the daemon answers within 10 s.
+;
 ; Layout (hold ModKey + key):
 ;   h j k l  focus left/down/up/right          (+Shift = move window)
 ;                                             (+Ctrl  = merge into column)
@@ -53,17 +61,97 @@
 ; --- Config ------------------------------------------------------------------
 ModKey   := "Alt"                 ; the modifier every binding is held with
 flowExe := "flow"                ; path to flow.exe (PATH by default)
+PipeName := EnvGet("FLOW_PIPE_NAME") || "\\.\pipe\flow"
+DaemonUp := false
+DownTicks := 0
+BusyPolls := 0          ; consecutive polls that found the pipe busy (121)
+MaxBusyPolls := 5       ; after this many, "busy" means wedged, not alive
 
 ; --- Flow command helpers ----------------------------------------------------
 Flow(cmd) {
     global flowExe
-    Run(flowExe ' ' cmd, , 'Hide')
+    try Run('"' flowExe '" ' cmd, , 'Hide')
+    catch as e
+        TrayTip("could not run flow: " e.Message, "flow.ahk")
 }
 
+; Dispatch without blocking the hotkey thread (Run returns at once); the exit
+; code is collected asynchronously by DispatchDone so a failed dispatch still
+; re-checks the daemon right away and the next chord falls through to Windows.
 FlowDispatch(cmd) {
     global flowExe
-    Run(flowExe ' dispatch ' cmd, , 'Hide')
+    try Run('"' flowExe '" dispatch ' cmd, , 'Hide', &pid)
+    catch as e {
+        TrayTip("could not run flow: " e.Message, "flow.ahk")
+        return
+    }
+    ; PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE: enough to read the exit code.
+    h := DllCall("OpenProcess", "UInt", 0x1000 | 0x100000, "Int", 0, "UInt", pid, "Ptr")
+    if h
+        SetTimer(DispatchDone.Bind(h, 0), -50)
 }
+
+; Reap one dispatch: poll its process every 50 ms (never blocking a hotkey);
+; a non-zero exit means the daemon did not answer, so the liveness check runs
+; now instead of at the next 2 s tick. Gives up after ~5 s.
+DispatchDone(h, polls) {
+    if (DllCall("WaitForSingleObject", "Ptr", h, "UInt", 0) != 0) {   ; still running
+        if (polls < 100)
+            SetTimer(DispatchDone.Bind(h, polls + 1), -50)
+        else
+            DllCall("CloseHandle", "Ptr", h)
+        return
+    }
+    code := 0
+    DllCall("GetExitCodeProcess", "Ptr", h, "UInt*", &code)
+    DllCall("CloseHandle", "Ptr", h)
+    if (code != 0)
+        CheckDaemon()
+}
+
+; --- Daemon liveness --------------------------------------------------------
+DaemonAlive() {
+    global PipeName, BusyPolls, MaxBusyPolls
+    ; 1 ms wait: nonzero = an instance is free. A_LastError 2 = no such pipe
+    ; (daemon gone); 121 (ERROR_SEM_TIMEOUT) = pipe exists but busy. Busy is
+    ; alive only for a bounded run of polls: a wedged daemon holds the pipe
+    ; busy forever, and must count as down so ModKey is released.
+    if DllCall("WaitNamedPipe", "Str", PipeName, "UInt", 1) {
+        BusyPolls := 0
+        return true
+    }
+    if (A_LastError = 121)
+        return ++BusyPolls <= MaxBusyPolls
+    BusyPolls := 0
+    return false
+}
+
+CheckDaemon() {
+    global DaemonUp, DownTicks
+    if DaemonAlive() {
+        DaemonUp := true, DownTicks := 0
+        return
+    }
+    DaemonUp := false            ; chords fall through to Windows immediately
+    if (++DownTicks >= 5) {      ; ~10 s on the 2 s timer: release the hook
+        TrayTip("FlowWM daemon is gone; " ModKey " released.", "flow.ahk")
+        Sleep 1500
+        ExitApp()
+    }
+}
+
+; Startup gate: refuse to hook ModKey unless the daemon answers within 10 s.
+Loop 20 {
+    if DaemonAlive()
+        break
+    Sleep 500
+}
+if !DaemonAlive() {
+    MsgBox("flow daemon not reachable at " PipeName "; not binding " ModKey " keys.", "flow.ahk", "Iconx T10")
+    ExitApp()
+}
+DaemonUp := true
+SetTimer(CheckDaemon, 2000)
 
 ; --- Action handlers ---------------------------------------------------------
 ; Each handler maps one ModKey+key chord to a `flow dispatch` call. The
@@ -134,7 +222,10 @@ WorkspaceAction(n) {
 ; --- Register every binding --------------------------------------------------
 ; Done dynamically so ModKey is one changeable line: swap the modifier above and
 ; every chord below follows. Custom combos (e.g. "Alt & h") are passed
-; to Hotkey() as a single string built from ModKey.
+; to Hotkey() as a single string built from ModKey. Every registration is
+; conditional on DaemonUp (see CheckDaemon): with the daemon gone the chords
+; are inert and the keys behave as stock Windows again.
+HotIf((*) => DaemonUp)          ; criterion for the Hotkey() registrations below
 Hotkey(ModKey " & p", Act_Stop)
 Hotkey(ModKey " & h", Act_Left)
 Hotkey(ModKey " & l", Act_Right)

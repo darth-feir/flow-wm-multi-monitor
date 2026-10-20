@@ -45,14 +45,16 @@
 //!
 //! # Panics
 //!
-//! A process-wide panic hook logs the panic location and message and
-//! rewrites `flowd.status` with `stage: runtime`, `state: error` before
-//! unwinding starts. `flow.run()` runs under `catch_unwind`, so a
-//! main-thread panic still reaches `fail_back`; a panic on the animator
-//! worker marks it dead and the event loop fails back on its next wake. A
-//! panic inside a Win32 callback (hook thread) aborts the process after the
-//! hook has run — the kill-on-close job object then takes the hotkey script
-//! down with it.
+//! A process-wide panic hook rewrites `flowd.status` with `stage: runtime`,
+//! `state: error` and then logs the panic location and message, before
+//! unwinding starts (the status file first: it is what `flow start` and a
+//! human read, and logging can block on a wedged file). `flow.run()` runs
+//! under `catch_unwind`, so a main-thread panic still reaches `fail_back`; a
+//! panic on the animator worker marks it dead and the event loop fails back
+//! on its next wake with the panic message in the reason. The Win32
+//! callbacks (hook thread, session sink, border overlays) catch their own
+//! panics and request a shutdown, so they reach `fail_back` too; the
+//! kill-on-close job object remains the backstop for an outright abort.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -204,11 +206,15 @@ enum RunOutcome {
 
 /// Install the process-wide panic hook.
 ///
-/// The hook logs `panic at <file>:<line>:<col>: <message>` at `error`,
-/// rewrites `<config_dir>/flowd.status` with [`startup::panic_status`]
-/// (`stage: runtime`, `state: error`), and then defers to the default hook
-/// (which prints the panic to stderr). It never panics itself: a failed
-/// status write is logged and ignored.
+/// The hook first rewrites `<config_dir>/flowd.status` with
+/// [`startup::panic_status`] (`stage: runtime`, `state: error`), then logs
+/// `panic at <file>:<line>:<col>: <message>` at `error`, and then defers to
+/// the default hook (which prints the panic to stderr). The status file
+/// comes first on purpose: it is the one artefact `flow start` and a human
+/// can always read, whereas the logger may itself be the thing that is
+/// wedged (a full disk, a locked file) — so it must not stand between the
+/// panic and the status. It never panics itself: a failed status write is
+/// logged and ignored.
 fn install_panic_hook(config_dir: PathBuf, log_path: Option<PathBuf>) {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -216,19 +222,20 @@ fn install_panic_hook(config_dir: PathBuf, log_path: Option<PathBuf>) {
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
         let message = panic_payload_message(info.payload());
-        let thread = std::thread::current();
-        let reason = startup::panic_reason(location.as_deref(), &message);
-        log::error!(
-            "flowd: {reason} (thread {:?})",
-            thread.name().unwrap_or("<unnamed>")
-        );
         let status = startup::panic_status(
             std::process::id(),
             log_path.clone(),
             location.as_deref(),
             &message,
         );
-        if let Err(e) = startup::write_status(&config_dir, &status) {
+        let status_write = startup::write_status(&config_dir, &status);
+        let thread = std::thread::current();
+        let reason = startup::panic_reason(location.as_deref(), &message);
+        log::error!(
+            "flowd: {reason} (thread {:?})",
+            thread.name().unwrap_or("<unnamed>")
+        );
+        if let Err(e) = status_write {
             log::warn!(
                 "flowd: could not write {} from the panic hook: {e}",
                 startup::status_file_path_in(&config_dir).display()

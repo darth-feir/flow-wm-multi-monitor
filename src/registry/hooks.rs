@@ -847,6 +847,8 @@ pub fn start_hook_thread(
             #[cfg(not(debug_assertions))]
             let _ = desktop_name;
 
+            // SAFETY: GetCurrentThreadId takes no arguments and cannot fail;
+            // it only reads the calling thread's id.
             let os_thread_id = unsafe { GetCurrentThreadId() };
             run_hook_loop(|registered| {
                 // Report back only after the hooks are registered, so the caller
@@ -1164,6 +1166,14 @@ fn is_valid_hook(h: HWINEVENTHOOK) -> bool {
 /// windows (not child controls), then send typed [`HookEvent`]s through
 /// the global sender and signal the main thread via [`HOOK_SIGNAL`].
 ///
+/// # Panics
+///
+/// Never unwinds into Windows: the body ([`hook_callback_body`]) runs
+/// under `catch_unwind`. A panic there would otherwise abort the whole
+/// process from the hook thread, with no fail-back — so it is logged, a
+/// shutdown is requested (the main loop then runs the normal teardown),
+/// and the event is dropped.
+///
 /// # Safety
 ///
 /// This is called by Windows. The `HOOK_SENDER` and `HOOK_SIGNAL` globals
@@ -1177,6 +1187,20 @@ unsafe extern "system" fn hook_callback(
     _dw_event_thread: u32,
     _dwms_event_time: u32,
 ) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hook_callback_body(event, hwnd, id_object);
+    }));
+    if let Err(payload) = result {
+        log::error!(
+            "hook callback panicked on event {event:#x}: {}; requesting shutdown",
+            crate::animation::panic_payload_message(payload.as_ref())
+        );
+        request_shutdown();
+    }
+}
+
+/// The body of [`hook_callback`], free to panic.
+fn hook_callback_body(event: u32, hwnd: HWND, id_object: i32) {
     // Only process events for actual windows (OBJID_WINDOW = 0).
     if id_object != OBJID_WINDOW {
         return;
@@ -1227,6 +1251,8 @@ unsafe extern "system" fn hook_callback(
     // WaitForMultipleObjects on the main thread so hook events are processed
     // immediately, even when no IPC client is connected.
     if let Some(&raw) = HOOK_SIGNAL.get() {
+        // SAFETY: `raw` is the event handle stored by `start_hook_thread`,
+        // which stays open for the life of the process.
         let _ = unsafe { SetEvent(HANDLE(raw as *mut core::ffi::c_void)) };
     }
 }

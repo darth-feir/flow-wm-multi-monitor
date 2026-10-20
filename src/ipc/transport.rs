@@ -1,6 +1,10 @@
 //! Named pipe transport for IPC between `flow` CLI and `flowd` daemon.
 //!
-//! Uses the Windows named pipe `\\.\pipe\flow` with synchronous (blocking) I/O.
+//! Uses the Windows named pipe `\\.\pipe\flow`. Both ends open it for
+//! overlapped I/O so every read and write can carry a deadline: the client
+//! bounds its round trip by `IPC_TIMEOUT`, the daemon bounds a connected
+//! client's silence by [`SERVER_READ_TIMEOUT`] (a client that connects and
+//! never writes used to wedge the daemon's main loop in `ReadFile`).
 //! Messages are newline-delimited JSON (see [`super::message`]).
 
 use std::ffi::OsStr;
@@ -10,16 +14,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
     FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
-use windows::Win32::System::IO::{CancelIo, CancelSynchronousIo, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::IO::{CancelIo, CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
-    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent, WaitForSingleObject};
 use windows::core::HRESULT;
@@ -46,6 +52,34 @@ const BUF_SIZE: u32 = 8192;
 /// healthy daemon answers in milliseconds, so this ceiling only ever trips when
 /// the daemon is genuinely stuck, at which point failing fast beats hanging.
 const IPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Longest the daemon waits for a connected client to send its command.
+///
+/// A `flow` invocation writes its line the instant it connects, so two
+/// seconds is generous; a client that is still silent after that (a stuck
+/// process, a port scanner, `is_daemon_running`'s probe that never writes)
+/// is disconnected so the next client can be served. Without this the
+/// daemon's main loop sat in a `ReadFile` with no deadline.
+pub const SERVER_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Longest the daemon waits for a client to drain a response.
+const SERVER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the accept thread re-checks `stopping` while a connect is
+/// pending (its cancel is also issued directly, this is the backstop).
+const ACCEPT_POLL: Duration = Duration::from_millis(50);
+
+/// Longest a client keeps retrying a connect that fails with
+/// `ERROR_PIPE_BUSY`.
+///
+/// The daemon serves one client at a time on a single pipe instance: between
+/// `DisconnectNamedPipe` of the previous client and the re-armed
+/// `ConnectNamedPipe` (a thread spawn away), and for the whole of another
+/// client's session, `CreateFileW` fails with `ERROR_PIPE_BUSY`. A `flow
+/// stop` right after `flow start`'s ping, or two dispatches back to back,
+/// land in exactly that window, so the client waits for a free instance
+/// (`WaitNamedPipeW`) and retries instead of failing.
+const BUSY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Win32 `ERROR_IO_PENDING` (997 / `0x3E5`) expressed as the `HRESULT`
 /// windows-rs returns from an overlapped `ReadFile`/`WriteFile` that has not
@@ -174,7 +208,7 @@ pub struct PipeServer {
 }
 
 /// Longest [`PipeServer::shutdown`] waits for the accept thread to exit.
-pub const ACCEPT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1_000);
+pub(crate) const ACCEPT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1_000);
 
 impl PipeServer {
     /// Create a new named pipe server instance.
@@ -204,10 +238,12 @@ impl PipeServer {
         // access to the current user session. Currently any local process can
         // connect and send commands. Acceptable for Phase 1 MVP (single-user
         // desktop tool), but must be hardened before wider distribution.
+        // Overlapped so the server's reads, writes and accepts can all be
+        // bounded (see `read_message`) and cancelled (see `shutdown`).
         let handle = unsafe {
             CreateNamedPipeW(
                 windows::core::PCWSTR(name.as_ptr()),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,
                 BUF_SIZE,
@@ -251,21 +287,22 @@ impl PipeServer {
     }
 
     /// Stop accepting: cancel a pending `ConnectNamedPipe` and join the
-    /// accept thread, bounded by [`ACCEPT_SHUTDOWN_TIMEOUT`].
+    /// accept thread, bounded by `ACCEPT_SHUTDOWN_TIMEOUT`.
     ///
-    /// **Why this exists.** `CloseHandle` on a pipe whose other thread is
-    /// blocked in a *synchronous* `ConnectNamedPipe` does not cancel that
-    /// I/O — it blocks until the connect completes. Dropping a `PipeServer`
-    /// with an accept pending therefore hung `flowd` on every exit path
-    /// where no client had just connected (session end, signals, a dead
-    /// thread) until the next client happened to connect. `flow stop` never
-    /// hit it because the stopping client *was* the last connection.
+    /// **Why this exists.** `CloseHandle` on a pipe with a pending
+    /// `ConnectNamedPipe` does not cancel that I/O — it blocks until the
+    /// connect completes. Dropping a `PipeServer` with an accept pending
+    /// therefore hung `flowd` on every exit path where no client had just
+    /// connected (session end, signals, a dead thread) until the next client
+    /// happened to connect. `flow stop` never hit it because the stopping
+    /// client *was* the last connection.
     ///
-    /// Steps: set `stopping` (the thread exits instead of retrying), then
-    /// repeatedly `CancelSynchronousIo` the accept thread (re-issued every
-    /// 10 ms to cover the window before it enters `ConnectNamedPipe`), and
+    /// Steps: set `stopping` (the thread exits instead of retrying — it polls
+    /// the flag every `ACCEPT_POLL` while its overlapped connect is
+    /// pending), then repeatedly `CancelIoEx` the pipe (re-issued every 10 ms
+    /// to cover the window before the thread enters `ConnectNamedPipe`), and
     /// if that still has not freed it after a third of the budget, connect a
-    /// throwaway client to our own pipe so the accept returns normally.
+    /// throwaway client to our own pipe so the accept completes normally.
     /// Returns `true` if the thread was joined in time. If not, the pipe
     /// handle is deliberately **leaked** (not closed) so that dropping the
     /// server can no longer block; the process is exiting anyway.
@@ -278,8 +315,7 @@ impl PipeServer {
             let _ = thread.join();
             return true;
         }
-        use std::os::windows::io::AsRawHandle;
-        let thread_handle = HANDLE(thread.as_raw_handle());
+        let pipe = self.pipe();
         let start = Instant::now();
         let deadline = start + ACCEPT_SHUTDOWN_TIMEOUT;
         let mut self_connected = false;
@@ -288,9 +324,10 @@ impl PipeServer {
             if now >= deadline {
                 break;
             }
-            // SAFETY: the JoinHandle keeps the thread handle valid; cancelling
-            // another thread's synchronous I/O is the documented purpose.
-            let _ = unsafe { CancelSynchronousIo(thread_handle) };
+            // SAFETY: cancelling every pending I/O on our own pipe handle;
+            // the accept thread reaps the cancelled connect with
+            // GetOverlappedResult before touching its OVERLAPPED again.
+            let _ = unsafe { CancelIoEx(pipe, None) };
             if !self_connected && now - start >= ACCEPT_SHUTDOWN_TIMEOUT / 3 {
                 // Fallback: a real connection makes ConnectNamedPipe return.
                 self_connected = true;
@@ -316,8 +353,10 @@ impl PipeServer {
 
     /// Start accepting the next client connection on a background thread.
     ///
-    /// Spawns a short-lived thread that calls `ConnectNamedPipe` (blocking).
-    /// When a client connects, the thread signals `connected_event` via
+    /// Spawns a short-lived thread that issues an overlapped `ConnectNamedPipe`
+    /// and waits for it (polling `stopping` so [`shutdown`](Self::shutdown)
+    /// can always free it). When a client connects, the thread signals
+    /// `connected_event` via
     /// `SetEvent` and exits. The main thread should use
     /// [`connected_event_handle`] to obtain the event handle for
     /// `WaitForMultipleObjects`.
@@ -363,6 +402,14 @@ impl PipeServer {
             const ERROR_PIPE_CONNECTED_HRESULT: windows::core::HRESULT =
                 windows::core::HRESULT(0x8007_0217_u32 as i32);
 
+            let io_event = match EventHandle::new() {
+                Ok(e) => e,
+                Err(e) => {
+                    log::error!("PipeServer accept thread: cannot create its event: {e}");
+                    return;
+                }
+            };
+
             // Retry loop. ConnectNamedPipe can fail transiently with
             // ERROR_NO_DATA ("The pipe is being closed") when the CLI's
             // `is_daemon_running` health-check connects + disconnects in the
@@ -376,7 +423,44 @@ impl PipeServer {
             // error and the thread is killed on exit), so it cannot spin
             // forever in practice.
             loop {
-                let result = unsafe { ConnectNamedPipe(pipe, None) };
+                let _ = unsafe { ResetEvent(io_event.raw()) };
+                let mut overlapped = OVERLAPPED {
+                    hEvent: io_event.raw(),
+                    ..Default::default()
+                };
+                // SAFETY: the pipe is an overlapped handle and `overlapped`
+                // outlives the operation: every path below reaps a pending
+                // connect with GetOverlappedResult(bWait = true) before the
+                // struct goes out of scope, including after a cancel.
+                let started = unsafe { ConnectNamedPipe(pipe, Some(&mut overlapped)) };
+                let result = match started {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.code() == ERROR_PIPE_CONNECTED_HRESULT => Ok(()),
+                    Err(e) if e.code() == ERROR_IO_PENDING_HRESULT => {
+                        // Wait for a client, re-checking `stopping` so a
+                        // shutdown never depends on a cancel landing.
+                        loop {
+                            if stopping.load(Ordering::Acquire) {
+                                // SAFETY: cancels this thread's pending
+                                // connect on the pipe; reaped just below.
+                                let _ = unsafe { CancelIoEx(pipe, Some(&overlapped)) };
+                                break;
+                            }
+                            let ms = u32::try_from(ACCEPT_POLL.as_millis()).unwrap_or(50);
+                            // SAFETY: waiting on our own event handle.
+                            if unsafe { WaitForSingleObject(io_event.raw(), ms) } == WAIT_OBJECT_0 {
+                                break;
+                            }
+                        }
+                        let mut transferred = 0u32;
+                        // SAFETY: `overlapped` started an I/O on `pipe`;
+                        // bWait = true blocks until it has completed or its
+                        // cancellation has landed, so the struct is no longer
+                        // referenced by the kernel afterwards.
+                        unsafe { GetOverlappedResult(pipe, &overlapped, &mut transferred, true) }
+                    }
+                    Err(e) => Err(e),
+                };
                 // Shutdown: whether the connect was cancelled, failed or
                 // even succeeded (throwaway self-connect), leave without
                 // signalling — the main loop is no longer serving clients.
@@ -422,19 +506,22 @@ impl PipeServer {
 
     /// Read a single newline-terminated JSON message from the client.
     ///
-    /// Blocks until a full line (ending in `\n`) is received.
+    /// Blocks until a full line (ending in `\n`) is received, at most
+    /// [`SERVER_READ_TIMEOUT`].
     ///
     /// # Errors
     ///
     /// Returns an error on I/O failure or if the connection is closed
-    /// without sending a message. A line that arrives intact but does not
+    /// without sending a message. A client that stays silent for
+    /// [`SERVER_READ_TIMEOUT`] fails with [`io::ErrorKind::TimedOut`]; the
+    /// daemon disconnects it. A line that arrives intact but does not
     /// decode as a [`SocketMessage`] fails with
     /// [`io::ErrorKind::InvalidData`]; the daemon answers that one with
     /// [`unrecognised_message_response`] before disconnecting, so a newer
     /// `flow` CLI talking to an older daemon gets a reply instead of a
     /// closed pipe.
     pub fn read_message(&self) -> io::Result<SocketMessage> {
-        let line = read_line(self.pipe())?;
+        let line = read_line_overlapped(self.pipe(), Instant::now() + SERVER_READ_TIMEOUT)?;
         message::decode_message(&line).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -443,14 +530,20 @@ impl PipeServer {
         })
     }
 
-    /// Write a [`SocketResponse`] to the client as newline-delimited JSON.
+    /// Write a [`SocketResponse`] to the client as newline-delimited JSON,
+    /// bounded by `SERVER_WRITE_TIMEOUT`.
     ///
     /// # Errors
     ///
-    /// Returns an error if serialisation or the write fails.
+    /// Returns an error if serialisation or the write fails, or the client
+    /// does not drain the response in time (`TimedOut`).
     pub fn write_response(&self, response: &SocketResponse) -> io::Result<()> {
         let wire = message::encode_message(response)?;
-        write_all(self.pipe(), wire.as_bytes())
+        write_all_overlapped(
+            self.pipe(),
+            wire.as_bytes(),
+            Instant::now() + SERVER_WRITE_TIMEOUT,
+        )
     }
 
     /// Disconnect the current client so a new one can connect.
@@ -474,90 +567,21 @@ impl Drop for PipeServer {
     }
 }
 
-/// Read a single newline-terminated line from a pipe handle.
-///
-/// Blocks until a `\n` is received or the peer disconnects.
-/// Accumulates raw bytes and performs UTF-8 conversion only once at the end,
-/// avoiding corruption when a multi-byte character spans buffer boundaries.
-fn read_line(handle: HANDLE) -> io::Result<String> {
-    let mut buf = vec![0u8; BUF_SIZE as usize];
-    let mut raw: Vec<u8> = Vec::new();
-
-    loop {
-        let mut bytes_read = 0u32;
-        unsafe {
-            ReadFile(
-                handle,
-                Some(buf.as_mut_slice()),
-                Some(&mut bytes_read),
-                None,
-            )
-        }
-        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, format!("ReadFile: {e}")))?;
-
-        if bytes_read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "peer disconnected",
-            ));
-        }
-
-        raw.extend_from_slice(&buf[..bytes_read as usize]);
-
-        if raw.contains(&b'\n') {
-            break;
-        }
-    }
-
-    String::from_utf8(raw).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("non-UTF-8 data from pipe: {e}"),
-        )
-    })
-}
-
-/// Write all bytes to a pipe handle.
-fn write_all(handle: HANDLE, data: &[u8]) -> io::Result<()> {
-    let mut total_written = 0;
-    while total_written < data.len() {
-        let mut bytes_written = 0u32;
-        unsafe {
-            WriteFile(
-                handle,
-                Some(&data[total_written..]),
-                Some(&mut bytes_written),
-                None,
-            )
-        }
-        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, format!("WriteFile: {e}")))?;
-
-        if bytes_written == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "WriteFile wrote zero bytes",
-            ));
-        }
-        total_written += bytes_written as usize;
-    }
-    Ok(())
-}
-
-// ── Overlapped (deadline-bounded) client I/O ────────────────────────
+// ── Overlapped (deadline-bounded) I/O ───────────────────────────────
 //
-// The synchronous `read_line`/`write_all` above block forever: a `ReadFile`
-// on a byte-mode pipe returns only when data arrives or the peer disconnects,
-// with no timeout. That is acceptable for the *server* (whose clients are
-// one-shot `flow` invocations that always send immediately), but dangerous for
-// the *client*: if the daemon accepts the connection yet never replies, the
-// CLI — or a test's cleanup path — hangs indefinitely.
+// A synchronous `ReadFile` on a byte-mode pipe returns only when data arrives
+// or the peer disconnects, with no timeout. That is dangerous on both ends:
+// a daemon that accepts a connection yet never replies hangs the CLI — or a
+// test's cleanup path — indefinitely, and a client that connects yet never
+// writes wedged the daemon's main loop (every hotkey dead until that client
+// went away).
 //
-// The functions below service the client side of `send_message_to`. Because
-// the client handle is opened with `FILE_FLAG_OVERLAPPED` (see
-// [`connect_to_named_pipe`]), each I/O can be initiated asynchronously and
-// then awaited with a deadline. On timeout the outstanding operation is
-// cancelled via `CancelIo`, so an unresponsive daemon yields a `TimedOut`
-// error instead of a permanent hang.
+// Both handles are therefore opened with `FILE_FLAG_OVERLAPPED` (see
+// [`connect_to_named_pipe`] and [`PipeServer::create_named`]), so each I/O
+// can be initiated asynchronously and then awaited with a deadline. On
+// timeout the outstanding operation is cancelled via `CancelIo` and reaped,
+// so the unresponsive peer yields a `TimedOut` error instead of a permanent
+// hang.
 
 /// Convert a deadline (`Instant`) into the millisecond argument expected by
 /// [`WaitForSingleObject`], clamped at zero. Returns `None` if the deadline
@@ -618,22 +642,45 @@ unsafe fn await_overlapped(
         // Cancel the in-flight operation so the kernel releases the buffers,
         // then surface a timeout.
         WAIT_TIMEOUT => {
-            // SAFETY: cancelling I/O on our own client handle.
-            let _ = unsafe { CancelIo(handle) };
+            // SAFETY: cancelling this thread's I/O on our own handle, then
+            // reaping it so `overlapped` and the caller's buffer are no
+            // longer referenced by the kernel when they are dropped.
+            unsafe { cancel_and_reap(handle, overlapped) };
             Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "IPC operation timed out waiting for the daemon",
+                "IPC operation timed out waiting for the peer",
             ))
         }
         other => {
             // SAFETY: as above.
-            let _ = unsafe { CancelIo(handle) };
+            unsafe { cancel_and_reap(handle, overlapped) };
             Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 format!("WaitForSingleObject returned {other:?}"),
             ))
         }
     }
+}
+
+/// Cancel the calling thread's pending I/O on `handle` and wait for the
+/// cancellation to complete.
+///
+/// `CancelIo` only *requests* the cancel; the operation finishes
+/// asynchronously with `ERROR_OPERATION_ABORTED`. Until then the kernel may
+/// still write through `overlapped` and the buffer the I/O was started
+/// with, so they must not be freed — `GetOverlappedResult(bWait = true)`
+/// blocks until that has happened (a cancel lands within microseconds).
+///
+/// # Safety
+///
+/// `overlapped` must reference an operation started on `handle` by this
+/// thread.
+unsafe fn cancel_and_reap(handle: HANDLE, overlapped: &OVERLAPPED) {
+    // SAFETY: as documented above.
+    let _ = unsafe { CancelIo(handle) };
+    let mut transferred = 0u32;
+    // SAFETY: waits for the operation's completion (or aborted status).
+    let _ = unsafe { GetOverlappedResult(handle, overlapped, &mut transferred, true) };
 }
 
 /// Write all of `data` to an overlapped pipe handle, bounded by `deadline`.
@@ -788,7 +835,7 @@ pub fn send_message(msg: &SocketMessage) -> io::Result<SocketResponse> {
 ///
 /// # Timeout behaviour
 ///
-/// The whole request/response is bounded by [`IPC_TIMEOUT`]. The client pipe
+/// The whole request/response is bounded by `IPC_TIMEOUT`. The client pipe
 /// is opened for overlapped I/O and each read/write is awaited with that
 /// deadline; if the daemon never replies (or replies too slowly) the call
 /// returns [`io::ErrorKind::TimedOut`] instead of blocking forever. This is
@@ -799,7 +846,7 @@ pub fn send_message(msg: &SocketMessage) -> io::Result<SocketResponse> {
 ///
 /// - `ConnectionRefused` if the daemon is not running (pipe does not exist).
 /// - `TimedOut` if the daemon does not complete the round trip within
-///   [`IPC_TIMEOUT`].
+///   `IPC_TIMEOUT`.
 /// - `InvalidData` if serialisation fails or the daemon sends a malformed response.
 /// - Other I/O errors for transport failures.
 pub fn send_message_to(pipe_name: &str, msg: &SocketMessage) -> io::Result<SocketResponse> {
@@ -824,8 +871,14 @@ pub fn send_message_to(pipe_name: &str, msg: &SocketMessage) -> io::Result<Socke
 /// Check if the daemon is running by attempting to open the named pipe.
 ///
 /// Retries up to three times with a 50 ms sleep between attempts. This handles
-/// the brief window after a previous `connect_to_pipe` + drop cycle where the
+/// the brief window after a previous connect + drop cycle where the
 /// daemon may be between `DisconnectNamedPipe` and the next `ConnectNamedPipe`.
+///
+/// A pipe that exists but has no free instance — the daemon is serving
+/// another client, so `CreateFileW` fails with `ERROR_PIPE_BUSY` and
+/// `WaitNamedPipeW` with `ERROR_SEM_TIMEOUT` (121) — counts as **running**:
+/// only a live daemon can hold the pipe busy. (The AHK keymaps apply the
+/// same rule, with a cap on consecutive busy polls.)
 ///
 /// The handle is RAII-wrapped and closed immediately when dropped — no kernel
 /// handle leak.
@@ -833,8 +886,9 @@ pub fn send_message_to(pipe_name: &str, msg: &SocketMessage) -> io::Result<Socke
 /// Returns `true` if the pipe exists (daemon is running), `false` otherwise.
 #[must_use]
 pub fn is_daemon_running() -> bool {
+    let name = message::pipe_name();
     for _ in 0..3 {
-        if connect_to_pipe().is_ok() {
+        if pipe_exists(&name) {
             return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -842,12 +896,25 @@ pub fn is_daemon_running() -> bool {
     false
 }
 
-/// Open the daemon's named pipe, returning an RAII-wrapped handle.
-///
-/// Uses the pipe name from the `FLOW_PIPE_NAME` environment variable
-/// (or the default `\\.\pipe\flow`).
-fn connect_to_pipe() -> io::Result<PipeHandle> {
-    connect_to_named_pipe(&message::pipe_name())
+/// One probe of [`is_daemon_running`]: connect, or recognise a busy pipe.
+/// Never waits on a busy instance (unlike [`connect_to_named_pipe`]): busy
+/// already answers the question.
+fn pipe_exists(pipe_name: &str) -> bool {
+    match open_named_pipe(pipe_name) {
+        Ok(_handle) => true,
+        Err(e) if e.code() == HRESULT::from_win32(ERROR_PIPE_BUSY.0) => true,
+        Err(_) => {
+            // Second opinion: WaitNamedPipeW answers at once when the pipe
+            // does not exist (ERROR_FILE_NOT_FOUND) and times out with
+            // ERROR_SEM_TIMEOUT when it exists but every instance is busy.
+            let name = wide(pipe_name);
+            // SAFETY: `name` is a valid null-terminated UTF-16 path.
+            let ok = unsafe { WaitNamedPipeW(windows::core::PCWSTR(name.as_ptr()), 1) };
+            ok.as_bool()
+                || windows::core::Error::from_thread().code()
+                    == windows::core::HRESULT::from_win32(ERROR_SEM_TIMEOUT.0)
+        }
+    }
 }
 
 /// Open a named pipe by path, returning an RAII-wrapped handle.
@@ -857,8 +924,55 @@ fn connect_to_pipe() -> io::Result<PipeHandle> {
 /// [`send_message_to`]). This is what prevents an unresponsive daemon from
 /// hanging the CLI/test forever: overlapped operations are awaited with
 /// [`WaitForSingleObject`] and cancelled with [`CancelIo`] on timeout.
+///
+/// A busy pipe (every instance serving another client, or the daemon
+/// between one client's disconnect and the next accept) is waited for with
+/// `WaitNamedPipeW` and retried for up to `BUSY_CONNECT_TIMEOUT`.
+///
+/// # Errors
+///
+/// - `ConnectionRefused` ("daemon not running") when the pipe does not
+///   exist or cannot be opened for any reason other than being busy; the
+///   raw Win32 error goes to the debug log only.
+/// - `ResourceBusy` ("daemon is busy …") when it stayed busy for the whole
+///   budget.
 fn connect_to_named_pipe(pipe_name: &str) -> io::Result<PipeHandle> {
+    let deadline = Instant::now() + BUSY_CONNECT_TIMEOUT;
+    let busy = HRESULT::from_win32(ERROR_PIPE_BUSY.0);
+    loop {
+        let err = match open_named_pipe(pipe_name) {
+            Ok(handle) => return Ok(handle),
+            Err(e) => e,
+        };
+        if err.code() != busy {
+            log::debug!("connect to {pipe_name}: {err}");
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "daemon not running",
+            ));
+        }
+        let Some(ms) = ms_until(deadline) else {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!(
+                    "daemon is busy serving another client (no free pipe instance for {}s); retry shortly",
+                    BUSY_CONNECT_TIMEOUT.as_secs()
+                ),
+            ));
+        };
+        // Returns as soon as an instance is free (or when `ms` elapse);
+        // either way the next CreateFileW decides.
+        let name = wide(pipe_name);
+        // SAFETY: `name` is a valid null-terminated UTF-16 path.
+        let _ = unsafe { WaitNamedPipeW(windows::core::PCWSTR(name.as_ptr()), ms) };
+    }
+}
+
+/// One `CreateFileW` on a named pipe (overlapped), with the raw Win32 error.
+fn open_named_pipe(pipe_name: &str) -> windows::core::Result<PipeHandle> {
     let name = wide(pipe_name);
+    // SAFETY: `name` is a valid null-terminated UTF-16 path; the handle is
+    // owned by the returned PipeHandle.
     let handle = unsafe {
         CreateFileW(
             windows::core::PCWSTR(name.as_ptr()),
@@ -869,9 +983,7 @@ fn connect_to_named_pipe(pipe_name: &str) -> io::Result<PipeHandle> {
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
             None,
         )
-    }
-    .map_err(|_| io::Error::new(io::ErrorKind::ConnectionRefused, "daemon not running"))?;
-
+    }?;
     Ok(PipeHandle(handle))
 }
 
@@ -981,9 +1093,114 @@ mod tests {
     }
 
     #[test]
+    fn server_read_times_out_on_a_silent_client() {
+        // A client that connects and never writes must not wedge the
+        // daemon: read_message returns TimedOut after SERVER_READ_TIMEOUT.
+        let name = isolated_pipe_name("silent");
+        let mut server = PipeServer::create_named(&name).expect("pipe");
+        server.start_accept();
+        let _silent_client = connect_to_named_pipe(&name).expect("client connects");
+        assert_eq!(
+            unsafe { WaitForSingleObject(server.connected_event_handle(), 3_000) },
+            WAIT_OBJECT_0,
+            "accept thread must signal the connection"
+        );
+
+        let t0 = Instant::now();
+        let err = server
+            .read_message()
+            .expect_err("a silent client must time out");
+        let elapsed = t0.elapsed();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(
+            elapsed >= SERVER_READ_TIMEOUT - Duration::from_millis(200),
+            "returned too early: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+
+        // The daemon's loop then disconnects it and accepts the next one.
+        server.disconnect().expect("disconnect");
+        server.start_accept();
+        assert!(server.shutdown());
+    }
+
+    #[test]
+    fn second_client_connects_at_once_after_the_first_disconnects() {
+        // The daemon serves one client per accept: a second client arriving
+        // while the server is still between DisconnectNamedPipe and the
+        // re-armed ConnectNamedPipe sees ERROR_PIPE_BUSY and must wait for
+        // the instance instead of failing.
+        let name = isolated_pipe_name("busy");
+        let mut server = PipeServer::create_named(&name).expect("pipe");
+        server.start_accept();
+        let first = connect_to_named_pipe(&name).expect("first client");
+        assert_eq!(
+            unsafe { WaitForSingleObject(server.connected_event_handle(), 3_000) },
+            WAIT_OBJECT_0
+        );
+        drop(first);
+
+        // Second client starts connecting before the server has re-armed.
+        let second = std::thread::spawn({
+            let name = name.clone();
+            move || {
+                let t0 = Instant::now();
+                let handle = connect_to_named_pipe(&name);
+                (handle.map(|_| ()), t0.elapsed())
+            }
+        });
+        // The server loop: the busy instance is torn down and re-armed.
+        std::thread::sleep(Duration::from_millis(10));
+        server.disconnect().expect("disconnect");
+        server.start_accept();
+
+        let (result, elapsed) = second.join().expect("client thread");
+        result.expect("second client must connect");
+        assert!(elapsed < Duration::from_millis(100), "took {elapsed:?}");
+        assert_eq!(
+            unsafe { WaitForSingleObject(server.connected_event_handle(), 3_000) },
+            WAIT_OBJECT_0
+        );
+        server.disconnect().expect("disconnect");
+        assert!(server.shutdown());
+    }
+
+    #[test]
+    fn missing_pipe_is_daemon_not_running() {
+        let err = connect_to_named_pipe(&isolated_pipe_name("absent"))
+            .expect_err("no server on this name");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(err.to_string(), "daemon not running");
+    }
+
+    #[test]
+    fn server_round_trip_over_the_overlapped_pipe() {
+        // The server's overlapped read and write still carry a normal
+        // request/response.
+        let name = isolated_pipe_name("roundtrip");
+        let mut server = PipeServer::create_named(&name).expect("pipe");
+        server.start_accept();
+        let client = std::thread::spawn({
+            let name = name.clone();
+            move || send_message_to(&name, &SocketMessage::Ping)
+        });
+        assert_eq!(
+            unsafe { WaitForSingleObject(server.connected_event_handle(), 3_000) },
+            WAIT_OBJECT_0
+        );
+        let msg = server.read_message().expect("read");
+        assert!(matches!(msg, SocketMessage::Ping));
+        server.write_response(&SocketResponse::Ok).expect("write");
+        let reply = client.join().expect("client thread").expect("reply");
+        assert_eq!(reply, SocketResponse::Ok);
+        server.disconnect().expect("disconnect");
+        assert!(server.shutdown());
+    }
+
+    #[test]
     fn shutdown_immediately_after_start_accept_does_not_hang() {
         // Race variant: the thread may not have reached ConnectNamedPipe yet
-        // when shutdown is called; the re-issued CancelSynchronousIo (and the
+        // when shutdown is called; the re-issued CancelIoEx (and the
         // self-connect fallback) must still free it.
         let mut server = PipeServer::create_named(&isolated_pipe_name("race")).expect("pipe");
         server.start_accept();

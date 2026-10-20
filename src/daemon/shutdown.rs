@@ -12,7 +12,9 @@
 //!
 //! 1. `animator.cancel_and_wait()` — no further `SetWindowPos` from the
 //!    worker, so step 2 cannot be overwritten by a still-running tween.
-//! 2. [`rescue_stranded_windows`](FlowWM::rescue_stranded_windows).
+//! 2. [`rescue_stranded_windows`](FlowWM::rescue_stranded_windows) — if
+//!    step 1 was not acknowledged in time, the pass runs twice with another
+//!    bounded wait in between, so a late frame cannot undo it.
 //! 3. Drop every border overlay (`DestroyWindow`).
 //! 4. Stop the hook thread (`WM_QUIT`).
 //! 5. Kill the hotkey script and remove its pidfile, releasing the Win key.
@@ -68,7 +70,13 @@ pub struct RescueMonitor {
 ///   `None` to fall back to the anchor's monitor. Before `FlowWM` exists no
 ///   workspace bookkeeping is available, so pass `|_| None`.
 ///
-/// Returns the number of windows moved.
+/// Minimized windows ([`minimized_windows`](WindowRegistry::minimized_windows))
+/// get a second pass: their `WINDOWPLACEMENT` normal position is clamped
+/// on-screen (see
+/// [`rescue_minimized_placement`](crate::rescue::rescue_minimized_placement))
+/// without un-minimizing them.
+///
+/// Returns the number of windows moved or re-anchored.
 pub fn rescue_stranded_windows_with(
     registry: &WindowRegistry,
     virtual_screen: Rect,
@@ -103,8 +111,33 @@ pub fn rescue_stranded_windows_with(
             rescued += 1;
         }
     }
-    log::info!("shutdown rescue: brought {rescued} stranded window(s) back on-screen");
-    rescued
+    let mut re_anchored = 0_usize;
+    for (hwnd_val, invisible_bounds) in registry.minimized_windows() {
+        let hwnd = HWND(hwnd_val as *mut _);
+        let owner = owner_of(WindowId(hwnd_val)).filter(|i| *i < monitors.len());
+        match crate::rescue::rescue_minimized_placement(hwnd, invisible_bounds, monitors, owner) {
+            Ok(Some((from, to))) => {
+                log::info!(
+                    "shutdown rescue: re-anchored minimized hwnd {hwnd_val} from ({},{}) to ({},{})",
+                    from.x,
+                    from.y,
+                    to.x,
+                    to.y
+                );
+                re_anchored += 1;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                log::warn!(
+                    "shutdown rescue: placement of minimized hwnd {hwnd_val} not fixed: {e}"
+                );
+            }
+        }
+    }
+    log::info!(
+        "shutdown rescue: brought {rescued} stranded window(s) back on-screen, re-anchored {re_anchored} minimized window(s)"
+    );
+    rescued + re_anchored
 }
 
 /// Index of the monitor whose screen rect contains `rect`'s centre, else the
@@ -140,16 +173,42 @@ impl FlowWM {
     /// 3. Otherwise, move it to its `pre_manage_rect` anchor, clamped into the
     ///    `work_area` if the anchor is itself off-screen.
     ///
-    /// `Ignored`, `Minimized`, and `Hidden` windows never reach this loop — the
-    /// registry accessor filters them out, since flow does not actively place
-    /// them.
+    /// `Ignored` and `Hidden` windows never reach this loop — the registry
+    /// accessor filters them out, since flow does not actively place them.
+    /// `Minimized` windows get their restore placement re-anchored instead
+    /// (see `rescue_stranded_windows_with`).
     ///
     /// Failures (window vanished mid-loop, `SetWindowPos` rejected) are logged
     /// at `warn` and skipped: one bad window must not abort the rescue pass.
+    ///
+    /// If the animator does not acknowledge the cancel within its timeout, a
+    /// frame may still land after the first pass; the pass is then run a
+    /// second time after another bounded wait.
     pub fn rescue_stranded_windows(&mut self) -> usize {
         // Stop the worker first: a tween still in flight would otherwise
         // re-apply its interpolated rects over the rescued positions.
-        self.animator.cancel_and_wait();
+        let acknowledged = self.animator.cancel_and_wait();
+        let rescued = self.rescue_stranded_windows_pass();
+        if acknowledged {
+            return rescued;
+        }
+        // The worker was silent (wedged in a backend call, or dead). Give it
+        // one more bounded chance to drain, then undo whatever a late frame
+        // may have re-applied.
+        let late_ack = self.animator.cancel_and_wait();
+        log::warn!(
+            "shutdown rescue: animator did not acknowledge the cancel before the first pass ({}); running the rescue again",
+            if late_ack {
+                "acknowledged now"
+            } else {
+                "still silent"
+            }
+        );
+        rescued + self.rescue_stranded_windows_pass()
+    }
+
+    /// One rescue pass over the current registry and monitor geometry.
+    fn rescue_stranded_windows_pass(&mut self) -> usize {
         // "Stranded" means off every monitor, not merely off the active one:
         // a window parked beyond the virtual screen must come back, a window
         // that lives on another monitor must be left alone.
@@ -172,7 +231,7 @@ impl FlowWM {
     }
 
     /// Hand the desktop back to plain Windows: the single teardown used by
-    /// every exit path (see the [module docs](self) for the order and why).
+    /// every exit path (see the module docs for the order and why).
     ///
     /// `reason` is logged (at `info` for a clean stop, `error` otherwise)
     /// and is what the status file will carry. Every step is best-effort

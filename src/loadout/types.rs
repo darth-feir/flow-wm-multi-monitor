@@ -204,6 +204,45 @@ mod tests {
         assert!(!json.contains("class"));
     }
 
+    /// A file written by a single-monitor build has no `monitor` field: it
+    /// deserialises to the primary (0) instead of being rejected.
+    #[test]
+    fn workspace_monitor_field_defaults_to_zero_when_absent() {
+        let json = r#"{
+            "workspace_id": 3,
+            "active": false,
+            "scrolling": { "viewport_offset": 0, "focus": null, "columns": [] },
+            "floating": []
+        }"#;
+        let ws: WorkspaceSnapshot = serde_json::from_str(json).expect("legacy snapshot loads");
+        assert_eq!(ws.monitor, 0);
+        assert_eq!(ws.workspace_id, 3);
+    }
+
+    /// A non-zero monitor index survives save → load unchanged.
+    #[test]
+    fn workspace_monitor_field_round_trips() {
+        let file = LoadoutFile {
+            version: LoadoutFile::CURRENT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                monitor: 2,
+                workspace_id: 1,
+                active: true,
+                scrolling: ScrollingSnapshot {
+                    viewport_offset: 0,
+                    focus: None,
+                    columns: vec![],
+                },
+                floating: vec![],
+            }],
+        };
+        let json = serde_json::to_string(&file).expect("serialize");
+        assert!(json.contains("\"monitor\":2"), "{json}");
+        let restored: LoadoutFile = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.workspaces[0].monitor, 2);
+        assert_eq!(restored.workspaces[0].workspace_id, 1);
+    }
+
     /// Round-trip an empty loadout (no workspaces).
     // Positive: empty loadout round-trips without loss.
     #[test]

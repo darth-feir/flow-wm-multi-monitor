@@ -23,7 +23,7 @@ features.
 | Remaining IPC stubs | 🜂 Near-term | `PlaceAbove`, `QueryState`, `CheckConfig`, `SetConfigValue`, `ForgetApp`/`ForgetAllApps` |
 | Floating enhancements | 🜂 Near-term | smart placement, size memory, z-order, gap mgmt |
 | Real cross-column `MoveWindow` | 🜂 Near-term | Left/Right aliased to swap-column; row-preserving move + floating nudge pending |
-| Multi-monitor support | ✅ Baseline | one `Monitor` + scrolling space per display; windows tile on the monitor they appear on; parked columns and parked workspaces stay off every monitor (neighbours modelled on all four sides); cross-monitor focus/move commands pending |
+| Multi-monitor support | ✅ Done | one `Monitor` + scrolling space per display; windows tile on the monitor they appear on; parked columns and parked workspaces stay off every monitor (neighbours modelled on all four sides); cross-monitor focus/move commands (`focus-monitor`, `move-to-monitor`, edge hops) — see [Command Reference › Monitors](../user-guide/dispatch-reference.md#monitors) |
 | Monitor hotplug | ✅ Done | `WM_DISPLAYCHANGE` / `SPI_SETWORKAREA` debounced into one reconcile: monitors matched by handle → rect → primary, survivors re-projected in place, windows of a vanished display migrated to the monitor Windows reports for them (else the primary), owner memory remapped, everything re-seated instantly — see [IPC & fail-back](./ipc-and-watchdog.md#monitor-hotplug) |
 | Cloak parked windows (`DWMWA_CLOAK`) | ◷ Mid-term | read side exists; write side missing |
 | Watchdog + recovery snapshot | ◷ Mid-term | not started; gated on `flow`/`flowd` being complete |

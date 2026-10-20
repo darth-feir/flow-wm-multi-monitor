@@ -33,14 +33,15 @@
 //! - [`dispatch`] — IPC command dispatch router and action handlers
 //! - [`query`] — query handlers (extracted from dispatch)
 //! - [`edge_scroll`] — pure, clock-injectable edge-scroll auto-repeat scheduler
-//! - [`hotplug`] — display-topology changes: debounce, re-enumerate, match
+//! - `hotplug` — display-topology changes: debounce, re-enumerate, match
 //!   monitors, migrate the windows of a vanished display
-//!   ([`FlowWM::reconcile_monitors`])
+//!   (`FlowWM::reconcile_monitors`)
 //! - [`animation`] — animation bridge ([`FlowWM::animate_layout`])
 //! - [`config_derive`] — configuration derivation helpers and tests
-//! - [`shutdown`] — graceful-shutdown window rescue and fail-back
+//! - `shutdown` — graceful-shutdown window rescue and fail-back
 //!   ([`FlowWM::rescue_stranded_windows`], [`FlowWM::fail_back`])
-//! - [`session`] — session-end / console-control signals ([`session::SessionSink`])
+//! - [`session`] — session-end / console-control signals (`SessionSink`,
+//!   the phase-1 logoff rescue)
 //! - [`startup`] — staged startup reporting ([`StartupStage`],
 //!   [`StartupError`], the `flowd.status` file, `FLOW_FAIL_AT` injection)
 //!
@@ -62,10 +63,9 @@ mod new;
 mod query;
 mod run;
 pub mod session;
-pub mod shutdown;
+pub(crate) mod shutdown;
 pub mod startup;
 mod types;
 
-pub use run::RunExit;
 pub use startup::{StartupError, StartupReporter, StartupStage};
 pub use types::FlowWM;

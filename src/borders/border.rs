@@ -18,7 +18,8 @@
 //! See `docs/src/dev-guide/borders.md` for the threading model and the
 //! "daemon commands, border obeys" principle.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -65,9 +66,11 @@ static OVERLAY_CLASS_ATOM: OnceLock<u16> = OnceLock::new();
 /// graceful-exit signals: each one calls
 /// [`request_shutdown`](crate::registry::hooks::request_shutdown) so the
 /// main loop runs the normal rescue path instead of letting logoff strand
-/// parked windows. `WM_QUERYENDSESSION` answers `TRUE` (we never veto a
-/// logoff); `WM_CLOSE` returns without destroying the overlay (the daemon
-/// drops it during fail-back). `WM_DISPLAYCHANGE` and
+/// parked windows. `WM_QUERYENDSESSION` first runs the synchronous phase-1
+/// rescue ([`rescue_on_session_end`](crate::daemon::session::rescue_on_session_end),
+/// once per process) and answers `TRUE` (we never veto a logoff);
+/// `WM_CLOSE` returns without destroying the overlay (the daemon drops it
+/// during fail-back). `WM_DISPLAYCHANGE` and
 /// `WM_SETTINGCHANGE(SPI_SETWORKAREA)` report a display-topology change via
 /// [`request_topology_refresh`](crate::registry::hooks::request_topology_refresh)
 /// — an overlay may receive them before the session sink does, and the
@@ -83,6 +86,13 @@ static OVERLAY_CLASS_ATOM: OnceLock<u16> = OnceLock::new();
 /// until the IPC thread dispatches it here, so all `BorderInner` access
 /// remains single-threaded and the mutexes are uncontended.
 ///
+/// # Panics
+///
+/// Never unwinds into Windows: the body runs under [`catch_unwind`], and a
+/// panic (logged) requests a shutdown and lets the message fall through to
+/// `DefWindowProcW` — unwinding out of an `extern "system"` callback would
+/// abort the process with no fail-back.
+///
 /// # Safety
 ///
 /// Called by Windows. Must match the `WindowProc` signature exactly.
@@ -92,6 +102,34 @@ unsafe extern "system" fn overlay_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    match catch_unwind(AssertUnwindSafe(|| {
+        overlay_wnd_proc_body(hwnd, msg, wparam, lparam)
+    })) {
+        Ok(result) => result,
+        Err(payload) => {
+            log::error!(
+                "border overlay: window procedure panicked on message {msg:#x}: {}; requesting shutdown",
+                crate::animation::panic_payload_message(payload.as_ref())
+            );
+            crate::registry::hooks::request_shutdown();
+            // SAFETY: pass-through with unchanged arguments.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+    }
+}
+
+/// Lock a mutex, recovering the data if a panicking thread poisoned it.
+///
+/// Every mutex here guards plain values (a raw HWND, a style, a cached
+/// surface) that stay consistent whatever a panic interrupted, so a poisoned
+/// lock is not a reason to panic again — least of all inside a window
+/// procedure or the fail-back that destroys the overlays.
+fn lock_tolerant<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The body of [`overlay_wnd_proc`], free to panic.
+fn overlay_wnd_proc_body(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_SIZE {
         // SAFETY: GWLP_USERDATA was set in `Border::create`. The stored
         // pointer is valid for the HWND's lifetime because `BorderInner::drop`
@@ -114,7 +152,7 @@ unsafe extern "system" fn overlay_wnd_proc(
             return LRESULT(0);
         }
         WM_QUERYENDSESSION => {
-            crate::registry::hooks::request_shutdown();
+            crate::daemon::session::rescue_on_session_end(hwnd);
             return LRESULT(1);
         }
         WM_ENDSESSION => {
@@ -156,7 +194,7 @@ fn ensure_window_class_registered() -> Result<(), String> {
     }
     // Double-checked locking: hold the lock only for the actual registration
     // so the common (already-registered) path is lock-free.
-    let _guard = OVERLAY_CLASS_LOCK.lock().expect("class lock poisoned");
+    let _guard = lock_tolerant(&OVERLAY_CLASS_LOCK);
     if OVERLAY_CLASS_ATOM.get().is_some() {
         return Ok(());
     }
@@ -349,7 +387,7 @@ impl Border {
     /// animator's `SetWindowPos`-based backend moves them like any other).
     #[must_use]
     pub(crate) fn hwnd(&self) -> isize {
-        *self.inner.overlay.lock().expect("overlay mutex poisoned")
+        *lock_tolerant(&self.inner.overlay)
     }
 
     /// Returns the target window's corner-rounding preference, cached at
@@ -375,7 +413,7 @@ impl Border {
     /// only. Safe to call with a destroyed overlay or target — the call fails
     /// and is ignored at `trace` level by the caller's expectation.
     pub(crate) fn seat_above_target(&self) {
-        let raw = *self.inner.overlay.lock().expect("overlay mutex poisoned");
+        let raw = *lock_tolerant(&self.inner.overlay);
         if raw == 0 {
             return;
         }
@@ -400,7 +438,7 @@ impl Border {
 
 impl Drop for BorderInner {
     fn drop(&mut self) {
-        let mut guard = self.overlay.lock().expect("overlay mutex poisoned");
+        let mut guard = lock_tolerant(&self.overlay);
         let raw = *guard;
         if raw == 0 {
             return;
@@ -430,7 +468,7 @@ impl BorderInner {
     /// Returns `None` if the overlay is destroyed or `GetWindowRect` fails
     /// (e.g. during shutdown races); the caller treats that as a no-op paint.
     fn overlay_rect(&self) -> Option<Rect> {
-        let raw = *self.overlay.lock().expect("overlay mutex poisoned");
+        let raw = *lock_tolerant(&self.overlay);
         if raw == 0 {
             return None;
         }
@@ -478,14 +516,14 @@ impl BorderInner {
         if w <= 0 || h <= 0 {
             return;
         }
-        let raw = *self.overlay.lock().expect("overlay mutex poisoned");
+        let raw = *lock_tolerant(&self.overlay);
         if raw == 0 {
             return;
         }
         let overlay_hwnd = HWND(raw as *mut _);
-        let style = *self.style.lock().expect("style mutex poisoned");
+        let style = *lock_tolerant(&self.style);
 
-        let mut surface_guard = self.surface.lock().expect("surface mutex poisoned");
+        let mut surface_guard = lock_tolerant(&self.surface);
         let shape_matches = surface_guard
             .as_ref()
             .is_some_and(|s| s.shape_matches(w, h, &style));
@@ -574,7 +612,7 @@ impl Border {
         if visible_rect.is_empty() {
             return;
         }
-        let raw = *self.inner.overlay.lock().expect("overlay mutex poisoned");
+        let raw = *lock_tolerant(&self.inner.overlay);
         if raw == 0 {
             return;
         }
@@ -626,7 +664,7 @@ impl Border {
         // `on_focus_changed` refresh only the prev/new focus windows without
         // forcing redundant repaints.
         {
-            let mut guard = self.inner.style.lock().expect("style mutex poisoned");
+            let mut guard = lock_tolerant(&self.inner.style);
             if *guard == style {
                 return;
             }
@@ -640,7 +678,7 @@ impl Border {
 
     /// Show or hide the overlay (used for minimize/restore).
     pub(crate) fn set_visible(&self, visible: bool) {
-        let raw = *self.inner.overlay.lock().expect("overlay mutex poisoned");
+        let raw = *lock_tolerant(&self.inner.overlay);
         if raw == 0 {
             return;
         }

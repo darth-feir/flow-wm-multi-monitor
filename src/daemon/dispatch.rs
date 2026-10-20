@@ -552,7 +552,7 @@ impl FlowWM {
             if self.registry.is_tracked(candidate.0) && is_live(candidate.0) {
                 return Some(candidate);
             }
-            log::warn!(
+            log::debug!(
                 "focus_monitor: dropping dead window {} from monitor {target}",
                 candidate.0
             );

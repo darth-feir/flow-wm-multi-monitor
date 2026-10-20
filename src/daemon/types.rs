@@ -13,7 +13,7 @@ use crate::config::types::FlowConfig;
 use crate::ipc::transport::PipeServer;
 use crate::registry::WindowRegistry;
 use crate::registry::hooks::{HookSignal, HookThreadHandle};
-use crate::workspace::{FloatingSpace, Monitor, ScrollingSpace, Workspace};
+use crate::workspace::{FloatingSpace, Monitor, ScrollingSpace};
 
 /// Intermediate struct holding layout engine parameters derived from
 /// [`FlowConfig`]. Used during construction to keep the parameter list
@@ -156,8 +156,8 @@ pub struct FlowWM {
     /// The invisible top-level window that receives `WM_QUERYENDSESSION` /
     /// `WM_ENDSESSION` / `WM_CLOSE` so logoff and shutdown always trigger
     /// the rescue, even when no border overlay exists. Destroyed on drop.
-    #[allow(dead_code)] // RAII: held only so its Drop runs with the daemon's.
-    pub(super) session_sink: super::session::SessionSink,
+    /// RAII: held only so its `Drop` runs with the daemon's.
+    pub(super) _session_sink: super::session::SessionSink,
 
     /// The hotkey script launched by this daemon (`flowd --ahk`), living in
     /// a kill-on-close job object. `None` when not requested, not found, or
@@ -476,19 +476,6 @@ impl FlowWM {
     /// This is the workspace every IPC command and hook event operates on
     /// by default. Workspace-switching commands (`switch-workspace`,
     /// `move-to-workspace`) reassign the active index before animating.
-    #[must_use]
-    #[allow(dead_code)] // API surface: float paths now resolve the owning monitor explicitly.
-    pub(super) fn active_workspace(&self) -> &Workspace {
-        self.active_monitor().active_workspace()
-    }
-
-    /// Mutably borrow the active workspace of the active monitor.
-    #[must_use]
-    #[allow(dead_code)] // API surface: float paths now resolve the owning monitor explicitly.
-    pub(super) fn active_workspace_mut(&mut self) -> &mut Workspace {
-        self.active_monitor_mut().active_workspace_mut()
-    }
-
     /// Borrow the scrolling space of the active workspace.
     ///
     /// This is the primary accessor the daemon's hook and dispatch handlers

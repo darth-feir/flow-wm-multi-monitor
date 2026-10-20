@@ -44,11 +44,12 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetCursorPos, GetDesktopWindow,
-    GetForegroundWindow, GetShellWindow, GetSystemMetrics, GetWindowLongW, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-    IsWindowVisible, IsZoomed, PostMessageW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_CLOSE, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_THICKFRAME,
+    GetForegroundWindow, GetShellWindow, GetSystemMetrics, GetWindowLongW, GetWindowPlacement,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow, SetWindowPlacement, SetWindowPos,
+    ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT, WM_CLOSE, WS_CAPTION,
+    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_THICKFRAME,
 };
 use windows::core::PWSTR;
 
@@ -455,6 +456,8 @@ pub fn is_window(hwnd_val: isize) -> bool {
     if hwnd_val == 0 {
         return false;
     }
+    // SAFETY: IsWindow accepts any handle value and only reports whether it
+    // currently names a window; no memory is dereferenced.
     unsafe { IsWindow(Some(HWND(hwnd_val as *mut _))) }.as_bool()
 }
 
@@ -653,6 +656,8 @@ fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> bool {
 /// neither exists or both calls were refused.
 #[must_use]
 pub fn clear_foreground_window() -> bool {
+    // SAFETY: GetDesktopWindow takes no arguments and returns the handle of
+    // the desktop window (never invalid while a session is running).
     let desktop = unsafe { GetDesktopWindow() };
     let desktop = (!desktop.0.is_null()).then_some(desktop.0 as isize);
     for (name, hwnd) in [("shell", get_shell_window()), ("desktop", desktop)] {
@@ -978,6 +983,8 @@ pub fn is_cloaked(hwnd: HWND) -> bool {
 pub fn is_fullscreen(hwnd: HWND) -> Result<bool, String> {
     let rect = get_window_rect(hwnd)?;
 
+    // SAFETY: GetSystemMetrics is a pure query over a system constant and
+    // cannot fail for the primary-screen metrics.
     let screen_cx = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let screen_cy = unsafe { GetSystemMetrics(SM_CYSCREEN) };
 
@@ -1272,6 +1279,8 @@ pub fn get_primary_monitor_info() -> Result<MonitorGeometry, String> {
     };
 
     // NULL hwnd + MONITOR_DEFAULTTOPRIMARY → primary display monitor.
+    // SAFETY: MonitorFromWindow tolerates a null HWND; with
+    // MONITOR_DEFAULTTOPRIMARY it then resolves to the primary monitor.
     let hmonitor = unsafe { MonitorFromWindow(HWND::default(), MONITOR_DEFAULTTOPRIMARY) };
 
     // cbSize must be set before the call; the rects are filled in by Win32.
@@ -1341,6 +1350,9 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorGeometry>, String> {
     }
 
     let mut handles: Vec<HMONITOR> = Vec::new();
+    // SAFETY: `collect` matches MONITORENUMPROC; `handles` outlives the
+    // synchronous enumeration, and lparam carries its address only for the
+    // duration of the call.
     let ok = unsafe {
         EnumDisplayMonitors(
             None,
@@ -1382,6 +1394,7 @@ pub fn virtual_screen_rect() -> Rect {
         GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
         SM_YVIRTUALSCREEN,
     };
+    // SAFETY: GetSystemMetrics is a pure query over system constants.
     unsafe {
         Rect {
             x: GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -1397,7 +1410,101 @@ pub fn virtual_screen_rect() -> Rect {
 #[must_use]
 pub fn monitor_handle_for_window(hwnd: HWND) -> isize {
     use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+    // SAFETY: MonitorFromWindow accepts any HWND value (a dead handle still
+    // yields the nearest monitor under MONITOR_DEFAULTTONEAREST).
     unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }.0 as isize
+}
+
+/// A window's `WINDOWPLACEMENT`: its show state and the "normal" (restored)
+/// rect Windows keeps while the window is minimized or maximized.
+///
+/// `rcNormalPosition` is in *workspace* coordinates — screen coordinates
+/// offset by the primary monitor's work-area origin (identical to screen
+/// coordinates with a bottom or right taskbar). The rescue passes convert
+/// with `rescue::workspace_offset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowPlacement {
+    /// `showCmd`: `SW_SHOWMINIMIZED`, `SW_SHOWNORMAL`, … (kept verbatim so a
+    /// write-back never changes the show state).
+    pub show_cmd: u32,
+    /// `WINDOWPLACEMENT.flags`, kept verbatim.
+    pub flags: u32,
+    /// `ptMinPosition` (x, y).
+    pub min_position: (i32, i32),
+    /// `ptMaxPosition` (x, y).
+    pub max_position: (i32, i32),
+    /// `rcNormalPosition` as a rect (workspace coordinates).
+    pub normal_position: Rect,
+}
+
+/// Read a window's placement (`GetWindowPlacement`).
+///
+/// The one way to learn where a *minimized* window will reappear:
+/// `GetWindowRect` reports the iconic (-32000, -32000) position, while the
+/// placement's normal rect is what `ShowWindow(SW_RESTORE)` uses.
+///
+/// # Errors
+///
+/// Returns the Win32 error as a string (dead or inaccessible window).
+pub fn get_window_placement(hwnd: HWND) -> Result<WindowPlacement, String> {
+    let mut wp = WINDOWPLACEMENT {
+        length: size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `wp.length` is set as the API requires and `wp` outlives the
+    // call; GetWindowPlacement only writes into it.
+    unsafe { GetWindowPlacement(hwnd, &mut wp) }
+        .map_err(|e| format!("GetWindowPlacement failed: {e}"))?;
+    let r = wp.rcNormalPosition;
+    Ok(WindowPlacement {
+        show_cmd: wp.showCmd,
+        flags: wp.flags.0,
+        min_position: (wp.ptMinPosition.x, wp.ptMinPosition.y),
+        max_position: (wp.ptMaxPosition.x, wp.ptMaxPosition.y),
+        normal_position: Rect {
+            x: r.left,
+            y: r.top,
+            width: r.right - r.left,
+            height: r.bottom - r.top,
+        },
+    })
+}
+
+/// Write a window's placement (`SetWindowPlacement`).
+///
+/// Passing back a placement read with [`get_window_placement`] whose
+/// `normal_position` was changed moves where a minimized window will be
+/// restored **without** un-minimizing it, because `show_cmd` is written
+/// verbatim.
+///
+/// # Errors
+///
+/// Returns the Win32 error as a string.
+pub fn set_window_placement(hwnd: HWND, placement: &WindowPlacement) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::WINDOWPLACEMENT_FLAGS;
+    let n = placement.normal_position;
+    let wp = WINDOWPLACEMENT {
+        length: size_of::<WINDOWPLACEMENT>() as u32,
+        flags: WINDOWPLACEMENT_FLAGS(placement.flags),
+        showCmd: placement.show_cmd,
+        ptMinPosition: POINT {
+            x: placement.min_position.0,
+            y: placement.min_position.1,
+        },
+        ptMaxPosition: POINT {
+            x: placement.max_position.0,
+            y: placement.max_position.1,
+        },
+        rcNormalPosition: RECT {
+            left: n.x,
+            top: n.y,
+            right: n.right(),
+            bottom: n.bottom(),
+        },
+    };
+    // SAFETY: a fully-initialised WINDOWPLACEMENT with the correct `length`;
+    // SetWindowPlacement only reads it.
+    unsafe { SetWindowPlacement(hwnd, &wp) }.map_err(|e| format!("SetWindowPlacement failed: {e}"))
 }
 
 #[cfg(test)]

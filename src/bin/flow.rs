@@ -74,7 +74,7 @@ enum Commands {
         /// redirects all of its logging to this exact file (truncated on each
         /// start) instead of the default date-stamped log — useful for
         /// capturing a clean, isolated debug log for a single run. The log
-        /// level is still controlled by the `RUST_LOG` environment variable.
+        /// level comes from `--verbose` / `--log-level` (else `RUST_LOG`).
         #[arg(long, value_name = "PATH")]
         log_file: Option<String>,
         /// Also launch the user's `flow.ahk` keybinding script once the daemon
@@ -103,8 +103,14 @@ enum Commands {
         log_level: Option<String>,
     },
     /// Stop the running flowd daemon (and the hotkey script, if one is
-    /// recorded in `flow.ahk.pid`).
+    /// recorded in `flow.ahk.pid`). Returns once the daemon process has
+    /// exited, so `flow start` can follow immediately.
     Stop {
+        /// Config directory path (where `flowd.status` and `flow.ahk.pid`
+        /// live). Overrides FLOW_CONFIG_DIR env var and default path; resolve
+        /// it the same way the daemon was started.
+        #[arg(long)]
+        config: Option<String>,
         /// Accepted for compatibility; the hotkey script is always stopped.
         #[arg(long, hide = true)]
         ahk: bool,
@@ -121,7 +127,9 @@ enum Commands {
         force: bool,
     },
     /// Check that the daemon is alive: prints its version, pid, monitor
-    /// count and registered-hook count. Exits non-zero if it does not answer.
+    /// count, registered-hook count and — when the daemon launched the
+    /// hotkey script — the flow.ahk pid. Exits non-zero if it does not
+    /// answer.
     Ping,
     /// Save or restore a window arrangement (a "loadout").
     Loadout {
@@ -454,7 +462,7 @@ fn main() {
                 }
             }
         }
-        Commands::Stop { ahk: _ } => cmd_stop(),
+        Commands::Stop { config, ahk: _ } => cmd_stop(config),
         Commands::Rescue { force } => cmd_rescue(force),
         Commands::Ping => cmd_ping(),
         Commands::Loadout { command } => cmd_loadout(command),
@@ -737,7 +745,7 @@ fn preflight_config_check(config_dir: &Path) -> Result<config::FlowConfig, Strin
     let config = match config::load_app_config(&app_path) {
         Ok(c) => c,
         // Fatal: surface why+where and refuse to spawn.
-        Err(e) => return Err(format!("flow: cannot start: {e}")),
+        Err(e) => return Err(format!("cannot start: {e}")),
     };
 
     let rules_path = config::dirs::user_rules_path_in(config_dir);
@@ -752,33 +760,59 @@ fn preflight_config_check(config_dir: &Path) -> Result<config::FlowConfig, Strin
 /// file no longer `ready`) before cleaning up a leftover hotkey script.
 const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Send a Stop message to the daemon, wait for it to finish, then clean up
-/// a leftover hotkey script.
+/// Send a Stop message to the daemon, wait for it to be gone, then clean
+/// up a leftover hotkey script.
+///
+/// `config` is resolved exactly like `flow start --config` (flag, then
+/// `FLOW_CONFIG_DIR`, then the default), so the status file and pidfile
+/// consulted are the running daemon's.
 ///
 /// The daemon is the one that kills its script (during fail-back, which runs
 /// after it has acknowledged `Stop`). So this waits — up to
 /// [`DAEMON_STOP_TIMEOUT`] — for the daemon's status file to leave `ready`
-/// (it becomes `stopped`), and only then runs
-/// [`autostart::stop_ahk_script`]: that finds a pidfile only if the daemon
-/// did not launch the script itself (an older `flow start --ahk`) or died
-/// before removing it, and it treats an already-exited pid as nothing to do.
-/// Nothing is printed when there was nothing to stop.
+/// (it becomes `stopped`), then for the daemon **process** itself to exit
+/// (the status flips a moment before the pipe handle is closed, and `flow
+/// start` right after needs the pipe gone), and only then runs
+/// [`autostart::stop_ahk_script_in`]: that finds a pidfile only if the
+/// daemon did not launch the script itself (an older `flow start --ahk`) or
+/// died before removing it, and it treats an already-exited or reused pid
+/// as nothing to do. Nothing is printed when there was nothing to stop.
 ///
 /// # Errors
 ///
 /// Returns an error string if the daemon cannot be reached, or if
 /// terminating a still-live recorded AHK process fails.
-fn cmd_stop() -> Result<(), String> {
+fn cmd_stop(config: Option<String>) -> Result<(), String> {
+    let config_dir = config::dirs::resolve_config_dir(config.as_deref().map(Path::new));
+    // The pid to wait on: ask the daemon itself, else trust its status file.
+    let daemon_pid = match transport::send_message(&SocketMessage::Ping) {
+        Ok(SocketResponse::Pong { pid, .. }) => Some(pid),
+        _ => startup::read_status(&config_dir).map(|st| st.pid),
+    };
     send_command(SocketMessage::Stop, "daemon stopped")?;
-    let config_dir = config::dirs::resolve_config_dir(None);
+    let deadline = std::time::Instant::now() + DAEMON_STOP_TIMEOUT;
     if !wait_for_daemon_stop(&config_dir, DAEMON_STOP_TIMEOUT) {
         eprintln!("flow: warning: the daemon has not reported its stop yet; cleaning up anyway");
     }
-    if autostart::stop_ahk_script()? {
+    if let Some(pid) = daemon_pid {
+        let remaining = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .max(DAEMON_EXIT_MIN_WAIT);
+        if !autostart::wait_for_process_exit(pid, remaining) {
+            eprintln!(
+                "flow: warning: the daemon (pid {pid}) is still running; `flow start` may fail until it exits"
+            );
+        }
+    }
+    if autostart::stop_ahk_script_in(&config_dir)? {
         println!("flow: stopped flow.ahk");
     }
     Ok(())
 }
+
+/// Least time `flow stop` grants the daemon process to exit after its
+/// status flipped, even when the status wait used up the whole budget.
+const DAEMON_EXIT_MIN_WAIT: Duration = Duration::from_millis(500);
 
 /// Poll the status file until it no longer says `ready`/`starting`, or the
 /// pipe has gone away, or `timeout` elapses. Returns `true` when the daemon
@@ -815,37 +849,67 @@ fn daemon_finished(state: StartupState) -> bool {
 /// Returns an error string if a daemon is running (without `--force`) or
 /// if windows / monitors cannot be enumerated.
 fn cmd_rescue(force: bool) -> Result<(), String> {
-    if !force && transport::is_daemon_running() {
+    let text = cmd_rescue_with(
+        force,
+        transport::is_daemon_running,
+        rescue::rescue_offscreen_windows,
+    )?;
+    print!("{text}");
+    Ok(())
+}
+
+/// [`cmd_rescue`] over injectable probes: `daemon_running` is consulted
+/// only when `force` is false, and `run_rescue` only when the rescue is
+/// allowed to go ahead. Returns the text to print.
+fn cmd_rescue_with(
+    force: bool,
+    daemon_running: impl FnOnce() -> bool,
+    run_rescue: impl FnOnce() -> Result<rescue::RescueReport, String>,
+) -> Result<String, String> {
+    if !force && daemon_running() {
         return Err(
             "a daemon is running; use `flow stop` (it rescues on exit) or `flow rescue --force`"
                 .to_owned(),
         );
     }
-    let report = rescue::rescue_offscreen_windows()?;
-    print!("{}", format_rescue_report(&report));
-    Ok(())
+    Ok(format_rescue_report(&run_rescue()?))
 }
 
 /// The lines `flow rescue` prints for a report.
 fn format_rescue_report(report: &rescue::RescueReport) -> String {
     let mut out = String::new();
-    if report.moved.is_empty() {
+    if report.moved.is_empty() && report.minimized.is_empty() {
         out.push_str(&format!(
             "flow: no off-screen windows ({} window(s) checked)\n",
             report.scanned
         ));
         return out;
     }
-    out.push_str(&format!(
-        "flow: moved {} off-screen window(s) back on-screen ({} checked):\n",
-        report.moved.len(),
-        report.scanned
-    ));
-    for w in &report.moved {
+    if !report.moved.is_empty() {
         out.push_str(&format!(
-            "  {:?}  ({},{}) -> ({},{})\n",
-            w.title, w.from.x, w.from.y, w.to.x, w.to.y
+            "flow: moved {} off-screen window(s) back on-screen ({} checked):\n",
+            report.moved.len(),
+            report.scanned
         ));
+        for w in &report.moved {
+            out.push_str(&format!(
+                "  {:?}  ({},{}) -> ({},{})\n",
+                w.title, w.from.x, w.from.y, w.to.x, w.to.y
+            ));
+        }
+    }
+    if !report.minimized.is_empty() {
+        out.push_str(&format!(
+            "flow: re-anchored {} minimized window(s) whose restore position was off-screen ({} checked):\n",
+            report.minimized.len(),
+            report.scanned
+        ));
+        for w in &report.minimized {
+            out.push_str(&format!(
+                "  {:?}  ({},{}) -> ({},{})  (still minimized)\n",
+                w.title, w.from.x, w.from.y, w.to.x, w.to.y
+            ));
+        }
     }
     out
 }
@@ -1416,7 +1480,9 @@ fn find_daemon_exe() -> Result<std::path::PathBuf, String> {
 ///    reused for `flow`'s own exit.
 /// 2. `<config_dir>/flowd.status` with `pid == child.id()` — a stale file
 ///    from an earlier daemon is ignored. `state: error` fails immediately
-///    with the reported stage; `state: ready` moves on to step 3.
+///    with the reported stage; `state: ready` moves on to step 3. No file
+///    of ours at all (the daemon could not write it) also moves on to step
+///    3: a `Pong` carrying the child's pid is proof enough on its own.
 /// 3. A `Ping` round-trip whose `Pong.pid` matches the child — only then is
 ///    the daemon considered started.
 ///
@@ -1464,40 +1530,37 @@ fn wait_for_daemon(
         }
 
         // 2. What does the status file say (ours only)?
-        if let Some(st) = own_status(config_dir, child_pid) {
-            last_stage = Some(st.stage.name().to_owned());
-            match st.state {
-                StartupState::Error => {
-                    return Err(StartError::at_stage(
-                        st.stage.name(),
-                        &st.reason,
-                        log_path_of(&st, expected_log_path),
-                        st.stage.exit_code(),
-                    ));
-                }
-                StartupState::Ready => {
-                    // 3. Must actually answer on the pipe.
-                    if let Ok(SocketResponse::Pong {
-                        pid,
-                        monitors,
-                        hooks_registered,
-                        ahk_pid,
-                        ..
-                    }) = transport::send_message(&SocketMessage::Ping)
-                        && pid == child_pid
-                    {
-                        return Ok(StartSummary {
-                            pid,
-                            monitors,
-                            hooks_registered,
-                            ahk_pid,
-                        });
+        match own_status(config_dir, child_pid) {
+            Some(st) => {
+                last_stage = Some(st.stage.name().to_owned());
+                match st.state {
+                    StartupState::Error => {
+                        return Err(StartError::at_stage(
+                            st.stage.name(),
+                            &st.reason,
+                            log_path_of(&st, expected_log_path),
+                            st.stage.exit_code(),
+                        ));
                     }
+                    StartupState::Ready => {
+                        // 3. Must actually answer on the pipe.
+                        if let Some(summary) = ping_own_daemon(child_pid) {
+                            return Ok(summary);
+                        }
+                    }
+                    StartupState::Starting => {}
+                    // Our own pid says it already stopped: the next `try_wait`
+                    // poll reports the exit with its code.
+                    StartupState::Stopped => {}
                 }
-                StartupState::Starting => {}
-                // Our own pid says it already stopped: the next `try_wait`
-                // poll reports the exit with its code.
-                StartupState::Stopped => {}
+            }
+            // No status file of ours (unwritable config dir, or the write
+            // lost its retries): the daemon answering with our pid is ready
+            // all the same.
+            None => {
+                if let Some(summary) = ping_own_daemon(child_pid) {
+                    return Ok(summary);
+                }
             }
         }
 
@@ -1514,6 +1577,26 @@ fn wait_for_daemon(
             ));
         }
         std::thread::sleep(DAEMON_POLL_INTERVAL);
+    }
+}
+
+/// One `Ping` round-trip; `Some` only if a daemon answered **and** its
+/// `Pong.pid` is `child_pid` (an older daemon on the pipe does not count).
+fn ping_own_daemon(child_pid: u32) -> Option<StartSummary> {
+    match transport::send_message(&SocketMessage::Ping) {
+        Ok(SocketResponse::Pong {
+            pid,
+            monitors,
+            hooks_registered,
+            ahk_pid,
+            ..
+        }) if pid == child_pid => Some(StartSummary {
+            pid,
+            monitors,
+            hooks_registered,
+            ahk_pid,
+        }),
+        _ => None,
     }
 }
 
@@ -1622,6 +1705,7 @@ mod tests {
         let empty = rescue::RescueReport {
             scanned: 3,
             moved: vec![],
+            minimized: vec![],
         };
         assert_eq!(
             format_rescue_report(&empty),
@@ -1640,11 +1724,52 @@ mod tests {
                 from: r(-960, 0),
                 to: r(0, 0),
             }],
+            minimized: vec![],
         };
         assert_eq!(
             format_rescue_report(&moved),
             "flow: moved 1 off-screen window(s) back on-screen (4 checked):\n  \"Notepad\"  (-960,0) -> (0,0)\n"
         );
+        let minimized = rescue::RescueReport {
+            scanned: 5,
+            moved: vec![],
+            minimized: vec![rescue::RescuedWindow {
+                title: "Terminal".to_owned(),
+                from: r(1936, 0),
+                to: r(1120, 0),
+            }],
+        };
+        assert_eq!(
+            format_rescue_report(&minimized),
+            "flow: re-anchored 1 minimized window(s) whose restore position was off-screen (5 checked):\n  \"Terminal\"  (1936,0) -> (1120,0)  (still minimized)\n"
+        );
+    }
+
+    #[test]
+    fn rescue_refuses_while_a_daemon_is_running_unless_forced() {
+        // The refusal must come before any window is touched.
+        let err = cmd_rescue_with(false, || true, || panic!("rescue must not run"))
+            .expect_err("a running daemon blocks the rescue");
+        assert!(err.contains("a daemon is running"), "{err}");
+        assert!(err.contains("--force"), "{err}");
+
+        let report = || {
+            Ok(rescue::RescueReport {
+                scanned: 2,
+                moved: vec![],
+                minimized: vec![],
+            })
+        };
+        // --force skips the probe entirely.
+        let out = cmd_rescue_with(true, || panic!("probe must not run"), report).expect("forced");
+        assert_eq!(out, "flow: no off-screen windows (2 window(s) checked)\n");
+        // No daemon: the rescue runs.
+        let out = cmd_rescue_with(false, || false, report).expect("no daemon");
+        assert_eq!(out, "flow: no off-screen windows (2 window(s) checked)\n");
+        // A rescue failure is passed through.
+        let err = cmd_rescue_with(false, || false, || Err("EnumWindows failed".to_owned()))
+            .expect_err("rescue error propagates");
+        assert_eq!(err, "EnumWindows failed");
     }
 
     #[test]
@@ -1825,7 +1950,21 @@ mod tests {
     fn parse_stop() {
         // `flow stop` needs no flag: the hotkey script is always stopped.
         let cli = Cli::try_parse_from(["flow", "stop"]).unwrap();
-        assert!(matches!(cli.command, Commands::Stop { ahk: false }));
+        assert!(matches!(
+            cli.command,
+            Commands::Stop {
+                ahk: false,
+                config: None
+            }
+        ));
+        let cli = Cli::try_parse_from(["flow", "stop", "--config", "C:\\cfg"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Stop {
+                ahk: false,
+                config: Some(ref c)
+            } if c == "C:\\cfg"
+        ));
         // Negative: no positionals.
         assert!(Cli::try_parse_from(["flow", "stop", "now"]).is_err());
     }
@@ -1848,7 +1987,7 @@ mod tests {
     fn parse_stop_with_ahk_flag() {
         // Still accepted (hidden) for scripts written against the old CLI.
         let cli = Cli::try_parse_from(["flow", "stop", "--ahk"]).unwrap();
-        assert!(matches!(cli.command, Commands::Stop { ahk: true }));
+        assert!(matches!(cli.command, Commands::Stop { ahk: true, .. }));
     }
 
     #[test]
@@ -2921,8 +3060,10 @@ mod tests {
     }
 
     /// Negative: a `flow.toml` that exists but cannot parse is fatal -- startup
-    /// must be refused with the canonical prefix so the user sees why on their
-    /// terminal (the detached daemon's own error output is discarded).
+    /// must be refused with the canonical reason so the user sees why on their
+    /// terminal (the detached daemon's own error output is discarded). The
+    /// `flow: ` prefix is added once, by `main`'s error printer, so the
+    /// reason itself must not carry it (it used to print `flow: flow: …`).
     #[test]
     fn preflight_config_check_rejects_malformed_flow_toml() {
         // Arrange: a flow.toml that exists but is unparseable.
@@ -2932,11 +3073,16 @@ mod tests {
         // Act: pre-flight must refuse to start.
         let result = preflight_config_check(tmp.path());
 
-        // Assert: fatal error with the canonical prefix.
+        // Assert: fatal error with the canonical reason, no doubled prefix.
         assert!(result.is_err(), "malformed flow.toml must be fatal");
+        let err = result.unwrap_err();
         assert!(
-            result.unwrap_err().starts_with("flow: cannot start:"),
-            "error must use the canonical 'flow: cannot start:' prefix"
+            err.starts_with("cannot start:"),
+            "error must use the canonical 'cannot start:' reason, got {err:?}"
+        );
+        assert!(
+            !err.contains("flow:"),
+            "the caller adds the single 'flow: ' prefix: {err:?}"
         );
     }
 }
