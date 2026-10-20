@@ -525,6 +525,80 @@ A watchdog that restores from an on-disk snapshot is still planned (see the
 | Which windows are controlled | `WindowRegistry::restorable_windows` in [`src/registry/core.rs`](../../src/registry/core.rs) |
 | Clamp geometry | `Rect::clamped_into` in [`src/common/types.rs`](../../src/common/types.rs) |
 
+## Monitor hotplug
+
+The daemon enumerates monitors once at startup, and every parked column and
+parked workspace is positioned relative to that enumeration (beyond the
+virtual screen, one monitor height away). Attaching or detaching a display,
+changing a resolution or moving the taskbar invalidates all of it: before this
+pass the daemon kept animating windows to a dead rect, and a slot that used to
+be "off every monitor" could sit inside a new neighbour. The handling lives in
+[`src/daemon/hotplug.rs`](../../src/daemon/hotplug.rs) and runs in three
+steps.
+
+**Detect.** The session-sink window and the border overlays receive
+`WM_DISPLAYCHANGE` (display attached / detached / re-configured) and
+`WM_SETTINGCHANGE` with `wParam == SPI_SETWORKAREA` (taskbar moved, resized
+or set to auto-hide). Each one calls `registry::hooks::request_topology_refresh()`,
+which sets a static flag and signals the hook event — the same pattern as
+`request_shutdown`. Windows sends several of these per change, so the main loop
+only takes the flag on each wake and re-arms a settle deadline
+(`TOPOLOGY_SETTLE`, 300 ms); the deadline is folded into the loop's wait
+timeout like the float-resume and foreground-sync deadlines, and the reconcile
+runs once, after the last message. A reconcile that falls inside a tile drag is
+postponed by one settle period; one requested after a shutdown is skipped, so
+the fail-back rescues with the geometry it has instead of fighting a re-seat.
+
+**Reconcile** (`FlowWM::reconcile_monitors`). The animator is cancelled and
+joined first — a batch in flight would keep steering windows to the old parked
+slots. Then the desktop is re-enumerated and the old monitors are matched to
+the new ones (`match_monitors`): by `HMONITOR`, then by identical screen rect
+(Windows hands out a fresh handle when a display is re-attached at the same
+position), then the old primary to the new primary (a resolution change on a
+single display keeps its workspaces). Every survivor gets its rects and handle
+updated and all ten of its workspaces are re-projected in place — new
+`MonitorInfo` (work area, virtual screen, neighbour flags), re-derived layout
+parameters, and row heights rescaled proportionally into a changed work-area
+height (`mutations::refit_heights`), because row heights are the layout's
+source of truth and projection never rescales them. An added display gets a
+fresh `Monitor` with ten empty workspaces. The enumeration failing (or coming
+back empty, which Windows does transiently mid-switch) leaves the monitor list
+untouched.
+
+**Migrate** (`plan_migration`). Every window of a vanished monitor — tiles and
+floats on all ten workspaces — moves to the *active* workspace of its fallback
+monitor: the one `MonitorFromWindow` now reports for it, else the primary.
+Tiles are appended as columns; floats are clamped into the fallback's work
+area. The registry's owning-monitor memory is remapped for every tracked
+window with the same rule (`remap_owner`: the survivor's new index, else
+`MonitorFromWindow`, else the primary), including the minimized and hidden
+windows that live in no space, so loadout snapshots (built live from the
+monitor list) and the restore path both see the new indices. Windows that
+Windows itself minimized when their display went away (`IsIconic`, rect at
+−32000) are restored with `ShowWindow(SW_RESTORE)`; the resulting
+`MINIMIZEEND` hook re-adds them through the normal restore path, onto the
+owner just recorded. The active monitor follows the focused window, else stays
+where it was if that monitor survived, else moves to the primary.
+
+Finally every monitor's workspaces are re-seated as **instant** animator
+targets (`instant_seating_targets`: the active workspace at its projected
+rects, the others at their new `WorkspaceParking` slots), the registry's slots
+and rects are synced from every workspace, the float-tracking set is rebuilt
+and the border overlays refreshed. Instant because the windows' previous
+positions belong to a geometry that no longer exists; a tween from an old
+parked slot would sweep across the screen. The pass ends with one summary line:
+
+```text
+hotplug: 1 monitor(s) (+0 -1), 4 window(s) migrated, 1 restored
+```
+
+`flow ping` (`Pong.monitors`) and `flow query all` (`monitors`,
+`active_monitor`, per-window `monitor`) read the live list, so they reflect the
+new topology immediately. The Win32 questions the reconcile asks are behind the
+`TopologyProbe` trait, so the whole pass — removal with migration, addition
+with neighbour updates, work-area-only change — is unit-tested against a mock
+desktop.
+
 ## Watchdog
 
 A separate watchdog process is planned for crash recovery — restoring windows

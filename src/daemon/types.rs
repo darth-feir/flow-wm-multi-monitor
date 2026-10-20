@@ -226,6 +226,17 @@ pub struct FlowWM {
     /// focus — closing the gap when `EVENT_SYSTEM_FOREGROUND` is dropped under
     /// rapid window churn. (`docs/src/dev-guide/event-pipelines.md`)
     pub(super) last_foreground_sync: std::time::Instant,
+
+    /// When the pending display-topology change settles and
+    /// [`reconcile_monitors`](super::FlowWM::reconcile_monitors) runs.
+    ///
+    /// `None` while no change is pending. Armed (and re-armed) to
+    /// `now + TOPOLOGY_SETTLE` by the main loop every time a window
+    /// procedure reported `WM_DISPLAYCHANGE` / `SPI_SETWORKAREA` — Windows
+    /// sends several per change, so the reconcile runs once, after the last
+    /// one. Folded into the loop's wait timeout like the other deadlines.
+    /// See `daemon::hotplug`.
+    pub(super) topology_deadline: Option<std::time::Instant>,
 }
 
 impl FlowWM {

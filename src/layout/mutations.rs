@@ -193,6 +193,57 @@ pub fn distribute_heights(n: usize, available: i32, gap: i32) -> Vec<i32> {
         .collect()
 }
 
+/// Rescale every column's row heights into `config.available_height()`,
+/// keeping each column's proportions — the row-height counterpart of a
+/// monitor whose work area changed height (a display re-configured, a
+/// taskbar moved) while the strip's membership did not.
+///
+/// Within a column the new budget `available − (n + 1) * gap` is split in
+/// the ratio of the old heights, the integer remainder going one pixel at a
+/// time to the top rows (as in [`distribute_heights`]). A column whose old
+/// heights sum to nothing (all zero) is given the equal split instead. Pure:
+/// returns a new layout; the input is untouched.
+#[must_use]
+pub fn refit_heights(layout: &VirtualLayout, config: &MutationConfig) -> VirtualLayout {
+    let available = config.available_height();
+    let gap = config.padding.window_gap;
+    let mut out = layout.clone();
+    for col in &mut out.columns {
+        let n = col.rows.len();
+        if n == 0 {
+            continue;
+        }
+        let old_total: i64 = col.rows.iter().map(|r| i64::from(r.height.max(0))).sum();
+        let numerator = available - (n as i32 + 1) * gap;
+        if old_total <= 0 || numerator <= 0 {
+            let heights = distribute_heights(n, available, gap);
+            for (row, h) in col.rows.iter_mut().zip(heights) {
+                row.height = h;
+            }
+            continue;
+        }
+        let mut assigned: i64 = 0;
+        let mut heights: Vec<i32> = Vec::with_capacity(n);
+        for row in &col.rows {
+            let h = i64::from(numerator) * i64::from(row.height.max(0)) / old_total;
+            assigned += h;
+            heights.push(h as i32);
+        }
+        let mut remainder = i64::from(numerator) - assigned;
+        for h in &mut heights {
+            if remainder <= 0 {
+                break;
+            }
+            *h += 1;
+            remainder -= 1;
+        }
+        for (row, h) in col.rows.iter_mut().zip(heights) {
+            row.height = h;
+        }
+    }
+    out
+}
+
 /// Build a fresh single-row [`Column`] at the given width, with the row's
 /// height set to the equal-share of `config.available_height()` for `n = 1`.
 ///
@@ -1556,6 +1607,50 @@ mod tests {
     // the branching logic (n=0, negative numerator, remainder distribution
     // to the TOP rows) deserves direct pins — a regression in the remainder
     // order would silently redistribute pixels to the wrong rows.
+
+    #[test]
+    fn refit_heights_scales_rows_proportionally_into_the_new_budget() {
+        let mut config = test_config();
+        // Two rows of 536 and 536 on a 1080 monitor (gap 4 → budget 1068).
+        // One of them was dragged: 800 / 268.
+        let layout = VirtualLayout::with_columns(
+            vec![
+                Column::with_rows(
+                    960,
+                    vec![Row::new(WindowId(1), 800), Row::new(WindowId(2), 268)],
+                ),
+                Column::with_row(960, Row::new(WindowId(3), 1072)),
+            ],
+            0,
+        );
+        // The monitor lost 80 px of height (taskbar grew).
+        config.monitor_height = 1000;
+        let refit = refit_heights(&layout, &config);
+        let two = &refit.columns[0].rows;
+        // Budget 1000 - 3*4 = 988, split 800:268 → 740 + 248 = 988.
+        assert_eq!(two[0].height + two[1].height, 988);
+        assert!(two[0].height > two[1].height * 2, "{two:?}");
+        // A single row takes the whole budget: 1000 - 2*4.
+        assert_eq!(refit.columns[1].rows[0].height, 992);
+        // Pure: the input is untouched.
+        assert_eq!(layout.columns[1].rows[0].height, 1072);
+    }
+
+    #[test]
+    fn refit_heights_falls_back_to_the_equal_split_for_zero_rows() {
+        let config = test_config();
+        let layout = VirtualLayout::with_columns(
+            vec![Column::with_rows(
+                960,
+                vec![Row::new(WindowId(1), 0), Row::new(WindowId(2), 0)],
+            )],
+            0,
+        );
+        let refit = refit_heights(&layout, &config);
+        let expected = distribute_heights(2, config.available_height(), config.padding.window_gap);
+        let got: Vec<i32> = refit.columns[0].rows.iter().map(|r| r.height).collect();
+        assert_eq!(got, expected);
+    }
 
     #[test]
     fn distribute_heights_zero_count_returns_empty_vec() {

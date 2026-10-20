@@ -216,6 +216,42 @@ impl ScrollingSpace {
         self.actual.clone()
     }
 
+    /// Replace the space's [`MonitorInfo`] (work area, virtual screen,
+    /// neighbour flags) after a display-topology change and re-derive the
+    /// ladder and projection from it with the current layout parameters,
+    /// keeping the existing [`VirtualLayout`] — columns, order, focus and
+    /// viewport offset survive a display being attached, detached or
+    /// resized. The hotplug reconcile (`daemon::hotplug`) follows this with
+    /// [`reconfigure`](Self::reconfigure) when the parameters themselves
+    /// depend on the monitor (an auto-derived `column_width`).
+    ///
+    /// Row heights are the layout's source of truth (projection consumes
+    /// them verbatim), so when the work area's height changed every column's
+    /// rows are rescaled into the new budget in proportion
+    /// ([`mutations::refit_heights`]); a width-only change leaves them alone.
+    ///
+    /// Returns the freshly projected [`ActualLayout`] for the new geometry.
+    pub fn set_monitor_info(&mut self, monitor: MonitorInfo) -> ActualLayout {
+        let old_available = self.config.available_height();
+        self.monitor = monitor;
+        let c = self.config;
+        self.config = build_mutation_config(
+            &self.monitor,
+            c.column_width,
+            c.min_column_width_px,
+            c.min_window_height_px,
+            c.min_row_height_px,
+            c.padding,
+            c.columns_per_screen,
+        );
+        if self.config.available_height() != old_available {
+            self.virtual_layout = mutations::refit_heights(&self.virtual_layout, &self.config);
+        }
+        self.actual =
+            projection::project(&self.virtual_layout, &self.monitor, &self.config.padding);
+        self.actual.clone()
+    }
+
     /// Get a reference to the current virtual layout.
     #[must_use]
     pub fn virtual_layout(&self) -> &VirtualLayout {
@@ -870,6 +906,35 @@ mod tests {
         assert_eq!(engine.last_focused_window(), Some(WindowId(1)));
         assert_eq!(engine.virtual_layout().columns.len(), 3);
         assert_eq!(engine.virtual_layout().window_count(), 3);
+    }
+
+    #[test]
+    fn set_monitor_info_refits_row_heights_and_reprojects_into_the_new_work_area() {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        engine.add_window(WindowId(1));
+        engine.add_window(WindowId(2));
+        engine
+            .add_window_to_focused_column(WindowId(3))
+            .expect("column 1 gains a second row");
+        // The monitor lost 80 px to a taller taskbar.
+        let shorter = MonitorInfo::single(Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1000,
+        });
+        let actual = engine.set_monitor_info(shorter);
+        assert_eq!(engine.monitor().work_area.height, 1000);
+        // Every projected rect fits the new work area …
+        for entry in &actual.entries {
+            assert!(entry.rect.bottom() <= 1000, "{entry:?}");
+        }
+        // … the layout itself is untouched …
+        assert_eq!(engine.virtual_layout().columns.len(), 2);
+        assert_eq!(engine.last_focused_window(), Some(WindowId(3)));
+        // … and the ladder was re-derived from the new monitor.
+        assert_eq!(engine.config().monitor_height, 1000);
+        assert_eq!(engine.config().available_height(), 1000);
     }
 
     #[test]

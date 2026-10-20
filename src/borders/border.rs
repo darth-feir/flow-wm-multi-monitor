@@ -29,11 +29,11 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetWindowLongPtrW,
-    GetWindowRect, RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSENDCHANGING, SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos, ShowWindow, ULW_ALPHA,
-    UpdateLayeredWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_ENDSESSION,
-    WM_QUERYENDSESSION, WM_SIZE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    GetWindowRect, RegisterClassExW, SPI_SETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSENDCHANGING, SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    ULW_ALPHA, UpdateLayeredWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_DISPLAYCHANGE,
+    WM_ENDSESSION, WM_QUERYENDSESSION, WM_SETTINGCHANGE, WM_SIZE, WNDCLASSEXW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::PCWSTR;
 use windows::core::w;
@@ -67,7 +67,11 @@ static OVERLAY_CLASS_ATOM: OnceLock<u16> = OnceLock::new();
 /// main loop runs the normal rescue path instead of letting logoff strand
 /// parked windows. `WM_QUERYENDSESSION` answers `TRUE` (we never veto a
 /// logoff); `WM_CLOSE` returns without destroying the overlay (the daemon
-/// drops it during fail-back). All other messages are passed through to
+/// drops it during fail-back). `WM_DISPLAYCHANGE` and
+/// `WM_SETTINGCHANGE(SPI_SETWORKAREA)` report a display-topology change via
+/// [`request_topology_refresh`](crate::registry::hooks::request_topology_refresh)
+/// — an overlay may receive them before the session sink does, and the
+/// main loop debounces either way. All other messages are passed through to
 /// `DefWindowProcW`.
 ///
 /// # Threading
@@ -117,6 +121,14 @@ unsafe extern "system" fn overlay_wnd_proc(
             if wparam.0 != 0 {
                 crate::registry::hooks::request_shutdown();
             }
+            return LRESULT(0);
+        }
+        WM_DISPLAYCHANGE => {
+            crate::registry::hooks::request_topology_refresh();
+            return LRESULT(0);
+        }
+        WM_SETTINGCHANGE if wparam.0 == SPI_SETWORKAREA.0 as usize => {
+            crate::registry::hooks::request_topology_refresh();
             return LRESULT(0);
         }
         _ => {}

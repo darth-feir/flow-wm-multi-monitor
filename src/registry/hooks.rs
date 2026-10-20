@@ -379,6 +379,40 @@ pub(crate) fn reset_shutdown_flags_for_test() {
     SHUTDOWN_COMPLETE.store(false, Ordering::Release);
 }
 
+// â”€â”€ Display-topology change (monitor hotplug, work-area change) â”€â”€â”€â”€â”€â”€
+
+/// Set by [`request_topology_refresh`] when a window procedure sees
+/// `WM_DISPLAYCHANGE` or `WM_SETTINGCHANGE(SPI_SETWORKAREA)`: a monitor was
+/// attached or detached, a resolution changed, or the taskbar moved. The
+/// main loop takes the flag on every wake ([`take_topology_dirty`]) and
+/// re-arms its settle timer; the reconcile runs once the messages stop
+/// (see `daemon::hotplug`).
+static TOPOLOGY_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// Report that the display topology (monitors or work areas) changed.
+///
+/// Sets the dirty flag and wakes the main loop by signalling the hook event,
+/// exactly like [`request_shutdown`]. Safe to call from any window
+/// procedure or thread; Windows sends several messages per change and
+/// calling this for each of them is expected â€” the main loop debounces.
+pub fn request_topology_refresh() {
+    if !TOPOLOGY_DIRTY.swap(true, Ordering::AcqRel) {
+        log::debug!("display topology change reported");
+    }
+    if let Some(&raw) = HOOK_SIGNAL.get() {
+        // SAFETY: the raw value is the signal event created in
+        // `start_hook_thread`; it lives for the daemon's lifetime.
+        let _ = unsafe { SetEvent(HANDLE(raw as *mut core::ffi::c_void)) };
+    }
+}
+
+/// Take the topology-dirty flag: `true` if a change was reported since the
+/// last call, clearing it. Only the main loop calls this.
+#[must_use]
+pub fn take_topology_dirty() -> bool {
+    TOPOLOGY_DIRTY.swap(false, Ordering::AcqRel)
+}
+
 // ── Floating-location tracking (shared with the hook callback) ───────
 
 /// HWND values of the active workspace's floating windows.

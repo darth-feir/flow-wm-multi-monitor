@@ -43,12 +43,12 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetCursorPos, GetForegroundWindow,
-    GetShellWindow, GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
-    PostMessageW, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow,
-    SetWindowPos, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WS_CAPTION, WS_EX_APPWINDOW,
-    WS_EX_TOOLWINDOW, WS_THICKFRAME,
+    BringWindowToTop, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetCursorPos, GetDesktopWindow,
+    GetForegroundWindow, GetShellWindow, GetSystemMetrics, GetWindowLongW, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, IsZoomed, PostMessageW, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SWP_NOACTIVATE,
+    SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_CLOSE, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_THICKFRAME,
 };
 use windows::core::PWSTR;
 
@@ -540,7 +540,21 @@ pub fn get_shell_window() -> Option<isize> {
 /// ```
 #[must_use]
 pub fn set_foreground_window(hwnd_val: isize) -> bool {
+    set_foreground_window_impl(hwnd_val, false)
+}
+
+/// [`set_foreground_window`] with its failure logging at `debug` instead of
+/// `warn` when `quiet` — for callers that have a fallback and report the
+/// outcome themselves ([`clear_foreground_window`]).
+fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> bool {
     let target_hwnd = HWND(hwnd_val as *mut _);
+    let report = |message: String| {
+        if quiet {
+            log::debug!("{message}");
+        } else {
+            log::warn!("{message}");
+        }
+    };
 
     // Get the current foreground window.
     let foreground_hwnd = unsafe { GetForegroundWindow() };
@@ -563,11 +577,11 @@ pub fn set_foreground_window(hwnd_val: isize) -> bool {
     let foreground_thread_id =
         unsafe { GetWindowThreadProcessId(foreground_hwnd, Some(&mut foreground_pid)) };
     if foreground_thread_id == 0 {
-        log::warn!(
+        report(format!(
             "set_foreground_window: GetWindowThreadProcessId returned thread_id 0 for foreground hwnd {:?} (Win32 error {:#x}); falling back to direct SetForegroundWindow",
             foreground_hwnd,
             unsafe { GetLastError() }.0
-        );
+        ));
         let result = unsafe { SetForegroundWindow(target_hwnd) };
         return result.as_bool();
     }
@@ -582,19 +596,19 @@ pub fn set_foreground_window(hwnd_val: isize) -> bool {
     let attach_ok =
         unsafe { AttachThreadInput(our_thread_id, foreground_thread_id, true) }.as_bool();
     if !attach_ok {
-        log::warn!(
+        report(format!(
             "set_foreground_window: AttachThreadInput(true) failed for our_thread={our_thread_id} fg_thread={foreground_thread_id} fg_pid={foreground_pid} (Win32 error {:#x})",
             unsafe { GetLastError() }.0
-        );
+        ));
     }
 
     // Compute success first, then detach in all paths.
     let success = unsafe { SetForegroundWindow(target_hwnd) }.as_bool();
     if !success {
-        log::warn!(
+        report(format!(
             "set_foreground_window: SetForegroundWindow failed for hwnd {hwnd_val} (Win32 error {:#x})",
             unsafe { GetLastError() }.0
-        );
+        ));
     }
 
     // Bring the window to the top of the Z-order. Failure here is
@@ -626,22 +640,57 @@ pub fn set_foreground_window(hwnd_val: isize) -> bool {
 /// receives keyboard input. Used when switching to an empty workspace so
 /// keystrokes do not leak to the previously focused window.
 ///
-/// Resolves the shell window via [`get_shell_window`] and pushes it to the
-/// foreground via [`set_foreground_window`] (reusing its `AttachThreadInput`
-/// foreground-lock bypass).
+/// Tries the shell window ([`get_shell_window`]) and then the desktop window
+/// (`GetDesktopWindow`), skipping any handle `IsWindow` rejects, and pushes
+/// the first live one to the foreground via the quiet form of
+/// [`set_foreground_window`] (same `AttachThreadInput` foreground-lock
+/// bypass). Not being able to focus the desktop is a non-event — there is
+/// simply nothing to focus — so every failure here is logged at `debug`.
 ///
 /// # Returns
 ///
-/// `true` if the shell window was resolved and `SetForegroundWindow`
-/// succeeded, `false` otherwise (no shell window, or the call was defeated
-/// by the foreground lock).
+/// `true` if a shell or desktop window took the foreground, `false` when
+/// neither exists or both calls were refused.
 #[must_use]
 pub fn clear_foreground_window() -> bool {
-    let Some(shell_hwnd) = get_shell_window() else {
-        log::warn!("clear_foreground_window: GetShellWindow returned null");
+    let desktop = unsafe { GetDesktopWindow() };
+    let desktop = (!desktop.0.is_null()).then_some(desktop.0 as isize);
+    for (name, hwnd) in [("shell", get_shell_window()), ("desktop", desktop)] {
+        let Some(hwnd) = hwnd else {
+            log::debug!("clear_foreground_window: no {name} window");
+            continue;
+        };
+        if !is_window(hwnd) {
+            log::debug!("clear_foreground_window: {name} window {hwnd} is not a live window");
+            continue;
+        }
+        if set_foreground_window_impl(hwnd, true) {
+            return true;
+        }
+    }
+    log::debug!("clear_foreground_window: nothing could take the foreground");
+    false
+}
+
+/// Restore a minimized window (`ShowWindow(SW_RESTORE)`) — what the user
+/// does by clicking its taskbar button. Used by the monitor-hotplug
+/// reconcile for windows Windows minimized when their display vanished;
+/// the resulting `EVENT_SYSTEM_MINIMIZEEND` then re-adds the window through
+/// the normal restore path.
+///
+/// # Returns
+///
+/// `true` when the call was issued on a live window (`IsWindow`), `false`
+/// for a dead handle. The return value of `ShowWindow` itself ("was
+/// previously visible") is not meaningful here and is ignored.
+#[must_use]
+pub fn show_window_restored(hwnd_val: isize) -> bool {
+    if !is_window(hwnd_val) {
         return false;
-    };
-    set_foreground_window(shell_hwnd)
+    }
+    // SAFETY: ShowWindow is sound for any HWND value.
+    let _ = unsafe { ShowWindow(HWND(hwnd_val as *mut _), SW_RESTORE) };
+    true
 }
 
 /// Politely ask a window to close itself by posting `WM_CLOSE` to it.

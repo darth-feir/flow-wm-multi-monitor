@@ -524,9 +524,7 @@ impl FlowWM {
             None => {
                 self.drop_tracked_focus();
                 if !registry_win32::clear_foreground_window() {
-                    log::warn!(
-                        "focus_monitor: clear_foreground_window failed (could not focus desktop)"
-                    );
+                    log::debug!("focus_monitor: clear_foreground_window failed (nothing to focus)");
                 }
             }
         }
@@ -1182,8 +1180,8 @@ impl FlowWM {
             // to the previous workspace's window. The desktop is untracked, so
             // on_focus_changed will early-return and cannot do this for us.
             if !registry_win32::clear_foreground_window() {
-                log::warn!(
-                    "switch_active_workspace: clear_foreground_window failed (could not focus desktop)"
+                log::debug!(
+                    "switch_active_workspace: clear_foreground_window failed (nothing to focus)"
                 );
             }
         }

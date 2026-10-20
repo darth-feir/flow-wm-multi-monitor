@@ -24,6 +24,7 @@ features.
 | Floating enhancements | 🜂 Near-term | smart placement, size memory, z-order, gap mgmt |
 | Real cross-column `MoveWindow` | 🜂 Near-term | Left/Right aliased to swap-column; row-preserving move + floating nudge pending |
 | Multi-monitor support | ✅ Baseline | one `Monitor` + scrolling space per display; windows tile on the monitor they appear on; parked columns and parked workspaces stay off every monitor (neighbours modelled on all four sides); cross-monitor focus/move commands pending |
+| Monitor hotplug | ✅ Done | `WM_DISPLAYCHANGE` / `SPI_SETWORKAREA` debounced into one reconcile: monitors matched by handle → rect → primary, survivors re-projected in place, windows of a vanished display migrated to the monitor Windows reports for them (else the primary), owner memory remapped, everything re-seated instantly — see [IPC & fail-back](./ipc-and-watchdog.md#monitor-hotplug) |
 | Cloak parked windows (`DWMWA_CLOAK`) | ◷ Mid-term | read side exists; write side missing |
 | Watchdog + recovery snapshot | ◷ Mid-term | not started; gated on `flow`/`flowd` being complete |
 | Input hooks (DragSession etc.) | ◷ Aspirational | `src/input/` does not exist |
@@ -143,15 +144,19 @@ arrangement parks a workspace one height away, which is off every monitor but
 inside the virtual-screen bounding box, so the shutdown rescue (which tests
 overlap against that box) leaves such a window where it is.
 
-The workspace hierarchy already models `Vec<Monitor>` with
-`active_monitor: usize`, and every IPC command routes through
-`active_scrolling()` so multi-monitor can land without touching call sites.
-The current constructor hard-codes a single monitor derived from
-`get_primary_monitor_info()` ([`src/daemon/new.rs`](../../src/daemon/new.rs)).
-Expanding to multiple monitors requires iterating `EnumDisplayMonitors` /
-`MonitorFromPoint` + `GetMonitorInfoW`, building a `Monitor` per display,
-and adding `flow dispatch focusmonitor` / `move-to-workspace <id> <monitor>`
-plumbing.
+**Hotplug (done).** The monitor list follows the desktop at runtime:
+`WM_DISPLAYCHANGE` and `SPI_SETWORKAREA` are debounced into one reconcile that
+matches old monitors to the new enumeration, re-projects survivors, migrates
+the windows of a vanished display and re-seats everything instantly. See
+[Monitor hotplug](./ipc-and-watchdog.md#monitor-hotplug). Still open: a
+window the user had deliberately minimized on a display that is then
+unplugged is restored along with the ones Windows minimized (the two are
+indistinguishable), and a reconcile that lands mid-drag is simply postponed.
+
+The workspace hierarchy models `Vec<Monitor>` with `active_monitor: usize`,
+and every IPC command routes through `active_scrolling()`; the constructor
+builds one `Monitor` per display from `EnumDisplayMonitors` + `GetMonitorInfoW`
+([`src/daemon/new.rs`](../../src/daemon/new.rs)).
 
 ### Performance: Cloaking Off-Screen Windows
 

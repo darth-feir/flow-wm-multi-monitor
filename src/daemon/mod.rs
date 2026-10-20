@@ -33,6 +33,9 @@
 //! - [`dispatch`] — IPC command dispatch router and action handlers
 //! - [`query`] — query handlers (extracted from dispatch)
 //! - [`edge_scroll`] — pure, clock-injectable edge-scroll auto-repeat scheduler
+//! - [`hotplug`] — display-topology changes: debounce, re-enumerate, match
+//!   monitors, migrate the windows of a vanished display
+//!   ([`FlowWM::reconcile_monitors`])
 //! - [`animation`] — animation bridge ([`FlowWM::animate_layout`])
 //! - [`config_derive`] — configuration derivation helpers and tests
 //! - [`shutdown`] — graceful-shutdown window rescue and fail-back
@@ -53,6 +56,7 @@ mod drag;
 mod edge_scroll;
 mod floating_sync;
 mod hooks;
+mod hotplug;
 mod loadout;
 mod new;
 mod query;

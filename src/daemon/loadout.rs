@@ -266,7 +266,7 @@ fn resolve_seating_target(
 /// would visibly snap on-screen windows off-screen. The full rationale is
 /// restated briefly at the call site in `apply_loadout`.
 #[must_use]
-fn build_seating_batches(
+pub(super) fn build_seating_batches(
     workspaces: &[Workspace],
     target_id: WorkspaceId,
     parking: &WorkspaceParking,

@@ -30,13 +30,13 @@ use windows::Win32::System::Console::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, WINDOW_EX_STYLE, WM_CLOSE,
-    WM_DISPLAYCHANGE, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSEXW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SPI_SETWORKAREA,
+    WINDOW_EX_STYLE, WM_CLOSE, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_QUERYENDSESSION,
+    WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
-use crate::registry::hooks::{request_shutdown, wait_shutdown_complete};
+use crate::registry::hooks::{request_shutdown, request_topology_refresh, wait_shutdown_complete};
 
 /// Window class of the session sink.
 const SINK_CLASS_NAME: PCWSTR = w!("FlowSessionSink");
@@ -151,8 +151,12 @@ fn ensure_class_registered() -> Result<(), String> {
 /// Every session-end path funnels into [`request_shutdown`]; the main loop
 /// then runs the rescue. `WM_QUERYENDSESSION` answers `TRUE` so a logoff is
 /// never vetoed, and `WM_ENDSESSION` with `wParam == TRUE` is the definitive
-/// "session is ending" notice. `WM_DISPLAYCHANGE` is only logged for now
-/// (monitor hot-plug handling is tracked separately).
+/// "session is ending" notice. `WM_DISPLAYCHANGE` (a monitor attached,
+/// detached or re-configured) and `WM_SETTINGCHANGE` with `SPI_SETWORKAREA`
+/// (taskbar moved, resized or set to auto-hide) report a display-topology
+/// change through
+/// [`request_topology_refresh`](crate::registry::hooks::request_topology_refresh);
+/// the main loop debounces and reconciles (see `daemon::hotplug`).
 ///
 /// # Safety
 ///
@@ -188,6 +192,12 @@ unsafe extern "system" fn sink_wnd_proc(
                 ((lparam.0 >> 16) & 0xffff) as u32,
                 wparam.0
             );
+            request_topology_refresh();
+            LRESULT(0)
+        }
+        WM_SETTINGCHANGE if is_work_area_change(wparam) => {
+            log::info!("session sink: WM_SETTINGCHANGE(SPI_SETWORKAREA) — work area changed");
+            request_topology_refresh();
             LRESULT(0)
         }
         // SAFETY: pass-through with unchanged arguments.
@@ -233,6 +243,14 @@ unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
     BOOL(1)
 }
 
+/// `true` when a `WM_SETTINGCHANGE` announces a work-area change
+/// (`wParam == SPI_SETWORKAREA`): the taskbar or an appbar moved, resized
+/// or toggled auto-hide, so every monitor's work area must be re-read.
+#[must_use]
+pub fn is_work_area_change(wparam: WPARAM) -> bool {
+    wparam.0 == SPI_SETWORKAREA.0 as usize
+}
+
 /// `true` for the console events after which Windows terminates the
 /// process as soon as the handler returns (close, logoff, shutdown).
 #[must_use]
@@ -268,6 +286,13 @@ mod tests {
         assert!(!console_event_is_terminal(CTRL_C_EVENT));
         assert!(!console_event_is_terminal(CTRL_BREAK_EVENT));
         assert!(!console_event_is_terminal(999));
+    }
+
+    #[test]
+    fn work_area_change_is_only_spi_setworkarea() {
+        assert!(is_work_area_change(WPARAM(SPI_SETWORKAREA.0 as usize)));
+        assert!(!is_work_area_change(WPARAM(0)));
+        assert!(!is_work_area_change(WPARAM(0x0011)));
     }
 
     #[test]

@@ -95,6 +95,25 @@ impl Monitor {
         self.hmonitor
     }
 
+    /// Replace the Win32 monitor handle. Used by the hotplug reconcile when
+    /// a display that was matched by its screen rect came back under a new
+    /// `HMONITOR` (Windows hands out a fresh handle on every re-attach).
+    pub fn set_hmonitor(&mut self, hmonitor: isize) {
+        self.hmonitor = hmonitor;
+    }
+
+    /// Replace both screen rectangles after a display-topology change.
+    ///
+    /// Only the monitor's own copies are updated; each workspace's
+    /// [`ScrollingSpace`] carries its own [`MonitorInfo`](crate::layout::types::MonitorInfo)
+    /// and must be re-projected separately
+    /// ([`ScrollingSpace::set_monitor_info`]). The hotplug reconcile
+    /// does both so the two never drift.
+    pub fn set_geometry(&mut self, screen_rect: Rect, work_area: Rect) {
+        self.screen_rect = screen_rect;
+        self.work_area = work_area;
+    }
+
     /// The full physical [`Rect`] for this monitor (taskbar included).
     ///
     /// Use this for inter-workspace math (parking workspaces off-screen).
@@ -531,6 +550,32 @@ mod tests {
         };
         let monitor = Monitor::new(screen, work, Vec::new(), 0);
         assert_eq!(monitor.screen_rect(), screen);
+    }
+
+    #[test]
+    fn set_geometry_and_set_hmonitor_replace_the_stored_values() {
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let mut monitor = Monitor::new(screen, screen, Vec::new(), 0).with_hmonitor(7);
+        let new_screen = Rect {
+            x: -2560,
+            y: 0,
+            width: 2560,
+            height: 1440,
+        };
+        let new_work = Rect {
+            height: 1400,
+            ..new_screen
+        };
+        monitor.set_geometry(new_screen, new_work);
+        monitor.set_hmonitor(9);
+        assert_eq!(monitor.screen_rect(), new_screen);
+        assert_eq!(monitor.work_area(), new_work);
+        assert_eq!(monitor.hmonitor(), 9);
     }
 
     #[test]

@@ -378,6 +378,7 @@ impl FlowWM {
             float_resume_deadline: None,
             drag_state: None,
             last_foreground_sync: std::time::Instant::now(),
+            topology_deadline: None,
         };
         // Adopt pre-existing float-classified windows (found during the init
         // scan) into workspace 1's FloatingSpace, at their current on-screen
@@ -483,6 +484,7 @@ impl FlowWM {
             float_resume_deadline: None,
             drag_state: None,
             last_foreground_sync: std::time::Instant::now(),
+            topology_deadline: None,
         }
     }
 }

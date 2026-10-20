@@ -168,10 +168,11 @@ impl FlowWM {
     /// loop {
     ///     if shutdown requested / a helper thread died: return
     ///     resume float tracking if its deadline arrived
+    ///     take the display-topology flag; reconcile monitors once it settles
     ///     reconcile foreground against GetForegroundWindow()
     ///     timeout = soonest(pending_creations?100ms, float_resume_deadline,
     ///                       foreground_sync_interval, edge_scroll_deadline,
-    ///                       LIVENESS_TICK_MS)
+    ///                       topology_deadline, LIVENESS_TICK_MS)
     ///     MsgWaitForMultipleObjects(          // Sleep until something happens
     ///         [hook_signal, connected_event],
     ///         timeout,
@@ -273,6 +274,11 @@ impl FlowWM {
             // Same top-of-loop pattern as the float-resume handler above: handle
             // a due deadline now rather than re-scheduling a 1 ms re-wake.
             self.maybe_fire_edge_scroll();
+
+            // Display-topology changes (monitor plugged / unplugged, taskbar
+            // moved): take the flag the window procedures set, re-arm the
+            // settle timer, and reconcile the monitor list once it is due.
+            self.poll_topology_change();
 
             // Reconcile internal focus against GetForegroundWindow(). This runs
             // on every wake, but no-ops in ~1 µs when tracked focus already
@@ -497,6 +503,7 @@ impl FlowWM {
             self.float_resume_deadline,
             next_foreground_sync,
             edge_scroll_deadline,
+            self.topology_deadline,
             std::time::Instant::now(),
         )
     }
@@ -627,7 +634,7 @@ impl FlowWM {
 /// to a free function so the branching is unit-testable without constructing
 /// a full [`FlowWM`] (which needs Win32 + a hook thread).
 ///
-/// Four finite-deadline sources fold into the result via `min`:
+/// Five finite-deadline sources fold into the result via `min`:
 /// 1. `has_pending_creations` → fixed `PENDING_RETRY_TIMEOUT_MS` cadence.
 /// 2. `float_resume_deadline` → remaining ms until float tracking resumes.
 /// 3. `next_foreground_sync` → remaining ms until the foreground is reconciled
@@ -636,11 +643,15 @@ impl FlowWM {
 /// 4. `edge_scroll_deadline` → remaining ms until the drag's armed auto-repeat
 ///    timer fires (so a held cursor in a band keeps scrolling even with no
 ///    hook/IPC activity).
+/// 5. `topology_deadline` → remaining ms until a reported display-topology
+///    change has settled and the monitor list is reconciled
+///    (`daemon::hotplug`).
 fn compute_wait_timeout_inner(
     has_pending_creations: bool,
     float_resume_deadline: Option<std::time::Instant>,
     next_foreground_sync: Option<std::time::Instant>,
     edge_scroll_deadline: Option<std::time::Instant>,
+    topology_deadline: Option<std::time::Instant>,
     now: std::time::Instant,
 ) -> u32 {
     let mut best: Option<u32> = None;
@@ -654,6 +665,7 @@ fn compute_wait_timeout_inner(
         .into_iter()
         .chain(next_foreground_sync)
         .chain(edge_scroll_deadline)
+        .chain(topology_deadline)
     {
         let remaining = deadline.saturating_duration_since(now);
         let ms = remaining.as_millis().min(u32::MAX as u128) as u32;
@@ -672,13 +684,13 @@ mod tests {
     fn wait_timeout_is_liveness_tick_when_idle() {
         let now = Instant::now();
         assert_eq!(
-            compute_wait_timeout_inner(false, None, None, None, now),
+            compute_wait_timeout_inner(false, None, None, None, None, now),
             LIVENESS_TICK_MS
         );
         // A deadline farther out than the tick is capped at the tick.
         let far = now + Duration::from_secs(30);
         assert_eq!(
-            compute_wait_timeout_inner(false, Some(far), None, None, now),
+            compute_wait_timeout_inner(false, Some(far), None, None, None, now),
             LIVENESS_TICK_MS
         );
     }
@@ -687,7 +699,7 @@ mod tests {
     fn wait_timeout_pending_creations_uses_retry_cadence() {
         let now = Instant::now();
         assert_eq!(
-            compute_wait_timeout_inner(true, None, None, None, now),
+            compute_wait_timeout_inner(true, None, None, None, None, now),
             PENDING_RETRY_TIMEOUT_MS,
         );
     }
@@ -697,7 +709,7 @@ mod tests {
         let now = Instant::now();
         let deadline = now + Duration::from_millis(500);
         assert_eq!(
-            compute_wait_timeout_inner(false, Some(deadline), None, None, now),
+            compute_wait_timeout_inner(false, Some(deadline), None, None, None, now),
             500
         );
     }
@@ -708,7 +720,7 @@ mod tests {
         // Pending = 100 ms cadence; deadline in 50 ms → 50 wins.
         let deadline = now + Duration::from_millis(50);
         assert_eq!(
-            compute_wait_timeout_inner(true, Some(deadline), None, None, now),
+            compute_wait_timeout_inner(true, Some(deadline), None, None, None, now),
             50
         );
     }
@@ -719,7 +731,7 @@ mod tests {
         // Pending = 100 ms; deadline in 5 s → 100 wins.
         let deadline = now + Duration::from_secs(5);
         assert_eq!(
-            compute_wait_timeout_inner(true, Some(deadline), None, None, now),
+            compute_wait_timeout_inner(true, Some(deadline), None, None, None, now),
             PENDING_RETRY_TIMEOUT_MS,
         );
     }
@@ -731,7 +743,7 @@ mod tests {
         // loop re-wakes and runs the resume handler instead of busy-spinning.
         let deadline = now - Duration::from_millis(10);
         assert_eq!(
-            compute_wait_timeout_inner(false, Some(deadline), None, None, now),
+            compute_wait_timeout_inner(false, Some(deadline), None, None, None, now),
             1
         );
     }
@@ -742,7 +754,7 @@ mod tests {
         // Sync deadline in 250 ms (the default interval) → 250.
         let deadline = now + Duration::from_millis(250);
         assert_eq!(
-            compute_wait_timeout_inner(false, None, Some(deadline), None, now),
+            compute_wait_timeout_inner(false, None, Some(deadline), None, None, now),
             250
         );
     }
@@ -755,7 +767,14 @@ mod tests {
         let float_deadline = now + Duration::from_secs(5);
         let sync_deadline = now + Duration::from_millis(80);
         assert_eq!(
-            compute_wait_timeout_inner(false, Some(float_deadline), Some(sync_deadline), None, now),
+            compute_wait_timeout_inner(
+                false,
+                Some(float_deadline),
+                Some(sync_deadline),
+                None,
+                None,
+                now
+            ),
             80
         );
     }
@@ -766,7 +785,7 @@ mod tests {
         // Armed auto-repeat timer in 120 ms → 120.
         let deadline = now + Duration::from_millis(120);
         assert_eq!(
-            compute_wait_timeout_inner(false, None, None, Some(deadline), now),
+            compute_wait_timeout_inner(false, None, None, Some(deadline), None, now),
             120
         );
     }
@@ -779,8 +798,39 @@ mod tests {
         let float_deadline = now + Duration::from_secs(5);
         let edge_deadline = now + Duration::from_millis(60);
         assert_eq!(
-            compute_wait_timeout_inner(false, Some(float_deadline), None, Some(edge_deadline), now),
+            compute_wait_timeout_inner(
+                false,
+                Some(float_deadline),
+                None,
+                Some(edge_deadline),
+                None,
+                now
+            ),
             60
+        );
+    }
+
+    #[test]
+    fn wait_timeout_topology_deadline_uses_remaining_ms_and_wins_when_soonest() {
+        let now = Instant::now();
+        // A settling display change in 300 ms → 300.
+        let deadline = now + Duration::from_millis(300);
+        assert_eq!(
+            compute_wait_timeout_inner(false, None, None, None, Some(deadline), now),
+            300
+        );
+        // Sooner than the foreground sync: it wins the min-reduce.
+        let sync = now + Duration::from_millis(900);
+        let soon = now + Duration::from_millis(40);
+        assert_eq!(
+            compute_wait_timeout_inner(false, None, Some(sync), None, Some(soon), now),
+            40
+        );
+        // Already due → floor to 1 so the loop re-wakes and reconciles.
+        let past = now - Duration::from_millis(5);
+        assert_eq!(
+            compute_wait_timeout_inner(false, None, None, None, Some(past), now),
+            1
         );
     }
 
@@ -790,7 +840,7 @@ mod tests {
         // Already past → floor to 1 so the loop re-wakes and fires the repeat.
         let deadline = now - Duration::from_millis(5);
         assert_eq!(
-            compute_wait_timeout_inner(false, None, None, Some(deadline), now),
+            compute_wait_timeout_inner(false, None, None, Some(deadline), None, now),
             1
         );
     }
