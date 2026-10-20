@@ -88,6 +88,14 @@ pub struct Column {
     pub width_px: i32,
     /// Rows (window slots) ordered top-to-bottom within this column.
     pub rows: Vec<Row>,
+    /// Index of the first row shown when the column holds more rows than
+    /// its viewport shows (`[columns] visible_rows`, carried as
+    /// `MutationConfig::visible_rows`). The rows `row_offset ..
+    /// row_offset + slots` are on screen; the ones above and below are
+    /// parked off-screen vertically by projection. Always `0` when every
+    /// row fits (no viewport). Kept in `0 ..= rows.len() - slots` by
+    /// [`clamp_row_offset`](Self::clamp_row_offset).
+    pub row_offset: usize,
 }
 
 impl Column {
@@ -103,6 +111,7 @@ impl Column {
         Self {
             width_px,
             rows: vec![row],
+            row_offset: 0,
         }
     }
 
@@ -112,7 +121,81 @@ impl Column {
     /// equal-with-remainder heights when row membership changes.
     #[must_use]
     pub fn with_rows(width_px: i32, rows: Vec<Row>) -> Self {
-        Self { width_px, rows }
+        Self {
+            width_px,
+            rows,
+            row_offset: 0,
+        }
+    }
+
+    /// The same column with its row viewport starting at `row_offset`
+    /// (not clamped here — see [`clamp_row_offset`](Self::clamp_row_offset)).
+    #[must_use]
+    pub fn with_row_offset(mut self, row_offset: usize) -> Self {
+        self.row_offset = row_offset;
+        self
+    }
+
+    /// How many of this column's rows are shown at once: every row when
+    /// `visible_rows` is `0` (no viewport), else `min(rows, visible_rows)`.
+    /// This is the row count the column's height budget is split over.
+    #[must_use]
+    pub fn slots(&self, visible_rows: u32) -> usize {
+        let n = self.rows.len();
+        if visible_rows == 0 {
+            n
+        } else {
+            n.min(visible_rows as usize)
+        }
+    }
+
+    /// Whether this column holds more rows than its viewport shows, i.e.
+    /// some of its rows are parked.
+    #[must_use]
+    pub fn has_parked_rows(&self, visible_rows: u32) -> bool {
+        self.slots(visible_rows) < self.rows.len()
+    }
+
+    /// The largest valid `row_offset`: `rows - slots`.
+    #[must_use]
+    pub fn max_row_offset(&self, visible_rows: u32) -> usize {
+        self.rows.len().saturating_sub(self.slots(visible_rows))
+    }
+
+    /// Pull `row_offset` back into `0 ..= max_row_offset`, e.g. after rows
+    /// were removed. Returns whether it changed.
+    pub fn clamp_row_offset(&mut self, visible_rows: u32) -> bool {
+        let max = self.max_row_offset(visible_rows);
+        if self.row_offset > max {
+            self.row_offset = max;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether row `row` is inside the viewport (on screen when the column
+    /// is).
+    #[must_use]
+    pub fn row_visible(&self, row: usize, visible_rows: u32) -> bool {
+        let slots = self.slots(visible_rows);
+        row >= self.row_offset && row < self.row_offset + slots
+    }
+
+    /// Shift the viewport by the minimum needed to show row `row` (after
+    /// clamping). Returns whether `row_offset` changed.
+    pub fn reveal_row(&mut self, row: usize, visible_rows: u32) -> bool {
+        let before = self.row_offset;
+        self.clamp_row_offset(visible_rows);
+        let slots = self.slots(visible_rows);
+        if row < self.rows.len() && slots > 0 {
+            if row < self.row_offset {
+                self.row_offset = row;
+            } else if row >= self.row_offset + slots {
+                self.row_offset = row + 1 - slots;
+            }
+        }
+        self.row_offset != before
     }
 
     /// Structural validity check: a column must have a strictly positive width.
@@ -264,6 +347,11 @@ impl Default for ActualLayout {
 pub struct MonitorInfo {
     /// Monitor work area in screen coordinates.
     pub work_area: Rect,
+    /// The monitor's full physical screen rect (taskbar included). Rows
+    /// parked above or below the column viewport on a side with no
+    /// neighbouring monitor sit just beyond this rect, never in the
+    /// taskbar strip. For [`single`](Self::single) it equals `work_area`.
+    pub screen_rect: Rect,
     /// Bounding box of every attached monitor (the Win32 "virtual screen").
     /// Off-viewport columns are parked outside this box so they can never
     /// land on a neighbouring monitor. For a single monitor this equals the
@@ -297,6 +385,7 @@ impl MonitorInfo {
     pub fn single(work_area: Rect) -> Self {
         Self {
             work_area,
+            screen_rect: work_area,
             virtual_screen: work_area,
             neighbour_left: false,
             neighbour_right: false,
@@ -338,6 +427,7 @@ impl MonitorInfo {
             .any(|o| shares_column(o) && o.y >= screen_rect.bottom());
         Self {
             work_area,
+            screen_rect,
             virtual_screen,
             neighbour_left,
             neighbour_right,

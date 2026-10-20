@@ -189,7 +189,8 @@ impl FlowWM {
                 layout_config.min_row_height_px,
                 layout_config.padding,
                 app_config.columns_per_screen,
-            );
+            )
+            .with_row_limits(layout_config.visible_rows, layout_config.max_rows);
             per_monitor.push(PerMonitor {
                 info,
                 layout_config,
@@ -382,7 +383,8 @@ impl FlowWM {
                     layout_config.min_row_height_px,
                     layout_config.padding,
                     app_config.columns_per_screen,
-                );
+                )
+                .with_row_limits(layout_config.visible_rows, layout_config.max_rows);
                 workspaces.push(Workspace::new(WorkspaceId(id), empty_scrolling));
             }
             monitors.push(

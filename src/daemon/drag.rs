@@ -534,7 +534,8 @@ impl FlowWM {
         // Project with the FROZEN viewport (boundary-move preserves
         // viewport_offset) and teleport bystanders. The dragged window is
         // excluded by the active-drag filter inside teleport_preview.
-        let actual = projection::project(&preview_vl, &monitor, &config.padding);
+        let actual =
+            projection::project(&preview_vl, &monitor, &config.padding, config.visible_rows);
         let applied = AppliedLayout {
             virtual_layout: preview_vl,
             actual_layout: actual,

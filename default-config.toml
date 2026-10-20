@@ -36,9 +36,17 @@ min_column_width_px = 640
 # monitor starts on (it must be one of `presets`; omitted = the first one).
 # Without this section columns are sized from columns_per_screen / column_width.
 #
+# Stacked columns: `visible_rows` is how many rows of a column are on screen
+# at once (0 = every row shares the height, the default); a column with more
+# rows keeps a viewport that `focus up`/`focus down` scroll through, the rows
+# outside it parked off-screen. `max_rows` caps how many rows a column may
+# hold (0 = unlimited); merging into a full column moves the window past it.
+#
 # [columns]
 # presets = ["1/3", "1/2", "1/1"]
 # default = "1/2"
+# visible_rows = 2
+# max_rows = 4
 
 # Minimum row height in pixels — the floor for any single window's allocated
 # height inside a column. Bounds the maximum number of rows that can stack

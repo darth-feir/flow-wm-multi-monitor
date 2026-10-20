@@ -9,7 +9,9 @@
 //! (`docs/src/dev-guide/tile-drag.md`)
 
 use crate::common::{Rect, WindowId};
-use crate::layout::mutations::{MutationConfig, distribute_heights, remove_window};
+#[cfg(test)]
+use crate::layout::mutations::distribute_heights;
+use crate::layout::mutations::{MutationConfig, column_heights, remove_window};
 use crate::layout::projection;
 use crate::layout::types::{AppliedLayout, Column, MonitorInfo, Row, VirtualLayout};
 
@@ -89,6 +91,11 @@ pub fn preview_move(
             if col_idx >= layout.columns.len() {
                 return None;
             }
+            // A full column (`max_rows`) refuses the drop: a drag has no
+            // "past the column" to walk to, the user picks another zone.
+            if config.column_full(layout.columns[col_idx].rows.len()) {
+                return None;
+            }
             insert_row_at(&mut layout, col_idx, row, dragged_id, config);
         }
         DropZone::ScrollLeft | DropZone::ScrollRight => return None,
@@ -103,7 +110,7 @@ pub fn preview_move(
     }
 
     // Step 4: Project to actual screen coordinates.
-    let actual = projection::project(&layout, monitor, &config.padding);
+    let actual = projection::project(&layout, monitor, &config.padding, config.visible_rows);
 
     Some(AppliedLayout {
         virtual_layout: layout,
@@ -115,14 +122,16 @@ pub fn preview_move(
 ///
 /// Duplicates the private `single_row_column` logic from `mutations.rs`.
 fn make_single_row_column(window: WindowId, width_px: i32, config: &MutationConfig) -> Column {
-    let h = distribute_heights(1, config.available_height(), config.padding.window_gap)[0];
+    let h = column_heights(1, config)[0];
     Column::with_row(width_px, Row::new(window, h))
 }
 
 /// Insert `window` as a new row at `row_idx` in the column at `col_idx`.
 ///
-/// Redistributes all row heights equally for `n+1` rows. Clamps `row_idx`
-/// to the current column length (append at bottom if beyond last row).
+/// Redistributes all row heights equally for `n+1` rows
+/// ([`column_heights`]) and scrolls the column's row viewport to the new
+/// row. Clamps `row_idx` to the current column length (append at bottom if
+/// beyond last row).
 fn insert_row_at(
     layout: &mut VirtualLayout,
     col_idx: usize,
@@ -131,13 +140,13 @@ fn insert_row_at(
     config: &MutationConfig,
 ) {
     let col = &mut layout.columns[col_idx];
-    let n = col.rows.len() + 1;
-    let heights = distribute_heights(n, config.available_height(), config.padding.window_gap);
-    for (i, row) in col.rows.iter_mut().enumerate() {
-        row.height = heights[i];
-    }
     let pos = row_idx.min(col.rows.len());
-    col.rows.insert(pos, Row::new(window, heights[n - 1]));
+    col.rows.insert(pos, Row::new(window, 0));
+    let heights = column_heights(col.rows.len(), config);
+    for (row, h) in col.rows.iter_mut().zip(heights) {
+        row.height = h;
+    }
+    col.reveal_row(pos, config.visible_rows);
 }
 
 /// Map an index from the original layout to the post-removal layout.
@@ -387,6 +396,8 @@ mod tests {
                 down: 0,
             },
             columns_per_screen: 2,
+            visible_rows: 0,
+            max_rows: 0,
         }
     }
 
@@ -783,6 +794,7 @@ mod tests {
             &applied.virtual_layout,
             &test_monitor(),
             &test_config().padding,
+            0,
         );
         assert_eq!(applied.actual_layout, expected_actual);
     }
@@ -908,7 +920,7 @@ mod tests {
     /// Build an AppliedLayout projected with the given gap and viewport offset.
     fn make_rdz_applied(columns: Vec<Column>, viewport_offset: i32, gap: i32) -> AppliedLayout {
         let vl = VirtualLayout::with_columns(columns, viewport_offset);
-        let actual = projection::project(&vl, &rdz_monitor(), &rdz_padding(gap));
+        let actual = projection::project(&vl, &rdz_monitor(), &rdz_padding(gap), 0);
         AppliedLayout {
             virtual_layout: vl,
             actual_layout: actual,
@@ -1738,7 +1750,7 @@ mod tests {
             ],
             500,
         );
-        let actual = projection::project(&vl, &monitor, &rdz_padding(10));
+        let actual = projection::project(&vl, &monitor, &rdz_padding(10), 0);
         let layout = AppliedLayout {
             virtual_layout: vl,
             actual_layout: actual,
@@ -1795,7 +1807,7 @@ mod tests {
             ],
             500,
         );
-        let actual = projection::project(&vl, &monitor, &rdz_padding(10));
+        let actual = projection::project(&vl, &monitor, &rdz_padding(10), 0);
         (
             AppliedLayout {
                 virtual_layout: vl,
@@ -1933,6 +1945,40 @@ mod tests {
                 72
             ),
             Some(DropZone::Row { col: 1, row: 0 }),
+        );
+    }
+
+    /// A drop onto a column that already holds `max_rows` rows is refused:
+    /// the preview is `None`, nothing moves.
+    #[test]
+    fn row_zone_into_a_full_column_is_refused() {
+        let config = MutationConfig {
+            max_rows: 2,
+            ..test_config()
+        };
+        // [A] [B, C]: drag A onto the stacked column.
+        let layout = two_col_layout();
+        assert_eq!(layout.columns[1].rows.len(), 2);
+        assert!(
+            preview_move(
+                &layout,
+                WindowId(1),
+                DropZone::Row { col: 1, row: 1 },
+                &config,
+                &test_monitor()
+            )
+            .is_none()
+        );
+        // A column zone is still fine.
+        assert!(
+            preview_move(
+                &layout,
+                WindowId(1),
+                DropZone::Column { col: 2 },
+                &config,
+                &test_monitor()
+            )
+            .is_some()
         );
     }
 }

@@ -116,9 +116,47 @@ pub struct MutationConfig {
     /// uses `projection::canvas_width` rather than this field; see
     /// (`docs/src/dev-guide/layout/mutations.md`).
     pub columns_per_screen: u32,
+    /// `[columns] visible_rows`: how many rows of a column are shown at
+    /// once. `0` = every row (no viewport, the historical behaviour). A
+    /// column with more rows keeps a row viewport ([`Column::row_offset`])
+    /// and the rows outside it are parked off-screen vertically.
+    pub visible_rows: u32,
+    /// `[columns] max_rows`: the most rows a column may hold. `0` =
+    /// unlimited. A merge or consume into a full column moves the window
+    /// past it instead ([`merge_column`]); every other insert path appends a
+    /// new column after the full one ([`add_window_to_column`],
+    /// [`set_layout`]).
+    pub max_rows: u32,
 }
 
 impl MutationConfig {
+    /// The row count a column of `n` rows splits its height budget over:
+    /// `n`, or `visible_rows` when that is set and smaller. See
+    /// [`Column::slots`].
+    #[must_use]
+    pub fn slots_for(&self, n: usize) -> usize {
+        if self.visible_rows == 0 {
+            n
+        } else {
+            n.min(self.visible_rows as usize)
+        }
+    }
+
+    /// Whether a column holding `n` rows may not take another one
+    /// (`max_rows` set and reached).
+    #[must_use]
+    pub fn column_full(&self, n: usize) -> bool {
+        self.max_rows > 0 && n >= self.max_rows as usize
+    }
+
+    /// Whether a column of `n` rows respects `min_window_height_px`: every
+    /// one of its visible slots must be at least that tall.
+    #[must_use]
+    pub fn rows_fit(&self, n: usize) -> bool {
+        let floor = self.min_window_height_px as i32;
+        column_heights(n, self).iter().all(|&h| h >= floor)
+    }
+
     /// One expand/shrink slot step: `column_width + window_gap`.
     ///
     /// This is the gap-aware step that the old eighths quantization discarded.
@@ -193,6 +231,28 @@ pub fn distribute_heights(n: usize, available: i32, gap: i32) -> Vec<i32> {
         .collect()
 }
 
+/// Heights for the `n` rows of one column: the equal split of
+/// [`distribute_heights`] over the column's **slots**
+/// ([`MutationConfig::slots_for`]), repeated for every row. With no row
+/// viewport (`visible_rows = 0`) this is exactly `distribute_heights`; with
+/// one, every row is sized as a row of a `visible_rows`-row column, so any
+/// `visible_rows` of them stacked fill the budget and the viewport can
+/// start at any row offset.
+#[must_use]
+pub fn column_heights(n: usize, config: &MutationConfig) -> Vec<i32> {
+    let slots = config.slots_for(n);
+    let per_slot = distribute_heights(slots, config.available_height(), config.padding.window_gap);
+    (0..n).map(|i| per_slot[i % slots.max(1)]).collect()
+}
+
+/// Write [`column_heights`] into every row of `column`.
+fn reheight_column(column: &mut Column, config: &MutationConfig) {
+    let heights = column_heights(column.rows.len(), config);
+    for (row, h) in column.rows.iter_mut().zip(heights) {
+        row.height = h;
+    }
+}
+
 /// Rescale every column's row heights into `config.available_height()`,
 /// keeping each column's proportions — the row-height counterpart of a
 /// monitor whose work area changed height (a display re-configured, a
@@ -215,11 +275,11 @@ pub fn refit_heights(layout: &VirtualLayout, config: &MutationConfig) -> Virtual
         }
         let old_total: i64 = col.rows.iter().map(|r| i64::from(r.height.max(0))).sum();
         let numerator = available - (n as i32 + 1) * gap;
-        if old_total <= 0 || numerator <= 0 {
-            let heights = distribute_heights(n, available, gap);
-            for (row, h) in col.rows.iter_mut().zip(heights) {
-                row.height = h;
-            }
+        // A column with parked rows has no proportions to keep across all
+        // of its rows (only a viewport's worth is ever on screen), so it
+        // takes the per-slot equal split.
+        if old_total <= 0 || numerator <= 0 || col.has_parked_rows(config.visible_rows) {
+            reheight_column(col, config);
             continue;
         }
         let mut assigned: i64 = 0;
@@ -252,8 +312,50 @@ pub fn refit_heights(layout: &VirtualLayout, config: &MutationConfig) -> Virtual
 /// `promote_window`). The row's height is the source-of-truth consumed verbatim
 /// by projection.
 fn single_row_column(window: WindowId, width_px: i32, config: &MutationConfig) -> Column {
-    let h = distribute_heights(1, config.available_height(), config.padding.window_gap)[0];
+    let h = column_heights(1, config)[0];
     Column::with_row(width_px, Row::new(window, h))
+}
+
+// ---------------------------------------------------------------------------
+// Row viewports
+// ---------------------------------------------------------------------------
+
+/// Shift the row viewport of `window`'s column so the window is one of the
+/// visible rows (the vertical analogue of [`ensure_column_visible`]). A
+/// window that is not in the layout, or whose column has no parked rows,
+/// leaves the layout unchanged.
+#[must_use]
+pub fn ensure_row_visible(
+    layout: &VirtualLayout,
+    window: WindowId,
+    config: &MutationConfig,
+) -> VirtualLayout {
+    let mut out = layout.clone();
+    if let Some((col, row)) = out.find_window(window) {
+        out.columns[col].reveal_row(row, config.visible_rows);
+    }
+    out
+}
+
+/// Clamp every column's row viewport after rows were removed, then (when
+/// `focused` is in the layout) shift its column so it is visible. This is
+/// the invariant [`ScrollingSpace`](crate::workspace::ScrollingSpace)
+/// restores after every mutation: the focused window is never parked
+/// inside its own column.
+#[must_use]
+pub fn normalize_row_viewports(
+    layout: &VirtualLayout,
+    focused: Option<WindowId>,
+    config: &MutationConfig,
+) -> VirtualLayout {
+    let mut out = layout.clone();
+    for col in &mut out.columns {
+        col.clamp_row_offset(config.visible_rows);
+    }
+    if let Some(f) = focused {
+        out = ensure_row_visible(&out, f, config);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +595,12 @@ pub struct FocusResult {
 /// Focus is tracked by [`WindowId`], not by position, so this function simply
 /// resolves the target window ID and optionally adjusts the camera.
 ///
+/// For vertical focus changes (Up/Down) in a column with a row viewport
+/// (`visible_rows`), the viewport shifts by one row when the target row is
+/// parked ([`ensure_row_visible`]), so focusing down through a stack scrolls
+/// it. At the first/last row there is no neighbour and this returns `None`,
+/// exactly as without a viewport.
+///
 /// Returns `None` if there is no window to focus in that direction.
 #[must_use]
 pub fn focus(
@@ -514,7 +622,7 @@ pub fn focus(
         }
         Direction::Up | Direction::Down => Some(FocusResult {
             focused: target_window,
-            new_layout: layout.clone(),
+            new_layout: ensure_row_visible(layout, target_window, config),
         }),
     }
 }
@@ -691,18 +799,21 @@ pub fn swap_window(
         // because the row count is unchanged.
         new_layout.columns[src_col].rows.swap(src_row, dst_row);
     } else {
-        // Different columns — exchange the entire `Row` items (window id
-        // AND its height) between the two positions. Heights therefore
-        // travel with the window across columns too, preserving any
-        // future drag-resize state. Row counts in each column are
-        // unchanged, so no redistribution is required.
-        let dst_row_val = new_layout.columns[dst_col].rows[dst_row];
-        let src_row_val = new_layout.columns[src_col].rows[src_row];
-        new_layout.columns[dst_col].rows[dst_row] = src_row_val;
-        new_layout.columns[src_col].rows[src_row] = dst_row_val;
+        // Different columns — exchange the window ids only. A row's height
+        // is a share of *its column's* budget (a 1-row column's row is the
+        // whole work area, a stacked column's row a slice of it), so the
+        // heights stay with their slots and each column keeps a stack that
+        // still fills the work area.
+        let dst_id = new_layout.columns[dst_col].rows[dst_row].window_id;
+        let src_id = new_layout.columns[src_col].rows[src_row].window_id;
+        new_layout.columns[dst_col].rows[dst_row].window_id = src_id;
+        new_layout.columns[src_col].rows[src_row].window_id = dst_id;
     }
 
-    // Ensure the focused window (now at dst position) is visible
+    // Ensure the focused window (now at dst position) is visible: its
+    // column on screen and, inside a stacked column, its row inside the
+    // row viewport (the viewport follows the moved window).
+    let new_layout = ensure_row_visible(&new_layout, focused, config);
     Some(ensure_column_visible(&new_layout, dst_col, config))
 }
 
@@ -1087,7 +1198,10 @@ pub fn initialize_windows(
 ///
 /// A fresh [`VirtualLayout`] with quantized column widths, equally-distributed
 /// row heights, and the given viewport offset. Empty `columns` yields an empty
-/// layout with offset 0.
+/// layout with offset 0. A column spec with more than
+/// [`max_rows`](MutationConfig::max_rows) rows keeps the first `max_rows`;
+/// the rest follow it as single-row columns at the same width (the cap is
+/// never exceeded, the windows are never dropped).
 ///
 /// (`docs/src/dev-guide/layout/mutations.md`)
 #[must_use]
@@ -1096,25 +1210,29 @@ pub fn set_layout(
     columns: Vec<(u32, Vec<WindowId>)>,
     viewport_offset: i32,
 ) -> VirtualLayout {
-    let gap = config.padding.window_gap;
-    let available = config.available_height();
-
     // A column spec with no rows (a loadout column whose windows were all
     // gone when it was saved) builds no column: a column always has at least
     // one row, and the focus-successor and projection code rely on it.
     let built: Vec<Column> = columns
         .into_iter()
         .filter(|(_, row_ids)| !row_ids.is_empty())
-        .map(|(raw_width, row_ids)| {
+        .flat_map(|(raw_width, row_ids)| {
             let width = quantize_to_ladder(raw_width as i32, config);
-            let n = row_ids.len();
-            let heights = distribute_heights(n, available, gap);
-            let rows: Vec<Row> = row_ids
-                .into_iter()
-                .zip(heights)
-                .map(|(wid, h)| Row::new(wid, h))
-                .collect();
-            Column::with_rows(width, rows)
+            let cap = if config.max_rows == 0 {
+                row_ids.len()
+            } else {
+                config.max_rows as usize
+            };
+            let mut specs: Vec<Vec<WindowId>> = Vec::new();
+            let mut ids = row_ids.into_iter();
+            specs.push(ids.by_ref().take(cap).collect());
+            specs.extend(ids.map(|id| vec![id]));
+            specs.into_iter().map(move |ids| {
+                let rows: Vec<Row> = ids.into_iter().map(|wid| Row::new(wid, 0)).collect();
+                let mut col = Column::with_rows(width, rows);
+                reheight_column(&mut col, config);
+                col
+            })
         })
         .collect();
     if built.is_empty() {
@@ -1274,8 +1392,12 @@ pub fn insert_window_after_focused_with_width(
 /// Add a window to an existing column as a new row (vertical container append).
 ///
 /// The column's rows are redistributed to equal heights via
-/// [`distribute_heights`] so the new window fits alongside its siblings.
+/// [`column_heights`] so the new window fits alongside its siblings.
 /// Returns the layout unchanged (no panic) if `col_idx` is out of bounds.
+///
+/// A column that already holds `max_rows` rows is not exceeded: the window
+/// becomes a new single-row column right after it instead (the "append
+/// past a full column" rule every non-interactive insert path follows).
 #[must_use]
 pub fn add_window_to_column(
     layout: &VirtualLayout,
@@ -1287,12 +1409,15 @@ pub fn add_window_to_column(
     let Some(col) = new_layout.columns.get_mut(col_idx) else {
         return new_layout;
     };
-    let n = col.rows.len() + 1;
-    let heights = distribute_heights(n, config.available_height(), config.padding.window_gap);
-    for (i, row) in col.rows.iter_mut().enumerate() {
-        row.height = heights[i];
+    if config.column_full(col.rows.len()) {
+        new_layout.columns.insert(
+            col_idx + 1,
+            single_row_column(window, config.column_width as i32, config),
+        );
+        return new_layout;
     }
-    col.rows.push(Row::new(window, heights[n - 1]));
+    col.rows.push(Row::new(window, 0));
+    reheight_column(col, config);
     new_layout
 }
 
@@ -1319,12 +1444,10 @@ pub fn remove_window(
     if col_ref.rows.is_empty() {
         new_layout.columns.remove(col);
     } else {
-        // Column still has rows — redistribute equally across the new count.
-        let n = col_ref.rows.len();
-        let heights = distribute_heights(n, config.available_height(), config.padding.window_gap);
-        for (i, r) in col_ref.rows.iter_mut().enumerate() {
-            r.height = heights[i];
-        }
+        // Column still has rows — redistribute equally across the new count
+        // and keep the row viewport inside the shorter stack.
+        reheight_column(col_ref, config);
+        col_ref.clamp_row_offset(config.visible_rows);
     }
 
     // Clamp viewport offset using actual config values
@@ -1361,7 +1484,17 @@ pub fn remove_window(
 /// below [`min_window_height_px`](MutationConfig::min_window_height_px), the
 /// merge is rejected with a warning log and `None` is returned. This keeps
 /// the invariant that no row ever ends up shorter than the configured floor,
-/// which is what naturally caps how many windows a column can hold.
+/// which is what naturally caps how many windows a column can hold. With a
+/// row viewport the check covers the `visible_rows` slots, not every row.
+///
+/// # Full destination (`max_rows`)
+///
+/// A destination that already holds [`max_rows`](MutationConfig::max_rows)
+/// rows does not refuse: the window **moves past** it instead, so repeated
+/// presses walk it along the strip. A window alone in its column swaps
+/// columns with the full one (exactly `move-window <left|right>` /
+/// [`swap_column`]); one that shares its column is extracted into a new
+/// single-row column on the far side of the full one.
 ///
 /// # Vertical directions
 ///
@@ -1410,17 +1543,20 @@ pub fn merge_column(
         }
     };
 
+    // A full destination (`max_rows`) is walked past, never exceeded.
+    if config.column_full(layout.columns[dst_col].rows.len()) {
+        return move_past_column(layout, focused, direction, config);
+    }
+
     // Speculative redistribution: would the destination column still respect
     // `min_window_height_px` once the focused window joins? This is the only
     // check that can reject an otherwise-valid merge.
-    let gap = config.padding.window_gap;
     let new_count = layout.columns[dst_col].rows.len() + 1;
-    let heights = distribute_heights(new_count, config.available_height(), gap);
-    let floor = config.min_window_height_px as i32;
-    if heights.iter().any(|&h| h < floor) {
+    if !config.rows_fit(new_count) {
         log::warn!(
             "merge_column: destination would have {new_count} rows; at least one \
-             redistributed height is below min_window_height_px ({floor}px) — rejected"
+             redistributed height is below min_window_height_px ({}px) — rejected",
+            config.min_window_height_px
         );
         return None;
     }
@@ -1437,12 +1573,11 @@ pub fn merge_column(
         new_layout.columns.remove(src_col);
     } else {
         // Source column still has rows — redistribute them for the new
-        // (smaller) row count so the freed vertical space is shared equally.
-        let n = new_layout.columns[src_col].rows.len();
-        let redistributed = distribute_heights(n, config.available_height(), gap);
-        for (i, r) in new_layout.columns[src_col].rows.iter_mut().enumerate() {
-            r.height = redistributed[i];
-        }
+        // (smaller) row count so the freed vertical space is shared equally,
+        // and keep its row viewport inside the shorter stack.
+        let src = &mut new_layout.columns[src_col];
+        reheight_column(src, config);
+        src.clamp_row_offset(config.visible_rows);
     }
 
     // If the source column was to the left of the destination (i.e. direction
@@ -1454,20 +1589,54 @@ pub fn merge_column(
         dst_col
     };
 
-    // Apply the pre-computed redistribution to the destination column and
-    // append the moved window as the new bottom row.
+    // Append the moved window as the new bottom row, redistribute, and
+    // scroll the destination's row viewport down to it.
     let dst = &mut new_layout.columns[dst_after_removal];
-    for (i, r) in dst.rows.iter_mut().enumerate() {
-        r.height = heights[i];
-    }
-    dst.rows
-        .push(Row::new(moved_row.window_id, heights[new_count - 1]));
+    dst.rows.push(Row::new(moved_row.window_id, 0));
+    reheight_column(dst, config);
+    let last = dst.rows.len() - 1;
+    dst.reveal_row(last, config.visible_rows);
 
     Some(ensure_column_visible(
         &new_layout,
         dst_after_removal,
         config,
     ))
+}
+
+/// Move `focused` past the adjacent column in `direction` — the
+/// full-destination branch of [`merge_column`]. Alone in its column it is
+/// [`swap_column`]; sharing its column it is extracted (like
+/// [`promote_window`]) into a new single-row column on the far side of the
+/// neighbour, the source column's rows re-sharing its height.
+fn move_past_column(
+    layout: &VirtualLayout,
+    focused: WindowId,
+    direction: Direction,
+    config: &MutationConfig,
+) -> Option<VirtualLayout> {
+    let (src_col, src_row) = layout.find_window(focused)?;
+    if layout.columns[src_col].rows.len() <= 1 {
+        return swap_column(layout, focused, direction, config);
+    }
+    let mut new_layout = layout.clone();
+    let moved = new_layout.columns[src_col].rows.remove(src_row);
+    let src = &mut new_layout.columns[src_col];
+    reheight_column(src, config);
+    src.clamp_row_offset(config.visible_rows);
+    // The far side of the neighbour: two to the right of the source, or
+    // one to the left of it (the neighbour's own index).
+    let insert_at = match direction {
+        Direction::Right => src_col + 2,
+        Direction::Left => src_col - 1,
+        Direction::Up | Direction::Down => return None,
+    };
+    let insert_at = insert_at.min(new_layout.columns.len());
+    new_layout.columns.insert(
+        insert_at,
+        single_row_column(moved.window_id, config.column_width as i32, config),
+    );
+    Some(ensure_column_visible(&new_layout, insert_at, config))
 }
 
 /// Promote the focused window into its own column (Left/Right).
@@ -1526,19 +1695,16 @@ pub fn promote_window(
         }
     };
 
-    let gap = config.padding.window_gap;
     let mut new_layout = layout.clone();
 
     // Detach the focused row.
     let moved_row = new_layout.columns[src_col].rows.remove(src_row);
 
     // Redistribute the source column's remaining rows so the freed vertical
-    // space is shared equally.
-    let n = new_layout.columns[src_col].rows.len();
-    let redistributed = distribute_heights(n, config.available_height(), gap);
-    for (i, r) in new_layout.columns[src_col].rows.iter_mut().enumerate() {
-        r.height = redistributed[i];
-    }
+    // space is shared equally, and keep its row viewport in range.
+    let src = &mut new_layout.columns[src_col];
+    reheight_column(src, config);
+    src.clamp_row_offset(config.visible_rows);
 
     // Build a fresh single-row column for the promoted window at the base
     // `column_width`. Its row height is the equal share for n=1 (full
@@ -1610,6 +1776,8 @@ mod tests {
                 down: 0,
             },
             columns_per_screen: 4,
+            visible_rows: 0,
+            max_rows: 0,
         }
     }
 
@@ -2016,6 +2184,8 @@ mod tests {
                 down: 0,
             },
             columns_per_screen: 4,
+            visible_rows: 0,
+            max_rows: 0,
         };
         let layout = VirtualLayout::with_columns(
             vec![
@@ -2050,6 +2220,8 @@ mod tests {
                 down: 0,
             },
             columns_per_screen: 4,
+            visible_rows: 0,
+            max_rows: 0,
         };
         let layout = VirtualLayout::with_columns(
             vec![
@@ -2251,6 +2423,8 @@ mod tests {
                 down: 0,
             },
             columns_per_screen: 4,
+            visible_rows: 0,
+            max_rows: 0,
         };
         let layout = VirtualLayout::with_columns(
             vec![
@@ -2447,6 +2621,8 @@ mod tests {
                 down: 0,
             },
             columns_per_screen: 4,
+            visible_rows: 0,
+            max_rows: 0,
         };
         let layout = VirtualLayout::with_columns(
             vec![
@@ -3271,6 +3447,8 @@ mod tests {
                 down: 0,
             },
             columns_per_screen,
+            visible_rows: 0,
+            max_rows: 0,
         }
     }
 
@@ -3350,6 +3528,8 @@ mod tests {
                 down: 0,
             },
             columns_per_screen: 2,
+            visible_rows: 0,
+            max_rows: 0,
         }
     }
 
@@ -3459,6 +3639,8 @@ mod tests {
                 down: 0,
             },
             columns_per_screen: 2,
+            visible_rows: 0,
+            max_rows: 0,
         }
     }
 
@@ -3509,6 +3691,8 @@ mod tests {
                 down: 0,
             },
             columns_per_screen: 3,
+            visible_rows: 0,
+            max_rows: 0,
         }
     }
 
@@ -3670,6 +3854,8 @@ mod tests {
                 down: 0,
             },
             columns_per_screen: 4,
+            visible_rows: 0,
+            max_rows: 0,
         };
         assert_eq!(
             config.column_shift(),
@@ -4861,5 +5047,365 @@ mod tests {
         let out = insert_window_at(&VirtualLayout::new(), 5, WindowId(4), &test_config());
         assert_eq!(out.columns.len(), 1);
         assert_eq!(out.columns[0].rows[0].window_id, WindowId(4));
+    }
+
+    // ── Row viewports and the row cap ─────────────────────────────────
+
+    fn stacked_config(visible_rows: u32, max_rows: u32) -> MutationConfig {
+        MutationConfig {
+            visible_rows,
+            max_rows,
+            ..test_config()
+        }
+    }
+
+    fn ids(col: &Column) -> Vec<isize> {
+        col.rows.iter().map(|r| r.window_id.0).collect()
+    }
+
+    /// `[A,B,C,D]` sized for the given config, viewport at `offset`.
+    fn stack(ids_: &[isize], offset: usize, config: &MutationConfig) -> Column {
+        let heights = column_heights(ids_.len(), config);
+        let rows = ids_
+            .iter()
+            .zip(heights)
+            .map(|(&id, h)| Row::new(WindowId(id), h))
+            .collect();
+        Column::with_rows(960, rows).with_row_offset(offset)
+    }
+
+    #[test]
+    fn column_heights_split_over_the_visible_slots() {
+        let config = stacked_config(2, 0);
+        let heights = column_heights(4, &config);
+        assert_eq!(heights.len(), 4);
+        let per_slot = distribute_heights(2, 1080, 4);
+        assert_eq!(
+            heights,
+            vec![per_slot[0], per_slot[1], per_slot[0], per_slot[1]]
+        );
+        // Any two consecutive rows plus three gaps fill the budget.
+        for w in heights.windows(2) {
+            assert_eq!(w[0] + w[1] + 3 * 4, 1080);
+        }
+        // No viewport: the flat split.
+        assert_eq!(
+            column_heights(4, &test_config()),
+            distribute_heights(4, 1080, 4)
+        );
+        // Fewer rows than the viewport: the flat split too.
+        assert_eq!(column_heights(1, &config), distribute_heights(1, 1080, 4));
+    }
+
+    #[test]
+    fn focus_down_scrolls_the_row_viewport_and_errors_at_the_last_row() {
+        let config = stacked_config(2, 0);
+        let layout = VirtualLayout::with_columns(vec![stack(&[1, 2, 3, 4], 0, &config)], 0);
+
+        // B (row 1) is visible: focusing it does not move the viewport.
+        let r = focus(&layout, WindowId(1), Direction::Down, &config).expect("down");
+        assert_eq!(r.focused, WindowId(2));
+        assert_eq!(r.new_layout.columns[0].row_offset, 0);
+
+        // C (row 2) is parked: the viewport shifts by one row.
+        let r = focus(&r.new_layout, WindowId(2), Direction::Down, &config).expect("down");
+        assert_eq!(r.focused, WindowId(3));
+        assert_eq!(r.new_layout.columns[0].row_offset, 1);
+        let r = focus(&r.new_layout, WindowId(3), Direction::Down, &config).expect("down");
+        assert_eq!(r.focused, WindowId(4));
+        assert_eq!(r.new_layout.columns[0].row_offset, 2);
+        assert!(focus(&r.new_layout, WindowId(4), Direction::Down, &config).is_none());
+
+        // Back up: B is parked above, the viewport follows up.
+        let r = focus(&r.new_layout, WindowId(4), Direction::Up, &config).expect("up");
+        assert_eq!(r.focused, WindowId(3));
+        assert_eq!(r.new_layout.columns[0].row_offset, 2);
+        let r = focus(&r.new_layout, WindowId(3), Direction::Up, &config).expect("up");
+        assert_eq!(r.focused, WindowId(2));
+        assert_eq!(r.new_layout.columns[0].row_offset, 1);
+        let r = focus(&r.new_layout, WindowId(2), Direction::Up, &config).expect("up");
+        assert_eq!(r.new_layout.columns[0].row_offset, 0);
+        assert!(focus(&r.new_layout, WindowId(1), Direction::Up, &config).is_none());
+    }
+
+    #[test]
+    fn focus_up_down_without_a_viewport_leaves_the_offset_alone() {
+        let config = test_config();
+        let layout = VirtualLayout::with_columns(vec![stack(&[1, 2, 3], 0, &config)], 0);
+        let r = focus(&layout, WindowId(1), Direction::Down, &config).expect("down");
+        assert_eq!(r.new_layout, layout);
+    }
+
+    #[test]
+    fn swap_window_down_carries_the_viewport_with_the_window() {
+        let config = stacked_config(2, 0);
+        let layout = VirtualLayout::with_columns(vec![stack(&[1, 2, 3, 4], 0, &config)], 0);
+        let swapped = swap_window(&layout, WindowId(2), Direction::Down, &config).expect("swap");
+        assert_eq!(ids(&swapped.columns[0]), vec![1, 3, 2, 4]);
+        assert_eq!(swapped.columns[0].row_offset, 1);
+        // And back up past the top of the viewport.
+        let swapped = swap_window(&swapped, WindowId(2), Direction::Up, &config).expect("swap");
+        let swapped = swap_window(&swapped, WindowId(2), Direction::Up, &config).expect("swap");
+        assert_eq!(ids(&swapped.columns[0]), vec![2, 1, 3, 4]);
+        assert_eq!(swapped.columns[0].row_offset, 0);
+    }
+
+    #[test]
+    fn swap_window_across_columns_keeps_each_column_height_profile() {
+        let config = stacked_config(2, 0);
+        let layout = VirtualLayout::with_columns(
+            vec![
+                Column::with_row(960, Row::new(WindowId(9), 1072)),
+                stack(&[1, 2, 3, 4], 0, &config),
+            ],
+            0,
+        );
+        let swapped = swap_window(&layout, WindowId(9), Direction::Right, &config).expect("swap");
+        assert_eq!(ids(&swapped.columns[0]), vec![1]);
+        assert_eq!(swapped.columns[0].rows[0].height, 1072);
+        assert_eq!(ids(&swapped.columns[1]), vec![9, 2, 3, 4]);
+        assert_eq!(
+            swapped.columns[1].rows[0].height,
+            column_heights(4, &config)[0]
+        );
+    }
+
+    #[test]
+    fn merge_into_a_stacked_column_reveals_the_new_bottom_row() {
+        let config = stacked_config(2, 0);
+        let layout = VirtualLayout::with_columns(
+            vec![
+                Column::with_row(960, Row::new(WindowId(9), 1072)),
+                stack(&[1, 2, 3], 0, &config),
+            ],
+            0,
+        );
+        let merged = merge_column(&layout, WindowId(9), Direction::Right, &config).expect("merge");
+        assert_eq!(merged.columns.len(), 1);
+        assert_eq!(ids(&merged.columns[0]), vec![1, 2, 3, 9]);
+        assert_eq!(merged.columns[0].row_offset, 2);
+        assert_eq!(
+            merged.columns[0].rows[3].height,
+            column_heights(4, &config)[3]
+        );
+    }
+
+    #[test]
+    fn merge_into_a_full_column_moves_the_window_past_it() {
+        let config = stacked_config(2, 2);
+        // [A] [B,C] [D]: A merges right into a full column → swaps past it.
+        let layout = VirtualLayout::with_columns(
+            vec![
+                Column::with_row(960, Row::new(WindowId(1), 1072)),
+                stack(&[2, 3], 0, &config),
+                Column::with_row(960, Row::new(WindowId(4), 1072)),
+            ],
+            0,
+        );
+        let moved =
+            merge_column(&layout, WindowId(1), Direction::Right, &config).expect("move past");
+        assert_eq!(
+            moved.columns.iter().map(ids).collect::<Vec<_>>(),
+            vec![vec![2, 3], vec![1], vec![4]]
+        );
+        assert_eq!(
+            moved,
+            swap_column(&layout, WindowId(1), Direction::Right, &config).expect("swap")
+        );
+        // Pressing again walks it on: D is not full, so now it merges.
+        let merged = merge_column(&moved, WindowId(1), Direction::Right, &config).expect("merge");
+        assert_eq!(
+            merged.columns.iter().map(ids).collect::<Vec<_>>(),
+            vec![vec![2, 3], vec![4, 1]]
+        );
+        // And leftward past the full column.
+        let back = merge_column(&moved, WindowId(1), Direction::Left, &config).expect("move past");
+        assert_eq!(back, layout);
+    }
+
+    #[test]
+    fn merge_from_a_stack_into_a_full_column_extracts_the_window_past_it() {
+        let config = stacked_config(2, 2);
+        let layout = VirtualLayout::with_columns(
+            vec![stack(&[1, 5], 0, &config), stack(&[2, 3], 0, &config)],
+            0,
+        );
+        let moved =
+            merge_column(&layout, WindowId(1), Direction::Right, &config).expect("move past");
+        assert_eq!(
+            moved.columns.iter().map(ids).collect::<Vec<_>>(),
+            vec![vec![5], vec![2, 3], vec![1]]
+        );
+        assert_eq!(moved.columns[0].rows[0].height, 1072);
+        let layout = VirtualLayout::with_columns(
+            vec![stack(&[2, 3], 0, &config), stack(&[1, 5], 0, &config)],
+            0,
+        );
+        let moved =
+            merge_column(&layout, WindowId(1), Direction::Left, &config).expect("move past");
+        assert_eq!(
+            moved.columns.iter().map(ids).collect::<Vec<_>>(),
+            vec![vec![1], vec![2, 3], vec![5]]
+        );
+    }
+
+    #[test]
+    fn merge_into_a_full_column_at_the_strip_end_is_still_an_edge() {
+        let config = stacked_config(2, 2);
+        let layout = VirtualLayout::with_columns(
+            vec![
+                stack(&[2, 3], 0, &config),
+                Column::with_row(960, Row::new(WindowId(1), 1072)),
+            ],
+            0,
+        );
+        assert!(merge_column(&layout, WindowId(1), Direction::Right, &config).is_none());
+        assert!(merge_column(&layout, WindowId(2), Direction::Left, &config).is_none());
+    }
+
+    #[test]
+    fn min_height_guard_counts_visible_slots_not_rows() {
+        // Four rows at 100px minimum fit in 1080 flat (4 rows → 266px each),
+        // but a floor of 300px rejects a 4th row without a viewport and
+        // accepts it with a 2-row viewport (two 534px slots).
+        let tight = MutationConfig {
+            min_window_height_px: 300,
+            ..test_config()
+        };
+        let layout = VirtualLayout::with_columns(
+            vec![
+                Column::with_row(960, Row::new(WindowId(9), 1072)),
+                stack(&[1, 2, 3], 0, &tight),
+            ],
+            0,
+        );
+        assert!(merge_column(&layout, WindowId(9), Direction::Right, &tight).is_none());
+        let roomy = MutationConfig {
+            visible_rows: 2,
+            ..tight
+        };
+        assert!(merge_column(&layout, WindowId(9), Direction::Right, &roomy).is_some());
+    }
+
+    #[test]
+    fn removing_rows_clamps_the_viewport() {
+        let config = stacked_config(2, 0);
+        let layout = VirtualLayout::with_columns(vec![stack(&[1, 2, 3, 4], 2, &config)], 0);
+        let shorter = remove_window(&layout, WindowId(4), &config);
+        assert_eq!(shorter.columns[0].row_offset, 1);
+        assert_eq!(
+            shorter.columns[0].rows[0].height,
+            column_heights(3, &config)[0]
+        );
+        let shorter = remove_window(&shorter, WindowId(3), &config);
+        assert_eq!(shorter.columns[0].row_offset, 0);
+        // Promote and merge-out clamp the source too.
+        let layout = VirtualLayout::with_columns(
+            vec![
+                stack(&[1, 2, 3], 1, &config),
+                Column::with_row(960, Row::new(WindowId(9), 1072)),
+            ],
+            0,
+        );
+        let promoted =
+            promote_window(&layout, WindowId(3), Direction::Right, &config).expect("promote");
+        assert_eq!(promoted.columns[0].row_offset, 0);
+        let merged = merge_column(&layout, WindowId(3), Direction::Right, &config).expect("merge");
+        assert_eq!(merged.columns[0].row_offset, 0);
+    }
+
+    #[test]
+    fn normalize_clamps_every_column_and_reveals_the_focused_row() {
+        let config = stacked_config(2, 0);
+        let layout = VirtualLayout::with_columns(
+            vec![
+                stack(&[1, 2, 3], 9, &config),
+                stack(&[4, 5, 6, 7], 0, &config),
+            ],
+            0,
+        );
+        let fixed = normalize_row_viewports(&layout, Some(WindowId(7)), &config);
+        assert_eq!(fixed.columns[0].row_offset, 1);
+        assert_eq!(fixed.columns[1].row_offset, 2);
+        // An unknown focus only clamps.
+        let fixed = normalize_row_viewports(&layout, Some(WindowId(42)), &config);
+        assert_eq!(fixed.columns[1].row_offset, 0);
+    }
+
+    #[test]
+    fn add_window_to_a_full_column_appends_a_column_after_it() {
+        let config = stacked_config(2, 2);
+        let layout = VirtualLayout::with_columns(
+            vec![
+                stack(&[1, 2], 0, &config),
+                Column::with_row(960, Row::new(WindowId(9), 1072)),
+            ],
+            0,
+        );
+        let added = add_window_to_column(&layout, 0, WindowId(3), &config);
+        assert_eq!(
+            added.columns.iter().map(ids).collect::<Vec<_>>(),
+            vec![vec![1, 2], vec![3], vec![9]]
+        );
+        // Under the cap it stacks as before.
+        let roomy = stacked_config(2, 3);
+        let added = add_window_to_column(&layout, 0, WindowId(3), &roomy);
+        assert_eq!(ids(&added.columns[0]), vec![1, 2, 3]);
+        assert_eq!(
+            added.columns[0].rows[2].height,
+            column_heights(3, &roomy)[2]
+        );
+    }
+
+    #[test]
+    fn set_layout_splits_columns_over_the_cap() {
+        let config = stacked_config(2, 2);
+        let layout = set_layout(
+            &config,
+            vec![
+                (
+                    960,
+                    vec![WindowId(1), WindowId(2), WindowId(3), WindowId(4)],
+                ),
+                (960, vec![WindowId(5)]),
+            ],
+            0,
+        );
+        assert_eq!(
+            layout.columns.iter().map(ids).collect::<Vec<_>>(),
+            vec![vec![1, 2], vec![3], vec![4], vec![5]]
+        );
+        // Unlimited: the column is kept whole and sized for the viewport.
+        let whole = set_layout(
+            &stacked_config(2, 0),
+            vec![(
+                960,
+                vec![WindowId(1), WindowId(2), WindowId(3), WindowId(4)],
+            )],
+            0,
+        );
+        assert_eq!(ids(&whole.columns[0]), vec![1, 2, 3, 4]);
+        assert_eq!(
+            whole.columns[0].rows[0].height,
+            column_heights(4, &stacked_config(2, 0))[0]
+        );
+    }
+
+    #[test]
+    fn refit_heights_gives_a_stacked_column_the_slot_split() {
+        let config = stacked_config(2, 0);
+        let mut layout = VirtualLayout::with_columns(vec![stack(&[1, 2, 3, 4], 0, &config)], 0);
+        for r in &mut layout.columns[0].rows {
+            r.height = 7;
+        }
+        let refit = refit_heights(&layout, &config);
+        assert_eq!(
+            refit.columns[0]
+                .rows
+                .iter()
+                .map(|r| r.height)
+                .collect::<Vec<_>>(),
+            column_heights(4, &config)
+        );
     }
 }

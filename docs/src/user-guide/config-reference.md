@@ -51,6 +51,8 @@ Not every field can change at runtime. Reload applies **live** fields in place;
 | `columns_per_screen` | Updates the cached threshold (no window movement; affects future auto-center). |
 | `column_width`, `min_column_width_px`, `min_window_height_px` | Update cached bounds; existing per-column widths preserved. |
 | `columns.presets`, `columns.default` | Each monitor's base width is re-derived from its preset (a monitor whose preset index no longer exists is clamped; a monitor that had no presets before starts on `default`). Existing per-column widths preserved. |
+| `columns.visible_rows` | Every column re-shares its height over the new viewport size and the focused row is kept visible (windows animate). |
+| `columns.max_rows` | Applies to the next merge/consume/insert; a column already over the new cap keeps its rows until windows leave it. |
 | `animation.*` | New duration / easing / enabled flag applies to the next animation. |
 | `navigation.edge_hop` | Applies to the next `focus` / `move-window` at a strip edge. |
 | **Workspace count (10), monitor geometry** | **Structural** — not reloadable. Restart the daemon. |
@@ -114,6 +116,8 @@ focused monitor through the list (see the
 |-------|------|---------|-------------|
 | `presets` | `Vec<String>` | `["1/3", "1/2", "1/1"]` | Ordered presets. Each is a fraction `"a/b"` of the work area, or a plain number in `(0, 1]` such as `0.5`. Must not be empty. |
 | `default` | `Option<String>` | `None` (= the first preset) | The preset every monitor starts on. Must be one of `presets`. |
+| `visible_rows` | `u32` | `0` | How many rows of a column are on screen at once. `0` shows every row sharing the height. With `2`, a column of four windows shows two at a time and `focus up/down` scrolls through the stack. |
+| `max_rows` | `u32` | `0` | The most rows a column may hold; `0` is unlimited. Must be at least `visible_rows` when both are set. Merging into a full column moves the window past it instead. |
 
 A preset `1/n` is sized so that `n` columns **plus their gaps** fill the work
 area exactly: `(work_area_width - window_gap * (n + 1)) / n`. So `"1/1"` is
@@ -138,6 +142,44 @@ Example:
 presets = ["1/3", "1/2", "1/1"]
 default = "1/2"
 ```
+
+#### Stacked columns: `visible_rows` and `max_rows`
+
+By default every window in a column shares the column's height, so stacking
+four windows gives four short rows. `visible_rows = 2` keeps a column at most
+two rows tall on screen: the column shows two of its windows, each taking an
+equal share of the work area, and the rest are **parked** off-screen above
+or below the monitor (beyond the whole virtual screen when another monitor is
+stacked on that side, so a parked row never lands on it). `focus up` /
+`focus down` move through the stack one row at a time and scroll the column's
+viewport when the next row is parked; `move-window up/down` swaps rows and the
+viewport follows the window. Any other way focus lands on a parked row (a
+mouse click, `focus-monitor`, a workspace switch, tiling coming back on)
+scrolls it into view too. When a column has no more rows than `visible_rows`
+nothing changes from today.
+
+`max_rows` caps the stack. `merge-column` and `consume-or-expel` into a full
+column do not refuse: the window moves past that column instead (exactly as
+`move-window left/right` would), so repeated presses walk it along the strip.
+Every other way a window joins a column — a loadout or display-change
+restore, a window coming back from floating or fullscreen — appends it as a
+new column after the full one. A mouse drag dropped onto a full column is
+refused.
+
+```toml
+[columns]
+presets = ["1/3", "1/2", "1/1"]
+default = "1/2"
+visible_rows = 2   # a stack shows two windows at a time
+max_rows = 4       # and holds at most four
+```
+
+Note that `[columns]` also switches column widths to presets: a table with
+only `visible_rows` / `max_rows` uses the default `presets`.
+
+`flow query all` reports, per monitor, each column's `row_count`,
+`row_offset` (the first visible row) and `visible_rows`, and every window's
+`parked_row`.
 
 ### `[padding]` — spacing
 

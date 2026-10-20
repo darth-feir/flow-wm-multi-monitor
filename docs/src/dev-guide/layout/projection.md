@@ -121,6 +121,37 @@ There are two parking zones:
 
 Parked windows use the same `row.height`-stacking logic as visible windows, so when a column scrolls from parked to visible (or vice versa), its windows animate smoothly with consistent dimensions — there is no sudden resize or padding change at the boundary.
 
+## Row viewports (stacked columns)
+
+`project` takes a fourth argument, `visible_rows` (`[columns] visible_rows`,
+carried as `MutationConfig::visible_rows`; `0` = no viewport). A column with
+more rows than that shows only `visible_rows` of them — the **slots** — from
+`Column::row_offset` on, stacked exactly like a column of that many rows (the
+row heights were distributed over the slot count by the mutation layer, see
+[`column_heights`](./mutations.md#row-heights-source-of-truth-model)). The
+other rows are **parked vertically** at the column's own x:
+
+| rows                                   | y                                                      |
+|----------------------------------------|--------------------------------------------------------|
+| before the offset (parked above)       | bottom edge at `park_above_bottom`: `PARK_MARGIN` above the monitor's physical screen rect, or above the **virtual screen** when a monitor is stacked above (`neighbour_up`) |
+| `row_offset .. row_offset + slots`     | stacked from the top of the work area as usual         |
+| after the viewport (parked below)      | top edge at `park_below_top`: `PARK_MARGIN` below the screen rect, or below the virtual screen when a monitor is stacked below (`neighbour_down`) |
+
+This is the workspace-parking rule applied to rows (one shared slot per side,
+the physical screen rect rather than the work area so a parked row clears a
+taskbar, the far slot on a blocked side so it never lands on the neighbour),
+which is why `MonitorInfo` now carries `screen_rect`. The parked rows of a
+column that is itself parked left/right keep their vertical slot too, so they
+are off-screen on both axes. The animation bridge needs no new rule: a rect
+parked above or below the virtual screen is classified by `park_sides` like
+a parked workspace and the move is instant when that side has a neighbour
+([Animation](../animation.md#instant-targets-and-the-neighbour-teleport-rule)).
+A stale `row_offset` (rows removed without a clamp) is projected as if
+clamped, so a column never hides every row.
+
+When a column has no more rows than `visible_rows`, or `visible_rows` is
+`0`, the output is identical to the flat model above.
+
 ## Why projection is the only place padding lives
 
 Padding is applied exclusively during projection and never stored on `Column`, `VirtualLayout`, or individual windows. This design choice keeps the virtual canvas model clean: columns are pure containers of windows with widths, and the spatial realities of screen edges, gaps, and margins are deferred to the one function that converts canvas geometry to screen coordinates. The `ActualEntry` rects produced by projection are the **final HWND rects** — they can be passed directly to `SetWindowPos` without any further adjustment.

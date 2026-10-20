@@ -189,6 +189,15 @@ pub struct ColumnsConfig {
     #[schemars(with = "Option<String>")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<WidthPreset>,
+    /// How many rows of a stacked column are on screen at once. `0` (the
+    /// default) shows every row sharing the height, as before. With
+    /// `visible_rows = 2` a column of four windows shows two, and
+    /// `focus up/down` scrolls through the stack.
+    pub visible_rows: u32,
+    /// The most rows a column may hold; `0` (the default) is unlimited.
+    /// Merging into a full column moves the window past it instead. Must be
+    /// at least `visible_rows` when both are set.
+    pub max_rows: u32,
 }
 
 impl Default for ColumnsConfig {
@@ -199,18 +208,27 @@ impl Default for ColumnsConfig {
                 .filter_map(|p| WidthPreset::parse(p).ok())
                 .collect(),
             default: None,
+            visible_rows: 0,
+            max_rows: 0,
         }
     }
 }
 
 impl ColumnsConfig {
-    /// Validate the section: at least one preset, and `default` (when set)
-    /// names one of them.
+    /// Validate the section: at least one preset, `default` (when set)
+    /// names one of them, and `max_rows` (when set) is not below
+    /// `visible_rows` (when set).
     ///
     /// # Errors
     ///
     /// A message naming the offending field.
     pub fn validate(&self) -> Result<(), String> {
+        if self.visible_rows > 0 && self.max_rows > 0 && self.max_rows < self.visible_rows {
+            return Err(format!(
+                "columns.max_rows ({}) must be at least columns.visible_rows ({})",
+                self.max_rows, self.visible_rows
+            ));
+        }
         if self.presets.is_empty() {
             return Err(
                 "columns.presets must list at least one preset (e.g. [\"1/3\", \"1/2\", \"1/1\"])"
@@ -346,5 +364,34 @@ mod tests {
         assert!(bad.validate().is_err());
         let empty: ColumnsConfig = toml::from_str("presets = []").expect("parse");
         assert!(empty.validate().is_err());
+    }
+
+    #[test]
+    fn row_limits_default_to_zero_and_validate_against_each_other() {
+        let cfg: ColumnsConfig = toml::from_str("presets = [\"1/2\"]").expect("parse");
+        assert_eq!((cfg.visible_rows, cfg.max_rows), (0, 0));
+        assert!(cfg.validate().is_ok());
+
+        let cfg: ColumnsConfig =
+            toml::from_str("presets = [\"1/2\"]\nvisible_rows = 2\nmax_rows = 4").expect("parse");
+        assert_eq!((cfg.visible_rows, cfg.max_rows), (2, 4));
+        assert!(cfg.validate().is_ok());
+
+        // Equal is fine; only one of them set is fine.
+        let cfg: ColumnsConfig =
+            toml::from_str("presets = [\"1/2\"]\nvisible_rows = 3\nmax_rows = 3").expect("parse");
+        assert!(cfg.validate().is_ok());
+        let cfg: ColumnsConfig =
+            toml::from_str("presets = [\"1/2\"]\nmax_rows = 1").expect("parse");
+        assert!(cfg.validate().is_ok());
+        let cfg: ColumnsConfig =
+            toml::from_str("presets = [\"1/2\"]\nvisible_rows = 5").expect("parse");
+        assert!(cfg.validate().is_ok());
+
+        // A cap below the viewport is rejected.
+        let bad: ColumnsConfig =
+            toml::from_str("presets = [\"1/2\"]\nvisible_rows = 3\nmax_rows = 2").expect("parse");
+        let err = bad.validate().expect_err("max_rows < visible_rows");
+        assert!(err.contains("max_rows"), "{err}");
     }
 }

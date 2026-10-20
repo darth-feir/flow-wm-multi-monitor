@@ -45,6 +45,14 @@ pub(super) struct LayoutConfig {
 
     /// Padding converted from config types to layout types.
     pub(super) padding: crate::layout::types::Padding,
+
+    /// `[columns] visible_rows` (`0` = every row), see
+    /// [`ColumnsConfig::visible_rows`](crate::config::width_preset::ColumnsConfig::visible_rows).
+    pub(super) visible_rows: u32,
+
+    /// `[columns] max_rows` (`0` = unlimited), see
+    /// [`ColumnsConfig::max_rows`](crate::config::width_preset::ColumnsConfig::max_rows).
+    pub(super) max_rows: u32,
 }
 
 /// The single orchestrator for the FlowWM daemon.

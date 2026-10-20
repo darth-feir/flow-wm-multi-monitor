@@ -129,6 +129,10 @@ fn build_mutation_config(
         abs_max_width,
         padding,
         columns_per_screen,
+        // The row limits are not geometry: `new` starts without them and
+        // `reconfigure` / `set_monitor_info` carry the current ones over.
+        visible_rows: 0,
+        max_rows: 0,
     }
 }
 
@@ -170,7 +174,7 @@ impl ScrollingSpace {
             padding,
             columns_per_screen,
         );
-        let actual = projection::project(&virtual_layout, &monitor, &config.padding);
+        let actual = projection::project(&virtual_layout, &monitor, &config.padding, 0);
 
         Self {
             virtual_layout,
@@ -218,10 +222,60 @@ impl ScrollingSpace {
             padding,
             columns_per_screen,
         );
+        self.config.visible_rows = old.visible_rows;
+        self.config.max_rows = old.max_rows;
         self.refit_to_config(&old);
-        self.actual =
-            projection::project(&self.virtual_layout, &self.monitor, &self.config.padding);
+        self.reproject();
         self.actual.clone()
+    }
+
+    /// The strip with `[columns] visible_rows` / `max_rows` set to
+    /// `visible_rows` / `max_rows` (`0` = unlimited) — the construction-time
+    /// form of [`set_row_limits`](Self::set_row_limits).
+    #[must_use]
+    pub fn with_row_limits(mut self, visible_rows: u32, max_rows: u32) -> Self {
+        let _ = self.set_row_limits(visible_rows, max_rows);
+        self
+    }
+
+    /// Change the row viewport size (`visible_rows`, `0` = every row) and the
+    /// per-column cap (`max_rows`, `0` = unlimited) — the live-reload path
+    /// for the two `[columns]` keys. A changed `visible_rows` re-shares every
+    /// column's height over its new slot count and keeps the focused row
+    /// visible; a changed `max_rows` only governs future inserts (a column
+    /// already over the cap keeps its rows until windows leave it). Returns
+    /// the re-projected layout for the animator.
+    pub fn set_row_limits(&mut self, visible_rows: u32, max_rows: u32) -> ActualLayout {
+        let old = self.config;
+        self.config.visible_rows = visible_rows;
+        self.config.max_rows = max_rows;
+        if old.visible_rows != visible_rows {
+            let mut layout = self.virtual_layout.clone();
+            for col in &mut layout.columns {
+                let heights = mutations::column_heights(col.rows.len(), &self.config);
+                for (row, h) in col.rows.iter_mut().zip(heights) {
+                    row.height = h;
+                }
+            }
+            self.virtual_layout = layout;
+        }
+        self.virtual_layout = mutations::normalize_row_viewports(
+            &self.virtual_layout,
+            self.last_focused_window,
+            &self.config,
+        );
+        self.reproject();
+        self.actual.clone()
+    }
+
+    /// Re-project the current virtual layout into `self.actual`.
+    fn reproject(&mut self) {
+        self.actual = projection::project(
+            &self.virtual_layout,
+            &self.monitor,
+            &self.config.padding,
+            self.config.visible_rows,
+        );
     }
 
     /// Bring the existing layout within the bounds of a freshly built
@@ -322,9 +376,10 @@ impl ScrollingSpace {
             old.padding,
             old.columns_per_screen,
         );
+        self.config.visible_rows = old.visible_rows;
+        self.config.max_rows = old.max_rows;
         self.refit_to_config(&old);
-        self.actual =
-            projection::project(&self.virtual_layout, &self.monitor, &self.config.padding);
+        self.reproject();
         self.actual.clone()
     }
 
@@ -401,8 +456,32 @@ impl ScrollingSpace {
     /// This method returns the full [`ActualLayout`] and lets the animation
     /// layer decide which windows to animate by comparing each target rect
     /// against the window's real on-screen position.
+    ///
+    /// Before projecting, every column's row viewport is clamped and the
+    /// focused window's column is scrolled so the focused row is visible
+    /// ([`mutations::normalize_row_viewports`]): whatever the mutation did
+    /// — focus arriving from another column, a merge, a removal, a restore
+    /// — the focused window is never left parked inside its own column.
     fn apply_mutation(&mut self, new_layout: VirtualLayout) -> AppliedLayout {
-        let new_actual = projection::project(&new_layout, &self.monitor, &self.config.padding);
+        self.apply_mutation_for(new_layout, self.last_focused_window)
+    }
+
+    /// [`apply_mutation`](Self::apply_mutation) keeping `window` (the
+    /// caller-resolved target of a swap/merge/promote, normally the
+    /// OS-foreground tile) visible in its column instead of the strip's
+    /// focus cursor.
+    fn apply_mutation_for(
+        &mut self,
+        new_layout: VirtualLayout,
+        window: Option<WindowId>,
+    ) -> AppliedLayout {
+        let new_layout = mutations::normalize_row_viewports(&new_layout, window, &self.config);
+        let new_actual = projection::project(
+            &new_layout,
+            &self.monitor,
+            &self.config.padding,
+            self.config.visible_rows,
+        );
 
         let result = AppliedLayout {
             actual_layout: new_actual.clone(),
@@ -459,7 +538,10 @@ impl ScrollingSpace {
         let result = mutations::focus(&self.virtual_layout, source, direction, &self.config)?;
         self.last_focused_window = Some(result.focused);
 
-        let diff = if result.new_layout.viewport_offset != self.virtual_layout.viewport_offset {
+        // The camera moved (left/right) or a stacked column's row viewport
+        // shifted (up/down): either way windows move and the layout must
+        // be animated.
+        let diff = if result.new_layout != self.virtual_layout {
             Some(self.apply_mutation(result.new_layout))
         } else {
             None
@@ -492,7 +574,7 @@ impl ScrollingSpace {
     pub fn swap_column(&mut self, target: WindowId, direction: Direction) -> Option<AppliedLayout> {
         let new_layout =
             mutations::swap_column(&self.virtual_layout, target, direction, &self.config)?;
-        Some(self.apply_mutation(new_layout))
+        Some(self.apply_mutation_for(new_layout, Some(target)))
     }
 
     /// Swap the target **window** with an adjacent individual window.
@@ -508,7 +590,7 @@ impl ScrollingSpace {
     pub fn swap_window(&mut self, target: WindowId, direction: Direction) -> Option<AppliedLayout> {
         let new_layout =
             mutations::swap_window(&self.virtual_layout, target, direction, &self.config)?;
-        Some(self.apply_mutation(new_layout))
+        Some(self.apply_mutation_for(new_layout, Some(target)))
     }
 
     // -----------------------------------------------------------------------
@@ -534,7 +616,7 @@ impl ScrollingSpace {
     ) -> Option<AppliedLayout> {
         let new_layout =
             mutations::merge_column(&self.virtual_layout, target, direction, &self.config)?;
-        Some(self.apply_mutation(new_layout))
+        Some(self.apply_mutation_for(new_layout, Some(target)))
     }
 
     /// Promote the target window out of its column into a new standalone column.
@@ -556,7 +638,7 @@ impl ScrollingSpace {
     ) -> Option<AppliedLayout> {
         let new_layout =
             mutations::promote_window(&self.virtual_layout, target, direction, &self.config)?;
-        Some(self.apply_mutation(new_layout))
+        Some(self.apply_mutation_for(new_layout, Some(target)))
     }
 
     // -----------------------------------------------------------------------
@@ -779,30 +861,37 @@ impl ScrollingSpace {
             (self.config.min_column_width_px as i32).min(self.config.abs_max_width),
             self.config.abs_max_width,
         );
-        let into_existing = !alone && col < new_layout.columns.len() && {
-            let n = new_layout.columns[col].rows.len() + 1;
-            let heights = mutations::distribute_heights(
-                n,
-                self.config.available_height(),
-                self.config.padding.window_gap,
-            );
-            heights
-                .iter()
-                .all(|h| *h >= self.config.min_window_height_px as i32)
-        };
-        let seat_col = if into_existing {
-            new_layout = mutations::add_window_to_column(&new_layout, col, window, &self.config);
-            let rows = &mut new_layout.columns[col].rows;
-            let last = rows.len() - 1;
-            let at = row.min(last);
-            let moved = rows.remove(last);
-            rows.insert(at, moved);
-            col
-        } else {
-            let idx = col.min(new_layout.columns.len());
-            new_layout = mutations::seat_window_at(&new_layout, idx, window, &self.config);
-            new_layout.columns[idx].width_px = width;
-            idx
+        // Back into its old column when that column still exists, is not
+        // full (`max_rows`) and has room above `min_window_height_px`; a
+        // full column is followed instead (the window becomes a new column
+        // right after it), never exceeded.
+        let existing = (!alone && col < new_layout.columns.len()).then(|| {
+            let n = new_layout.columns[col].rows.len();
+            (self.config.column_full(n), self.config.rows_fit(n + 1))
+        });
+        let seat_col = match existing {
+            Some((false, true)) => {
+                new_layout =
+                    mutations::add_window_to_column(&new_layout, col, window, &self.config);
+                let rows = &mut new_layout.columns[col].rows;
+                let last = rows.len() - 1;
+                let at = row.min(last);
+                let moved = rows.remove(last);
+                rows.insert(at, moved);
+                col
+            }
+            Some((true, _)) => {
+                let idx = (col + 1).min(new_layout.columns.len());
+                new_layout = mutations::seat_window_at(&new_layout, idx, window, &self.config);
+                new_layout.columns[idx].width_px = width;
+                idx
+            }
+            _ => {
+                let idx = col.min(new_layout.columns.len());
+                new_layout = mutations::seat_window_at(&new_layout, idx, window, &self.config);
+                new_layout.columns[idx].width_px = width;
+                idx
+            }
         };
         new_layout = mutations::ensure_column_visible(&new_layout, seat_col, &self.config);
         self.last_focused_window = Some(window);
@@ -1012,17 +1101,24 @@ impl ScrollingSpace {
     /// Delegates to [`mutations::ensure_column_visible`] on the focused
     /// column. Used by the MoveWindowToWorkspace overflow case to bring the
     /// moved window into view. See (`docs/src/dev-guide/layout/mutations.md`).
+    ///
+    /// Inside a stacked column the focused **row** is revealed as well
+    /// (the row viewport shifts, [`mutations::ensure_row_visible`]), so a
+    /// mouse click, a focus-monitor arrival or a workspace switch landing on
+    /// a parked row scrolls it on screen.
     pub(crate) fn ensure_focused_visible(&mut self) -> Option<AppliedLayout> {
         if self.virtual_layout.columns.is_empty() {
             return None;
         }
         let focus_col = self.focus_col_index();
-        let prev_offset = self.virtual_layout.viewport_offset;
-        let new_layout =
+        let mut new_layout =
             mutations::ensure_column_visible(&self.virtual_layout, focus_col, &self.config);
+        if let Some(f) = self.last_focused_window {
+            new_layout = mutations::ensure_row_visible(&new_layout, f, &self.config);
+        }
         // Already visible — no scroll, no diff. This makes the method a natural
         // no-op for self-induced foreground changes re-entering via the hook.
-        if new_layout.viewport_offset == prev_offset {
+        if new_layout == self.virtual_layout {
             return None;
         }
         Some(self.apply_mutation(new_layout))
@@ -3268,5 +3364,156 @@ mod tests {
         assert_eq!(applied.virtual_layout.columns.len(), 1);
         assert_eq!(engine.last_focused_window(), Some(WindowId(1)));
         assert_eq!(applied.actual_layout.entries.len(), 1);
+    }
+
+    // ── Row viewports (stacked columns) ───────────────────────────────
+
+    /// A strip with a two-row viewport holding `[1,2,3,4]` in one column,
+    /// focus on window 1.
+    fn stacked_engine() -> ScrollingSpace {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4)
+            .with_row_limits(2, 0);
+        engine.add_window(WindowId(1));
+        for id in 2..=4 {
+            engine
+                .add_window_to_focused_column(WindowId(id))
+                .expect("stack");
+        }
+        engine.set_focus(WindowId(1));
+        let _ = engine.ensure_focused_visible();
+        engine
+    }
+
+    fn parked(engine: &ScrollingSpace, id: isize) -> bool {
+        let rect = engine
+            .actual_layout()
+            .find(WindowId(id))
+            .expect("window projected")
+            .rect;
+        engine.monitor().is_parked(rect)
+    }
+
+    #[test]
+    fn stacked_engine_shows_two_rows_and_parks_the_rest() {
+        let engine = stacked_engine();
+        assert_eq!(engine.virtual_layout().columns[0].row_offset, 0);
+        assert!(!parked(&engine, 1) && !parked(&engine, 2));
+        assert!(parked(&engine, 3) && parked(&engine, 4));
+        let h = engine
+            .actual_layout()
+            .find(WindowId(1))
+            .expect("1")
+            .rect
+            .height;
+        assert_eq!(h, mutations::column_heights(4, engine.config())[0]);
+    }
+
+    #[test]
+    fn focus_down_through_a_stack_scrolls_it_and_returns_a_diff() {
+        let mut engine = stacked_engine();
+        let (f, diff) = engine.focus(WindowId(1), Direction::Down).expect("down");
+        assert_eq!(f, WindowId(2));
+        assert!(diff.is_none(), "row 2 was already visible");
+        let (f, diff) = engine.focus(WindowId(2), Direction::Down).expect("down");
+        assert_eq!(f, WindowId(3));
+        assert!(diff.is_some(), "the viewport shifted");
+        assert_eq!(engine.virtual_layout().columns[0].row_offset, 1);
+        assert!(parked(&engine, 1) && !parked(&engine, 3) && parked(&engine, 4));
+        let (f, _) = engine.focus(WindowId(3), Direction::Down).expect("down");
+        assert_eq!(f, WindowId(4));
+        assert!(engine.focus(WindowId(4), Direction::Down).is_none());
+        assert_eq!(engine.virtual_layout().columns[0].row_offset, 2);
+    }
+
+    #[test]
+    fn ensure_focused_visible_reveals_a_parked_row() {
+        let mut engine = stacked_engine();
+        engine.set_focus(WindowId(4));
+        let diff = engine.ensure_focused_visible();
+        assert!(diff.is_some());
+        assert_eq!(engine.virtual_layout().columns[0].row_offset, 2);
+        assert!(!parked(&engine, 4));
+        // Already visible: no diff.
+        assert!(engine.ensure_focused_visible().is_none());
+    }
+
+    #[test]
+    fn removing_the_last_rows_clamps_the_viewport() {
+        let mut engine = stacked_engine();
+        engine.set_focus(WindowId(4));
+        let _ = engine.ensure_focused_visible();
+        assert_eq!(engine.virtual_layout().columns[0].row_offset, 2);
+        let _ = engine.remove_window(WindowId(4));
+        assert_eq!(engine.last_focused_window(), Some(WindowId(3)));
+        assert_eq!(engine.virtual_layout().columns[0].row_offset, 1);
+        assert!(!parked(&engine, 3) && !parked(&engine, 2) && parked(&engine, 1));
+    }
+
+    #[test]
+    fn set_row_limits_reshares_heights_and_keeps_the_focus_visible() {
+        let mut engine = stacked_engine();
+        engine.set_focus(WindowId(4));
+        let _ = engine.ensure_focused_visible();
+        // Widen the viewport to three rows: the offset is pulled back so the
+        // focused row stays in, heights are re-shared over three slots.
+        let _ = engine.set_row_limits(3, 0);
+        assert_eq!(engine.virtual_layout().columns[0].row_offset, 1);
+        assert!(!parked(&engine, 4) && parked(&engine, 1));
+        let h = engine
+            .actual_layout()
+            .find(WindowId(4))
+            .expect("4")
+            .rect
+            .height;
+        assert_eq!(h, mutations::column_heights(4, engine.config())[3]);
+        // Back to no viewport: everything on screen, offset 0.
+        let _ = engine.set_row_limits(0, 0);
+        assert_eq!(engine.virtual_layout().columns[0].row_offset, 0);
+        assert!((1..=4).all(|id| !parked(&engine, id)));
+        // Reconfigure keeps the limits.
+        let _ = engine.set_row_limits(2, 3);
+        let _ = engine.set_base_column_width(800);
+        assert_eq!(
+            (engine.config().visible_rows, engine.config().max_rows),
+            (2, 3)
+        );
+    }
+
+    #[test]
+    fn restore_into_a_full_column_seats_the_window_after_it() {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4)
+            .with_row_limits(2, 2);
+        engine.add_window(WindowId(1));
+        engine
+            .add_window_to_focused_column(WindowId(2))
+            .expect("stack");
+        engine.add_window(WindowId(9));
+        // Window 3 claims row 1 of column 0, which is full: it becomes a
+        // new column between the stack and window 9.
+        let _ = engine.restore_window_at(0, 1, false, WindowId(3), None);
+        let order: Vec<Vec<isize>> = engine
+            .virtual_layout()
+            .columns
+            .iter()
+            .map(|c| c.rows.iter().map(|r| r.window_id.0).collect())
+            .collect();
+        assert_eq!(order, vec![vec![1, 2], vec![3], vec![9]]);
+        assert_eq!(engine.last_focused_window(), Some(WindowId(3)));
+    }
+
+    #[test]
+    fn set_layout_clamps_the_viewport_to_the_restored_focus() {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4)
+            .with_row_limits(2, 0);
+        let _ = engine.set_layout(
+            vec![(
+                960,
+                vec![WindowId(1), WindowId(2), WindowId(3), WindowId(4)],
+            )],
+            Some(WindowId(4)),
+            0,
+        );
+        assert_eq!(engine.virtual_layout().columns[0].row_offset, 2);
+        assert!(!parked(&engine, 4) && parked(&engine, 1));
     }
 }

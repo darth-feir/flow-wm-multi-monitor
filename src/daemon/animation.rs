@@ -1609,7 +1609,7 @@ mod tests {
             vl.viewport_offset = 0;
             let monitor = *flow.monitors[0].active_scrolling().monitor();
             let padding = flow.monitors[0].active_scrolling().padding();
-            let actual = crate::layout::projection::project(&vl, &monitor, &padding);
+            let actual = crate::layout::projection::project(&vl, &monitor, &padding, 0);
             crate::layout::types::AppliedLayout {
                 virtual_layout: vl,
                 actual_layout: actual,

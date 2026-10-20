@@ -327,7 +327,9 @@ pub fn resize_column_boundary_move(
 /// Pure over `(&Column, &MutationConfig)`; unit-tested without Win32.
 #[must_use]
 pub fn derived_max_row_height(column: &Column, config: &MutationConfig) -> i32 {
-    let n = column.rows.len() as i32;
+    // Only the visible slots share the budget (a column with a row viewport
+    // stacks `visible_rows` of its rows, not all of them).
+    let n = column.slots(config.visible_rows) as i32;
     let gap = config.padding.window_gap;
     let min = config.min_row_height_px as i32;
     let total_content = config.available_height() - (n + 1) * gap;
@@ -403,6 +405,14 @@ pub fn resize_row_boundary_move(
     }
     let neighbor_idx = neighbor_idx as usize;
 
+    // Both rows must be on screen: a parked row's height is not part of the
+    // visible stack, so stealing from it would leave the stack short.
+    if !column.row_visible(row, config.visible_rows)
+        || !column.row_visible(neighbor_idx, config.visible_rows)
+    {
+        return None;
+    }
+
     let min = config.min_row_height_px as i32;
     let max = derived_max_row_height(column, config);
     let clamped_target = target_height.clamp(min, max);
@@ -456,6 +466,8 @@ mod tests {
                 down: 0,
             },
             columns_per_screen: 4,
+            visible_rows: 0,
+            max_rows: 0,
         }
     }
 
@@ -1123,5 +1135,32 @@ mod tests {
             .and_then(|l| resize_column_boundary_move(&l, 0, ResizeEdge::Right, 1200, &cfg))
             .expect("vh");
         assert_eq!(hv, vh);
+    }
+
+    /// With a row viewport, only a boundary between two visible rows can be
+    /// dragged: a parked neighbour is not part of the visible stack.
+    #[test]
+    fn row_resize_refuses_a_parked_neighbor() {
+        let config = MutationConfig {
+            visible_rows: 2,
+            ..test_config()
+        };
+        let heights = crate::layout::mutations::column_heights(3, &config);
+        let rows: Vec<Row> = (1..=3)
+            .zip(heights)
+            .map(|(i, h)| Row::new(WindowId(i), h))
+            .collect();
+        let layout = VirtualLayout::with_columns(vec![Column::with_rows(960, rows)], 0);
+        // Rows 0 and 1 are visible: dragging the boundary between them works.
+        assert!(
+            resize_row_boundary_move(&layout, 0, 0, VerticalEdge::Bottom, 300, &config).is_some()
+        );
+        // Row 2 is parked: the boundary between 1 and 2 is pinned.
+        assert!(
+            resize_row_boundary_move(&layout, 0, 1, VerticalEdge::Bottom, 300, &config).is_none()
+        );
+        // The ceiling is derived from the two visible slots, not three rows.
+        let max = derived_max_row_height(&layout.columns[0], &config);
+        assert_eq!(max, 1080 - 3 * 4 - 100);
     }
 }

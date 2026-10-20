@@ -69,6 +69,8 @@ pub(super) fn derive_layout_config(app_config: &FlowConfig, monitor: &MonitorInf
             up: app_config.padding.up,
             down: app_config.padding.down,
         },
+        visible_rows: app_config.columns.as_ref().map_or(0, |c| c.visible_rows),
+        max_rows: app_config.columns.as_ref().map_or(0, |c| c.max_rows),
     }
 }
 

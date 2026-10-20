@@ -1046,7 +1046,8 @@ fn fresh_monitor(
                     lc.min_row_height_px,
                     lc.padding,
                     columns_per_screen,
-                ),
+                )
+                .with_row_limits(lc.visible_rows, lc.max_rows),
             )
         })
         .collect();

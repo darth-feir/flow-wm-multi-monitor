@@ -221,6 +221,7 @@ impl FlowWM {
                     lc.padding,
                     columns_per_screen,
                 );
+                let _ = ws.scrolling.set_row_limits(lc.visible_rows, lc.max_rows);
             }
         }
     }

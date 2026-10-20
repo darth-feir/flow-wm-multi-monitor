@@ -91,11 +91,24 @@ pub const PARK_MARGIN: i32 = 16;
 ///
 /// The window rect fills the full `col.width_px` (no horizontal inset); the
 /// gap between columns comes from the slot structure itself.
+///
+/// # Row viewports
+///
+/// `visible_rows` is `[columns] visible_rows` (`0` = every row is shown).
+/// A column with more rows than that shows the `visible_rows` rows from
+/// [`Column::row_offset`] on, stacked exactly as a column of that many rows;
+/// the rows before the offset are parked **above** the monitor and the rows
+/// after the window **below** it, at the column's own x (see
+/// [`park_above_bottom`] / [`park_below_top`]). The rule mirrors workspace
+/// parking: just beyond the monitor's physical screen rect on a free side,
+/// beyond the whole virtual screen when another monitor is stacked on that
+/// side, so a parked row never lands on a neighbour.
 #[must_use]
 pub fn project(
     virtual_layout: &VirtualLayout,
     monitor: &MonitorInfo,
     padding: &Padding,
+    visible_rows: u32,
 ) -> ActualLayout {
     let monitor_rect = monitor.work_area;
     let viewport_left = virtual_layout.viewport_offset;
@@ -136,7 +149,15 @@ pub fn project(
             park_right_x(monitor)
         };
 
-        stack_column_rows(column, x, monitor_rect, col_width, padding, &mut entries);
+        stack_column_rows(
+            column,
+            x,
+            monitor,
+            col_width,
+            padding,
+            visible_rows,
+            &mut entries,
+        );
         canvas_x += col_width + slot_gap;
     }
 
@@ -157,33 +178,80 @@ pub fn park_right_x(monitor: &MonitorInfo) -> i32 {
     monitor.virtual_screen.right() + PARK_MARGIN
 }
 
+/// Bottom edge of the slot rows parked **above** the column viewport sit
+/// against: `PARK_MARGIN` above the virtual screen when a monitor is
+/// stacked above this one (`neighbour_up`), else `PARK_MARGIN` above the
+/// monitor's own screen rect. Every row parked above shares this edge (the
+/// one-slot-per-side model of workspace parking); a row's y is this minus
+/// its height.
+#[must_use]
+pub fn park_above_bottom(monitor: &MonitorInfo) -> i32 {
+    let edge = if monitor.neighbour_up {
+        monitor.virtual_screen.y
+    } else {
+        monitor.screen_rect.y
+    };
+    edge - PARK_MARGIN
+}
+
+/// Top edge of the slot rows parked **below** the column viewport sit
+/// against: `PARK_MARGIN` below the virtual screen when a monitor is
+/// stacked below this one (`neighbour_down`), else `PARK_MARGIN` below
+/// the monitor's own screen rect.
+#[must_use]
+pub fn park_below_top(monitor: &MonitorInfo) -> i32 {
+    let edge = if monitor.neighbour_down {
+        monitor.virtual_screen.bottom()
+    } else {
+        monitor.screen_rect.bottom()
+    };
+    edge + PARK_MARGIN
+}
+
 fn stack_column_rows(
     column: &Column,
     x: i32,
-    monitor_rect: Rect,
+    monitor: &MonitorInfo,
     col_width: i32,
     padding: &Padding,
+    visible_rows: u32,
     entries: &mut Vec<ActualEntry>,
 ) {
     if column.rows.is_empty() {
         return;
     }
+    let monitor_rect = monitor.work_area;
+    let slots = column.slots(visible_rows);
+    // A stale offset (rows removed without a clamp) must not hide every
+    // row: project as if it had been clamped.
+    let first = column.row_offset.min(column.max_row_offset(visible_rows));
+    let last = first + slots; // exclusive
 
     // First row starts one gap below the top padding edge; each subsequent row
     // starts one gap below the previous row's bottom.
     let mut y = monitor_rect.y + padding.up + padding.window_gap;
+    let above_bottom = park_above_bottom(monitor);
+    let below_top = park_below_top(monitor);
 
-    for row in &column.rows {
+    for (i, row) in column.rows.iter().enumerate() {
+        let row_y = if i < first {
+            above_bottom - row.height
+        } else if i >= last {
+            below_top
+        } else {
+            let at = y;
+            y += row.height + padding.window_gap;
+            at
+        };
         entries.push(ActualEntry {
             window_id: row.window_id,
             rect: Rect {
                 x,
-                y,
+                y: row_y,
                 width: col_width,
                 height: row.height,
             },
         });
-        y += row.height + padding.window_gap;
     }
 }
 
@@ -245,7 +313,7 @@ mod tests {
             vec![Column::with_row(1920, Row::new(WindowId(1), 1072))],
             0,
         );
-        let actual = project(&layout, &test_monitor(), &test_padding());
+        let actual = project(&layout, &test_monitor(), &test_padding(), 0);
 
         assert_eq!(actual.entries.len(), 1);
         let entry = &actual.entries[0];
@@ -270,7 +338,7 @@ mod tests {
             ],
             0,
         );
-        let actual = project(&layout, &test_monitor(), &test_padding());
+        let actual = project(&layout, &test_monitor(), &test_padding(), 0);
 
         assert_eq!(actual.entries.len(), 2);
 
@@ -294,7 +362,7 @@ mod tests {
             )],
             0,
         );
-        let actual = project(&layout, &test_monitor(), &test_padding());
+        let actual = project(&layout, &test_monitor(), &test_padding(), 0);
 
         assert_eq!(actual.entries.len(), 2);
         assert_eq!(actual.entries[0].rect.x, actual.entries[1].rect.x);
@@ -317,7 +385,7 @@ mod tests {
             ],
             968, // offset = start of col 1's slot
         );
-        let actual = project(&layout, &monitor, &padding);
+        let actual = project(&layout, &monitor, &padding, 0);
 
         // First column parked just beyond the virtual screen's left edge
         assert_eq!(actual.entries[0].rect.x, -960 - PARK_MARGIN);
@@ -340,7 +408,7 @@ mod tests {
             ],
             0,
         );
-        let actual = project(&layout, &monitor, &padding);
+        let actual = project(&layout, &monitor, &padding, 0);
 
         // Third column parked just beyond the virtual screen's right edge
         assert_eq!(actual.entries[2].rect.x, 1920 + PARK_MARGIN);
@@ -378,7 +446,7 @@ mod tests {
             ],
             0,
         );
-        let actual = project(&layout, &test_monitor(), &test_padding());
+        let actual = project(&layout, &test_monitor(), &test_padding(), 0);
         assert_eq!(actual.entries.len(), 3);
 
         // Slot model: canvas starts at window_gap=4
@@ -410,7 +478,7 @@ mod tests {
             ],
             0,
         );
-        let actual = project(&layout, &test_monitor(), &zero_padding);
+        let actual = project(&layout, &test_monitor(), &zero_padding, 0);
         let total_width: i32 = actual.entries.iter().map(|e| e.rect.width).sum();
         assert_eq!(
             total_width, 1920,
@@ -435,7 +503,7 @@ mod tests {
             ],
             1932, // offset: start of col 2's slot
         );
-        let actual = project(&layout, &test_monitor(), &test_padding());
+        let actual = project(&layout, &test_monitor(), &test_padding(), 0);
 
         // Col 0 (canvas 4–964): 964 <= 1932 → parked left
         assert_eq!(actual.entries[0].rect.x, -960 - PARK_MARGIN);
@@ -465,7 +533,7 @@ mod tests {
             ],
             968, // offset past col 0
         );
-        let actual = project(&layout, &test_monitor(), &test_padding());
+        let actual = project(&layout, &test_monitor(), &test_padding(), 0);
 
         // Col 0 is parked left — must not overlap monitor area
         let parked_entry = &actual.entries[0];
@@ -488,7 +556,7 @@ mod tests {
             ],
             500, // non-zero offset
         );
-        let actual = project(&layout, &test_monitor(), &test_padding());
+        let actual = project(&layout, &test_monitor(), &test_padding(), 0);
 
         // Col 0: canvas_x=4, screen_x = 0 + (4 - 500) = -496
         assert_eq!(actual.entries[0].rect.x, -496);
@@ -511,7 +579,7 @@ mod tests {
             )],
             0,
         );
-        let actual = project(&layout, &test_monitor(), &test_padding());
+        let actual = project(&layout, &test_monitor(), &test_padding(), 0);
 
         assert_eq!(actual.entries.len(), 2);
         // row.height consumed verbatim — no inset applied by projection.
@@ -528,7 +596,7 @@ mod tests {
         // Positive: narrow 240px column
         let layout =
             VirtualLayout::with_columns(vec![Column::with_row(240, Row::new(WindowId(1), 0))], 0);
-        let actual = project(&layout, &test_monitor(), &test_padding());
+        let actual = project(&layout, &test_monitor(), &test_padding(), 0);
 
         assert_eq!(actual.entries.len(), 1);
         // Slot model: full col_width, no horizontal inset
@@ -539,7 +607,7 @@ mod tests {
     fn project_empty_layout_yields_empty_actual() {
         // Positive: empty virtual layout → no entries
         let layout = VirtualLayout::new();
-        let actual = project(&layout, &test_monitor(), &test_padding());
+        let actual = project(&layout, &test_monitor(), &test_padding(), 0);
         assert!(actual.entries.is_empty());
     }
 
@@ -582,7 +650,7 @@ mod tests {
             vec![Column::with_row(1920, Row::new(WindowId(1), 1022))],
             0,
         );
-        let actual = project(&layout, &test_monitor(), &padding);
+        let actual = project(&layout, &test_monitor(), &padding, 0);
 
         assert_eq!(actual.entries.len(), 1);
         let entry = &actual.entries[0];
@@ -605,7 +673,7 @@ mod tests {
             )],
             0,
         );
-        let actual = project(&layout, &test_monitor(), &test_padding());
+        let actual = project(&layout, &test_monitor(), &test_padding(), 0);
 
         assert_eq!(actual.entries.len(), 2);
         // row 0: y = 0 + 0 + 4 = 4, height = 200 verbatim
@@ -819,7 +887,7 @@ mod tests {
                 .collect(),
             968, // col 1 fills the viewport; col 0 off-left, col 2 overhangs right
         );
-        let actual = project(&layout, &m, &padding);
+        let actual = project(&layout, &m, &padding, 0);
         assert_eq!(actual.entries[0].rect.x, park_left_x(&m, 960));
         assert_eq!(actual.entries[0].rect.x, vs.x - 960 - PARK_MARGIN);
         assert_eq!(actual.entries[1].rect.x, 0);
@@ -843,7 +911,7 @@ mod tests {
             464, // start of col 1's slot
         );
         let m = primary_with_left_neighbour();
-        let actual = project(&layout, &m, &padding);
+        let actual = project(&layout, &m, &padding, 0);
         let left_monitor = Rect {
             x: -1920,
             y: 0,
@@ -881,12 +949,12 @@ mod tests {
         );
         // Primary: left neighbour → the overhanging column is parked left.
         let m = primary_with_left_neighbour();
-        let actual = project(&layout, &m, &padding);
+        let actual = project(&layout, &m, &padding, 0);
         assert_eq!(actual.entries[0].rect.x, park_left_x(&m, 960));
         assert!(m.is_parked(actual.entries[0].rect));
         // Secondary: left edge is free → same column keeps its overhang.
         let m2 = secondary_with_right_neighbour();
-        let actual2 = project(&layout, &m2, &padding);
+        let actual2 = project(&layout, &m2, &padding, 0);
         assert_eq!(actual2.entries[0].rect.x, -1920 + (4 - 500));
         assert!(!m2.is_parked(actual2.entries[0].rect));
     }
@@ -899,7 +967,7 @@ mod tests {
         let layout =
             VirtualLayout::with_columns(vec![Column::with_row(1912, Row::new(WindowId(1), 0))], 0);
         let m = primary_with_left_neighbour();
-        let actual = project(&layout, &m, &padding);
+        let actual = project(&layout, &m, &padding, 0);
         assert!(!m.is_parked(actual.entries[0].rect));
         assert_eq!(actual.entries[0].rect.x, 4);
         assert_eq!(actual.entries[0].rect.right(), 1916);
@@ -914,11 +982,11 @@ mod tests {
         let layout =
             VirtualLayout::with_columns(vec![Column::with_row(1920, Row::new(WindowId(1), 0))], 10);
         let m = primary_with_left_neighbour();
-        let actual = project(&layout, &m, &padding);
+        let actual = project(&layout, &m, &padding, 0);
         assert!(m.is_parked(actual.entries[0].rect));
         // With no neighbour on that side it keeps its overhang as before.
         let lone = MonitorInfo::single(m.work_area);
-        let actual = project(&layout, &lone, &padding);
+        let actual = project(&layout, &lone, &padding, 0);
         assert!(!lone.is_parked(actual.entries[0].rect));
         assert_eq!(actual.entries[0].rect.x, 4 - 10);
     }
@@ -935,7 +1003,7 @@ mod tests {
             0,
         );
         let m = secondary_with_right_neighbour();
-        let actual = project(&layout, &m, &padding);
+        let actual = project(&layout, &m, &padding, 0);
         // col 2 is off the right of the secondary; the primary sits there,
         // so it is parked beyond the primary's far edge.
         assert_eq!(actual.entries[2].rect.x, 1920 + PARK_MARGIN);
@@ -992,7 +1060,7 @@ mod tests {
                 .collect(),
             968,
         );
-        let actual = project(&layout, &m, &padding);
+        let actual = project(&layout, &m, &padding, 0);
         assert_eq!(actual.entries[0].rect.x, -1920 - 960 - PARK_MARGIN);
         assert_eq!(actual.entries[1].rect.x, 0);
         // Overhang toward the right neighbour: parked beyond ITS far edge.
@@ -1027,7 +1095,7 @@ mod tests {
             ],
             500,
         );
-        let actual = project(&layout, &m, &padding);
+        let actual = project(&layout, &m, &padding, 0);
         assert_eq!(actual.entries[0].rect.x, park_left_x(&m, 960));
         assert_eq!(actual.entries[0].rect.x, -1920 - 960 - PARK_MARGIN);
         assert_eq!(actual.entries[1].rect.x, 968 - 500);
@@ -1055,7 +1123,7 @@ mod tests {
             ],
             0,
         );
-        let actual = project(&layout, &m, &padding);
+        let actual = project(&layout, &m, &padding, 0);
         assert_eq!(actual.entries[0].rect.x, -1920 + 4);
         assert_eq!(actual.entries[0].rect.y, -1080 + 10 + 4);
         assert_eq!(actual.entries[1].rect.x, -1920 + 968);
@@ -1066,7 +1134,7 @@ mod tests {
 
         // Scrolled past col 0: parked beyond the monitor's left edge.
         let layout = VirtualLayout::with_columns(layout.columns.clone(), 968);
-        let actual = project(&layout, &m, &padding);
+        let actual = project(&layout, &m, &padding, 0);
         assert_eq!(actual.entries[0].rect.x, -1920 - 960 - PARK_MARGIN);
         assert_eq!(actual.entries[1].rect.x, -1920);
     }
@@ -1110,7 +1178,7 @@ mod tests {
 
         // Viewport at 0: columns are placed from the WORK AREA's left edge.
         let layout = VirtualLayout::with_columns(columns.clone(), 0);
-        let actual = project(&layout, &m, &padding);
+        let actual = project(&layout, &m, &padding, 0);
         assert_eq!(actual.entries[0].rect.x, 60 + 4);
         // Col 1 (1028..1988) overhangs the free right edge: kept.
         assert_eq!(actual.entries[1].rect.x, 60 + 968);
@@ -1122,9 +1190,233 @@ mod tests {
         // the taskbar strip left of the work area, with a neighbour beyond.
         // Overhang is judged against the work area, so it is parked.
         let layout = VirtualLayout::with_columns(columns, 30);
-        let actual = project(&layout, &m, &padding);
+        let actual = project(&layout, &m, &padding, 0);
         assert_eq!(actual.entries[0].rect.x, park_left_x(&m, 960));
         assert_eq!(actual.entries[0].rect.x, -1920 - 960 - PARK_MARGIN);
         assert_eq!(actual.entries[1].rect.x, 60 + 968 - 30);
+    }
+
+    // ── Row viewports (stacked columns) ───────────────────────────────
+
+    /// Four rows sized for a two-row viewport (any two fill the budget).
+    fn stacked_column(width: i32, ids: &[isize], visible: usize, row_offset: usize) -> Column {
+        let per_slot = crate::layout::mutations::distribute_heights(visible, 1080, 4);
+        let rows: Vec<Row> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| Row::new(WindowId(id), per_slot[i % visible]))
+            .collect();
+        Column::with_rows(width, rows).with_row_offset(row_offset)
+    }
+
+    fn rect_of(actual: &ActualLayout, id: isize) -> Rect {
+        actual.find(WindowId(id)).expect("window projected").rect
+    }
+
+    /// `visible_rows = 2`: the two rows from the offset are stacked exactly
+    /// like a two-row column; the rows after them are parked below the
+    /// monitor at the column's x, the rows before it above.
+    #[test]
+    fn row_viewport_stacks_visible_rows_and_parks_the_rest() {
+        let m = test_monitor();
+        let layout = VirtualLayout::with_columns(vec![stacked_column(960, &[1, 2, 3, 4], 2, 0)], 0);
+        let actual = project(&layout, &m, &test_padding(), 2);
+        let h = (1080 - 3 * 4) / 2;
+        assert_eq!(
+            rect_of(&actual, 1),
+            Rect {
+                x: 4,
+                y: 4,
+                width: 960,
+                height: h
+            }
+        );
+        assert_eq!(
+            rect_of(&actual, 2),
+            Rect {
+                x: 4,
+                y: 4 + h + 4,
+                width: 960,
+                height: h
+            }
+        );
+        // Rows 3 and 4 share the below slot: top edge PARK_MARGIN under the
+        // screen, same x as the column.
+        for id in [3, 4] {
+            let r = rect_of(&actual, id);
+            assert_eq!(r.y, 1080 + PARK_MARGIN, "row {id} parked below");
+            assert_eq!(r.x, 4);
+            assert!(m.is_parked(r));
+        }
+
+        // Offset 1: row 1 parks above (bottom edge PARK_MARGIN over the
+        // screen), rows 2 and 3 are on screen, row 4 stays below.
+        let layout = VirtualLayout::with_columns(vec![stacked_column(960, &[1, 2, 3, 4], 2, 1)], 0);
+        let actual = project(&layout, &m, &test_padding(), 2);
+        let above = rect_of(&actual, 1);
+        assert_eq!(above.bottom(), -PARK_MARGIN);
+        assert!(m.is_parked(above));
+        assert_eq!(rect_of(&actual, 2).y, 4);
+        assert_eq!(rect_of(&actual, 3).y, 4 + h + 4);
+        assert_eq!(rect_of(&actual, 4).y, 1080 + PARK_MARGIN);
+    }
+
+    /// With `visible_rows = 0`, or when the column has no more rows than
+    /// the viewport shows, projection is unchanged from the flat model.
+    #[test]
+    fn row_viewport_is_inert_when_every_row_fits() {
+        let m = test_monitor();
+        let layout = VirtualLayout::with_columns(vec![stacked_column(960, &[1, 2], 2, 0)], 0);
+        let flat = project(&layout, &m, &test_padding(), 0);
+        let capped = project(&layout, &m, &test_padding(), 2);
+        let roomy = project(&layout, &m, &test_padding(), 5);
+        assert_eq!(flat, capped);
+        assert_eq!(flat, roomy);
+        assert!(!m.is_parked(rect_of(&flat, 1)));
+        assert!(!m.is_parked(rect_of(&flat, 2)));
+    }
+
+    /// A stale offset past the end (rows removed without a clamp) projects
+    /// as if clamped — the column never hides every row.
+    #[test]
+    fn stale_row_offset_projects_clamped() {
+        let m = test_monitor();
+        let layout = VirtualLayout::with_columns(vec![stacked_column(960, &[1, 2, 3], 2, 7)], 0);
+        let actual = project(&layout, &m, &test_padding(), 2);
+        assert!(m.is_parked(rect_of(&actual, 1)));
+        assert!(!m.is_parked(rect_of(&actual, 2)));
+        assert!(!m.is_parked(rect_of(&actual, 3)));
+    }
+
+    /// Parked rows keep their vertical slot inside a column that is itself
+    /// parked left/right: the rect is off-screen on both axes and its x is
+    /// the column's parking x.
+    #[test]
+    fn parked_rows_follow_a_parked_column() {
+        let m = test_monitor();
+        let layout = VirtualLayout::with_columns(
+            vec![
+                stacked_column(960, &[1, 2, 3], 2, 0),
+                Column::with_row(960, Row::new(WindowId(9), 1072)),
+            ],
+            968,
+        );
+        let actual = project(&layout, &m, &test_padding(), 2);
+        let r = rect_of(&actual, 3);
+        assert_eq!(r.x, -960 - PARK_MARGIN);
+        assert_eq!(r.y, 1080 + PARK_MARGIN);
+    }
+
+    /// A laptop panel at (0,0) under a 1440p display: above is blocked, so a
+    /// row parked above goes beyond the whole virtual screen (over the
+    /// external), while below is free and parks just under the laptop.
+    fn laptop_under_external() -> (MonitorInfo, Rect, Rect) {
+        let laptop = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let external = Rect {
+            x: 0,
+            y: -1440,
+            width: 2560,
+            height: 1440,
+        };
+        let vs = Rect {
+            x: 0,
+            y: -1440,
+            width: 2560,
+            height: 2520,
+        };
+        (
+            MonitorInfo::in_desktop(laptop, laptop, vs, &[external]),
+            laptop,
+            external,
+        )
+    }
+
+    #[test]
+    fn parked_rows_go_beyond_the_virtual_screen_toward_a_stacked_neighbour() {
+        let (m, laptop, external) = laptop_under_external();
+        assert!(m.neighbour_up && !m.neighbour_down);
+        let layout = VirtualLayout::with_columns(vec![stacked_column(960, &[1, 2, 3, 4], 2, 1)], 0);
+        let actual = project(&layout, &m, &test_padding(), 2);
+        let above = rect_of(&actual, 1);
+        assert_eq!(above.bottom(), external.y - PARK_MARGIN);
+        assert!(
+            !above.overlaps(external),
+            "parked row must not land on the external"
+        );
+        assert!(!above.overlaps(laptop));
+        assert!(m.is_parked(above));
+        let below = rect_of(&actual, 4);
+        assert_eq!(below.y, laptop.bottom() + PARK_MARGIN);
+        assert!(!below.overlaps(external));
+        assert!(!below.overlaps(laptop));
+    }
+
+    /// The external display of the same pair: below is blocked (the laptop
+    /// is there), above is free.
+    #[test]
+    fn parked_rows_on_the_upper_monitor_skip_the_laptop_below() {
+        let laptop = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let external = Rect {
+            x: 0,
+            y: -1440,
+            width: 2560,
+            height: 1440,
+        };
+        let vs = Rect {
+            x: 0,
+            y: -1440,
+            width: 2560,
+            height: 2520,
+        };
+        let m = MonitorInfo::in_desktop(external, external, vs, &[laptop]);
+        assert!(m.neighbour_down && !m.neighbour_up);
+        let layout = VirtualLayout::with_columns(vec![stacked_column(960, &[1, 2, 3, 4], 2, 1)], 0);
+        let actual = project(&layout, &m, &test_padding(), 2);
+        let above = rect_of(&actual, 1);
+        assert_eq!(above.bottom(), external.y - PARK_MARGIN);
+        let below = rect_of(&actual, 4);
+        assert_eq!(below.y, laptop.bottom() + PARK_MARGIN);
+        for id in [1, 4] {
+            let r = rect_of(&actual, id);
+            assert!(
+                !r.overlaps(laptop) && !r.overlaps(external),
+                "row {id} straddles a monitor"
+            );
+        }
+    }
+
+    /// A monitor with a taskbar: the work area is shorter than the screen,
+    /// and a row parked below on the free side clears the taskbar strip
+    /// (it sits under the physical screen rect, not the work area).
+    #[test]
+    fn parked_rows_clear_the_taskbar_strip() {
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let work = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1032,
+        };
+        let m = MonitorInfo::in_desktop(work, screen, screen, &[]);
+        let layout = VirtualLayout::with_columns(vec![stacked_column(960, &[1, 2, 3], 2, 0)], 0);
+        let actual = project(&layout, &m, &test_padding(), 2);
+        let below = rect_of(&actual, 3);
+        assert_eq!(below.y, screen.bottom() + PARK_MARGIN);
+        assert!(m.is_parked(below));
     }
 }
