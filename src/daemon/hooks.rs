@@ -663,6 +663,37 @@ impl FlowWM {
         self.refresh_border_for(hwnd);
     }
 
+    /// Handle `EVENT_OBJECT_CLOAKED` — DWM stopped rendering a window that
+    /// is still `WS_VISIBLE`. A UWP app that is suspended, and one that is
+    /// minimized without going iconic, arrives here and nowhere else. It is
+    /// treated exactly like [`on_window_hidden`](Self::on_window_hidden):
+    /// `reconcile_visibility` already counts a cloaked window as not
+    /// user-visible, so a tracked active tile leaves the layout (focus to
+    /// the successor) and keeps its record for the uncloak; an untracked
+    /// window is a no-op.
+    pub(super) fn on_window_cloaked(&mut self, hwnd: isize) {
+        self.on_window_hidden(hwnd);
+    }
+
+    /// Handle `EVENT_OBJECT_UNCLOAKED` — DWM started rendering a window.
+    ///
+    /// A UWP frame (`ApplicationFrameHost.exe` / `ApplicationFrameWindow`)
+    /// is created **cloaked** and uncloaked once its content is ready, with
+    /// no `SHOW` and no further `CREATE`; the creation gates had rejected it
+    /// as not Alt+Tab visible, so this is the first event at which it can be
+    /// registered. Treated exactly like [`on_window_shown`](Self::on_window_shown):
+    /// an untracked window gets the full creation pipeline (seated like a
+    /// new window), a tracked one that was `Hidden` (cloaked) is re-added.
+    /// The foreground hook would usually catch the opened app too (it takes
+    /// focus), but not when it is still cloaked at that moment.
+    pub(super) fn on_window_uncloaked(&mut self, hwnd: isize) {
+        if !self.registry.is_tracked(hwnd) {
+            let _ = self.register_if_untracked(hwnd, "on_window_uncloaked");
+            return;
+        }
+        self.on_window_shown(hwnd);
+    }
+
     /// Handle `EVENT_SYSTEM_FOREGROUND` — the single sink for all foreground
     /// changes, both external (alt-tab, PowerToys, clicks) and self-induced
     /// (`set_foreground_window` from `dispatch_focus` /

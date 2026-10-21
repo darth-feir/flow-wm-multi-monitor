@@ -599,6 +599,12 @@ impl FlowWM {
                 HookEvent::Hidden { hwnd } => {
                     self.on_window_hidden(hwnd);
                 }
+                HookEvent::Cloaked { hwnd } => {
+                    self.on_window_cloaked(hwnd);
+                }
+                HookEvent::Uncloaked { hwnd } => {
+                    self.on_window_uncloaked(hwnd);
+                }
                 HookEvent::StateChange { hwnd } => {
                     // Option D recovery: a window ignored at creation because
                     // it launched maximized/fullscreen may now be restored.

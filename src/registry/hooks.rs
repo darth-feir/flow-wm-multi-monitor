@@ -22,7 +22,7 @@
 //!
 //! # Hook registration
 //!
-//! Eight hooks are registered. `STATECHANGE`, `NAMECHANGE`, and
+//! Nine hooks are registered. `STATECHANGE`, `NAMECHANGE`, and
 //! `LOCATIONCHANGE` are each registered as single-event hooks so the ranges
 //! between them stay disjoint:
 //!
@@ -36,6 +36,7 @@
 //! | STATECHANGE | `EVENT_OBJECT_STATECHANGE` (single) | Maximized/fullscreen recovery |
 //! | NAMECHANGE | `EVENT_OBJECT_NAMECHANGE` (single) | Late-title recovery (e.g. Windows Terminal) |
 //! | LOCATIONCHANGE | `EVENT_OBJECT_LOCATIONCHANGE` (single) | Float/tile-drag position tracking |
+//! | CLOAK | `EVENT_OBJECT_CLOAKED` → `EVENT_OBJECT_UNCLOAKED` | UWP frames: registered when DWM uncloaks them, hidden while cloaked |
 //!
 //! `LOCATIONCHANGE` fires on every move/resize pixel system-wide, so the
 //! callback drops all of them except those for tracked active-workspace float
@@ -159,6 +160,23 @@ const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
 /// hook table.
 const EVENT_OBJECT_NAMECHANGE: u32 = 0x800C;
 
+/// `EVENT_OBJECT_CLOAKED` — DWM cloaked a window (it is still `WS_VISIBLE`
+/// but no longer rendered). A UWP app being suspended or minimized is
+/// cloaked rather than hidden or iconic in some cases, so this is the only
+/// signal that it left the screen.
+const EVENT_OBJECT_CLOAKED: u32 = 0x8017;
+
+/// `EVENT_OBJECT_UNCLOAKED` — DWM uncloaked a window.
+///
+/// A UWP frame (`ApplicationFrameHost.exe`, class `ApplicationFrameWindow`)
+/// is **created cloaked** and uncloaked by DWM once its content is ready —
+/// with no `EVENT_OBJECT_SHOW` or further `CREATE`. The creation gates
+/// reject a cloaked window (it is not Alt+Tab visible), so without this
+/// hook a UWP app opened after the daemon started was never registered
+/// (the Settings app, observed 2026-10-21). The daemon attempts creation
+/// for an untracked window on this event, and re-shows a tracked one.
+const EVENT_OBJECT_UNCLOAKED: u32 = 0x8018;
+
 /// `OBJID_WINDOW` — identifies the window object itself (not a child).
 const OBJID_WINDOW: i32 = 0x0000;
 
@@ -258,6 +276,24 @@ pub enum HookEvent {
     /// change would cause layout churn).
     NameChange {
         /// The window whose title changed.
+        hwnd: isize,
+    },
+    /// DWM cloaked a window (`EVENT_OBJECT_CLOAKED`): it is still
+    /// `WS_VISIBLE` but not rendered — a suspended or, for some UWP apps,
+    /// minimized frame. Handled like [`Hidden`](Self::Hidden): the registry
+    /// reconciles against real visibility (cloaked counts as not visible)
+    /// and a tracked active tile leaves the layout, keeping its record.
+    Cloaked {
+        /// The cloaked window handle value.
+        hwnd: isize,
+    },
+    /// DWM uncloaked a window (`EVENT_OBJECT_UNCLOAKED`). A UWP frame is
+    /// created cloaked and uncloaked once its content is ready, with no
+    /// `SHOW`; this is the first moment the creation gates accept it.
+    /// Handled like [`Shown`](Self::Shown): an untracked window gets the
+    /// creation pipeline, a tracked hidden one is re-added.
+    Uncloaked {
+        /// The uncloaked window handle value.
         hwnd: isize,
     },
     /// A floating window's screen rect changed (`EVENT_OBJECT_LOCATIONCHANGE`).
@@ -617,7 +653,7 @@ impl HookThreadHandle {
 /// Short names of every hook [`register_hooks`] attempts, in registration
 /// order. These are the names reported over the start channel and checked
 /// against [`MANDATORY_HOOKS`].
-pub const HOOK_NAMES: [&str; 8] = [
+pub const HOOK_NAMES: [&str; 9] = [
     "CREATE/DESTROY",
     "FOREGROUND",
     "MOVESIZE",
@@ -626,12 +662,13 @@ pub const HOOK_NAMES: [&str; 8] = [
     "STATECHANGE",
     "NAMECHANGE",
     "LOCATIONCHANGE",
+    "CLOAK",
 ];
 
 /// Hooks without which the daemon cannot track windows at all. If any of
 /// these fails to register, [`start_hook_thread`] returns an error instead of
-/// a silently deaf daemon. `MOVESIZE`, `STATECHANGE` and `NAMECHANGE` are
-/// recovery/drag niceties and are only logged when missing.
+/// a silently deaf daemon. `MOVESIZE`, `STATECHANGE`, `NAMECHANGE` and
+/// `CLOAK` are recovery/drag niceties and are only logged when missing.
 pub const MANDATORY_HOOKS: [&str; 5] = [
     "CREATE/DESTROY",
     "FOREGROUND",
@@ -969,6 +1006,8 @@ fn run_hook_loop(report: impl FnOnce(Vec<&'static str>)) {
 /// - `EVENT_OBJECT_STATECHANGE` (single; maximized/fullscreen recovery)
 /// - `EVENT_OBJECT_NAMECHANGE` (single; late-title recovery)
 /// - `EVENT_OBJECT_LOCATIONCHANGE` (single; float drag tracking)
+/// - `EVENT_OBJECT_CLOAKED` → `EVENT_OBJECT_UNCLOAKED` (range; UWP frames
+///   registered on uncloak, hidden while cloaked)
 ///
 /// `STATECHANGE`, `NAMECHANGE`, and `LOCATIONCHANGE` are each registered as
 /// **single-event** hooks rather than one `0x800A..=0x800C` range. `LOCATIONCHANGE`
@@ -1125,6 +1164,30 @@ fn register_hooks() -> Vec<(HWINEVENTHOOK, &'static str)> {
         log::error!("failed to hook NAMECHANGE");
     }
 
+    // Hook: EVENT_OBJECT_CLOAKED + EVENT_OBJECT_UNCLOAKED (range)
+    //
+    // UWP frames are created cloaked and uncloaked by DWM later with no SHOW:
+    // UNCLOAKED is the daemon's chance to register them. CLOAKED is the
+    // "hidden" signal for a UWP app that is suspended or minimized without
+    // becoming iconic. Both are rare events (no filtering needed).
+    let h = unsafe {
+        SetWinEventHook(
+            EVENT_OBJECT_CLOAKED,
+            EVENT_OBJECT_UNCLOAKED,
+            None,
+            Some(hook_callback),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        )
+    };
+    if is_valid_hook(h) {
+        hooks.push((h, HOOK_NAMES[8]));
+        log::debug!("hook registered: CLOAK");
+    } else {
+        log::error!("failed to hook CLOAK");
+    }
+
     // Hook: EVENT_OBJECT_LOCATIONCHANGE (single event)
     //
     // Registered as a single-event hook (not folded into the STATECHANGE /
@@ -1237,6 +1300,8 @@ fn hook_callback_body(event: u32, hwnd: HWND, id_object: i32) {
         EVENT_OBJECT_HIDE => HookEvent::Hidden { hwnd: hwnd_val },
         EVENT_OBJECT_STATECHANGE => HookEvent::StateChange { hwnd: hwnd_val },
         EVENT_OBJECT_NAMECHANGE => HookEvent::NameChange { hwnd: hwnd_val },
+        EVENT_OBJECT_CLOAKED => HookEvent::Cloaked { hwnd: hwnd_val },
+        EVENT_OBJECT_UNCLOAKED => HookEvent::Uncloaked { hwnd: hwnd_val },
         EVENT_OBJECT_LOCATIONCHANGE => HookEvent::LocationChange { hwnd: hwnd_val },
         EVENT_SYSTEM_MOVESIZESTART => HookEvent::MoveSizeStart { hwnd: hwnd_val },
         EVENT_SYSTEM_MOVESIZEEND => HookEvent::MoveSizeEnd { hwnd: hwnd_val },
@@ -1332,6 +1397,26 @@ mod tests {
         assert_eq!(EVENT_OBJECT_HIDE, 0x8003);
         // Ordering invariant checked at compile time (operands are const).
         const _: () = assert!(EVENT_OBJECT_SHOW < EVENT_OBJECT_HIDE);
+    }
+
+    #[test]
+    fn event_object_cloak_constants_correct_and_adjacent() {
+        // winuser.h: EVENT_OBJECT_CLOAKED 0x8017, EVENT_OBJECT_UNCLOAKED 0x8018
+        // — adjacent, so one range hook covers both and nothing in between.
+        assert_eq!(EVENT_OBJECT_CLOAKED, 0x8017);
+        assert_eq!(EVENT_OBJECT_UNCLOAKED, 0x8018);
+        const _: () = assert!(EVENT_OBJECT_UNCLOAKED == EVENT_OBJECT_CLOAKED + 1);
+        assert_eq!(HOOK_NAMES[8], "CLOAK");
+        assert!(!MANDATORY_HOOKS.contains(&"CLOAK"), "a recovery nicety");
+        match (
+            HookEvent::Cloaked { hwnd: 1 },
+            HookEvent::Uncloaked { hwnd: 2 },
+        ) {
+            (HookEvent::Cloaked { hwnd: a }, HookEvent::Uncloaked { hwnd: b }) => {
+                assert_eq!((a, b), (1, 2));
+            }
+            _ => panic!("variants carry their hwnd"),
+        }
     }
 
     #[test]

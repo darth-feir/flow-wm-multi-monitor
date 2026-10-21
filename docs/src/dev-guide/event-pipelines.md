@@ -317,6 +317,30 @@ fires both `MINIMIZESTART` and `HIDE` for ordinary minimizes.
 3. **Re-show** — if the window was `Hidden` and now transitions to `Shown`,
    re-add to layout via `add_window()`.
 
+### Cloaked / Uncloaked (`EVENT_OBJECT_CLOAKED` / `EVENT_OBJECT_UNCLOAKED`)
+
+DWM cloaking is how UWP / WinUI frames (`ApplicationFrameHost.exe`, class
+`ApplicationFrameWindow`) leave and enter the screen: such a frame is
+**created cloaked** and uncloaked once its content is ready, with no
+`EVENT_OBJECT_SHOW` and no further `CREATE`, and a suspended (or, for some
+apps, minimized) UWP window is cloaked rather than hidden or iconic. The
+creation gates reject a cloaked window (not Alt+Tab visible), so before
+these hooks a UWP app opened after the daemon started was never registered
+(the Settings app, observed 2026-10-21) unless some later event happened to
+reach it.
+
+| Event | Condition | Action |
+|-------|-----------|--------|
+| `UNCLOAKED` | Not tracked | Attempt the full creation pipeline (`register_if_untracked`): the window is now uncloaked, titled and visible, so it is seated like a new window |
+| `UNCLOAKED` | Tracked | Same as [Shown](#hidden--shown-event_object_hide--event_object_show): OS-ignored recovery, then `Hidden → Active` re-add |
+| `CLOAKED` | Tracked | Same as [Hidden](#hidden--shown-event_object_hide--event_object_show): `reconcile_visibility` (cloaked counts as not user-visible) moves an active tile out of the layout, record kept |
+| `CLOAKED` | Not tracked | Skip |
+
+The two events are adjacent (`0x8017`, `0x8018`) and registered as one range
+hook, `CLOAK`; it is not mandatory. The foreground hook usually catches an
+opened UWP app as well (it takes focus), but not while it is still cloaked
+at that moment — both paths stay.
+
 ### State Change (`EVENT_OBJECT_STATECHANGE`)
 
 Handles recovery for windows that launched maximized or fullscreen. When a

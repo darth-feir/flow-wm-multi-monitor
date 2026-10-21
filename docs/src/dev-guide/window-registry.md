@@ -336,21 +336,23 @@ window-rect coordinates (what `SetWindowPos` expects). See
 
 ## Hooks Used
 
-The registry listens to eight Win32 events registered via `SetWinEventHook` on a
+The registry listens to eleven Win32 events (nine hooks) registered via `SetWinEventHook` on a
 dedicated background thread:
 
 | Hook | Win32 event | Meaning | Action |
 |------|-----------|---------|--------|
 | Create/Destroy range | `EVENT_OBJECT_CREATE` / `EVENT_OBJECT_DESTROY` | Window lifecycle | Classify and register, or remove from registry |
-| Foreground | `EVENT_SYSTEM_FOREGROUND` | Focus changed | Update `focused` field |
-| Minimize range | `EVENT_SYSTEM_MINIMIZESTART` / `EVENT_SYSTEM_MINIMIZEEND` | Minimize/restore | Transition Active to/from Minimized, save/restore virtual slot |
+| Foreground | `EVENT_SYSTEM_FOREGROUND` | Focus changed | Register the window if untracked, then update `focused` field |
+| Minimize range | `EVENT_SYSTEM_MINIMIZESTART` / `EVENT_SYSTEM_MINIMIZEEND` | Minimize/restore | Transition Active to/from Minimized, save/restore virtual slot (`MINIMIZEEND` registers the window first if untracked) |
 | Show/Hide range | `EVENT_OBJECT_SHOW` / `EVENT_OBJECT_HIDE` | Visibility | Reconcile visibility (tray-hide, DWM cloak, re-show) |
 | StateChange | `EVENT_OBJECT_STATECHANGE` | State bits changed | Recovery: re-classify `Ignored(Maximized/Fullscreen)` windows when the user restores them |
 | NameChange | `EVENT_OBJECT_NAMECHANGE` | Title changed | Recovery: re-attempt registration for windows not yet tracked (late-titling apps like Windows Terminal) |
+| Cloak range | `EVENT_OBJECT_CLOAKED` / `EVENT_OBJECT_UNCLOAKED` | DWM cloaking | `UNCLOAKED`: register an untracked window (UWP frames are created cloaked and never `SHOW`n), re-show a tracked hidden one; `CLOAKED`: reconcile a tracked window to `Hidden` |
 
-`EVENT_OBJECT_LOCATIONCHANGE` is deliberately **not** hooked — it fires on every
-pixel of window movement and would flood the event channel. Maximize/restore is
-already covered by `STATECHANGE`.
+`EVENT_OBJECT_LOCATIONCHANGE` is hooked separately and callback-filtered to
+tracked floats and the dragged tile — it fires on every pixel of window
+movement and would otherwise flood the event channel. Maximize/restore is
+covered by `STATECHANGE`.
 
 `STATECHANGE` and `NAMECHANGE` are registered as single-event hooks (min == max)
 so the intervening `LOCATIONCHANGE` (which sits between them numerically) is
