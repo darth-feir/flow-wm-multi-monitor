@@ -518,8 +518,25 @@ impl FlowWM {
     ///    space: it is placed now, where it reappeared, like a float met at
     ///    startup (`populate_existing_floats`).
     pub(super) fn on_window_restored(&mut self, hwnd: isize) {
-        if !self.register_if_untracked(hwnd, "on_window_restored") {
-            return;
+        if !self.registry.is_tracked(hwnd) {
+            // MINIMIZEEND can arrive while GetWindowRect still reports the
+            // icon's frame; registering now would make that the window's
+            // pre-manage rect. Let the pending-creation retry (100 ms) or
+            // the activation that follows a restore register it instead.
+            if registry_win32::get_window_rect(HWND(hwnd as *mut _))
+                .is_ok_and(registry_win32::is_icon_rect)
+            {
+                log::debug!(
+                    "on_window_restored: {hwnd:#x} not tracked and still icon-sized — deferring creation"
+                );
+                if !self.pending_creations.iter().any(|(h, _)| *h == hwnd) {
+                    self.pending_creations.push((hwnd, 0));
+                }
+                return;
+            }
+            if !self.register_if_untracked(hwnd, "on_window_restored") {
+                return;
+            }
         }
         self.registry.restore_window(hwnd);
 

@@ -427,6 +427,38 @@ pub fn is_iconic(hwnd: HWND) -> bool {
     result.as_bool()
 }
 
+/// Whether `rect` has the size Windows gives a minimized window's frame
+/// (`SM_CXMINIMIZED` × `SM_CYMINIMIZED`, 160 × 28 at 96 dpi). See
+/// [`is_icon_rect`].
+#[must_use]
+pub fn is_icon_sized(rect: Rect, icon_w: i32, icon_h: i32) -> bool {
+    rect.width == icon_w && rect.height == icon_h
+}
+
+/// Whether `rect` (a `GetWindowRect` reading) is the frame of a minimized
+/// window rather than of a window on screen.
+///
+/// `IsIconic` flips before the frame has left the icon: at
+/// `EVENT_SYSTEM_MINIMIZEEND`, and briefly after a style change on an
+/// iconic window, `GetWindowRect` can still report the icon rect — at
+/// (-32000, -32000) for a taskbar window, at the bottom-left of the
+/// desktop for one without a taskbar button. Registering or re-measuring
+/// from that rect would make the icon the window's pre-manage rect (and
+/// `tiling off` would hand the window back icon-sized), so the readers
+/// check here and wait instead.
+#[must_use]
+pub fn is_icon_rect(rect: Rect) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{SM_CXMINIMIZED, SM_CYMINIMIZED};
+    // SAFETY: GetSystemMetrics is a pure query over system constants.
+    let (w, h) = unsafe {
+        (
+            GetSystemMetrics(SM_CXMINIMIZED),
+            GetSystemMetrics(SM_CYMINIMIZED),
+        )
+    };
+    is_icon_sized(rect, w, h)
+}
+
 /// Query the currently foreground (active) window handle.
 ///
 /// Wraps the Win32 `GetForegroundWindow()` call. Returns the HWND as an
@@ -2024,5 +2056,21 @@ mod tests {
     #[test]
     fn restored_geometry_fails_for_an_invalid_hwnd() {
         assert!(restored_geometry(invalid_hwnd()).is_err());
+    }
+
+    /// An icon-sized rect is recognised wherever it lies; a window-sized
+    /// one is not, nor a rect that shares only one dimension with the icon.
+    #[test]
+    fn icon_sized_matches_the_minimized_frame_size_only() {
+        use windows::Win32::UI::WindowsAndMessaging::{SM_CXMINIMIZED, SM_CYMINIMIZED};
+        assert!(is_icon_sized(r(-32000, -32000, 160, 28), 160, 28));
+        assert!(is_icon_sized(r(0, 1004, 160, 28), 160, 28));
+        assert!(!is_icon_sized(r(100, 100, 600, 400), 160, 28));
+        assert!(!is_icon_sized(r(0, 0, 160, 400), 160, 28));
+        // The live query agrees with itself on a real icon rect.
+        let w = unsafe { GetSystemMetrics(SM_CXMINIMIZED) };
+        let h = unsafe { GetSystemMetrics(SM_CYMINIMIZED) };
+        assert!(is_icon_rect(r(0, 0, w, h)));
+        assert!(!is_icon_rect(r(0, 0, w + 1, h)));
     }
 }

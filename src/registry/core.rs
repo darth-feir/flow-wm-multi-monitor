@@ -1218,6 +1218,14 @@ impl WindowRegistry {
         let Ok(rect) = win32::get_window_rect(hwnd) else {
             return;
         };
+        // Mid-restore: the frame is still the icon's. The placement rect
+        // the record carries is where the window is about to be, so keep it.
+        if win32::is_icon_rect(rect) {
+            log::debug!(
+                "refresh_geometry: isize={hwnd_val} still reports its icon rect; keeping the placement geometry"
+            );
+            return;
+        }
         let bounds = win32::get_invisible_bounds(hwnd);
         if let Some(window) = self.windows.get_mut(&hwnd_val) {
             window.pre_manage_rect = rect;
