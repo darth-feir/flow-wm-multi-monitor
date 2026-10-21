@@ -20,7 +20,11 @@
 //!    its workspace-local layout rect clamped into its monitor's work area
 //!    ([`pause_target`]). A **float** is left where it is unless it sits off
 //!    the virtual screen (a float of a parked workspace), in which case it
-//!    is clamped into its monitor's work area.
+//!    is clamped into its monitor's work area. A tile or float the daemon
+//!    **un-maximized to manage** ([`Window::adopted_from_maximized`]) is
+//!    not moved but maximized again (`SW_MAXIMIZE`, on the monitor it is
+//!    nearest to), and the foreground is put back afterwards since
+//!    maximizing activates.
 //! 3. Minimized windows get the stage-7B placement rescue: a restore
 //!    position parked beyond the screen is rewritten so the window comes
 //!    back on-screen when the user restores it.
@@ -51,9 +55,13 @@
 //!
 //! 1. A deferred display change is reconciled (`reconcile_monitors`).
 //! 2. The top-level windows are re-scanned (`scan_existing_windows`), so
-//!    windows created during the pause are classified through the rules;
-//!    windows that no longer exist are dropped from the registry and every
-//!    space, and the minimized state is re-synced with `IsIconic`.
+//!    windows created during the pause are classified through the rules
+//!    (with `adopt_maximized`, maximized ones are un-maximized and
+//!    classified too — the adoption is off during the pause and switched
+//!    back on here); windows that no longer exist are dropped from the
+//!    registry and every space, the minimized state is re-synced with
+//!    `IsIconic`, and a window the pause handed back maximized is
+//!    un-maximized again before it is seated.
 //! 3. Every strip keeps the windows that are still live `Tiling(Active)` in
 //!    their remembered (monitor, workspace, column, row) seats — row
 //!    heights and column widths included — and drops the others; a float
@@ -113,6 +121,10 @@ pub(super) trait TilingProbe: TopologyProbe {
     fn window_rect(&self, hwnd: isize) -> Option<Rect>;
     /// `GetForegroundWindow()`.
     fn foreground_window(&self) -> Option<isize>;
+    /// `IsZoomed(hwnd)` — whether the window is maximized.
+    fn is_zoomed(&self, hwnd: isize) -> bool;
+    /// `ShowWindow(hwnd, SW_MAXIMIZE)`; `true` when issued on a live window.
+    fn maximize_window(&self, hwnd: isize) -> bool;
     /// Re-anchor a minimized window whose restore position is off-screen
     /// ([`crate::rescue::rescue_minimized_placement`]); `Ok(Some)` when the
     /// placement was rewritten.
@@ -160,7 +172,18 @@ impl TopologyProbe for Win32Tiling {
 
 impl TilingProbe for Win32Tiling {
     fn scan_windows(&self, registry: &mut WindowRegistry) -> Result<(), String> {
-        registry.scan_existing_windows()
+        registry.scan_existing_windows()?;
+        // `adopt_maximized` (switched back on by the resume before this
+        // call): windows the scan just registered maximized are
+        // un-maximized and classified through the rules.
+        let adopted = registry.adopt_ignored_maximized();
+        if !adopted.is_empty() {
+            log::info!(
+                "tiling: adopted {} maximized window(s) on resume",
+                adopted.len()
+            );
+        }
+        Ok(())
     }
 
     fn window_rect(&self, hwnd: isize) -> Option<Rect> {
@@ -169,6 +192,14 @@ impl TilingProbe for Win32Tiling {
 
     fn foreground_window(&self) -> Option<isize> {
         registry_win32::get_foreground_window()
+    }
+
+    fn is_zoomed(&self, hwnd: isize) -> bool {
+        registry_win32::is_zoomed(HWND(hwnd as *mut _))
+    }
+
+    fn maximize_window(&self, hwnd: isize) -> bool {
+        registry_win32::maximize_window(hwnd)
     }
 
     fn fix_minimized_placement(
@@ -193,6 +224,8 @@ pub struct PauseSummary {
     pub restored: usize,
     /// Floats that sat off the virtual screen and were clamped on-screen.
     pub floats_clamped: usize,
+    /// Windows the daemon had un-maximized to manage, maximized again.
+    pub remaximized: usize,
     /// Minimized windows whose off-screen restore placement was fixed.
     pub minimized_fixed: usize,
     /// Border overlays dropped.
@@ -216,6 +249,8 @@ pub struct ResumeSummary {
     pub floats: usize,
     /// Windows dropped from the registry because they no longer exist.
     pub dropped: usize,
+    /// Windows the pause had maximized again, un-maximized before seating.
+    pub unmaximized: usize,
     /// Animator targets submitted by the final instant seating.
     pub targets: usize,
 }
@@ -234,6 +269,9 @@ pub(super) struct PauseTargets {
     pub restored: usize,
     /// See [`PauseSummary::floats_clamped`].
     pub floats_clamped: usize,
+    /// Tiles and floats left out of the batch to be maximized again
+    /// instead ([`Window::adopted_from_maximized`]).
+    pub remaximized: Vec<isize>,
 }
 
 /// Where a tiled window goes when tiling is turned off, as a **visible**
@@ -336,6 +374,7 @@ impl FlowWM {
             tiles,
             restored,
             mut floats_clamped,
+            remaximized: to_remaximize,
         } = self.pause_targets();
         for (hwnd, rect) in demoted {
             let bounds = self
@@ -357,6 +396,26 @@ impl FlowWM {
             }
         }
         self.record_submitted(&submitted);
+
+        // 2c. Windows the daemon un-maximized to manage go back maximized.
+        //     SW_MAXIMIZE activates, so the foreground is put back after
+        //     the run (unless it was one of them).
+        let mut remaximized = 0_usize;
+        if !to_remaximize.is_empty() {
+            let foreground = probe.foreground_window();
+            for &hwnd in &to_remaximize {
+                if probe.maximize_window(hwnd) {
+                    remaximized += 1;
+                } else {
+                    log::debug!("tiling: hwnd {hwnd} is gone; not re-maximized");
+                }
+            }
+            if let Some(fg) = foreground
+                && !to_remaximize.contains(&fg)
+            {
+                let _ = probe.focus_window(fg);
+            }
+        }
 
         // 3. Minimized windows: a restore position parked beyond the screen
         //    is rewritten so the window comes back on-screen when restored.
@@ -403,6 +462,8 @@ impl FlowWM {
             self.topology_retries = 0;
         }
         self.tiling_paused = true;
+        // No un-maximizing while the desktop is Windows' to arrange.
+        self.registry.set_adopt_maximized(false);
         self.write_tiling_status(false);
 
         let summary = PauseSummary {
@@ -410,14 +471,16 @@ impl FlowWM {
             tiles,
             restored,
             floats_clamped,
+            remaximized,
             minimized_fixed,
             borders,
         };
         log::info!(
-            "tiling: off — {} tile(s) moved on-screen ({} to their pre-tiling rect), {} float(s) clamped, {} minimized placement(s) fixed, {} border(s) dropped; layout-mutating commands are refused until `flow dispatch tiling on`",
+            "tiling: off — {} tile(s) moved on-screen ({} to their pre-tiling rect), {} float(s) clamped, {} window(s) maximized again, {} minimized placement(s) fixed, {} border(s) dropped; layout-mutating commands are refused until `flow dispatch tiling on`",
             summary.tiles,
             summary.restored,
             summary.floats_clamped,
+            summary.remaximized,
             summary.minimized_fixed,
             summary.borders
         );
@@ -442,10 +505,16 @@ impl FlowWM {
             for ws in m.workspaces() {
                 let offset = parking.offset(ws.id, active_id);
 
-                // Every tile: back to its pre-tiling rect, else on-screen.
+                // Every tile: back to its pre-tiling rect, else on-screen —
+                // except one the daemon un-maximized, which is maximized
+                // again instead of being moved.
                 for entry in &ws.scrolling.actual_layout().entries {
                     let hwnd = entry.window_id.0;
                     let window = self.registry.get_window(HWND(hwnd as *mut _));
+                    if window.is_some_and(|w| w.adopted_from_maximized) {
+                        out.remaximized.push(hwnd);
+                        continue;
+                    }
                     let bounds = window.map(|w| w.invisible_bounds).unwrap_or_default();
                     let pre = window
                         .and_then(|w| w.pre_tiling_rect)
@@ -462,8 +531,18 @@ impl FlowWM {
 
                 // Floats: left alone unless off the virtual screen (a float
                 // of a parked workspace), then brought into the work area at
-                // their workspace-local rect.
+                // their workspace-local rect. One adopted from maximized is
+                // maximized again.
                 for f in ws.floating.windows() {
+                    let hwnd = f.window_id.0;
+                    if self
+                        .registry
+                        .get_window(HWND(hwnd as *mut _))
+                        .is_some_and(|w| w.adopted_from_maximized)
+                    {
+                        out.remaximized.push(hwnd);
+                        continue;
+                    }
                     let current = Rect {
                         y: f.rect.y + offset,
                         ..f.rect
@@ -471,7 +550,6 @@ impl FlowWM {
                     if current.overlaps(virtual_screen) {
                         continue;
                     }
-                    let hwnd = f.window_id.0;
                     let bounds = self
                         .registry
                         .get_window(HWND(hwnd as *mut _))
@@ -513,8 +591,12 @@ impl FlowWM {
             self.topology_first_report = None;
         }
 
-        // 2. The live desktop: new windows classified through the rules,
-        //    dead ones forgotten, the minimized state re-synced.
+        // 2. The live desktop: new windows classified through the rules
+        //    (maximized ones adopted when configured), dead ones forgotten,
+        //    the minimized state re-synced, and windows the pause handed
+        //    back maximized un-maximized again.
+        self.registry
+            .set_adopt_maximized(self.config.adopt_maximized);
         if let Err(e) = probe.scan_windows(&mut self.registry) {
             log::warn!("tiling: window re-scan failed, relying on the hooks' bookkeeping: {e}");
         }
@@ -529,6 +611,14 @@ impl FlowWM {
                 continue;
             }
             let iconic = probe.is_iconic(hwnd);
+            let adopted = self
+                .registry
+                .get_window(HWND(hwnd as *mut _))
+                .is_some_and(|w| w.adopted_from_maximized);
+            if adopted && !iconic && probe.is_zoomed(hwnd) {
+                let _ = probe.restore_window(hwnd);
+                summary.unmaximized += 1;
+            }
             let state = self
                 .registry
                 .get_window(HWND(hwnd as *mut _))
@@ -699,12 +789,13 @@ impl FlowWM {
         self.tiling_paused = false;
         self.write_tiling_status(true);
         log::info!(
-            "tiling: on — {} monitor(s), {} tile(s) kept their seat, {} appended, {} float(s) seated or refreshed, {} vanished window(s) dropped, {} target(s) seated{}",
+            "tiling: on — {} monitor(s), {} tile(s) kept their seat, {} appended, {} float(s) seated or refreshed, {} vanished window(s) dropped, {} window(s) un-maximized again, {} target(s) seated{}",
             summary.monitors,
             summary.kept,
             summary.appended,
             summary.floats,
             summary.dropped,
+            summary.unmaximized,
             summary.targets,
             if summary.topology_reconciled {
                 " (display change reconciled first)"
@@ -921,6 +1012,12 @@ mod tests {
         foreground: Option<isize>,
         /// Every placement fix attempted, in order.
         placements: RefCell<Vec<isize>>,
+        /// Handles `IsZoomed` says are maximized.
+        zoomed: HashSet<isize>,
+        /// Every `SW_MAXIMIZE` issued, in order.
+        maximized: RefCell<Vec<isize>>,
+        /// Every `SW_SHOWNOACTIVATE` restore issued, in order.
+        restored: RefCell<Vec<isize>>,
     }
 
     impl TopologyProbe for MockDesktop {
@@ -933,7 +1030,8 @@ mod tests {
         fn is_iconic(&self, hwnd: isize) -> bool {
             self.iconic.contains(&hwnd)
         }
-        fn restore_window(&self, _hwnd: isize) -> bool {
+        fn restore_window(&self, hwnd: isize) -> bool {
+            self.restored.borrow_mut().push(hwnd);
             true
         }
         fn focus_window(&self, _hwnd: isize) -> ForegroundPush {
@@ -962,6 +1060,13 @@ mod tests {
         }
         fn foreground_window(&self) -> Option<isize> {
             self.foreground
+        }
+        fn is_zoomed(&self, hwnd: isize) -> bool {
+            self.zoomed.contains(&hwnd)
+        }
+        fn maximize_window(&self, hwnd: isize) -> bool {
+            self.maximized.borrow_mut().push(hwnd);
+            true
         }
         fn fix_minimized_placement(
             &self,
@@ -1089,6 +1194,7 @@ mod tests {
                 tiles: 3,
                 restored: 1,
                 floats_clamped: 1,
+                remaximized: 0,
                 minimized_fixed: 1,
                 borders: 0,
             }
@@ -1109,6 +1215,65 @@ mod tests {
         assert!(again.already_paused);
         assert_eq!(again.tiles, 0);
         assert_eq!(probe.placements.borrow().len(), 1);
+    }
+
+    /// A tile the daemon un-maximized to manage is not moved by the pause
+    /// but maximized again (and the foreground put back); the resume
+    /// un-maximizes it before seating it in its remembered seat.
+    #[test]
+    fn pause_remaximizes_adopted_windows_and_resume_unmaximizes_them() {
+        let mut flow = fixture();
+        flow.config.borders.enabled = false;
+        flow.config.adopt_maximized = true;
+        if let Some(w) = flow.registry.get_window_mut(HWND(A as *mut _)) {
+            w.adopted_from_maximized = true;
+        }
+        if let Some(w) = flow.registry.get_window_mut(HWND(G as *mut _)) {
+            w.adopted_from_maximized = true;
+        }
+        let targets = flow.pause_targets();
+        assert_eq!(submitted_for(&targets, A), None, "A is not moved");
+        assert_eq!(submitted_for(&targets, G), None, "G is not clamped");
+        assert_eq!(targets.tiles, 2, "C and the parked B");
+        assert_eq!(targets.floats_clamped, 0);
+        let mut sorted = targets.remaximized.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![G, A]);
+
+        let mut probe = desktop();
+        probe.foreground = Some(C);
+        let summary = flow.pause_tiling_with(&probe);
+        assert_eq!(summary.remaximized, 2);
+        assert_eq!(summary.tiles, 2);
+        let mut maximized = probe.maximized.borrow().clone();
+        maximized.sort_unstable();
+        assert_eq!(maximized, vec![G, A]);
+        assert!(
+            !flow.registry.adopt_maximized(),
+            "adoption is off while tiling is off"
+        );
+        // Still a tile in its seat, still flagged.
+        assert!(flow.registry.is_tiling_active(A));
+        assert_eq!(column_order(&flow, 0, 1), vec![WindowId(A), WindowId(C)]);
+
+        // Resume: A is maximized on the desktop now; it is un-maximized
+        // before everything is seated, and keeps its seat.
+        probe.zoomed.insert(A);
+        let summary = flow.resume_tiling_with(&probe);
+        assert_eq!(summary.unmaximized, 1);
+        assert_eq!(*probe.restored.borrow(), vec![A]);
+        assert_eq!(summary.kept, 3);
+        assert_eq!(column_order(&flow, 0, 1), vec![WindowId(A), WindowId(C)]);
+        assert!(
+            flow.registry.adopt_maximized(),
+            "adoption follows the config again"
+        );
+        assert!(
+            flow.registry
+                .get_window(HWND(A as *mut _))
+                .is_some_and(|w| w.adopted_from_maximized),
+            "the flag outlives a toggle"
+        );
     }
 
     /// A fullscreen window is handed back as a plain float inside its work

@@ -731,7 +731,13 @@ impl FlowWM {
     /// Taking `drag_state` drops the translate edge-scroll scheduler and its
     /// armed deadline (translate variant), tearing down the auto-repeat timer —
     /// no leftover scroll continues after release.
-    pub(super) fn on_drag_end(&mut self, _hwnd: isize) {
+    pub(super) fn on_drag_end(&mut self, hwnd: isize) {
+        // Dragging a maximized window by its title bar un-maximizes it and
+        // ends in MOVESIZEEND, sometimes without a STATECHANGE: an
+        // OS-ignored window gets the recovery here (cheap gate first).
+        if self.registry.is_os_ignored(hwnd) {
+            self.on_window_state_change(hwnd);
+        }
         let Some(mut drag) = self.drag_state.take() else {
             return;
         };

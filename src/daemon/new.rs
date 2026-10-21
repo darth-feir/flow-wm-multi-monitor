@@ -15,10 +15,14 @@
 //!    turns logoff / shutdown / close into a graceful stop.
 //! 5. **`animator`** — creates [`WindowAnimator`] with the Win32 backend and
 //!    the user's configured animation duration.
-//! 6. **`initial_layout`** — batch-initializes each monitor's layout from
-//!    its existing tiling windows (sorted by x coordinate for deterministic
-//!    column assignment; viewport centered on the focused column) and
-//!    animates the windows to their tiling positions.
+//! 6. **`initial_layout`** — with `adopt_maximized`, first un-maximizes the
+//!    maximized windows the scan parked as `Ignored(Maximized)` and
+//!    classifies them through the rules (this is the first window move of
+//!    the boot, so it sits after the pipe and hook checks); then
+//!    batch-initializes each monitor's layout from its existing tiling
+//!    windows (sorted by x coordinate for deterministic column assignment;
+//!    viewport centered on the focused column) and animates the windows to
+//!    their tiling positions.
 //! 7. **`borders`** — adopts pre-existing floats and attaches border
 //!    overlays.
 //!
@@ -255,6 +259,24 @@ impl FlowWM {
         // ── 6. initial_layout ────────────────────────────────────────
         reporter.begin(S::InitialLayout)?;
 
+        // `adopt_maximized`: the scan registered maximized windows as
+        // `Ignored(Maximized)` without touching them; now that the pipe and
+        // the hooks are up (nothing before this point may move a window),
+        // un-maximize the ones the rules would manage so they join the
+        // initial layout. A failure from here on rescues them back
+        // maximized (`rescue_stranded_windows_with`).
+        registry.set_adopt_maximized(app_config.adopt_maximized);
+        if app_config.adopt_maximized {
+            let adopted = registry.adopt_ignored_maximized();
+            if !adopted.is_empty() {
+                log::info!(
+                    "init: adopted {} maximized window(s) ({} tiling)",
+                    adopted.len(),
+                    adopted.iter().filter(|(_, tiling)| *tiling).count()
+                );
+            }
+        }
+
         // Partition the pre-existing tiling windows by the monitor they sit on.
         let all_tiling = registry.tiling_window_ids_with_widths_sorted_by_x();
         let mut per_monitor_windows: Vec<(Vec<WindowId>, Vec<u32>)> =
@@ -476,7 +498,7 @@ impl FlowWM {
     /// failure). The visible rect is what [`FloatingSpace`](crate::workspace::FloatingSpace)
     /// stores — `GetWindowRect`'s window rect is translated back through the
     /// window's measured [`InvisibleBounds`](crate::common::InvisibleBounds).
-    fn current_visible_rect(&self, hwnd: isize) -> Option<Rect> {
+    pub(super) fn current_visible_rect(&self, hwnd: isize) -> Option<Rect> {
         let hwnd_handle = HWND(hwnd as *mut _);
         let window_rect = registry_win32::get_window_rect(hwnd_handle).ok()?;
         let window = self.registry.get_window(hwnd_handle)?;

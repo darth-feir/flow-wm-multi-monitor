@@ -181,6 +181,17 @@ pub struct FlowConfig {
     /// aborts startup. The explicit `flow update --check` command is unaffected
     /// by this flag. See (`docs/src/dev-guide/updater.md`).
     pub check_for_updates: bool,
+
+    /// Whether a **maximized** window the daemon meets — in the startup
+    /// scan, when it opens, on `tiling on` — is un-maximized and classified
+    /// through the rules (tiled or floated as they say) instead of being
+    /// left alone as `Ignored(Maximized)`. Fullscreen windows (games,
+    /// videos) are never adopted, and neither is a window the rules
+    /// ignore. An adopted window is handed back maximized by `tiling off`,
+    /// `flow stop` and the fail-back. Off by default (upstream behaviour: a
+    /// maximized window is ignored until it is restored or `set-window` is
+    /// run on it, which adopts it either way). Live-reloadable.
+    pub adopt_maximized: bool,
 }
 
 /// Loadout save/restore configuration.
@@ -245,6 +256,7 @@ impl Default for FlowConfig {
             navigation: NavigationConfig::default(),
             columns: None,
             check_for_updates: true,
+            adopt_maximized: false,
         }
     }
 }
@@ -969,6 +981,7 @@ mod tests {
         assert_eq!(parsed.padding.down, 0);
         assert_eq!(parsed.animation.duration_ms, 240);
         assert_eq!(parsed.animation.easing, ConfigEasing::EaseOutExpo);
+        assert!(!parsed.adopt_maximized, "adoption is off by default");
     }
 
     #[test]
@@ -979,6 +992,7 @@ mod tests {
 columns_per_screen = 3
 column_width = 1200
 min_column_width_px = 400
+adopt_maximized = true
 
 [padding]
 window_gap = 8
@@ -1000,6 +1014,22 @@ strategy = "original_slot"
         assert_eq!(config.padding.up, 10);
         assert_eq!(config.padding.down, 40);
         assert!(!config.animation.enabled);
+        assert!(config.adopt_maximized);
+    }
+
+    /// `adopt_maximized` is a top-level key: written after a `[section]`
+    /// header it would belong to that section and be ignored, so the
+    /// example configs keep it above the first header.
+    #[test]
+    fn adopt_maximized_parses_as_a_top_level_key() {
+        let config: FlowConfig = toml::from_str("adopt_maximized = true\n").expect("parse");
+        assert!(config.adopt_maximized);
+        let config: FlowConfig =
+            toml::from_str("[columns]\nadopt_maximized = true\n").expect("parse");
+        assert!(
+            !config.adopt_maximized,
+            "a key under [columns] is not the top-level key"
+        );
     }
 
     /// Positive: empty TOML deserializes to compiled defaults.
@@ -1172,6 +1202,7 @@ default = \"1/2\"",
                 .expect("columns"),
             ),
             check_for_updates: false,
+            adopt_maximized: true,
         };
 
         let toml_str = toml::to_string(&config).expect("serialize all fields");
@@ -1182,6 +1213,7 @@ default = \"1/2\"",
         assert_eq!(parsed.min_column_width_px, 400);
         assert_eq!(parsed.min_window_height_px, 120);
         assert_eq!(parsed.min_row_height_px, 120);
+        assert!(parsed.adopt_maximized);
         assert_eq!(parsed.padding.window_gap, 6);
         assert_eq!(parsed.padding.up, 10);
         assert_eq!(parsed.padding.down, 40);

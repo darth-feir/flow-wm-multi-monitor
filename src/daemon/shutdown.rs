@@ -14,7 +14,10 @@
 //!    worker, so step 2 cannot be overwritten by a still-running tween.
 //! 2. [`rescue_stranded_windows`](FlowWM::rescue_stranded_windows) — if
 //!    step 1 was not acknowledged in time, the pass runs twice with another
-//!    bounded wait in between, so a late frame cannot undo it.
+//!    bounded wait in between, so a late frame cannot undo it. The pass
+//!    also maximizes again every window the daemon had un-maximized to
+//!    manage (`Window::adopted_from_maximized`), so the desktop is handed
+//!    back as the user had it.
 //! 3. Drop every border overlay (`DestroyWindow`).
 //! 4. Stop the hook thread (`WM_QUIT`).
 //! 5. Kill the hotkey script and remove its pidfile, releasing the Win key.
@@ -74,9 +77,13 @@ pub struct RescueMonitor {
 /// get a second pass: their `WINDOWPLACEMENT` normal position is clamped
 /// on-screen (see
 /// [`rescue_minimized_placement`](crate::rescue::rescue_minimized_placement))
-/// without un-minimizing them.
+/// without un-minimizing them. A third pass maximizes again every window
+/// the daemon un-maximized to manage
+/// ([`adopted_maximized_windows`](WindowRegistry::adopted_maximized_windows)),
+/// after it has been brought on-screen, and puts the foreground back
+/// (`SW_MAXIMIZE` activates).
 ///
-/// Returns the number of windows moved or re-anchored.
+/// Returns the number of windows moved, re-anchored or re-maximized.
 pub fn rescue_stranded_windows_with(
     registry: &WindowRegistry,
     virtual_screen: Rect,
@@ -134,10 +141,26 @@ pub fn rescue_stranded_windows_with(
             }
         }
     }
+    let adopted = registry.adopted_maximized_windows();
+    let mut re_maximized = 0_usize;
+    if !adopted.is_empty() {
+        let foreground = win32::get_foreground_window();
+        for &hwnd_val in &adopted {
+            if win32::maximize_window(hwnd_val) {
+                re_maximized += 1;
+            }
+        }
+        if let Some(fg) = foreground
+            && !adopted.contains(&fg)
+            && win32::is_window(fg)
+        {
+            let _ = win32::set_foreground_window(fg);
+        }
+    }
     log::info!(
-        "shutdown rescue: brought {rescued} stranded window(s) back on-screen, re-anchored {re_anchored} minimized window(s)"
+        "shutdown rescue: brought {rescued} stranded window(s) back on-screen, re-anchored {re_anchored} minimized window(s), maximized {re_maximized} adopted window(s) again"
     );
-    rescued + re_anchored
+    rescued + re_anchored + re_maximized
 }
 
 /// Index of the monitor whose screen rect contains `rect`'s centre, else the
@@ -175,8 +198,9 @@ impl FlowWM {
     ///
     /// `Ignored` and `Hidden` windows never reach this loop — the registry
     /// accessor filters them out, since flow does not actively place them.
-    /// `Minimized` windows get their restore placement re-anchored instead
-    /// (see `rescue_stranded_windows_with`).
+    /// `Minimized` windows get their restore placement re-anchored instead,
+    /// and windows adopted from maximized are maximized again (see
+    /// `rescue_stranded_windows_with`).
     ///
     /// Failures (window vanished mid-loop, `SetWindowPos` rejected) are logged
     /// at `warn` and skipped: one bad window must not abort the rescue pass.

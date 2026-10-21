@@ -68,6 +68,16 @@ min_row_height_px = 100
 # of this flag. Set to false to silence the start-time notification.
 check_for_updates = true
 
+# Whether a window that is maximized when FlowWM meets it (at startup, when it
+# opens, when tiling is turned back on) is un-maximized and classified through
+# your rules — tiled or floated like any other window — instead of being left
+# alone as "ignored: maximized" until you restore it. Fullscreen windows
+# (games, videos) are never adopted, nor is a window your rules ignore. FlowWM
+# maximizes an adopted window again when it hands the desktop back
+# (`flow dispatch tiling off`, `flow stop`). `set-window tile|float|cycle` on
+# an ignored window adopts it whatever this is set to.
+adopt_maximized = false
+
 # Padding / spacing settings in pixels.
 #
 # - window_gap: uniform gap between all elements (windows and screen edges)

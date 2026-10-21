@@ -372,8 +372,10 @@ without constructing a `FlowWM` (which owns Win32 handles).
 ```mermaid
 flowchart TB
     REQ["SetWindow request<br/>(mode + focused window)"]
-    REQ --> CHECK{"Currently tiling<br/>or floating?"}
-    CHECK -- "No (ignored/minimized/hidden)" --> ERR["Err — no transition possible"]
+    REQ --> IGN{"Ignored?"}
+    IGN -- Yes --> ADOPT["Adopt: un-maximize if needed,<br/>tile/cycle → AdoptTiling,<br/>float → AdoptFloating,<br/>fullscreen → AdoptFullscreen"]
+    IGN -- No --> CHECK{"Currently tiling<br/>or floating?"}
+    CHECK -- "No (minimized/hidden)" --> ERR["Err — no transition possible"]
     CHECK -- Yes --> MODE{"Requested mode?"}
     MODE -- Float --> FCHECK{"Already floating?"}
     FCHECK -- Yes --> NOP1["NoOp"]
@@ -386,17 +388,30 @@ flowchart TB
     CCHECK -- No --> MT2["MakeTiling"]
 ```
 
-Full decision table:
+Full decision table (fullscreen aside — see below):
 
-| mode | currently tiling | currently floating | result |
-|------|------------------|--------------------|--------|
-| Float | true | false | MakeFloating |
-| Float | false | true | NoOp |
-| Tile | true | false | NoOp |
-| Tile | false | true | MakeTiling |
-| Cycle | true | false | MakeFloating |
-| Cycle | false | true | MakeTiling |
-| *any* | false | false | Err (ignored / minimized / hidden) |
+| mode | currently tiling | currently floating | ignored | result |
+|------|------------------|--------------------|---------|--------|
+| Float | true | false | false | MakeFloating |
+| Float | false | true | false | NoOp |
+| Tile | true | false | false | NoOp |
+| Tile | false | true | false | MakeTiling |
+| Cycle | true | false | false | MakeFloating |
+| Cycle | false | true | false | MakeTiling |
+| Tile / Cycle | false | false | true | AdoptTiling |
+| Float | false | false | true | AdoptFloating |
+| Fullscreen | false | false | true | AdoptFullscreen |
+| *any* | false | false | false | Err (minimized / hidden) |
+
+An adoption (`adopt_ignored_as_tile` / `adopt_ignored_as_float` in
+`dispatch.rs`) asks the registry to un-maximize the window if it is maximized
+and re-measure it (`WindowRegistry::adopt_ignored_window`), then seats it the
+way a freshly created window is seated: a tile goes next to the focused column
+of the strip on the monitor it is on (`insert_window`, the monitor's current
+width preset) and a float into the floating space at its current rect
+(`register_float`). A window that was maximized is flagged
+`adopted_from_maximized` and maximized again by `tiling off` / `flow stop`.
+See [Window Registry](./window-registry.md#state-transitions).
 
 ## Fullscreen windows
 

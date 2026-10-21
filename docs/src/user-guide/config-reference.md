@@ -55,6 +55,7 @@ Not every field can change at runtime. Reload applies **live** fields in place;
 | `columns.max_rows` | Applies to the next merge/consume/insert; a column already over the new cap keeps its rows until windows leave it. |
 | `animation.*` | New duration / easing / enabled flag applies to the next animation. |
 | `navigation.edge_hop` | Applies to the next `focus` / `move-window` at a strip edge. |
+| `adopt_maximized` | Applies to the next maximized window the daemon meets (a window already parked as ignored is adopted when it is next focused, shown or moved). |
 | **Workspace count (10), monitor geometry** | **Structural** — not reloadable. Restart the daemon. |
 
 What is preserved across reload: the user's arranged layout (columns, rows,
@@ -93,6 +94,7 @@ in the repo root — `flow config init` copies it verbatim.
 | `min_column_width_px` | `u32` | `640` | Floor for column width in pixels. Columns cannot be resized below this. |
 | `min_window_height_px` | `u32` | `100` | Minimum row height in pixels — the floor for any single window's allocated height inside a column. Bounds the maximum number of rows that can stack inside one column. |
 | `check_for_updates` | `bool` | `true` | Whether `flow start` checks GitHub for a newer release and prints a one-line notification prompting `flow update` when one exists. Runs after the daemon is ready, is bounded by a short timeout, and never blocks startup. The explicit `flow update --check` command is unaffected by this flag. |
+| `adopt_maximized` | `bool` | `false` | Whether a window that is **maximized** when FlowWM meets it — in the startup scan, when it opens, when tiling is turned back on — is un-maximized and classified through your rules (tiled or floated like any other window) instead of being left alone as "ignored: maximized" until you restore it. Fullscreen windows (video, games) are never adopted, nor is a window your rules ignore. An adopted window is maximized again when FlowWM hands the desktop back: `flow dispatch tiling off`, `flow stop`, a fail-back. With `false` (the stock behaviour) a maximized window stays ignored until you restore it or run [`set-window`](./dispatch-reference.md#set-window-mode) on it, which adopts it either way. |
 
 Example:
 
@@ -102,7 +104,13 @@ columns_per_screen = 4
 min_column_width_px = 640
 min_window_height_px = 100
 check_for_updates = true       # set false to silence the start-time update notification
+adopt_maximized = false        # true: un-maximize and tile/float windows found maximized
 ```
+
+These are **top-level** keys: they must come before the first `[section]`
+header in `flow.toml`. A key written after a header belongs to that section
+and is silently ignored (`[columns]` would swallow a `min_column_width_px`
+placed below it).
 
 ### `[columns]` — column width presets
 

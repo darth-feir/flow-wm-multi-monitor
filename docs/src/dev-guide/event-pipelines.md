@@ -236,6 +236,7 @@ animation if the columns are the same width.
 | Owned by another window (tooltip, etc.) | Skip |
 | Already tracked (de-dup) | Skip |
 | Matches an ignore rule (maximized, fullscreen, explicit) | Register as `Ignored`, no layout |
+| Maximized and `adopt_maximized` is on | Register as `Ignored(Maximized)`, then `reclassify_os_state()` un-maximizes it and classifies it through the rules: a tile is seated like a new window, a float like a new float; a window the rules ignore stays maximized |
 | Classified as floating | Register as `Floating`, add to active `FloatingSpace` (centered), animate, attach border |
 | Classified as tiling | Register as `Tiling::Active`, `insert_window()` next to focused, animate |
 
@@ -282,6 +283,7 @@ restoring saved virtual slots for all cases (minimize + destroy interleaving).
 
 | Condition | Action |
 |-----------|--------|
+| Tracked `Ignored(Maximized\|Fullscreen)` window | Run the [State Change](#state-change-event_object_statechange) recovery first (an un-maximize whose `STATECHANGE` never arrived is picked up here); a window now tiling is seated, then handled as below |
 | Any tracked window | `registry.set_focused(hwnd)` + `layout.set_focus(WindowId)` if tiling |
 
 Focus changes do not produce an `AppliedLayout` — they only update internal focus
@@ -303,24 +305,38 @@ with focus successor resolution — identical to the minimize path. The
 `is_tiling_active` check (not `is_tiling`) prevents double-removal since Win32
 fires both `MINIMIZESTART` and `HIDE` for ordinary minimizes.
 
-**Shown:** Two paths:
+**Shown:** Three paths:
 1. **Recovery** — if the window is not yet tracked (created invisible, e.g.
    `wt -p PowerShell`), re-run the full creation pipeline. By this point the
    window is visible and titled, so classification succeeds.
-2. **Re-show** — if the window was `Hidden` and now transitions to `Shown`,
+2. **OS-ignored** — a tracked `Ignored(Maximized|Fullscreen)` window gets the
+   [State Change](#state-change-event_object_statechange) recovery.
+3. **Re-show** — if the window was `Hidden` and now transitions to `Shown`,
    re-add to layout via `add_window()`.
 
 ### State Change (`EVENT_OBJECT_STATECHANGE`)
 
 Handles recovery for windows that launched maximized or fullscreen. When a
 tracked `Ignored(Maximized|Fullscreen)` window has its `WS_MAXIMIZE` bit
-cleared (the user restores it), `reclassify_os_state()` re-runs the classifier.
-If the window now qualifies as tiling, it is appended to the layout via
-`add_window()`.
+cleared (the user restores it), `reclassify_os_state()` re-runs the classifier
+(and re-measures the window's rect and invisible borders, which were those of
+the maximized frame). If the window now qualifies as tiling, it is appended to
+the layout via `add_window()`.
 
 The handler only acts on windows currently in `Ignored(Maximized|Fullscreen)`
 state, so the common case (no recoverable windows) costs a single `HashMap`
-lookup.
+lookup. Because the `STATECHANGE` for an un-maximize is not guaranteed to
+arrive, the same handler is also run from the Foreground, Shown and MoveSize
+End handlers when their window is still OS-ignored (same cheap gate).
+
+With `adopt_maximized = true`, `reclassify_os_state()` does not wait for the
+user: a window that is still maximized (not fullscreen) and that the rules
+would tile or float is un-maximized by the daemon (`SW_SHOWNOACTIVATE`),
+classified, and flagged `adopted_from_maximized` so `tiling off` / `flow
+stop` maximize it again. The daemon runs this over every `Ignored(Maximized)`
+window at the start of the `initial_layout` stage (the first point of the
+boot at which a window may move) and after the `tiling on` re-scan; it is
+switched off while tiling is paused.
 
 ### MoveSize Start / End (`EVENT_SYSTEM_MOVESIZESTART` / `EVENT_SYSTEM_MOVESIZEEND`)
 
@@ -329,6 +345,7 @@ lookup.
 | Not tracked | Skip |
 | Tracked, not `Tiling::Active` | Skip (float/ignored/minimized windows manage their own move) |
 | Tracked, `Tiling::Active` | `on_drag_start`: create `DragState`, `set_dragged_hwnd` (gates LOCATIONCHANGE filter) |
+| `MoveSizeEnd` on a tracked `Ignored(Maximized\|Fullscreen)` window | Run the [State Change](#state-change-event_object_statechange) recovery (dragging a maximized title bar un-maximizes the window) |
 | `MoveSizeEnd` with no active `DragState` | Skip (double-fire or spurious end) |
 | `MoveSizeEnd` with active `DragState` | `on_drag_end`: commit layout or snap-back, `clear_dragged_hwnd` |
 

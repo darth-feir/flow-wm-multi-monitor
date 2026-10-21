@@ -109,6 +109,15 @@ pub struct WindowRegistry {
 
     /// Multi-layer classification pipeline (user rules → learned → default → fallback).
     pipeline: classification::ClassificationPipeline,
+
+    /// The `adopt_maximized` config key as currently in force: whether an
+    /// `Ignored(Maximized)` window may be un-maximized and classified
+    /// through the rules by [`reclassify_os_state`](Self::reclassify_os_state)
+    /// (and so by every recovery hook and by
+    /// [`adopt_ignored_maximized`](Self::adopt_ignored_maximized)). Off by
+    /// default; the daemon turns it on once windows may move (after the
+    /// pipe and hook stages) and off while tiling is paused.
+    adopt_maximized: bool,
 }
 
 impl WindowRegistry {
@@ -128,7 +137,26 @@ impl WindowRegistry {
                 user_rules.clone(),
                 default_rules.clone(),
             ),
+            adopt_maximized: false,
         }
+    }
+
+    /// Turn the maximized-window adoption on or off (the `adopt_maximized`
+    /// config key). See [`reclassify_os_state`](Self::reclassify_os_state)
+    /// for what it changes. Registration itself never adopts: a maximized
+    /// window is always registered `Ignored(Maximized)` first, so the
+    /// daemon decides when the un-maximize may happen.
+    pub fn set_adopt_maximized(&mut self, on: bool) {
+        if self.adopt_maximized != on {
+            log::debug!("adopt_maximized: {on}");
+        }
+        self.adopt_maximized = on;
+    }
+
+    /// Whether maximized-window adoption is currently on.
+    #[must_use]
+    pub fn adopt_maximized(&self) -> bool {
+        self.adopt_maximized
     }
 
     /// Scans all existing top-level windows and registers them.
@@ -637,6 +665,8 @@ impl WindowRegistry {
     ///     is unavailable
     ///   - `invisible_bounds`: per-edge invisible border sizes (left, top, right, bottom)
     ///   - `pre_manage_rect`: position before flow touched the window
+    ///   - `adopted_from_maximized`: whether flow un-maximized the window to
+    ///     manage it (it is handed back maximized)
     /// - `viewport_offset`: camera position on the virtual canvas
     /// - `focused`: the focused HWND value (or null)
     /// - `count`: number of tracked windows
@@ -715,6 +745,7 @@ impl WindowRegistry {
                         "width": w.pre_manage_rect.width,
                         "height": w.pre_manage_rect.height,
                     }),
+                    "adopted_from_maximized": w.adopted_from_maximized,
                 })
             })
             .collect();
@@ -1008,6 +1039,154 @@ impl WindowRegistry {
         self.windows.contains_key(&hwnd_val)
     }
 
+    /// Returns `true` iff `hwnd_val` is tracked and parked as
+    /// `Ignored(Maximized)` or `Ignored(Fullscreen)` — the windows
+    /// [`reclassify_os_state`](Self::reclassify_os_state) can recover. The
+    /// daemon's foreground / show / move-size-end handlers use this as the
+    /// cheap gate before re-running the recovery, so an un-maximize whose
+    /// `EVENT_OBJECT_STATECHANGE` never arrived is still picked up.
+    #[must_use]
+    pub fn is_os_ignored(&self, hwnd_val: isize) -> bool {
+        matches!(
+            self.windows.get(&hwnd_val).map(|w| &w.state),
+            Some(WindowState::Ignored(
+                IgnoredReason::Maximized | IgnoredReason::Fullscreen
+            ))
+        )
+    }
+
+    /// Every window the daemon un-maximized to manage
+    /// ([`Window::adopted_from_maximized`]) that is currently an active
+    /// tile or float — the ones to hand back maximized when the daemon
+    /// gives the desktop back (`tiling off`, the shutdown rescue, the
+    /// fail-back). A minimized or hidden one is left alone: maximizing it
+    /// would un-minimize it.
+    #[must_use]
+    pub fn adopted_maximized_windows(&self) -> Vec<isize> {
+        self.windows
+            .iter()
+            .filter(|(_, w)| {
+                w.adopted_from_maximized
+                    && matches!(
+                        w.state,
+                        WindowState::Tiling(TilingState::Active { .. })
+                            | WindowState::Floating(FloatingState::Active { .. })
+                    )
+            })
+            .map(|(key, _)| *key)
+            .collect()
+    }
+
+    /// Re-read `hwnd_val`'s window rect and invisible borders from Win32
+    /// into `pre_manage_rect`, `last_natural_size` and `invisible_bounds`.
+    ///
+    /// Called after a window leaves the maximized state (a recovery or an
+    /// adoption): the values measured at registration describe the
+    /// maximized frame — a rect the size of the work area and the thick
+    /// off-screen borders Windows gives a maximized window — and would
+    /// mis-size the column, the float and the border overlay. A window
+    /// that cannot be queried (gone) keeps its old values.
+    fn refresh_geometry(&mut self, hwnd_val: isize) {
+        let hwnd = HWND(hwnd_val as *mut _);
+        let Ok(rect) = win32::get_window_rect(hwnd) else {
+            return;
+        };
+        let bounds = win32::get_invisible_bounds(hwnd);
+        if let Some(window) = self.windows.get_mut(&hwnd_val) {
+            window.pre_manage_rect = rect;
+            window.last_natural_size = crate::common::Size {
+                w: rect.width,
+                h: rect.height,
+            };
+            window.invisible_bounds = bounds;
+        }
+    }
+
+    /// Adopt an `Ignored` window on the user's explicit request
+    /// (`set-window tile|float|cycle|fullscreen` on it): un-maximize it when
+    /// it is maximized (`ShowWindow(SW_SHOWNOACTIVATE)`, which keeps the
+    /// foreground where it is), re-measure its geometry and set its state
+    /// to a placeholder `Tiling(Active)` (`tile`) or `Floating(Active)`
+    /// (`!tile`) for the daemon to seat — a float's rect is written by
+    /// `register_float`, a tile's slot by the layout sync. A window that
+    /// was maximized is marked [`Window::adopted_from_maximized`].
+    ///
+    /// Any ignore reason qualifies: a window ignored by a rule
+    /// (`Ignored(ExplicitRule)`) is adopted too — Mod+V is explicit intent,
+    /// and the learned rule the daemon records afterwards outranks a
+    /// bundled ignore rule for the app's next window (not a user rule in
+    /// `flow-rules.toml`, which always wins). The rules are **not**
+    /// re-consulted here: the user asked for this mode.
+    ///
+    /// # Errors
+    ///
+    /// The window is untracked, not `Ignored`, gone, or still maximized
+    /// after the restore (a window that refuses `SW_SHOWNOACTIVATE`).
+    pub fn adopt_ignored_window(&mut self, hwnd_val: isize, tile: bool) -> Result<(), String> {
+        let Some(window) = self.windows.get(&hwnd_val) else {
+            return Err("window not found in registry".to_owned());
+        };
+        if !matches!(window.state, WindowState::Ignored(_)) {
+            return Err(format!("window is not ignored ({:?})", window.state));
+        }
+        let hwnd = HWND(hwnd_val as *mut _);
+        let was_maximized = win32::is_zoomed(hwnd);
+        if was_maximized {
+            if !win32::show_window_restored(hwnd_val) {
+                return Err("window is gone".to_owned());
+            }
+            if win32::is_zoomed(hwnd) {
+                return Err("window stayed maximized after the restore".to_owned());
+            }
+        }
+        self.refresh_geometry(hwnd_val);
+        let Some(window) = self.windows.get_mut(&hwnd_val) else {
+            return Err("window not found in registry".to_owned());
+        };
+        window.state = if tile {
+            WindowState::Tiling(TilingState::Active { col: 0, row: 0 })
+        } else {
+            WindowState::Floating(FloatingState::Active {
+                rect: window
+                    .invisible_bounds
+                    .window_to_visible(window.pre_manage_rect),
+            })
+        };
+        if was_maximized {
+            window.adopted_from_maximized = true;
+        }
+        log::info!(
+            "adopt_ignored_window: isize={hwnd_val} ({}) adopted as {} (was_maximized={was_maximized})",
+            window.exe,
+            if tile { "tile" } else { "float" }
+        );
+        Ok(())
+    }
+
+    /// Run [`reclassify_os_state`](Self::reclassify_os_state) over every
+    /// `Ignored(Maximized)` window — the `adopt_maximized` pass of the
+    /// startup scan (once windows may move) and of `tiling on` (whose
+    /// re-scan registered the windows maximized). Returns `(hwnd,
+    /// now_tiling)` for each window that was recovered; with the adoption
+    /// off this only picks up windows restored meanwhile.
+    pub fn adopt_ignored_maximized(&mut self) -> Vec<(isize, bool)> {
+        let candidates: Vec<isize> = self
+            .windows
+            .iter()
+            .filter(|(_, w)| matches!(w.state, WindowState::Ignored(IgnoredReason::Maximized)))
+            .map(|(key, _)| *key)
+            .collect();
+        let mut recovered = Vec::new();
+        for hwnd_val in candidates {
+            if let super::types::ReclassifyResult::Recovered { now_tiling } =
+                self.reclassify_os_state(hwnd_val)
+            {
+                recovered.push((hwnd_val, now_tiling));
+            }
+        }
+        recovered
+    }
+
     /// Re-evaluates a tracked window's OS state (maximized/fullscreen) and
     /// updates its stored [`WindowState`] if that state has changed.
     ///
@@ -1018,7 +1197,22 @@ impl WindowRegistry {
     /// re-run the classifier against the window's *current* OS state. If the
     /// window is now tile-eligible, the returned
     /// [`Recovered`](super::types::ReclassifyResult::Recovered) variant tells
-    /// the daemon to insert it into the live layout.
+    /// the daemon to insert it into the live layout. The daemon also calls
+    /// it from the foreground, show and move-size-end handlers for a window
+    /// that is still OS-ignored, since the `STATECHANGE` for an un-maximize
+    /// does not always arrive.
+    ///
+    /// # Adoption (`adopt_maximized`)
+    ///
+    /// With [`set_adopt_maximized`](Self::set_adopt_maximized) on, an
+    /// `Ignored(Maximized)` window that is **still maximized** (and not
+    /// fullscreen) is un-maximized here — provided the rules would take it
+    /// as a tile or a float; a window the rules ignore is left maximized
+    /// and `Unchanged` — then classified like a freshly restored one and
+    /// marked [`Window::adopted_from_maximized`] so it is handed back
+    /// maximized later. A recovered window (adopted or not) also has its
+    /// geometry re-measured, because the registration-time rect and
+    /// invisible borders describe the maximized frame.
     ///
     /// # Filtering — why this is cheap on a noisy event
     ///
@@ -1078,8 +1272,52 @@ impl WindowRegistry {
         // and these use the same predicates the classification pipeline applied
         // at creation time, so recovery stays consistent with initial classify.
         let hwnd = HWND(hwnd_val as *mut _);
-        let is_maximized = win32::is_zoomed(hwnd);
+        let mut is_maximized = win32::is_zoomed(hwnd);
         let is_fullscreen = win32::is_fullscreen(hwnd).unwrap_or(false);
+
+        // Adoption: still maximized, and the daemon may un-maximize it. Only
+        // when the rules would manage the window — one they ignore stays as
+        // the user left it.
+        let mut adopted = false;
+        if was_maximized && is_maximized && !is_fullscreen && self.adopt_maximized {
+            let would_manage = match self.windows.get(&hwnd_val) {
+                Some(window) => {
+                    let candidate = classification::WindowCandidate {
+                        exe: window.exe.clone(),
+                        title: window.title.clone(),
+                        class: window.class.clone(),
+                        process_path: window.process_path.to_string_lossy().into_owned(),
+                    };
+                    !matches!(
+                        classification::classify_with_state_pipeline(
+                            &candidate,
+                            false,
+                            false,
+                            &self.pipeline,
+                        ),
+                        WindowState::Ignored(_)
+                    )
+                }
+                None => return ReclassifyResult::Untracked,
+            };
+            if !would_manage {
+                log::debug!(
+                    "reclassify_os_state: isize={hwnd_val} is maximized but the rules ignore it; not adopted"
+                );
+                return ReclassifyResult::Unchanged;
+            }
+            if !win32::show_window_restored(hwnd_val) {
+                return ReclassifyResult::Untracked;
+            }
+            is_maximized = win32::is_zoomed(hwnd);
+            if is_maximized {
+                log::warn!(
+                    "reclassify_os_state: isize={hwnd_val} stayed maximized after SW_SHOWNOACTIVATE; not adopted"
+                );
+                return ReclassifyResult::Unchanged;
+            }
+            adopted = true;
+        }
 
         // If the OS condition that originally caused the ignore is still in
         // effect, the user hasn't restored the window — nothing to do.
@@ -1112,13 +1350,18 @@ impl WindowRegistry {
         };
         let now_tiling = matches!(new_state, WindowState::Tiling(_));
 
-        // Stage 4: commit the new state.
+        // Stage 4: commit the new state. The window just left the maximized
+        // (or fullscreen) frame, so its geometry is re-measured too.
+        self.refresh_geometry(hwnd_val);
         if let Some(window) = self.windows.get_mut(&hwnd_val) {
             window.state = new_state;
+            if adopted {
+                window.adopted_from_maximized = true;
+            }
         }
         log::info!(
             "reclassify_os_state: window isize={hwnd_val} recovered \
-             (is_maximized={is_maximized}, is_fullscreen={is_fullscreen}, now_tiling={now_tiling})"
+             (is_maximized={is_maximized}, is_fullscreen={is_fullscreen}, now_tiling={now_tiling}, adopted={adopted})"
         );
         ReclassifyResult::Recovered { now_tiling }
     }

@@ -47,10 +47,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetShellWindow, GetSystemMetrics, GetWindowLongW, GetWindowPlacement,
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HWND_NOTOPMOST,
     HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SM_CXSCREEN,
-    SM_CYSCREEN, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SetForegroundWindow, SetWindowPlacement, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WINDOWPLACEMENT, WM_CLOSE, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
-    WS_THICKFRAME,
+    SM_CYSCREEN, SW_MAXIMIZE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SetForegroundWindow, SetWindowPlacement, SetWindowPos, ShowWindow,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT, WM_CLOSE, WS_CAPTION, WS_EX_APPWINDOW,
+    WS_EX_TOOLWINDOW, WS_THICKFRAME,
 };
 use windows::core::PWSTR;
 
@@ -753,15 +753,18 @@ pub fn clear_foreground_window() -> bool {
     false
 }
 
-/// Restore a minimized window **without activating it**
-/// (`ShowWindow(SW_SHOWNOACTIVATE)`: "displays the window in its most
-/// recent size and position", restoring it from minimized, but unlike
-/// `SW_RESTORE` it never takes the foreground). Used by the monitor-hotplug
-/// reconcile for windows Windows minimized when their display vanished — a
-/// run of restores must not bounce the foreground (and with it the daemon's
-/// active monitor) through every one of them. The reconcile seats the
-/// window itself; the resulting `EVENT_SYSTEM_MINIMIZEEND` finds it seated
-/// and only refreshes its border.
+/// Restore a minimized **or maximized** window to its normal size and
+/// position **without activating it** (`ShowWindow(SW_SHOWNOACTIVATE)`:
+/// like `SW_SHOWNORMAL` — "if the window is minimized, maximized, or
+/// arranged, the system restores it to its original size and position" —
+/// but unlike `SW_RESTORE` it never takes the foreground). Used by the
+/// monitor-hotplug reconcile for windows Windows minimized when their
+/// display vanished — a run of restores must not bounce the foreground (and
+/// with it the daemon's active monitor) through every one of them — and by
+/// the maximized-window adoption (`adopt_maximized`, `set-window` on an
+/// ignored window, `tiling on`) to un-maximize a window before it is tiled.
+/// The reconcile seats the window itself; the resulting
+/// `EVENT_SYSTEM_MINIMIZEEND` finds it seated and only refreshes its border.
 ///
 /// # Returns
 ///
@@ -775,6 +778,29 @@ pub fn show_window_restored(hwnd_val: isize) -> bool {
     }
     // SAFETY: ShowWindow is sound for any HWND value.
     let _ = unsafe { ShowWindow(HWND(hwnd_val as *mut _), SW_SHOWNOACTIVATE) };
+    true
+}
+
+/// Maximize a window (`ShowWindow(SW_MAXIMIZE)`) on the monitor it is on.
+///
+/// The inverse of [`show_window_restored`] for a window the daemon adopted
+/// from maximized (see `Window::adopted_from_maximized`): `tiling off`, the
+/// shutdown rescue and the fail-back hand such a window back maximized, the
+/// way the user had it. `SW_MAXIMIZE` activates the window — there is no
+/// non-activating maximize in `ShowWindow` — so callers that re-maximize a
+/// batch restore the previous foreground afterwards.
+///
+/// # Returns
+///
+/// `true` when the call was issued on a live window (`IsWindow`), `false`
+/// for a dead handle; `ShowWindow`'s own return value is not meaningful.
+#[must_use]
+pub fn maximize_window(hwnd_val: isize) -> bool {
+    if !is_window(hwnd_val) {
+        return false;
+    }
+    // SAFETY: ShowWindow is sound for any HWND value.
+    let _ = unsafe { ShowWindow(HWND(hwnd_val as *mut _), SW_MAXIMIZE) };
     true
 }
 

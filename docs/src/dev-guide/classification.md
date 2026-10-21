@@ -76,6 +76,19 @@ no-op (the window was already in the requested mode) records nothing. This
 keeps the history file free of redundant entries and makes repeated commands
 idempotent.
 
+An **adoption** is a transition too: `set-window tile|cycle|float|fullscreen`
+on an `Ignored` window (maximized or fullscreen at creation, or ignored by a
+rule) un-maximizes it if needed, seats it as a tile or a float, and records
+`Tile` or `Float` for the app (`fullscreen` records `Tile`, since the window
+entered the tiled layout; fullscreen itself is a view and never learned). For
+a window ignored by a **bundled** rule this is what makes the next window of
+the app managed: the learned layer sits above the default rules. A window
+ignored by the user's own `flow-rules.toml` is adopted just the same, but the
+user rule keeps outranking the learned one for the app's next window — the
+user's file is the escape hatch and is never overridden by history.
+Automatic adoption through the `adopt_maximized` config key records nothing:
+it is the rules deciding, not the user.
+
 The recording happens inside `dispatch_set_window`, after the transition
 succeeds:
 

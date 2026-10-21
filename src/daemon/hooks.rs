@@ -9,6 +9,11 @@
 //! - [`on_window_hidden`] — handles tray-hide / DWM-cloak events
 //! - [`on_window_shown`] — handles un-hide (tray-restore) events
 //! - [`on_focus_changed`] — handles focus changes
+//! - [`on_window_state_change`] — recovers (and, with `adopt_maximized`,
+//!   adopts) windows parked as `Ignored(Maximized|Fullscreen)`; also run
+//!   from the foreground, show and move-size-end handlers for such a
+//!   window, because the `STATECHANGE` for an un-maximize does not always
+//!   arrive
 //!
 //! # Window-removal pipeline
 //!
@@ -96,16 +101,22 @@ impl FlowWM {
         // Tiling: handle_created returns Some only for a freshly-registered
         // tiling window.
         if let Some(window_id) = self.registry.handle_created(hwnd) {
-            // Tile on the monitor the OS placed the window on, not blindly
-            // on the active one (a fresh window has no owning-monitor memory,
-            // so this resolves to MonitorFromWindow, then the rect).
-            let idx = self.home_monitor_for_hwnd(hwnd);
-            let applied = self.monitors[idx]
-                .active_scrolling_mut()
-                .insert_window(window_id);
-            self.remember_monitor(window_id, idx);
-            self.animate_layout_on(idx, &applied);
-            self.reconcile_new_window_focus(hwnd);
+            self.seat_created_tile(hwnd, window_id);
+            return true;
+        }
+
+        // `adopt_maximized`: a window just registered `Ignored(Maximized)`
+        // is un-maximized and classified through the rules right away (the
+        // registry leaves a window the rules ignore maximized). A tile is
+        // seated like any new window; a float falls through to the
+        // fresh-float branch below.
+        if !was_tracked
+            && self.registry.adopt_maximized()
+            && self.registry.is_os_ignored(hwnd)
+            && let ReclassifyResult::Recovered { now_tiling: true } =
+                self.registry.reclassify_os_state(hwnd)
+        {
+            self.seat_created_tile(hwnd, WindowId(hwnd));
             return true;
         }
 
@@ -138,6 +149,21 @@ impl FlowWM {
         // Report whether the window ended up tracked (classified) so the caller
         // retries only genuinely-not-ready windows (case 4).
         self.registry.is_tracked(hwnd)
+    }
+
+    /// Seat a freshly-classified (or freshly-adopted) tile the way a new
+    /// window is seated: on the monitor the OS placed it on — not blindly
+    /// on the active one (a fresh window has no owning-monitor memory, so
+    /// this resolves to MonitorFromWindow, then the rect) — next to that
+    /// strip's focused column, then push focus and attach the border.
+    fn seat_created_tile(&mut self, hwnd: isize, window_id: WindowId) {
+        let idx = self.home_monitor_for_hwnd(hwnd);
+        let applied = self.monitors[idx]
+            .active_scrolling_mut()
+            .insert_window(window_id);
+        self.remember_monitor(window_id, idx);
+        self.animate_layout_on(idx, &applied);
+        self.reconcile_new_window_focus(hwnd);
     }
 
     /// Reconcile OS focus and border overlays for a freshly-tracked window
@@ -529,6 +555,12 @@ impl FlowWM {
             return;
         }
 
+        // An OS-ignored window being shown may have been un-maximized
+        // without a STATECHANGE reaching us: re-run the recovery.
+        if self.registry.is_os_ignored(hwnd) {
+            self.on_window_state_change(hwnd);
+        }
+
         // Re-show path: a tracked window returning from hidden (Hidden → Active).
         let change = self.registry.reconcile_visibility(hwnd);
         // Tiling off: the registry transition above is all that happens.
@@ -555,6 +587,15 @@ impl FlowWM {
     /// natural no-op: the focused column is already visible, so
     /// `ensure_focused_visible` returns `None`.
     pub(super) fn on_focus_changed(&mut self, hwnd: isize) {
+        // An OS-ignored window taking the foreground may have been
+        // un-maximized without a STATECHANGE reaching us (seen with Firefox
+        // and Alacritty): re-run the recovery first, so a window the rules
+        // tile is seated before the focus bookkeeping below looks for it.
+        // One HashMap lookup for every other window.
+        if self.registry.is_os_ignored(hwnd) {
+            self.on_window_state_change(hwnd);
+        }
+
         // Tiling off: track the focus (the resume reads it to pick the
         // active monitor and workspace) but never switch a workspace,
         // scroll a strip or recolour a border — there are none.
@@ -667,12 +708,18 @@ impl FlowWM {
     }
 
     /// Handle `EVENT_OBJECT_STATECHANGE` — Option D recovery for windows that
-    /// launched maximized or fullscreen.
+    /// launched maximized or fullscreen. Also run by
+    /// [`on_focus_changed`](Self::on_focus_changed),
+    /// [`on_window_shown`](Self::on_window_shown) and the move-size-end
+    /// handler when their window is still OS-ignored, since the
+    /// `STATECHANGE` for an un-maximize does not always arrive.
     ///
     /// Pipeline:
     /// 1. `registry.reclassify_os_state(hwnd)` — re-queries the live OS state.
     ///    If a tracked window was `Ignored(Maximized|Fullscreen)` but is no
-    ///    longer, the classifier is re-run and its stored state is updated.
+    ///    longer, the classifier is re-run and its stored state is updated
+    ///    (with `adopt_maximized` on, a still-maximized window is
+    ///    un-maximized first — see the registry method).
     /// 2. If the window transitioned to tiling
     ///    ([`ReclassifyResult::Recovered`] with `now_tiling == true`):
     ///    - `layout.add_window(id)` — appends the recovered window to the

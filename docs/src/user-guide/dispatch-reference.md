@@ -259,6 +259,25 @@ flow dispatch set-window cycle
 
 Default hotkey: `Alt + t` (cycle).
 
+**Ignored windows are adopted.** A window FlowWM is not managing — because it
+was maximized or fullscreen when FlowWM met it (`flow query all` shows
+`Ignored::Maximized` / `Ignored::Fullscreen`), or because a rule ignores it
+(`Ignored::ExplicitRule`, e.g. File Explorer through a bundled rule) — is
+taken over by `set-window` instead of refused: `tile` and `cycle` (which means
+`tile` here, there is no float/tile state to flip) un-maximize it and tile it
+exactly like a window that just opened tiling — on the screen it is on, next
+to the focused column, at that screen's current width preset, with a border;
+`float` un-maximizes it and floats it where it is; `fullscreen` adopts it as a
+tile and then puts it fullscreen. The choice is learned like any other: the
+next window of that app is tiled (or floated) automatically. For an app a
+**bundled** rule ignores the learned rule wins, so the next window is managed
+too; a rule in your own `flow-rules.toml` outranks learned rules and keeps
+ignoring new windows until you change it. A window that was maximized is
+maximized again when FlowWM hands the desktop back (`tiling off`, `flow
+stop`). To have every maximized window adopted automatically, set
+[`adopt_maximized = true`](./config-reference.md#top-level-fields). Only a
+minimized or hidden window cannot be changed.
+
 #### `set-window fullscreen`
 
 Put the focused tiled or floating window over its monitor's **whole screen**
@@ -396,20 +415,23 @@ Turn the window manager off and on again **without stopping the daemon**.
 on every workspace of every monitor, parked ones included — is moved back
 on-screen (to the position it had before FlowWM first tiled it, where that is
 known; otherwise it is brought into its monitor's work area), the border
-overlays disappear, and FlowWM stops moving windows altogether. Windows you
-open, close, minimize or drag meanwhile are plain Windows windows; a
-minimized window whose restore position was off-screen is fixed so it comes
-back on-screen. A fullscreen window (`set-window fullscreen`) is handed back
-as a plain float inside its work area. The daemon and the hotkey script keep
-running, so the same chord turns tiling back on.
+overlays disappear, and FlowWM stops moving windows altogether. A window
+FlowWM had un-maximized to manage (`adopt_maximized`, or `set-window` on an
+ignored window) is maximized again instead. Windows you open, close, minimize
+or drag meanwhile are plain Windows windows; a minimized window whose restore
+position was off-screen is fixed so it comes back on-screen. A fullscreen
+window (`set-window fullscreen`) is handed back as a plain float inside its
+work area. The daemon and the hotkey script keep running, so the same chord
+turns tiling back on.
 
 `tiling on` rebuilds the layout from what is on the desktop now: windows that
 were tiled before go back to the same monitor, workspace, column and row
-(workspaces survive a toggle); windows that appeared meanwhile are classified
-through your rules and appended to the active workspace of the monitor they
-are on; windows that are gone are forgotten; floats you dragged stay where you
-left them. The borders come back and the window you are using decides the
-active monitor and workspace.
+(workspaces survive a toggle; a window `tiling off` maximized again is
+un-maximized first); windows that appeared meanwhile are classified through
+your rules (maximized ones adopted when `adopt_maximized` is on) and appended
+to the active workspace of the monitor they are on; windows that are gone are
+forgotten; floats you dragged stay where you left them. The borders come back
+and the window you are using decides the active monitor and workspace.
 
 While tiling is off every layout command (`focus`, `move-window`,
 `switch-workspace`, `set-window`, `center`, `move-to-monitor`, `flow config

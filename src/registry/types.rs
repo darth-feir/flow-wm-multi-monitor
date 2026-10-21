@@ -222,6 +222,17 @@ pub struct Window {
     /// desktop looks like it did before FlowWM tiled it.
     #[serde(default)]
     pub pre_tiling_rect: Option<Rect>,
+
+    /// Whether the daemon **un-maximized this window to manage it** — by
+    /// the `adopt_maximized` config key (startup scan, creation, `tiling
+    /// on`) or by a `set-window tile|float|cycle` on an `Ignored(Maximized)`
+    /// window. The window is handed back maximized wherever the daemon
+    /// gives windows back: `tiling off`, the shutdown rescue (`flow stop`,
+    /// session end) and the fail-back. Never cleared for the life of the
+    /// record: the user had it maximized, so "put everything back as it
+    /// was" means maximized. `false` for every other window.
+    #[serde(default)]
+    pub adopted_from_maximized: bool,
 }
 
 // SAFETY: `Window` contains `HWND` (a raw pointer), but we treat it as an
@@ -280,6 +291,7 @@ impl Window {
             border: None,
             monitor: None,
             pre_tiling_rect: None,
+            adopted_from_maximized: false,
         }
     }
 }
@@ -311,11 +323,16 @@ impl Window {
 /// | `Floating(Hidden)` | `EVENT_OBJECT_SHOW` | `Floating(Active)` with `pre_manage_rect` |
 ///
 /// Note: tile ↔ float transitions are implemented via `flow dispatch set-window`
-/// (see `docs/src/dev-guide/floating-space.md`). The remaining unimplemented
-/// directions are user-driven tiling ↔ `Ignored(Maximized|Fullscreen)` (e.g.,
-/// maximizing a tiled window); only the OS-driven recovery direction works —
-/// a restored `Ignored(Maximized)` window is re-classified into the layout via
-/// `EVENT_OBJECT_STATECHANGE`.
+/// (see `docs/src/dev-guide/floating-space.md`). An `Ignored` window leaves
+/// that state three ways: the OS-driven recovery (a restored
+/// `Ignored(Maximized|Fullscreen)` window is re-classified into the layout on
+/// `EVENT_OBJECT_STATECHANGE`, or on a foreground / show / move-size-end
+/// event when that one did not arrive), the `adopt_maximized` config key
+/// (the daemon un-maximizes it and classifies it through the rules), and
+/// `set-window tile|float|cycle|fullscreen`, which adopts any ignored window
+/// (see `Window::adopted_from_maximized`). The one direction that remains
+/// unimplemented is tiling → `Ignored(Maximized)` (maximizing a tiled window
+/// does not evict it from the layout).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WindowState {
     /// Window is participating in the tiling layout.
@@ -474,10 +491,13 @@ pub enum VisibilityChange {
 /// Outcome of an OS-state re-classification pass on a tracked window.
 ///
 /// Returned by [`WindowRegistry::reclassify_os_state`](super::core::WindowRegistry::reclassify_os_state)
-/// in response to [`EVENT_OBJECT_STATECHANGE`](super::HookEvent::StateChange).
+/// in response to [`EVENT_OBJECT_STATECHANGE`](super::HookEvent::StateChange)
+/// (and to a foreground / show / move-size-end event on an OS-ignored
+/// window, which covers an un-maximize whose `STATECHANGE` never arrived).
 /// The daemon layer uses this to decide whether to add the window to the live
 /// layout: only [`ReclassifyResult::Recovered`] with `now_tiling == true`
-/// triggers a layout insertion.
+/// triggers a layout insertion. With `adopt_maximized` on, a still-maximized
+/// window is un-maximized by the registry and reported as `Recovered` too.
 ///
 /// # Why a dedicated result type?
 ///

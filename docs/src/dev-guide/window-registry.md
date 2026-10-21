@@ -114,17 +114,34 @@ stateDiagram-v2
 
 User-driven tile ↔ float transitions **are** implemented via
 `flow dispatch set-window float|tile|cycle` — see [Floating Space](./floating-space.md)
-for the full transition table and animation. Two directions remain unimplemented:
+for the full transition table and animation. An `Ignored` window leaves that
+state three ways (none drawn above):
 
-- **Tiling → `Ignored(Maximized)`** — a tiled window the user then maximizes is
-  not yet reclassified out of the layout. The state diagram above has no
-  `TilingActive → IgnoredMaximized` edge.
-- **`Ignored(Maximized)` → tiling via a user command** — only the OS-driven
-  *recovery* direction works: an `Ignored(Maximized)` window restored by the
-  user is re-classified into the layout via `STATECHANGE` (see
-  [Event Pipelines](./event-pipelines.md)).
+- **OS-driven recovery** — an `Ignored(Maximized|Fullscreen)` window the user
+  restores is re-classified into the layout via `STATECHANGE`, or via a
+  foreground / show / move-size-end event on it when the `STATECHANGE` never
+  arrived (see [Event Pipelines](./event-pipelines.md)).
+- **`adopt_maximized`** (config key, default `false`) — the daemon
+  un-maximizes an `Ignored(Maximized)` window itself (`SW_SHOWNOACTIVATE`)
+  and classifies it through the rules: in the startup scan once the pipe and
+  hooks are up, at creation, on `tiling on`, and in the recovery paths above.
+  A window the rules would ignore is left maximized; fullscreen windows are
+  never adopted. `WindowRegistry::set_adopt_maximized` is the switch —
+  registration itself never un-maximizes, so a maximized window is always
+  `Ignored(Maximized)` first and the daemon decides when it may move.
+- **`set-window tile|float|cycle|fullscreen`** — adopts any ignored window,
+  explicit rule included (`WindowRegistry::adopt_ignored_window`).
 
-`Ignored(Fullscreen)` follows the same recovery rule.
+A window the daemon un-maximized carries `Window::adopted_from_maximized`
+and is maximized again (`SW_MAXIMIZE`) wherever the daemon gives windows
+back: `tiling off`, the shutdown rescue (`flow stop`, session end) and the
+fail-back; `tiling on` un-maximizes it again before seating it. The flag is
+never cleared.
+
+The one direction that remains unimplemented is **Tiling →
+`Ignored(Maximized)`** — a tiled window the user then maximizes is not
+reclassified out of the layout. The state diagram above has no
+`TilingActive → IgnoredMaximized` edge.
 
 ## The Classification Algorithm — Deep Dive
 
@@ -238,7 +255,10 @@ flowchart TB
 Maximized and fullscreen overrides always take precedence over rules. A window
 that is maximized will always be `Ignored(Maximized)` even if a config rule says
 to tile it — maximized and fullscreen windows have their own management behavior
-that conflicts with tiling.
+that conflicts with tiling. With `adopt_maximized` the daemon resolves the
+conflict the other way round: it un-maximizes the window and *then* lets the
+rules decide (see [State Transitions](#state-transitions)); fullscreen stays
+an unconditional ignore.
 
 ### Rule Matching Details
 
@@ -348,6 +368,12 @@ second chance:
   `STATECHANGE` fires. The daemon re-classifies the window (now not maximized)
   and adds it to the layout. Only windows currently `Ignored(Maximized|Fullscreen)`
   are re-evaluated, so the common-case cost is a single `HashMap` lookup.
+  The `STATECHANGE` for an un-maximize does not always arrive (observed with
+  Firefox and Alacritty), so the same re-classification also runs when such a
+  window takes the **foreground**, is **shown**, or finishes a **move/size**
+  (dragging a maximized title bar un-maximizes) — gated by the same
+  `is_os_ignored` lookup. With `adopt_maximized` on, the re-classification
+  un-maximizes a still-maximized window itself.
 
 ## Recovery Snapshot (Planned)
 

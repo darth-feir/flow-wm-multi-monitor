@@ -72,6 +72,7 @@ mod tests {
             "padding",
             "animation",
             "minimize_restore",
+            "adopt_maximized",
         ];
         for key in &expected_keys {
             assert!(
