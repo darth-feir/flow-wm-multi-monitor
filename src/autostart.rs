@@ -567,6 +567,13 @@ pub fn spawn_ahk_script_in(config_dir: &Path) -> Result<u32, String> {
 /// Terminate the AutoHotkey process recorded in the default config
 /// directory's pidfile. See [`stop_ahk_script_in`].
 ///
+/// Deliberately a one-line wrapper with **no unit test**: it resolves the
+/// real config directory (`FLOW_CONFIG_DIR`, else `%USERPROFILE%\.config\flow`)
+/// and kills whatever pid is recorded there, so a test calling it on a
+/// developer's box — even one that sets `FLOW_CONFIG_DIR` under a lock —
+/// can, under the env-var race, kill their live keymap. Test
+/// [`stop_ahk_script_in`] with a tempdir instead.
+///
 /// # Errors
 ///
 /// See [`stop_ahk_script_in`].
@@ -1137,27 +1144,31 @@ mod tests {
     }
 
     // ── stop_ahk_script ────────────────────────────────────────────────────
+    //
+    // These exercise `stop_ahk_script_in` against a tempdir and NEVER the
+    // default-dir wrapper `stop_ahk_script()`: that one resolves the real
+    // `%USERPROFILE%\.config\flow` unless `FLOW_CONFIG_DIR` is set, and the
+    // env-var race between test threads once let a run of this suite read
+    // the developer's live `flow.ahk.pid`, TerminateProcess their running
+    // keymap and delete the pidfile. The wrapper is one line of path
+    // resolution over the `_in` variant and is not tested on purpose.
 
     #[test]
     fn stop_ahk_script_returns_false_when_pidfile_missing() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _env = EnvGuard::capture();
-        let (_tmp, _startup, _cfg) = make_startup_tree();
+        let cfg = tempfile::tempdir().expect("tempdir");
 
-        let result = stop_ahk_script().expect("missing pidfile is a no-op");
+        let result = stop_ahk_script_in(cfg.path()).expect("missing pidfile is a no-op");
         assert!(!result, "should report nothing was stopped");
     }
 
     #[test]
     fn stop_ahk_script_handles_corrupt_pidfile() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _env = EnvGuard::capture();
-        let (_tmp, _startup, cfg) = make_startup_tree();
+        let cfg = tempfile::tempdir().expect("tempdir");
 
-        let pidfile = cfg.join("flow.ahk.pid");
+        let pidfile = cfg.path().join("flow.ahk.pid");
         fs::write(&pidfile, "not-a-number").unwrap();
 
-        let result = stop_ahk_script().expect("corrupt pidfile is a no-op");
+        let result = stop_ahk_script_in(cfg.path()).expect("corrupt pidfile is a no-op");
         assert!(!result, "should report nothing was stopped");
         // The corrupt pidfile must be cleaned up so the next start is clean.
         assert!(!pidfile.exists(), "corrupt pidfile should be removed");
@@ -1170,14 +1181,12 @@ mod tests {
         // case, so it must fall through to the generic I/O error branch and
         // surface an `Err`. On Windows, `read_to_string` on a directory
         // yields `PermissionDenied`, which is `!= NotFound` → Err path.
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _env = EnvGuard::capture();
-        let (_tmp, _startup, cfg) = make_startup_tree();
+        let cfg = tempfile::tempdir().expect("tempdir");
 
-        let pidfile = cfg.join("flow.ahk.pid");
+        let pidfile = cfg.path().join("flow.ahk.pid");
         fs::create_dir(&pidfile).expect("create dir as pidfile");
 
-        let result = stop_ahk_script();
+        let result = stop_ahk_script_in(cfg.path());
         assert!(
             result.is_err(),
             "unreadable pidfile should surface an error, got: {result:?}"
