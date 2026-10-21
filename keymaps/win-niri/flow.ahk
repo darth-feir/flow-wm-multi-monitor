@@ -26,15 +26,16 @@
 ;   Mod+T / Mod+Shift+T           Alacritty / Alacritty as admin (UAC)
 ;   Mod+Alt+T / Mod+Alt+Shift+T   Windows Terminal / Windows Terminal as admin (UAC)
 ;   Mod+Shift+/                   key-binding overlay (help.ahk); Esc or the same chord hides it
-;   Mod+Ctrl+T                    tiling toggle: `flow dispatch tiling toggle`
-;   Mod+Shift+E                   stop FlowWM (and this script); flow-resident.ahk, if it runs,
-;                                 starts FlowWM again with the same chord
+;   Mod+Ctrl+T                    stop FlowWM fully (daemon and this script); flow-resident.ahk,
+;                                 if it runs, starts FlowWM again with the same chord
+;   Mod+Ctrl+Shift+T              pause toggle: `flow dispatch tiling toggle` (daemon keeps running)
+;   Mod+Shift+E                   stop FlowWM (same as Mod+Ctrl+T; niri's quit chord)
 ;
 ; Tiling toggle: while tiling is off every window-management chord above
 ; (focus, move, monitors, workspaces, close, center, float, width, consume/
 ; expel) is released to Windows, so Win+Arrows snap, Win+1..9 launch from the
 ; taskbar, and so on. Only the toggle itself, the launcher, the help overlay
-; and Mod+Shift+E stay bound. The state is read from `flow ping` at startup
+; and the stop chords stay bound. The state is read from `flow ping` at startup
 ; ("tiling off" in its output) and flipped locally whenever the toggle
 ; dispatch exits 0; an on-screen message reports each flip.
 ;
@@ -57,8 +58,8 @@
 ; (Magnifier), Win+Arrows (Snap), Win+Ctrl+Left/Right (virtual desktops),
 ; Win+Shift+Left/Right (Windows' own move-to-monitor), Win+Space (Windows'
 ; input-language switcher; Win+Ctrl+Space, which cycles the other way, still
-; works). With tiling off only Win+Space, Win+D, Win+Shift+/, Win+Ctrl+T and
-; Win+Shift+E remain shadowed. The daemon side of this map (width presets,
+; works). With tiling off only Win+Space, Win+D, Win+Shift+/, Win+Ctrl+T,
+; Win+Ctrl+Shift+T and Win+Shift+E remain shadowed. The daemon side of this map (width presets,
 ; edge_hop = false) is in flow.toml.example next to this file.
 ; ════════════════════════════════════════════════════════════════════════════
 
@@ -364,11 +365,14 @@ Loop 9 {
 ; --- Always bound while the daemon runs (tiling on or off) -----------------
 #HotIf DaemonUp
 
-; --- Tiling toggle ----------------------------------------------------------
-#^t::D("tiling toggle", TilingToggled)
+; --- Pause toggle -----------------------------------------------------------
+#^+t::D("tiling toggle", TilingToggled)
 
 ; --- Daemon ----------------------------------------------------------------
-#+e:: {
+; Full stop. flow-resident.ahk binds Mod+Ctrl+T to start while no daemon runs.
+#^t::StopFlow()
+#+e::StopFlow()
+StopFlow() {
     Flow("stop")
     ExitApp()
 }

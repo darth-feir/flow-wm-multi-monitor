@@ -5,10 +5,10 @@
 ; FlowWM resident starter. Runs all the time (put a shortcut to it in
 ; shell:startup) and owns exactly one chord:
 ;
-;   Mod+Shift+E   start FlowWM (`flow start --ahk`) when no daemon is running
+;   Mod+Ctrl+T    start FlowWM (`flow start --ahk`) when no daemon is running
 ;
 ; While the daemon runs, flow.ahk owns the same chord and stops FlowWM, so
-; Mod+Shift+E is a plain on/off switch. Both scripts hook the key; the one
+; Mod+Ctrl+T is a plain on/off switch. Both scripts hook the key; the one
 ; whose #HotIf condition is false lets it pass through to the other, and the
 ; conditions are exclusive (daemon pipe absent / present).
 ;
@@ -65,5 +65,5 @@ ReportStart() {
 }
 
 #HotIf DaemonDown()
-#+e::StartFlow()
+#^t::StartFlow()
 #HotIf
