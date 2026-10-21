@@ -346,7 +346,7 @@ LauncherRun(*) {
     }
     if (text = "")
         return
-    try Run(text)
+    try Run(text, EnvGet("USERPROFILE"))
     catch as err
         Osd("could not run " text ": " err.Message)
 }
@@ -356,7 +356,7 @@ LauncherActivate(e) {
         if (e.kind = "Window")
             WinActivate("ahk_id " e.hwnd)
         else
-            Run(e.run)
+            Run(e.run, EnvGet("USERPROFILE"))
     } catch as err
         Osd("could not open " e.name ": " err.Message)
 }

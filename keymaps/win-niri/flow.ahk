@@ -287,7 +287,8 @@ WindowsTerminal(admin := false) {
 }
 Launch(exe, admin) {
     AhkLog("launch " (admin ? "(admin) " : "") exe)
-    try Run((admin ? "*RunAs " : "") '"' exe '"')
+    ; Start in the home folder, not wherever the daemon (and so this script) was started from.
+    try Run((admin ? "*RunAs " : "") '"' exe '"', EnvGet("USERPROFILE"))
     catch as e
         if !InStr(e.Message, "cancel")       ; a declined UAC prompt is not worth a popup
             Osd("could not start " exe ": " e.Message)
