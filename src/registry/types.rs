@@ -233,6 +233,18 @@ pub struct Window {
     /// was" means maximized. `false` for every other window.
     #[serde(default)]
     pub adopted_from_maximized: bool,
+
+    /// Whether the window was **registered while minimized** (the startup
+    /// scan, the `tiling on` re-scan or a creation event met it iconic)
+    /// and its geometry still comes from its `WINDOWPLACEMENT`: the
+    /// `pre_manage_rect` is the restore rect, `last_natural_size` its
+    /// size, and `invisible_bounds` is zero because DWM cannot measure an
+    /// iconic window. Cleared by the first
+    /// [`restore_window`](super::core::WindowRegistry::restore_window),
+    /// which re-measures all three from the now-visible frame before the
+    /// daemon seats the window. `false` for every window met visible.
+    #[serde(default)]
+    pub geometry_from_placement: bool,
 }
 
 // SAFETY: `Window` contains `HWND` (a raw pointer), but we treat it as an
@@ -292,6 +304,55 @@ impl Window {
             monitor: None,
             pre_tiling_rect: None,
             adopted_from_maximized: false,
+            geometry_from_placement: false,
+        }
+    }
+}
+
+// ── CreationSkip ────────────────────────────────────────────────────
+
+/// The Win32 pre-filter that kept a window out of the registry.
+///
+/// Returned by
+/// [`WindowRegistry::creation_gates`](super::core::WindowRegistry::creation_gates),
+/// the gate sequence shared by the startup scan and
+/// [`handle_created`](super::core::WindowRegistry::handle_created). Each
+/// variant is one gate, in the order they run (cheapest first), so a
+/// rejected window is diagnosable from the log and — for `set-window` on
+/// an unknown focused window — from the error the CLI prints. Being iconic
+/// is **not** a gate: a minimized window is registered in its `Minimized`
+/// state from its restore geometry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreationSkip {
+    /// The window is already in the registry (duplicate `CREATE`, or the
+    /// scan got there first).
+    AlreadyTracked,
+    /// `IsWindowVisible` is false (created hidden, or not shown yet).
+    NotVisible,
+    /// The title is empty (splash screen, container, late-titling app).
+    EmptyTitle,
+    /// `WS_EX_TOOLWINDOW` without `WS_EX_APPWINDOW`, or DWM-cloaked.
+    NotAltTabVisible,
+    /// Owned by another window (dialog, popup) or a `WS_CHILD` control.
+    OwnedOrChild,
+    /// Every gate passed but the window's metadata could not be read
+    /// (`get_window_info` failed — the window is gone or inaccessible).
+    InfoUnavailable(String),
+}
+
+impl std::fmt::Display for CreationSkip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyTracked => f.write_str("already tracked"),
+            Self::NotVisible => f.write_str("not visible"),
+            Self::EmptyTitle => f.write_str("empty title"),
+            Self::NotAltTabVisible => {
+                f.write_str("not Alt+Tab visible (tool window or DWM-cloaked)")
+            }
+            Self::OwnedOrChild => {
+                f.write_str("has an owner or parent (dialog, popup or child control)")
+            }
+            Self::InfoUnavailable(e) => write!(f, "window info unavailable: {e}"),
         }
     }
 }

@@ -113,7 +113,9 @@ sequenceDiagram
 every monitor → workspace, joins the virtual layout (columns, rows, viewport
 offset, focus) with per-window registry metadata, swaps `WindowId` for
 `WindowRef`, and writes pretty-printed JSON. Ignored windows (maximized,
-fullscreen, or rule-ignored) are excluded from both save and restore.
+fullscreen, or rule-ignored) are excluded from both save and restore. A
+minimized window is in no strip or floating space, so it is never saved
+either — including one the startup scan registered minimized.
 
 ### Restore
 
@@ -141,7 +143,10 @@ The load path (`FlowWM::apply_loadout`) is shared by auto-restore and manual
 5. **Leftover** windows — open now but not referenced by the loadout, plus
    the tiles and floats of an unknown-workspace snapshot — are appended as
    new columns on the active workspace (floats clamped into its work area),
-   so no open window disappears.
+   so no open window disappears. Only **active** tiles qualify: a tile the
+   registry holds `Minimized` or `Hidden` (registered minimized at startup,
+   or minimized since the save) has no seat to take until its restore /
+   show hook gives it one, and must not be appended as an iconic column.
 
 There is no staleness check: a loadout is restored whenever every saved `HWND`
 is live, and the no-partial abort handles the rest. See the Design Decisions

@@ -49,7 +49,7 @@ use crate::loadout::{
     ColumnSnapshot, FloatingEntry, LoadoutFile, MonitorSnapshot, RectJson, RowSnapshot,
     ScrollingSnapshot, WindowRef, WorkspaceSnapshot,
 };
-use crate::registry::types::{FloatingState, WindowState};
+use crate::registry::types::{FloatingState, TilingState, WindowState};
 use crate::workspace::{Workspace, WorkspaceId, WorkspaceParking};
 use windows::Win32::Foundation::HWND;
 
@@ -471,13 +471,15 @@ impl FlowWM {
         }
 
         // 4. Leftover tiling windows: live windows still in `live` (not claimed
-        //    by any slot) that are in the Tiling state. These are appended as
+        //    by any slot) that are **active** tiles. These are appended as
         //    new columns on the active workspace below. Floating leftovers are
         //    handled per-workspace by `replace_all`; Ignored windows never
-        //    entered `live`.
+        //    entered `live`; a minimized or hidden tile (one registered
+        //    minimized at startup, or minimized since the save) has no seat
+        //    to take until it comes back — the restore hook seats it then.
         let mut leftovers: Vec<WindowId> = Vec::new();
         for win in self.registry.windows() {
-            if !matches!(win.state, WindowState::Tiling(_)) {
+            if !matches!(win.state, WindowState::Tiling(TilingState::Active { .. })) {
                 continue;
             }
             let hwnd = win.hwnd.0 as isize;
@@ -1476,6 +1478,7 @@ mod tests {
             is_visible: true,
             is_maximized: false,
             is_fullscreen: false,
+            is_iconic: false,
         };
         registry.register_window_from_info(&info);
         if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {
@@ -1778,6 +1781,51 @@ mod tests {
         assert_eq!(seats(WindowId(0xA)), 1);
         assert_eq!(seats(WindowId(0xB)), 1);
         assert_eq!(seats(WindowId(0xF)), 1);
+    }
+
+    /// A tile the registry holds **minimized** (registered minimized at
+    /// startup, or minimized since the save) is not a leftover: it has no
+    /// seat until the restore hook gives it one, so the load must not
+    /// append an iconic window as a column.
+    #[test]
+    fn apply_does_not_seat_a_minimized_tile_as_a_leftover() {
+        const M: isize = 0x3;
+        let mut flow = two_monitor_flow();
+        fake_window(
+            &mut flow.registry,
+            M,
+            WindowState::Tiling(TilingState::Minimized),
+        );
+        let file = LoadoutFile {
+            version: LoadoutFile::CURRENT_VERSION,
+            monitors: vec![],
+            workspaces: vec![WorkspaceSnapshot {
+                monitor: 0,
+                workspace_id: 1,
+                active: true,
+                scrolling: ScrollingSnapshot {
+                    viewport_offset: 0,
+                    focus: Some(window_ref(0xA)),
+                    columns: vec![tiled_column(0xA)],
+                },
+                floating: vec![],
+            }],
+        };
+        let path = write_loadout(&file);
+        let result = flow.apply_loadout(Some(path.clone()));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(result, Ok(()));
+
+        assert_eq!(flow.monitor_index_containing(WindowId(M)), None);
+        assert!(flow.registry.is_minimized(M), "state untouched");
+        assert_eq!(
+            flow.monitors[0]
+                .active_scrolling()
+                .virtual_layout()
+                .window_count(),
+            1,
+            "only A on monitor 0"
+        );
     }
 
     /// A one-monitor file on a two-monitor desktop: monitor 1's unreferenced

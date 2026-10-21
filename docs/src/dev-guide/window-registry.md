@@ -105,6 +105,9 @@ stateDiagram-v2
     NotTracked --> IgnoredMaximized : maximized at creation
     NotTracked --> IgnoredFullscreen : fullscreen at creation
 
+    NotTracked --> TilingMinimized : met minimized, rules → Tile
+    NotTracked --> FloatingMinimized : met minimized, rules → Float
+
     TilingActive --> Removed : EVENT_OBJECT_DESTROY
     FloatingActive --> Removed : EVENT_OBJECT_DESTROY
     IgnoredExplicit --> Removed : EVENT_OBJECT_DESTROY
@@ -162,9 +165,7 @@ flowchart TB
     subgraph PreFilters["Win32 Pre-Filters (core.rs)"]
         A["EVENT_OBJECT_CREATE / init scan"] --> B{"IsWindowVisible?"}
         B -- No --> SKIP["Skip"]
-        B -- Yes --> C{"IsIconic?"}
-        C -- Yes --> SKIP
-        C -- No --> D{"Title non-empty?"}
+        B -- Yes --> D{"Title non-empty?"}
         D -- No --> SKIP
         D -- Yes --> E{"Alt+Tab visible?<br/>(not WS_EX_TOOLWINDOW<br/>unless WS_EX_APPWINDOW)"}
         E -- No --> SKIP
@@ -175,24 +176,29 @@ flowchart TB
         G -- No --> G2{"WS_CHILD?<br/>(style bit)"}
         G2 -- Yes --> SKIP
         G2 -- No --> H["get_window_info()"]
+        H --> I{"IsIconic?"}
+        I -- Yes --> P["geometry from<br/>WINDOWPLACEMENT<br/>→ registered Minimized"]
+        I -- No --> N["geometry from<br/>GetWindowRect<br/>→ registered Active"]
     end
 ```
 
-Each filter exists for a specific reason:
+The gate sequence is one function, `WindowRegistry::creation_gates`, shared
+by the startup scan, `handle_created` and the `set-window` path that registers
+an unknown focused window; it returns the first failing gate as a
+`CreationSkip` (so the log line, and the `set-window` error, name it). Each
+filter exists for a specific reason:
 
 1. **Visibility** (`IsWindowVisible`) — invisible windows have no place in the
-   layout. Note that minimized windows pass this check (`WS_VISIBLE` stays set),
-   which is why the iconic check exists separately.
+   layout. Note that minimized windows pass this check (`WS_VISIBLE` stays set);
+   being iconic is deliberately **not** a gate — see *Windows met minimized*
+   below.
 
-2. **Not iconic** (`IsIconic`) — minimized windows should not be tiled. They
-   are caught later by `MinimizeStart` events instead.
-
-3. **Non-empty title** (`GetWindowTextLengthW`) — titleless windows are
+2. **Non-empty title** (`GetWindowTextLengthW`) — titleless windows are
    typically internal containers or splash screens. This is the gate that causes
    late-titling apps (Windows Terminal) to be dropped on creation and recovered
    later via `NAMECHANGE`.
 
-4. **Alt+Tab visibility** — a two-part check. First, the `WS_EX_TOOLWINDOW`
+3. **Alt+Tab visibility** — a two-part check. First, the `WS_EX_TOOLWINDOW`
    extended style: windows with this style are hidden from Alt+Tab (tool
    windows, tray icons, floating toolbars). However, `WS_EX_APPWINDOW` forces
    visibility even if `WS_EX_TOOLWINDOW` is set. Second, a DWM cloak check
@@ -200,9 +206,9 @@ Each filter exists for a specific reason:
    `ApplicationFrameHost.exe` that are technically "visible" to Win32 but not
    rendered on screen.
 
-5. **No owner** (`GetWindow(GW_OWNER)`) — owned windows are dialogs or popups
+4. **No owner** (`GetWindow(GW_OWNER)`) — owned windows are dialogs or popups
    that belong to their owner. They should not be independently tiled.
-6. **Not a child window** (`WS_CHILD` style bit via `GetWindowLongW(GWL_STYLE)`) —
+5. **Not a child window** (`WS_CHILD` style bit via `GetWindowLongW(GWL_STYLE)`) —
    child windows are embedded controls (buttons, labels, the Inno Setup `TNew*`
    family, the Win32 `Button`/`Static` controls) that live inside another
    window's client area. They have no independent frame and cannot be tiled.
@@ -374,6 +380,44 @@ second chance:
   (dragging a maximized title bar un-maximizes) — gated by the same
   `is_os_ignored` lookup. With `adopt_maximized` on, the re-classification
   un-maximizes a still-maximized window itself.
+
+- **Untracked-window recovery on restore / foreground / show**: the
+  `MINIMIZEEND`, `FOREGROUND` and `SHOW` handlers all give a window the
+  registry does not track a run through the creation pipeline before their
+  own bookkeeping (`FlowWM::register_if_untracked`). This is what picks up a
+  window the scan could not classify (a minimized UWP frame is cloaked
+  until restored; a window created while the daemon was not listening) the
+  moment the user restores or focuses it. The fast path is one `HashMap`
+  miss plus the creation gates, which reject the taskbar, menus and dialogs
+  before any process query.
+
+### Windows met minimized
+
+A window that is iconic when the registry meets it — in the startup scan,
+the `tiling on` re-scan or at creation — is **not** skipped (it used to be,
+and a window minimized when the daemon started then stayed unmanaged until
+its app was reopened). Its `GetWindowRect` is the icon's (-32000, -32000)
+rect and `IsZoomed` is false, so `get_window_info` takes the geometry from
+its `WINDOWPLACEMENT` instead: `rcNormalPosition` (workspace coordinates,
+converted to screen coordinates with the primary monitor's work-area offset
+by `win32::normal_position_to_screen`) is the rect it restores to, and
+`WPF_RESTORETOMAXIMIZED` says whether it restores maximized. The usual gates
+and the rule pipeline run on that, and the window is registered in the
+**minimized** variant of its class — `Tiling(Minimized)` or
+`Floating(Minimized)`, `minimized_at` stamped, no virtual slot — exactly the
+record a window minimized *after* being managed has, so `MINIMIZEEND`
+seats it the same way (a tile is appended to its owning monitor's strip at
+that monitor's preset width; a float is placed where it reappears). A window
+the rules ignore is `Ignored(ExplicitRule)` as usual; one that restores to
+maximized is `Ignored(Maximized)` and goes through the maximized recovery
+once it is back on screen (`reclassify_os_state` waits while the window is
+iconic, since its OS state cannot be read). The owning-monitor memory is
+set from the restore rect (the daemon does this in the startup scan and at
+creation), so `flow query all` reports the window on the right monitor
+while it is still minimized. DWM cannot measure the invisible borders of an
+icon, so the record carries `Window::geometry_from_placement`: the first
+`restore_window` re-measures the rect, natural size and borders from the
+now-visible frame before the daemon seats the window.
 
 ## Recovery Snapshot (Planned)
 

@@ -235,6 +235,7 @@ animation if the columns are the same width.
 | Not visible / no title / not Alt-Tab visible | Defer to `pending_creations`, retry later |
 | Owned by another window (tooltip, etc.) | Skip |
 | Already tracked (de-dup) | Skip |
+| Minimized (iconic) | Classify from the placement's restore rect; register as `Tiling::Minimized` / `Floating::Minimized` (or `Ignored`), owning monitor from that rect, no layout — the restore hook seats it |
 | Matches an ignore rule (maximized, fullscreen, explicit) | Register as `Ignored`, no layout |
 | Maximized and `adopt_maximized` is on | Register as `Ignored(Maximized)`, then `reclassify_os_state()` un-maximizes it and classifies it through the rules: a tile is seated like a new window, a float like a new float; a window the rules ignore stays maximized |
 | Classified as floating | Register as `Floating`, add to active `FloatingSpace` (centered), animate, attach border |
@@ -271,8 +272,9 @@ synced.
 
 | Condition | Action |
 |-----------|--------|
-| Not tracked | Skip |
-| Now `Tiling::Active` | `add_window()` (appends at far right), animate |
+| Not tracked | Attempt the full creation pipeline first (`register_if_untracked`); a window that registers is seated by it and the rows below find it in place; one that fails a gate is skipped |
+| Now `Tiling::Active` | `add_window()` on the home monitor (appends at far right), animate; a window registered minimized has its geometry re-measured by `restore_window` first |
+| Now `Floating::Active` with no float seat (registered minimized) | `register_float` at its current rect (centred if unreadable), animate |
 | Not tiling | Registry state update only |
 
 Restored windows are appended at the far right of the canvas rather than
@@ -283,6 +285,7 @@ restoring saved virtual slots for all cases (minimize + destroy interleaving).
 
 | Condition | Action |
 |-----------|--------|
+| Not tracked | Attempt the full creation pipeline first (`register_if_untracked`): a window that registers is seated by it and then handled as below; the taskbar, menus and dialogs fail a gate and fall through (`set_focused` ignores them) |
 | Tracked `Ignored(Maximized\|Fullscreen)` window | Run the [State Change](#state-change-event_object_statechange) recovery first (an un-maximize whose `STATECHANGE` never arrived is picked up here); a window now tiling is seated, then handled as below |
 | Any tracked window | `registry.set_focused(hwnd)` + `layout.set_focus(WindowId)` if tiling |
 

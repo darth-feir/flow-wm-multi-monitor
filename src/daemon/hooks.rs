@@ -99,9 +99,19 @@ impl FlowWM {
         let was_tracked = self.registry.is_tracked(hwnd);
 
         // Tiling: handle_created returns Some only for a freshly-registered
-        // tiling window.
+        // active tiling window.
         if let Some(window_id) = self.registry.handle_created(hwnd) {
             self.seat_created_tile(hwnd, window_id);
+            return true;
+        }
+
+        // Met minimized: registered in its minimized state, nothing to seat
+        // until it is restored — but it needs an owning monitor now, from
+        // the rect it restores to (its icon rect says nothing), so the
+        // restore hook brings it back on that monitor and `flow query all`
+        // reports it there meanwhile.
+        if !was_tracked && self.registry.is_minimized(hwnd) {
+            self.remember_monitor_from_pre_manage_rect(hwnd);
             return true;
         }
 
@@ -148,6 +158,43 @@ impl FlowWM {
 
         // Report whether the window ended up tracked (classified) so the caller
         // retries only genuinely-not-ready windows (case 4).
+        self.registry.is_tracked(hwnd)
+    }
+
+    /// Record the owning monitor of a window registered **minimized**: the
+    /// monitor whose screen holds the centre of its restore rect
+    /// (`pre_manage_rect`, read from its placement), else the first one the
+    /// rect overlaps, else the one Windows reports for the handle, else the
+    /// active monitor. Used at creation (here) and by the startup scan.
+    pub(super) fn remember_monitor_from_pre_manage_rect(&mut self, hwnd: isize) {
+        let rect = self
+            .registry
+            .get_window(HWND(hwnd as *mut _))
+            .map(|w| w.pre_manage_rect);
+        let idx = rect
+            .and_then(|r| self.monitor_index_for_rect_opt(r))
+            .or_else(|| self.monitor_index_for_hmonitor_of(hwnd))
+            .unwrap_or(self.active_monitor);
+        self.remember_monitor(WindowId(hwnd), idx);
+        log::debug!("window {hwnd:#x} registered minimized; owning monitor {idx}");
+    }
+
+    /// Give an untracked window a chance to register before `event` is
+    /// handled: the restore, foreground and show hooks all reach windows
+    /// the scan and `CREATE` never classified (a window minimized when the
+    /// daemon started used to be skipped outright; a window created
+    /// invisible or titled late is missed by `CREATE`). Runs the full
+    /// creation pipeline ([`on_window_created`](Self::on_window_created)):
+    /// a tile is seated next to the focused column, a float is placed, an
+    /// ignored window is tracked as such. Returns whether the window is
+    /// tracked afterwards. For a tracked window this is one `HashMap` hit;
+    /// for the rest, the creation gates decide.
+    fn register_if_untracked(&mut self, hwnd: isize, event: &str) -> bool {
+        if self.registry.is_tracked(hwnd) {
+            return true;
+        }
+        log::debug!("{event}: {hwnd:#x} not tracked — attempting creation");
+        self.on_window_created(hwnd);
         self.registry.is_tracked(hwnd)
     }
 
@@ -457,11 +504,23 @@ impl FlowWM {
     /// Handle a window restore (un-minimize) event.
     ///
     /// Pipeline:
-    /// 1. `registry.restore_window(hwnd)` — updates state back to `Tiling::Active`.
+    /// 0. An untracked window gets the creation pipeline first
+    ///    ([`register_if_untracked`](Self::register_if_untracked)): a
+    ///    window the scan never met (minimized behind a cloak, created
+    ///    while tiling was off and gone before the resume, …) is seated as
+    ///    a new window and the steps below find it in place.
+    /// 1. `registry.restore_window(hwnd)` — updates state back to `Tiling::Active`
+    ///    (re-measuring the geometry of a window registered minimized).
     /// 2. If the window is now tiling-active (after restore):
-    ///    - `layout.add_window(id)` — re-adds to layout.
+    ///    - `layout.add_window(id)` — re-adds to layout on its home monitor.
     ///    - `animate_layout(applied)` — animates the new window appearing.
+    /// 3. A float registered minimized was never placed in a floating
+    ///    space: it is placed now, where it reappeared, like a float met at
+    ///    startup (`populate_existing_floats`).
     pub(super) fn on_window_restored(&mut self, hwnd: isize) {
+        if !self.register_if_untracked(hwnd, "on_window_restored") {
+            return;
+        }
         self.registry.restore_window(hwnd);
 
         // Tiling off: registry only. A window still in its strip's memory
@@ -475,12 +534,38 @@ impl FlowWM {
         // not to wherever its parked rect happens to be nearest.
         if self.registry.is_tiling(hwnd) {
             self.readd_tile_to_home_monitor(hwnd);
+        } else {
+            self.seat_float_if_unseated(hwnd);
         }
         // A fullscreen window comes back fullscreen (the registry restored
         // it as a float at its pre-manage rect).
         self.reassert_fullscreen(hwnd);
         // Border overlay: registry now records Active ⇒ refresh re-attaches.
         self.refresh_border_for(hwnd);
+    }
+
+    /// Place an active float that belongs to no floating space — one
+    /// registered while minimized and just restored — into the space of the
+    /// monitor it is on, at its current rect (centred if the rect cannot be
+    /// read), and animate that space. A float that already has a seat (one
+    /// minimized while managed keeps it) is left alone.
+    fn seat_float_if_unseated(&mut self, hwnd: isize) {
+        let wid = WindowId(hwnd);
+        let active_float = self
+            .registry
+            .get_window(HWND(hwnd as *mut _))
+            .is_some_and(|w| {
+                matches!(w.state, WindowState::Floating(FloatingState::Active { .. }))
+            });
+        if !active_float || self.monitor_index_containing(wid).is_some() {
+            return;
+        }
+        let rect = self
+            .current_visible_rect(hwnd)
+            .unwrap_or_else(|| self.centered_float_rect(wid));
+        let float_actual = self.register_float(wid, rect);
+        self.animate_workspaces(&[(float_actual, 0)]);
+        log::debug!("float {hwnd:#x} registered minimized is now seated at {rect:?}");
     }
 
     /// Handle `EVENT_OBJECT_SHOW`.
@@ -546,12 +631,10 @@ impl FlowWM {
         // CREATE and NAMECHANGE (both gate on visibility). SHOW is the first
         // event where the window is actually visible — attempt registration
         // now. Mirrors `on_window_name_change`; safe because `handle_created`
-        // de-duplicates by HWND.
+        // de-duplicates by HWND. A window registered here is fully seated by
+        // the creation pipeline, so nothing below applies to it.
         if !self.registry.is_tracked(hwnd) {
-            log::debug!(
-                "on_window_shown: {hwnd:#x} not tracked — attempting creation (created invisible?)"
-            );
-            self.on_window_created(hwnd);
+            let _ = self.register_if_untracked(hwnd, "on_window_shown");
             return;
         }
 
@@ -587,6 +670,16 @@ impl FlowWM {
     /// natural no-op: the focused column is already visible, so
     /// `ensure_focused_visible` returns `None`.
     pub(super) fn on_focus_changed(&mut self, hwnd: isize) {
+        // A window the registry never met taking the foreground (restored
+        // from a state the scan could not classify, created while the
+        // daemon was not listening) is registered first — seated as a new
+        // window by the creation pipeline — so the bookkeeping below finds
+        // it. The gates reject the taskbar, menus and dialogs cheaply; a
+        // tracked window costs one HashMap hit.
+        // An unregistrable window (taskbar, menu, dialog) falls through:
+        // `set_focused` ignores untracked handles and the rest no-ops.
+        let _ = self.register_if_untracked(hwnd, "on_focus_changed");
+
         // An OS-ignored window taking the foreground may have been
         // un-maximized without a STATECHANGE reaching us (seen with Firefox
         // and Alacritty): re-run the recovery first, so a window the rules
@@ -932,6 +1025,7 @@ mod readd_tests {
             is_visible: true,
             is_maximized: false,
             is_fullscreen: false,
+            is_iconic: false,
         };
         registry.register_window_from_info(&info);
         if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {

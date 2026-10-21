@@ -1371,6 +1371,7 @@ mod tests {
                 is_visible: true,
                 is_maximized: false,
                 is_fullscreen: false,
+                is_iconic: false,
             });
         }
         let info = laptop_under_external();
@@ -1530,6 +1531,7 @@ mod tests {
                 is_visible: true,
                 is_maximized: false,
                 is_fullscreen: false,
+                is_iconic: false,
             });
         }
         let info = primary_with_left_neighbour();

@@ -61,7 +61,9 @@ use crate::common::{InvisibleBounds, Rect};
 use crate::config::types::{WindowRule, WindowRulesConfig};
 
 use super::classification;
-use super::types::{FloatingState, IgnoredReason, TilingState, VirtualSlot, Window, WindowState};
+use super::types::{
+    CreationSkip, FloatingState, IgnoredReason, TilingState, VirtualSlot, Window, WindowState,
+};
 use super::win32;
 
 /// The authoritative source of truth for every window the daemon is aware of.
@@ -208,41 +210,40 @@ impl WindowRegistry {
         match enum_toplevel_windows() {
             Ok(hwnds) => {
                 for hwnd in hwnds {
-                    if !win32::is_window_visible(hwnd) {
-                        continue;
-                    }
-
-                    let title = win32::get_window_text(hwnd).unwrap_or_default();
-                    if title.is_empty() {
-                        continue;
-                    }
-
-                    // Skip windows that wouldn't appear in Alt+Tab (tool windows,
-                    // tray icons, background helpers like GearLink_KBAgent.exe).
-                    if !win32::is_alt_tab_visible(hwnd) {
-                        log::debug!("init: skipping {:?} — not Alt+Tab visible", hwnd);
-                        continue;
-                    }
-
-                    // Skip iconic (minimized) windows — `IsWindowVisible` returns
-                    // true for minimized windows, so this check is needed to
-                    // exclude them from the initial scan. They will be caught
-                    // by live MinimizeStart/MinimizeEnd events instead.
-                    if win32::is_iconic(hwnd) {
-                        log::debug!("init: skipping {:?} — iconic (minimized)", hwnd);
-                        continue;
-                    }
-
-                    // Skip owned windows (dialogs, popups) and child windows (controls inside
-                    // a dialog — e.g. buttons, labels). See has_owner and has_parent.
-                    if has_owner(hwnd) || has_parent(hwnd) {
-                        continue;
+                    let hwnd_val = hwnd_key(hwnd);
+                    match self.creation_gates(hwnd_val) {
+                        Ok(()) => {}
+                        // Not worth a line each: most of the desktop's
+                        // top-level windows are invisible or untitled, and
+                        // a re-scan (`tiling on`) meets every tracked one.
+                        Err(
+                            CreationSkip::AlreadyTracked
+                            | CreationSkip::NotVisible
+                            | CreationSkip::EmptyTitle,
+                        ) => continue,
+                        Err(skip) => {
+                            log::debug!("init: skipping {hwnd:?} — {skip}");
+                            continue;
+                        }
                     }
 
                     match win32::get_window_info(hwnd) {
                         Ok(info) => {
                             self.register_window_from_info(&info);
-                            log::debug!("init: registered {} ({:?})", info.exe, hwnd);
+                            if info.is_iconic {
+                                log::debug!(
+                                    "init: registered minimized {} ({:?}) — restores to ({},{},{},{}), state {:?}",
+                                    info.exe,
+                                    hwnd,
+                                    info.rect.x,
+                                    info.rect.y,
+                                    info.rect.width,
+                                    info.rect.height,
+                                    self.windows.get(&hwnd_val).map(|w| &w.state),
+                                );
+                            } else {
+                                log::debug!("init: registered {} ({:?})", info.exe, hwnd);
+                            }
                         }
                         Err(e) => {
                             log::warn!("init: skipping {:?}: {e}", hwnd);
@@ -276,6 +277,21 @@ impl WindowRegistry {
     /// and `EVENT_OBJECT_CREATE` can race to register the same window. The first
     /// registration wins.
     ///
+    /// # Minimized windows
+    ///
+    /// A window met iconic (`info.is_iconic`; its `rect` and `is_maximized`
+    /// then describe the restore geometry, see
+    /// [`win32::restored_geometry`]) is classified like a visible one and
+    /// registered in the **minimized** state of its class —
+    /// `Tiling(Minimized)` / `Floating(Minimized)`, `minimized_at` stamped,
+    /// no virtual slot — exactly the record a window minimized *after* it
+    /// was managed has, so the restore hook seats it the same way. An
+    /// ignored one is `Ignored(..)` as usual (a window that restores to
+    /// maximized is `Ignored(Maximized)` and goes through the maximized
+    /// recovery once it is back). Its invisible borders are not measured
+    /// (DWM has no frame for an icon): [`Window::geometry_from_placement`]
+    /// marks the record for a re-measure on restore.
+    ///
     /// # Design: Why Separate Classification from Registration?
     ///
     /// Classification is done by the [`super::classification`] module,
@@ -295,16 +311,25 @@ impl WindowRegistry {
             process_path: info.process_path.clone(),
         };
 
-        let state = classification::classify_with_state_pipeline(
+        let classified = classification::classify_with_state_pipeline(
             &candidate,
             info.is_maximized,
             info.is_fullscreen,
             &self.pipeline,
         );
+        let state = if info.is_iconic {
+            minimized_state_for(classified)
+        } else {
+            classified
+        };
 
-        let invisible_bounds = win32::get_invisible_bounds(info.hwnd);
+        let invisible_bounds = if info.is_iconic {
+            InvisibleBounds::zero()
+        } else {
+            win32::get_invisible_bounds(info.hwnd)
+        };
 
-        let window = Window::new(
+        let mut window = Window::new(
             info.hwnd,
             info.exe.clone(),
             info.title.clone(),
@@ -314,15 +339,82 @@ impl WindowRegistry {
             state,
             invisible_bounds,
         );
+        if info.is_iconic {
+            window.geometry_from_placement = true;
+            if matches!(
+                window.state,
+                WindowState::Tiling(TilingState::Minimized)
+                    | WindowState::Floating(FloatingState::Minimized)
+            ) {
+                window.minimized_at = Some(std::time::Instant::now());
+            }
+        }
 
         self.windows.insert(key, window);
         log::info!(
-            "registered window: {:?} ({}) class={:?} title={:?}",
+            "registered window: {:?} ({}) class={:?} title={:?}{}",
             info.hwnd,
             info.exe,
             info.class,
             info.title,
+            if info.is_iconic { " (minimized)" } else { "" },
         );
+    }
+
+    /// The Win32 pre-filters a window must pass before it is classified —
+    /// shared by the startup scan, [`handle_created`](Self::handle_created)
+    /// and the `set-window` path that registers an unknown focused window.
+    /// Cheapest first; the first failing gate is returned. Being iconic is
+    /// not a gate (see [`register_window_from_info`](Self::register_window_from_info)).
+    ///
+    /// # Errors
+    ///
+    /// The first [`CreationSkip`] gate the window fails.
+    pub fn creation_gates(&self, hwnd_val: isize) -> Result<(), CreationSkip> {
+        if self.windows.contains_key(&hwnd_val) {
+            return Err(CreationSkip::AlreadyTracked);
+        }
+        let hwnd = HWND(hwnd_val as *mut _);
+        // Only manage visible windows with titles. `IsWindowVisible` is
+        // true for a minimized window too (WS_VISIBLE stays set).
+        if !win32::is_window_visible(hwnd) {
+            return Err(CreationSkip::NotVisible);
+        }
+        if win32::get_window_text(hwnd)
+            .map(|t| t.is_empty())
+            .unwrap_or(true)
+        {
+            return Err(CreationSkip::EmptyTitle);
+        }
+        // Windows that would not appear in Alt+Tab (tool windows, tray
+        // icons, background helpers like GearLink_KBAgent.exe, cloaked
+        // UWP frames).
+        if !win32::is_alt_tab_visible(hwnd) {
+            return Err(CreationSkip::NotAltTabVisible);
+        }
+        // Owned windows (dialogs, popups) and child windows (controls
+        // inside a dialog — buttons, labels, Inno Setup TNew*). See
+        // has_owner and has_parent.
+        if has_owner(hwnd) || has_parent(hwnd) {
+            return Err(CreationSkip::OwnedOrChild);
+        }
+        Ok(())
+    }
+
+    /// Why `hwnd_val` is not in the registry after a registration attempt:
+    /// the gate it fails, or — when every gate passes — that its metadata
+    /// could not be read. For the error `set-window` prints on an unknown
+    /// focused window that cannot be registered.
+    #[must_use]
+    pub fn creation_skip_reason(&self, hwnd_val: isize) -> CreationSkip {
+        match self.creation_gates(hwnd_val) {
+            Err(skip) => skip,
+            Ok(()) => CreationSkip::InfoUnavailable(
+                win32::get_window_info(HWND(hwnd_val as *mut _))
+                    .err()
+                    .unwrap_or_else(|| "registration did not take".to_owned()),
+            ),
+        }
     }
 
     /// Removes a window from the registry.
@@ -503,6 +595,27 @@ impl WindowRegistry {
     /// row 0. This ensures the window always gets a valid tiling position
     /// rather than being lost.
     pub fn restore_window(&mut self, hwnd_val: isize) {
+        // A window registered while minimized carries its placement's
+        // restore rect and no invisible borders: now that its frame is on
+        // screen, measure the real thing before the daemon seats it.
+        if self
+            .windows
+            .get(&hwnd_val)
+            .is_some_and(|w| w.geometry_from_placement)
+        {
+            self.refresh_geometry(hwnd_val);
+            if let Some(window) = self.windows.get_mut(&hwnd_val) {
+                window.geometry_from_placement = false;
+                log::debug!(
+                    "restore_window: isize={hwnd_val} was registered minimized; geometry re-measured to ({},{},{},{}) bounds {:?}",
+                    window.pre_manage_rect.x,
+                    window.pre_manage_rect.y,
+                    window.pre_manage_rect.width,
+                    window.pre_manage_rect.height,
+                    window.invisible_bounds,
+                );
+            }
+        }
         if let Some(window) = self.windows.get_mut(&hwnd_val) {
             let new_state = match &window.state {
                 WindowState::Tiling(TilingState::Minimized) => {
@@ -1039,6 +1152,20 @@ impl WindowRegistry {
         self.windows.contains_key(&hwnd_val)
     }
 
+    /// Returns `true` iff `hwnd_val` is tracked in a `Minimized` state
+    /// (`Tiling(Minimized)` or `Floating(Minimized)`) — a window minimized
+    /// while managed, or one registered while minimized.
+    #[must_use]
+    pub fn is_minimized(&self, hwnd_val: isize) -> bool {
+        matches!(
+            self.windows.get(&hwnd_val).map(|w| &w.state),
+            Some(
+                WindowState::Tiling(TilingState::Minimized)
+                    | WindowState::Floating(FloatingState::Minimized)
+            )
+        )
+    }
+
     /// Returns `true` iff `hwnd_val` is tracked and parked as
     /// `Ignored(Maximized)` or `Ignored(Fullscreen)` — the windows
     /// [`reclassify_os_state`](Self::reclassify_os_state) can recover. The
@@ -1272,6 +1399,15 @@ impl WindowRegistry {
         // and these use the same predicates the classification pipeline applied
         // at creation time, so recovery stays consistent with initial classify.
         let hwnd = HWND(hwnd_val as *mut _);
+        // An iconic window tells nothing: `IsZoomed` is false while it is
+        // minimized even when it restores to maximized (a window registered
+        // minimized with `WPF_RESTORETOMAXIMIZED`, or one minimized while
+        // parked here). Wait for the restore; the foreground / show / state
+        // hooks run this again then.
+        if win32::is_iconic(hwnd) {
+            log::debug!("reclassify_os_state: isize={hwnd_val} is minimized; deciding on restore");
+            return ReclassifyResult::Unchanged;
+        }
         let mut is_maximized = win32::is_zoomed(hwnd);
         let is_fullscreen = win32::is_fullscreen(hwnd).unwrap_or(false);
 
@@ -1383,10 +1519,13 @@ impl WindowRegistry {
     /// # Returns
     ///
     /// Returns `Some(WindowId(hwnd_val))` if the window was classified as
-    /// tiling (i.e., it entered the registry in a `WindowState::Tiling` state).
-    /// Returns `None` for floating, ignored, or skipped windows. This allows the
-    /// caller (orchestrator) to immediately add the window to the layout engine
-    /// without a second lookup.
+    /// tiling **and is active** (it entered the registry as
+    /// `Tiling(Active)` and belongs in the layout now). Returns `None` for
+    /// floating, ignored, or skipped windows — and for a window met
+    /// minimized, which is registered `Tiling(Minimized)` /
+    /// `Floating(Minimized)` and seated by the restore hook later. This
+    /// allows the caller (orchestrator) to immediately add the window to
+    /// the layout engine without a second lookup.
     ///
     /// # Diagnostics
     ///
@@ -1401,47 +1540,20 @@ impl WindowRegistry {
     pub fn handle_created(&mut self, hwnd_val: isize) -> Option<crate::common::WindowId> {
         let hwnd = HWND(hwnd_val as *mut _);
 
-        // Already tracked — benign no-op. This can happen on a duplicate
-        // CREATE event or when the init scan already registered the window.
-        // Logged so a "never evaluated" window is distinguishable from one we
-        // correctly de-duplicated.
-        if self.windows.contains_key(&hwnd_val) {
-            log::debug!("handle_created: {hwnd:?} already tracked — skipping");
-            return None;
-        }
-
-        // Only manage visible windows with titles.
-        if !win32::is_window_visible(hwnd) {
-            log::debug!("handle_created: skipping {hwnd:?} — not visible");
-            return None;
-        }
-
-        let title = win32::get_window_text(hwnd).unwrap_or_default();
-        if title.is_empty() {
-            log::debug!("handle_created: skipping {hwnd:?} — empty title");
-            return None;
-        }
-
-        // Skip windows that wouldn't appear in Alt+Tab (tool windows,
-        // tray icons, background helpers).
-        if !win32::is_alt_tab_visible(hwnd) {
-            log::debug!("handle_created: skipping {hwnd:?} — not Alt+Tab visible");
-            return None;
-        }
-
-        // Skip iconic (minimized) windows — same rationale as scan_existing_windows.
-        if win32::is_iconic(hwnd) {
-            log::debug!("handle_created: skipping {hwnd:?} — iconic (minimized)");
-            return None;
-        }
-
-        // Skip windows with an owner (dialogs, popups) or a parent (child controls
-        // inside a dialog — e.g. buttons, labels, Inno Setup TNew* controls).
-        if has_owner(hwnd) || has_parent(hwnd) {
-            log::debug!(
-                "handle_created: skipping {hwnd:?} — has owner or parent (dialog/popup/child)"
-            );
-            return None;
+        match self.creation_gates(hwnd_val) {
+            Ok(()) => {}
+            // Already tracked — benign no-op. This can happen on a duplicate
+            // CREATE event or when the init scan already registered the
+            // window. Logged so a "never evaluated" window is
+            // distinguishable from one we correctly de-duplicated.
+            Err(CreationSkip::AlreadyTracked) => {
+                log::debug!("handle_created: {hwnd:?} already tracked — skipping");
+                return None;
+            }
+            Err(skip) => {
+                log::debug!("handle_created: skipping {hwnd:?} — {skip}");
+                return None;
+            }
         }
 
         match win32::get_window_info(hwnd) {
@@ -1454,10 +1566,27 @@ impl WindowRegistry {
             }
         }
 
-        // Check if the window was classified as tiling.
+        // Check if the window was classified as an active tile.
         if let Some(window) = self.windows.get(&hwnd_val) {
             match &window.state {
-                WindowState::Tiling(_) => Some(crate::common::WindowId(hwnd_val)),
+                WindowState::Tiling(TilingState::Active { .. }) => {
+                    Some(crate::common::WindowId(hwnd_val))
+                }
+                // Met minimized: tracked in its minimized state, seated by
+                // the restore hook like any minimized window.
+                WindowState::Tiling(TilingState::Minimized)
+                | WindowState::Floating(FloatingState::Minimized) => {
+                    log::debug!(
+                        "handle_created: {hwnd:?} ({}) registered minimized — restores to ({},{},{},{}), {:?}",
+                        window.exe,
+                        window.pre_manage_rect.x,
+                        window.pre_manage_rect.y,
+                        window.pre_manage_rect.width,
+                        window.pre_manage_rect.height,
+                        window.state,
+                    );
+                    None
+                }
                 // Passed every gate, but classified Floating/Ignored (e.g.
                 // maximized, fullscreen, or an explicit rule) — so it does not
                 // enter the layout. Logged because "passed the gates but still
@@ -1470,6 +1599,21 @@ impl WindowRegistry {
         } else {
             None
         }
+    }
+}
+
+/// The state a window met **minimized** is registered in: the `Minimized`
+/// variant of the class the rules gave it. A tile or float keeps its
+/// classification but no active slot or rect (the restore hook seats it);
+/// an ignored window is ignored just the same — in particular one that
+/// restores to maximized stays `Ignored(Maximized)` for the maximized
+/// recovery to pick up once it is back on screen.
+#[must_use]
+pub(crate) fn minimized_state_for(classified: WindowState) -> WindowState {
+    match classified {
+        WindowState::Tiling(_) => WindowState::Tiling(TilingState::Minimized),
+        WindowState::Floating(_) => WindowState::Floating(FloatingState::Minimized),
+        ignored @ WindowState::Ignored(_) => ignored,
     }
 }
 
@@ -1875,6 +2019,7 @@ mod tests {
             is_visible: true,
             is_maximized: false,
             is_fullscreen: false,
+            is_iconic: false,
         };
 
         reg.register_window_from_info(&info);
@@ -1966,6 +2111,201 @@ mod tests {
             w.state,
             WindowState::Tiling(TilingState::Active { col: 2, row: 1 })
         ));
+    }
+
+    // ── Windows met minimized ─────────────────────────────────────────
+
+    /// `WindowInfo` for a window met iconic: the rect is its restore rect.
+    fn iconic_info(hwnd_val: isize, exe: &str, restores_maximized: bool) -> win32::WindowInfo {
+        win32::WindowInfo {
+            hwnd: HWND(hwnd_val as *mut _),
+            title: "Inbox".into(),
+            class: "Outlook Host".into(),
+            rect: crate::common::Rect {
+                x: -1500,
+                y: 80,
+                width: 1200,
+                height: 900,
+            },
+            exe: exe.into(),
+            process_path: format!("C:\\{exe}"),
+            is_visible: true,
+            is_maximized: restores_maximized,
+            is_fullscreen: false,
+            is_iconic: true,
+        }
+    }
+
+    /// The minimized state keeps the class the rules gave and leaves an
+    /// ignored window ignored.
+    #[test]
+    fn minimized_state_for_maps_each_class_to_its_minimized_variant() {
+        assert!(matches!(
+            minimized_state_for(WindowState::Tiling(TilingState::Active { col: 3, row: 1 })),
+            WindowState::Tiling(TilingState::Minimized)
+        ));
+        assert!(matches!(
+            minimized_state_for(WindowState::Floating(FloatingState::Active {
+                rect: crate::common::Rect {
+                    x: 1,
+                    y: 2,
+                    width: 3,
+                    height: 4
+                }
+            })),
+            WindowState::Floating(FloatingState::Minimized)
+        ));
+        assert!(matches!(
+            minimized_state_for(WindowState::Ignored(IgnoredReason::Maximized)),
+            WindowState::Ignored(IgnoredReason::Maximized)
+        ));
+        assert!(matches!(
+            minimized_state_for(WindowState::Ignored(IgnoredReason::ExplicitRule)),
+            WindowState::Ignored(IgnoredReason::ExplicitRule)
+        ));
+    }
+
+    /// A window met minimized is registered exactly like one minimized
+    /// after it was managed — `Minimized` state of its class, `minimized_at`
+    /// stamped, no slot — with its restore rect as pre-manage rect and
+    /// natural size, zero invisible borders and the placement flag set.
+    #[test]
+    fn register_iconic_window_lands_in_its_minimized_state() {
+        let tile_rule = WindowRulesConfig {
+            default_action: crate::config::types::WindowAction::Float,
+            rules: vec![WindowRule {
+                match_: crate::config::types::MatchRule {
+                    exe: Some("olk.exe".into()),
+                    ..Default::default()
+                },
+                action: crate::config::types::WindowAction::Tile,
+                initial_width_px: None,
+                override_persist: false,
+            }],
+        };
+        let mut reg = WindowRegistry::new(&tile_rule, &WindowRulesConfig::default());
+
+        // Rules tile olk.exe → Tiling(Minimized).
+        reg.register_window_from_info(&iconic_info(0x11, "olk.exe", false));
+        let w = reg.windows.get(&0x11).expect("registered");
+        assert!(matches!(
+            w.state,
+            WindowState::Tiling(TilingState::Minimized)
+        ));
+        assert!(w.minimized_at.is_some(), "stamped like a minimize hook");
+        assert!(w.last_virtual_slot.is_none(), "never had a slot");
+        assert_eq!(w.pre_manage_rect.x, -1500);
+        assert_eq!(
+            (w.last_natural_size.w, w.last_natural_size.h),
+            (1200, 900),
+            "natural size is the restore size"
+        );
+        assert_eq!(w.invisible_bounds, InvisibleBounds::zero());
+        assert!(w.geometry_from_placement);
+        assert!(reg.is_minimized(0x11));
+        assert!(reg.is_tiling(0x11) && !reg.is_tiling_active(0x11));
+        assert_eq!(
+            reg.minimized_windows().len(),
+            1,
+            "the rescue / pause passes see it as minimized"
+        );
+        assert!(reg.restorable_windows().is_empty());
+        assert!(
+            reg.tiling_window_ids().is_empty(),
+            "not in the initial layout"
+        );
+
+        // Default action floats everything else → Floating(Minimized).
+        reg.register_window_from_info(&iconic_info(0x12, "notepad.exe", false));
+        assert!(matches!(
+            reg.windows.get(&0x12).map(|w| &w.state),
+            Some(WindowState::Floating(FloatingState::Minimized))
+        ));
+        assert!(reg.is_minimized(0x12));
+
+        // Restores to maximized → Ignored(Maximized), not minimized: the
+        // maximized recovery decides once it is back on screen.
+        reg.register_window_from_info(&iconic_info(0x13, "olk.exe", true));
+        let w = reg.windows.get(&0x13).expect("registered");
+        assert!(matches!(
+            w.state,
+            WindowState::Ignored(IgnoredReason::Maximized)
+        ));
+        assert!(w.minimized_at.is_none());
+        assert!(w.geometry_from_placement);
+        assert!(!reg.is_minimized(0x13));
+        assert!(reg.is_os_ignored(0x13));
+        // A fake handle is not iconic and not zoomed: the recovery would
+        // run — on a real minimized window it waits (see the iconic guard).
+        assert!(!matches!(
+            reg.reclassify_os_state(0x13),
+            super::super::types::ReclassifyResult::Untracked
+        ));
+    }
+
+    /// The restore hook seats a window registered minimized exactly like
+    /// one minimized while managed: `Tiling(Active)` at the default slot,
+    /// `minimized_at` cleared, and the placement flag cleared after the
+    /// geometry re-measure (which keeps the old values on a dead handle).
+    #[test]
+    fn restore_of_a_window_registered_minimized_activates_and_remeasures() {
+        let tile_all = WindowRulesConfig {
+            default_action: crate::config::types::WindowAction::Tile,
+            rules: vec![],
+        };
+        let mut reg = WindowRegistry::new(&tile_all, &WindowRulesConfig::default());
+        reg.register_window_from_info(&iconic_info(0x21, "olk.exe", false));
+        reg.register_window_from_info(&iconic_info(0x22, "olk.exe", false));
+        if let Some(w) = reg.windows.get_mut(&0x22) {
+            w.state = WindowState::Floating(FloatingState::Minimized);
+        }
+
+        reg.restore_window(0x21);
+        let w = reg.windows.get(&0x21).expect("tracked");
+        assert!(matches!(
+            w.state,
+            WindowState::Tiling(TilingState::Active { col: 0, row: 0 })
+        ));
+        assert!(w.minimized_at.is_none());
+        assert!(!w.geometry_from_placement, "measured (or attempted) once");
+        assert_eq!(w.pre_manage_rect.width, 1200, "dead handle: values kept");
+        assert!(reg.is_tiling_active(0x21));
+
+        // A float comes back active at its pre-manage rect, like any
+        // minimized float.
+        reg.restore_window(0x22);
+        let w = reg.windows.get(&0x22).expect("tracked");
+        assert!(matches!(
+            w.state,
+            WindowState::Floating(FloatingState::Active { rect }) if rect.x == -1500
+        ));
+        assert!(!w.geometry_from_placement);
+
+        // Restoring again is a no-op.
+        reg.restore_window(0x21);
+        assert!(reg.is_tiling_active(0x21));
+    }
+
+    /// The creation gates name the gate a window fails; a fake handle is
+    /// not a window, so it fails the visibility gate, and a tracked one is
+    /// reported as such first.
+    #[test]
+    fn creation_gates_name_the_failing_gate() {
+        let (user, default) = default_rules();
+        let mut reg = WindowRegistry::new(&user, &default);
+        assert_eq!(reg.creation_gates(0xDEAD), Err(CreationSkip::NotVisible));
+        assert_eq!(reg.creation_skip_reason(0xDEAD), CreationSkip::NotVisible);
+        assert_eq!(CreationSkip::NotVisible.to_string(), "not visible");
+        insert_test_window(
+            &mut reg,
+            0xDEAD,
+            WindowState::Tiling(TilingState::Active { col: 0, row: 0 }),
+        );
+        assert_eq!(
+            reg.creation_gates(0xDEAD),
+            Err(CreationSkip::AlreadyTracked)
+        );
+        assert!(reg.handle_created(0xDEAD).is_none());
     }
 
     // ── Helper to insert a test window ───────────────────────────────
@@ -2264,6 +2604,7 @@ mod tests {
             is_visible: true,
             is_maximized: false,
             is_fullscreen: false,
+            is_iconic: false,
         };
 
         assert!(reg.is_empty());
@@ -2296,6 +2637,7 @@ mod tests {
             is_visible: true,
             is_maximized: false,
             is_fullscreen: false,
+            is_iconic: false,
         };
 
         reg.register_window_from_info(&info);
@@ -2338,6 +2680,7 @@ mod tests {
             is_visible: true,
             is_maximized: true,
             is_fullscreen: false,
+            is_iconic: false,
         };
 
         reg.register_window_from_info(&info);
@@ -3723,5 +4066,64 @@ mod tests {
             !has_owner(windows.child),
             "WS_CHILD controls should have no GW_OWNER — that's why has_parent exists"
         );
+    }
+
+    /// A real window shown minimized: `get_window_info` reports it iconic
+    /// with its **restore** rect (not the -32000 icon rect), and the registry
+    /// registers it in the minimized state of its class.
+    ///
+    /// The window is a `WS_EX_TOOLWINDOW` so the host's taskbar shows no
+    /// button for the test's duration; the gate sequence would reject it
+    /// for that very reason, which is why `get_window_info` is called
+    /// directly here (the gates are covered by their own tests).
+    #[test]
+    fn real_minimized_window_registers_from_its_restore_rect() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SW_SHOWMINNOACTIVE, ShowWindow, WS_EX_TOOLWINDOW,
+        };
+        let windows = match RealTestWindows::create() {
+            Some(w) => w,
+            None => {
+                eprintln!("skipping: real window creation failed (headless test environment?)");
+                return;
+            }
+        };
+        let hwnd = windows.parent;
+        // SAFETY: plain style/show calls on a window this process owns.
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{GWL_EXSTYLE, SetWindowLongW};
+            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, WS_EX_TOOLWINDOW.0 as i32);
+            let _ = ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+        }
+        if !win32::is_iconic(hwnd) {
+            eprintln!("skipping: the window did not minimize (no interactive desktop?)");
+            return;
+        }
+        let info = win32::get_window_info(hwnd).expect("window info of a live window");
+        assert!(info.is_iconic);
+        assert!(!info.is_maximized, "restores to normal, not maximized");
+        assert!(!info.is_fullscreen);
+        // Windows widens an overlapped window to its minimum tracking size.
+        assert!(
+            info.rect.height == 100 && (100..600).contains(&info.rect.width),
+            "the restore rect's size, not the icon's: {:?}",
+            info.rect
+        );
+        assert!(
+            info.rect.x > -30000 && info.rect.y > -30000,
+            "not the iconic position: {:?}",
+            info.rect
+        );
+        let icon_rect = win32::get_window_rect(hwnd).expect("rect");
+        assert_ne!(icon_rect, info.rect, "GetWindowRect reports the icon");
+
+        let (user, default) = default_rules();
+        let mut reg = WindowRegistry::new(&user, &default);
+        reg.register_window_from_info(&info);
+        let key = hwnd_key(hwnd);
+        assert!(reg.is_minimized(key));
+        let w = reg.get_window(hwnd).expect("registered");
+        assert!(w.geometry_from_placement);
+        assert_eq!(w.pre_manage_rect, info.rect);
     }
 }

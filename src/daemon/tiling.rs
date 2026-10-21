@@ -917,6 +917,7 @@ mod tests {
             is_visible: true,
             is_maximized: false,
             is_fullscreen: false,
+            is_iconic: false,
         }
     }
 

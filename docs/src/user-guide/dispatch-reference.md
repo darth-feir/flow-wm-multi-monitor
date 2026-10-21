@@ -278,6 +278,22 @@ stop`). To have every maximized window adopted automatically, set
 [`adopt_maximized = true`](./config-reference.md#top-level-fields). Only a
 minimized or hidden window cannot be changed.
 
+**Unknown windows are registered first.** `set-window` acts on the window
+that has the keyboard focus right now. If FlowWM has never met it (`flow
+query all` does not list it — a window it could not classify when it
+appeared, e.g. a minimized UWP app, or one that opened while FlowWM was not
+listening), it is put through the normal window pipeline first — tiled or
+floated by your rules exactly like a window that just opened — and the
+requested mode is then applied: `tile`, `float` and `fullscreen` do what
+they say, and `cycle` means `tile` here (the window had no float/tile state
+to flip a moment ago). A window that fails one of FlowWM's gates — a tool
+window, an untitled window, a hidden or cloaked one, a dialog owned by
+another window — is refused with an error that names the gate, e.g.
+`focused window is not managed and cannot be registered: not Alt+Tab visible
+(tool window or DWM-cloaked)`. Windows that are minimized when FlowWM starts
+are registered as minimized and tiled (or floated) the moment you restore
+them, so this path is mostly for windows FlowWM never saw at all.
+
 #### `set-window fullscreen`
 
 Put the focused tiled or floating window over its monitor's **whole screen**

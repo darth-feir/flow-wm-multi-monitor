@@ -1564,14 +1564,12 @@ impl FlowWM {
     /// See (`docs/src/dev-guide/floating-space.md`) for the tile↔float
     /// transition design.
     fn dispatch_set_window(&mut self, mode: WindowMode) -> SocketResponse {
-        // 1. Get the OS-focused window from the registry.
-        let focused = match self.registry.focused() {
-            Some(f) => f,
-            None => {
-                return SocketResponse::Error {
-                    message: "no focused window".into(),
-                };
-            }
+        // 1. Resolve the window to act on: the OS foreground — registered
+        //    first when the registry never met it — else the registry's
+        //    tracked focus.
+        let (focused, mode) = match self.resolve_set_window_target(mode) {
+            Ok(target) => target,
+            Err(message) => return SocketResponse::Error { message },
         };
 
         // 2. Inspect the focused window's current state.
@@ -1648,6 +1646,65 @@ impl FlowWM {
         }
 
         response
+    }
+
+    /// The window `set-window` acts on, and the mode to apply to it.
+    ///
+    /// The OS foreground is the truth: when it is a window the registry
+    /// never met (the user's Outlook, minimized when the daemon started
+    /// and restored behind a cloak; a window that failed a gate at
+    /// creation and passes it now), it is registered through the creation
+    /// pipeline first — seated as a tile or a float by the rules, or
+    /// tracked as ignored — and the requested mode is then applied to it by
+    /// the normal decision table, with one adjustment from
+    /// [`resolve_unknown_focus`]: `cycle` on a window that was unknown a
+    /// moment ago means `tile`, as it does on an ignored window. A window
+    /// that cannot be registered (a tool window, no title, cloaked, owned)
+    /// is refused with the gate it failed. Without an OS foreground the
+    /// registry's tracked focus is used as before.
+    ///
+    /// # Errors
+    ///
+    /// No window to act on, or the foreground failed a creation gate.
+    fn resolve_set_window_target(
+        &mut self,
+        mode: WindowMode,
+    ) -> Result<(WindowId, WindowMode), String> {
+        if let Some(fg) = self.os_foreground_for_dispatch() {
+            let was_tracked = self.registry.is_tracked(fg);
+            if !was_tracked {
+                log::debug!("set-window: foreground {fg:#x} not tracked — attempting creation");
+                self.on_window_created(fg);
+            }
+            let outcome = if self.registry.is_tracked(fg) {
+                Ok(())
+            } else {
+                Err(self.registry.creation_skip_reason(fg))
+            };
+            let mode = resolve_unknown_focus(mode, was_tracked, outcome)?;
+            self.registry.set_focused(fg);
+            return Ok((WindowId(fg), mode));
+        }
+        self.registry
+            .focused()
+            .map(|f| (f, mode))
+            .ok_or_else(|| "no focused window".to_owned())
+    }
+
+    /// `GetForegroundWindow()` for the dispatch handlers that act on "the
+    /// focused window". `None` under `cfg(test)`: the unit tests run on a
+    /// developer's desktop whose foreground is a real window of theirs, and
+    /// registering it into a test registry would seat it (and draw a
+    /// border on it); the tests set the registry's focus instead.
+    #[cfg(not(test))]
+    fn os_foreground_for_dispatch(&self) -> Option<isize> {
+        registry_win32::get_foreground_window()
+    }
+
+    /// See the non-test variant: the tests drive the registry's focus.
+    #[cfg(test)]
+    fn os_foreground_for_dispatch(&self) -> Option<isize> {
+        None
     }
 
     /// Persist a `set-window` transition to `history-flow-rules.toml`.
@@ -2189,6 +2246,42 @@ const fn resolve_set_window_action(
     }
 }
 
+/// Pure decision behind [`FlowWM::resolve_set_window_target`] for a
+/// foreground window the registry did not track when the command arrived.
+///
+/// `was_tracked` is whether the foreground was already in the registry
+/// (then nothing was attempted and `mode` is returned as is); `outcome` is
+/// the result of the registration attempt otherwise: `Ok` when the window
+/// is tracked now, `Err(gate)` naming the creation gate it failed. A
+/// freshly registered window gets `mode` — except `cycle`, which means
+/// `tile` on a window that had no tile/float state a moment ago (the
+/// window may have been registered as a tile by a rule; `cycle` must not
+/// flip it straight back out). A window that could not be registered is
+/// refused with a message that names the gate, in place of the old
+/// "focused window not found in registry".
+///
+/// # Errors
+///
+/// The error message for the CLI when the window failed a gate.
+fn resolve_unknown_focus(
+    mode: WindowMode,
+    was_tracked: bool,
+    outcome: Result<(), crate::registry::types::CreationSkip>,
+) -> Result<WindowMode, String> {
+    if was_tracked {
+        return Ok(mode);
+    }
+    match outcome {
+        Ok(()) => Ok(match mode {
+            WindowMode::Cycle => WindowMode::Tile,
+            other => other,
+        }),
+        Err(gate) => Err(format!(
+            "focused window is not managed and cannot be registered: {gate}"
+        )),
+    }
+}
+
 /// Map a resolved transition to the learned-rule action it should produce.
 ///
 /// Returns `None` for [`SetWindowAction::NoOp`] — a no-op transition carries
@@ -2428,6 +2521,89 @@ mod tests {
         assert_eq!(action_to_learned(SetWindowAction::NoOp), None);
     }
 
+    // ── resolve_unknown_focus: set-window on a window the registry never met ──
+
+    /// A tracked foreground is untouched: the mode passes through, no
+    /// attempt is consulted.
+    #[test]
+    fn unknown_focus_passes_a_tracked_window_through() {
+        use crate::registry::types::CreationSkip;
+        for mode in [
+            WindowMode::Tile,
+            WindowMode::Float,
+            WindowMode::Cycle,
+            WindowMode::Fullscreen,
+        ] {
+            assert_eq!(resolve_unknown_focus(mode, true, Ok(())), Ok(mode));
+            // Even a failed outcome is irrelevant for a tracked window.
+            assert_eq!(
+                resolve_unknown_focus(mode, true, Err(CreationSkip::NotVisible)),
+                Ok(mode)
+            );
+        }
+    }
+
+    /// A window registered a moment ago gets the requested mode, except
+    /// that `cycle` means `tile` (it had no tile/float state to flip).
+    #[test]
+    fn unknown_focus_registered_now_keeps_the_mode_but_cycle_means_tile() {
+        assert_eq!(
+            resolve_unknown_focus(WindowMode::Tile, false, Ok(())),
+            Ok(WindowMode::Tile)
+        );
+        assert_eq!(
+            resolve_unknown_focus(WindowMode::Float, false, Ok(())),
+            Ok(WindowMode::Float)
+        );
+        assert_eq!(
+            resolve_unknown_focus(WindowMode::Fullscreen, false, Ok(())),
+            Ok(WindowMode::Fullscreen)
+        );
+        assert_eq!(
+            resolve_unknown_focus(WindowMode::Cycle, false, Ok(())),
+            Ok(WindowMode::Tile)
+        );
+    }
+
+    /// A window that failed a creation gate is refused with the gate named,
+    /// whatever the mode.
+    #[test]
+    fn unknown_focus_that_cannot_register_names_the_gate() {
+        use crate::registry::types::CreationSkip;
+        let err = resolve_unknown_focus(
+            WindowMode::Cycle,
+            false,
+            Err(CreationSkip::NotAltTabVisible),
+        )
+        .expect_err("refused");
+        assert_eq!(
+            err,
+            "focused window is not managed and cannot be registered: not Alt+Tab visible (tool window or DWM-cloaked)"
+        );
+        let err = resolve_unknown_focus(WindowMode::Tile, false, Err(CreationSkip::EmptyTitle))
+            .expect_err("refused");
+        assert!(err.ends_with("empty title"), "{err}");
+        let err = resolve_unknown_focus(
+            WindowMode::Float,
+            false,
+            Err(CreationSkip::InfoUnavailable("gone".into())),
+        )
+        .expect_err("refused");
+        assert!(err.ends_with("window info unavailable: gone"), "{err}");
+    }
+
+    /// `set-window` with no OS foreground and a registry focus that is a
+    /// minimized tile is refused as before (no registration attempt
+    /// happens for a tracked window).
+    #[test]
+    fn set_window_on_a_tracked_minimized_window_is_still_refused() {
+        let mut flow = flow_with_focused_state(WindowState::Tiling(TilingState::Minimized));
+        assert!(matches!(
+            flow.dispatch_set_window(WindowMode::Cycle),
+            SocketResponse::Error { message } if message.contains("only an active or ignored window")
+        ));
+    }
+
     // ── fallback_float_size: built-in default size for floating windows ──
     //
     // Pure integer arithmetic extracted from `set_window_to_float`. The policy
@@ -2532,6 +2708,7 @@ mod tests {
             is_visible: true,
             is_maximized: false,
             is_fullscreen: false,
+            is_iconic: false,
         };
         registry.register_window_from_info(&info);
 
@@ -2981,6 +3158,7 @@ mod tests {
                 is_visible: true,
                 is_maximized: false,
                 is_fullscreen: false,
+                is_iconic: false,
             };
             flow.registry.register_window_from_info(&info);
         }
@@ -3088,6 +3266,7 @@ mod tests {
                 is_visible: true,
                 is_maximized: false,
                 is_fullscreen: false,
+                is_iconic: false,
             };
             flow.registry.register_window_from_info(&info);
         }
@@ -3263,6 +3442,7 @@ mod tests {
             is_visible: true,
             is_maximized: false,
             is_fullscreen: false,
+            is_iconic: false,
         };
         flow.registry.register_window_from_info(&info);
         if let Some(win) = flow.registry.get_window_mut(HWND(hwnd as *mut _)) {

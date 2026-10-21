@@ -277,6 +277,32 @@ impl FlowWM {
             }
         }
 
+        // Windows the scan met minimized: tracked in their minimized state,
+        // seated nowhere until restored. Their owning monitor is the one
+        // their restore rect lies on (the icon rect says nothing), so the
+        // restore hook brings them back there and `flow query all` reports
+        // them there meanwhile.
+        let screen_rects_for_minimized = screen_rects.clone();
+        for (hwnd, _) in registry.minimized_windows() {
+            let rect = registry
+                .get_window(HWND(hwnd as *mut _))
+                .map(|w| w.pre_manage_rect);
+            let idx = rect
+                .and_then(|r| {
+                    super::types::monitor_index_for_rect_in(&screen_rects_for_minimized, r)
+                })
+                .or_else(|| {
+                    let h = registry_win32::monitor_handle_for_window(HWND(hwnd as *mut _));
+                    geometries.iter().position(|g| g.hmonitor == h)
+                })
+                .unwrap_or(0);
+            registry.set_monitor(hwnd, idx);
+            log::debug!(
+                "init: minimized window {hwnd:#x} restores to {:?}; owning monitor {idx}",
+                rect
+            );
+        }
+
         // Partition the pre-existing tiling windows by the monitor they sit on.
         let all_tiling = registry.tiling_window_ids_with_widths_sorted_by_x();
         let mut per_monitor_windows: Vec<(Vec<WindowId>, Vec<u32>)> =

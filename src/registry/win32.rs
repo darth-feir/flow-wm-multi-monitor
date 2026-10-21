@@ -91,6 +91,13 @@ pub struct WindowInfo {
     pub is_maximized: bool,
     /// Whether the window is in exclusive or borderless fullscreen.
     pub is_fullscreen: bool,
+    /// Whether the window is minimized (`IsIconic`). For such a window
+    /// `rect` is **not** `GetWindowRect` (the iconic (-32000, -32000)
+    /// position) but the placement's restore rect in screen coordinates —
+    /// where `ShowWindow(SW_RESTORE)` will put it — and `is_maximized`
+    /// says whether it restores to maximized (`WPF_RESTORETOMAXIMIZED`);
+    /// `is_fullscreen` is `false`. See [`restored_geometry`].
+    pub is_iconic: bool,
 }
 
 // ── String conversion helpers ──────────────────────────────────────
@@ -1308,10 +1315,20 @@ fn get_process_path_from_handle(
 pub fn get_window_info(hwnd: HWND) -> Result<WindowInfo, String> {
     let title = get_window_text(hwnd).unwrap_or_default();
     let class = get_class_name(hwnd).unwrap_or_default();
-    let rect = get_window_rect(hwnd)?;
     let is_visible = is_window_visible(hwnd);
-    let is_maximized = is_zoomed(hwnd);
-    let is_fullscreen = is_fullscreen(hwnd).unwrap_or(false);
+    let is_iconic = is_iconic(hwnd);
+    // A minimized window's rect, maximized bit and fullscreen test all
+    // describe the icon, not the window: take the geometry it restores to.
+    let (rect, is_maximized, is_fullscreen) = if is_iconic {
+        let (rect, restores_maximized) = restored_geometry(hwnd)?;
+        (rect, restores_maximized, false)
+    } else {
+        (
+            get_window_rect(hwnd)?,
+            is_zoomed(hwnd),
+            is_fullscreen(hwnd).unwrap_or(false),
+        )
+    };
 
     let pid = match get_window_thread_process_id(hwnd) {
         Ok(p) => p,
@@ -1326,6 +1343,7 @@ pub fn get_window_info(hwnd: HWND) -> Result<WindowInfo, String> {
                 is_visible,
                 is_maximized,
                 is_fullscreen,
+                is_iconic,
             });
         }
     };
@@ -1343,6 +1361,7 @@ pub fn get_window_info(hwnd: HWND) -> Result<WindowInfo, String> {
         is_visible,
         is_maximized,
         is_fullscreen,
+        is_iconic,
     })
 }
 
@@ -1606,6 +1625,49 @@ pub fn get_window_placement(hwnd: HWND) -> Result<WindowPlacement, String> {
             height: r.bottom - r.top,
         },
     })
+}
+
+/// Translate a placement's `rcNormalPosition` (workspace coordinates) into
+/// screen coordinates.
+///
+/// Workspace coordinates are screen coordinates shifted by the primary
+/// monitor's work-area origin, so the conversion adds `primary_work.x -
+/// primary_screen.x` and the same for `y`: zero with a bottom or right
+/// taskbar, the taskbar's thickness with a top or left one (the inverse of
+/// `rescue::placement_target`'s write-back). The size is unchanged.
+#[must_use]
+pub fn normal_position_to_screen(normal: Rect, primary_screen: Rect, primary_work: Rect) -> Rect {
+    Rect {
+        x: normal.x + (primary_work.x - primary_screen.x),
+        y: normal.y + (primary_work.y - primary_screen.y),
+        ..normal
+    }
+}
+
+/// Where a minimized window will reappear, as a window rect in screen
+/// coordinates (the same space as [`get_window_rect`]), and whether it
+/// restores to **maximized** (`WPF_RESTORETOMAXIMIZED` — `IsZoomed` is
+/// `false` while a window is iconic, so the flag is the only way to know).
+///
+/// This is what the registry classifies a window by when it meets it
+/// minimized: its monitor, its pre-manage rect and its natural size all
+/// come from here, since `GetWindowRect` reports the off-screen icon.
+///
+/// # Errors
+///
+/// Returns the Win32 error as a string if the placement or the primary
+/// monitor cannot be read.
+pub fn restored_geometry(hwnd: HWND) -> Result<(Rect, bool), String> {
+    use windows::Win32::UI::WindowsAndMessaging::WPF_RESTORETOMAXIMIZED;
+    let placement = get_window_placement(hwnd)?;
+    let primary = get_primary_monitor_info()?;
+    let rect = normal_position_to_screen(
+        placement.normal_position,
+        primary.screen_rect,
+        primary.work_area,
+    );
+    let restores_maximized = placement.flags & WPF_RESTORETOMAXIMIZED.0 != 0;
+    Ok((rect, restores_maximized))
 }
 
 /// Write a window's placement (`SetWindowPlacement`).
@@ -1899,5 +1961,68 @@ mod tests {
     fn is_iconic_has_correct_signature() {
         let fn_ptr: fn(HWND) -> bool = is_iconic;
         let _ = fn_ptr; // Compile-time signature check.
+    }
+
+    // --- placement rect → screen rect ---
+
+    fn r(x: i32, y: i32, w: i32, h: i32) -> Rect {
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    /// A bottom (or right) taskbar leaves the work-area origin on the
+    /// screen origin: workspace coordinates are screen coordinates.
+    #[test]
+    fn normal_position_is_unchanged_with_a_bottom_taskbar() {
+        let screen = r(0, 0, 1920, 1080);
+        let work = r(0, 0, 1920, 1040);
+        assert_eq!(
+            normal_position_to_screen(r(100, 200, 800, 600), screen, work),
+            r(100, 200, 800, 600)
+        );
+        // A rect on a monitor left of the primary keeps its negative x.
+        assert_eq!(
+            normal_position_to_screen(r(-1500, 50, 640, 480), screen, work),
+            r(-1500, 50, 640, 480)
+        );
+    }
+
+    /// A top taskbar shifts workspace coordinates up by its thickness, a
+    /// left one shifts them left: the screen rect adds the offset back.
+    #[test]
+    fn normal_position_adds_the_work_area_offset_of_a_top_or_left_taskbar() {
+        let screen = r(0, 0, 1920, 1080);
+        let top = r(0, 40, 1920, 1040);
+        assert_eq!(
+            normal_position_to_screen(r(100, 0, 800, 600), screen, top),
+            r(100, 40, 800, 600)
+        );
+        let left = r(60, 0, 1860, 1080);
+        assert_eq!(
+            normal_position_to_screen(r(0, 100, 800, 600), screen, left),
+            r(60, 100, 800, 600)
+        );
+    }
+
+    /// The primary may itself sit at a non-zero origin (a monitor left of
+    /// it exists): only the work-area *offset* matters, never the origin.
+    #[test]
+    fn normal_position_uses_the_offset_not_the_primary_origin() {
+        let screen = r(1920, 0, 1920, 1080);
+        let work = r(1920, 40, 1920, 1040);
+        assert_eq!(
+            normal_position_to_screen(r(2000, 100, 800, 600), screen, work),
+            r(2000, 140, 800, 600)
+        );
+    }
+
+    /// `restored_geometry` on a dead handle fails instead of inventing a rect.
+    #[test]
+    fn restored_geometry_fails_for_an_invalid_hwnd() {
+        assert!(restored_geometry(invalid_hwnd()).is_err());
     }
 }
