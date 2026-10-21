@@ -56,6 +56,7 @@ Not every field can change at runtime. Reload applies **live** fields in place;
 | `animation.*` | New duration / easing / enabled flag applies to the next animation. |
 | `navigation.edge_hop` | Applies to the next `focus` / `move-window` at a strip edge. |
 | `adopt_maximized` | Applies to the next maximized window the daemon meets (a window already parked as ignored is adopted when it is next focused, shown or moved). |
+| `floating.always_on_top` | Immediate: turned on, every floating window and every rule-ignored window is raised above the tiles; turned off, they go back to the normal z-order (a window that was "always on top" by itself keeps that). |
 | **Workspace count (10), monitor geometry** | **Structural** — not reloadable. Restart the daemon. |
 
 What is preserved across reload: the user's arranged layout (columns, rows,
@@ -291,18 +292,19 @@ unfocused_color = "#555555"
 floating_color = "#AA00FF"
 ```
 
-### `[floating]` — default floating window size
+### `[floating]` — floating windows
 
-Both fields optional. When unset, the daemon falls back to a built-in policy:
-60% × 80% of the monitor work area, capped at roughly 1536 × 1152 (QHD-derived)
-so ultrawide / 4K monitors don't produce absurdly large popups. An explicit
-pixel value below is always respected as-is — the cap applies only to the
-fallback path.
+The two size fields are optional. When unset, the daemon falls back to a
+built-in policy: 60% × 80% of the monitor work area, capped at roughly
+1536 × 1152 (QHD-derived) so ultrawide / 4K monitors don't produce absurdly
+large popups. An explicit pixel value below is always respected as-is — the
+cap applies only to the fallback path.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `default_width` | `Option<u32>` | `None` | Explicit default width (pixels) for newly floated windows. |
 | `default_height` | `Option<u32>` | `None` | Explicit default height (pixels) for newly floated windows. |
+| `always_on_top` | `bool` | `false` | The **floating layer**, as in niri: floating windows always sit above the tiled windows, even when a tiled window has the focus, so a dialog is never hidden behind the strip and never has to be hunted for. Applies to every floating window and to every window your rules ignore (`Ignored::ExplicitRule` — dialogs, popups, File Explorer through a bundled rule); not to windows ignored because they are maximized or fullscreen, nor to minimized or hidden ones (they are raised again when restored or shown). Implemented with Windows' "topmost" band (`WS_EX_TOPMOST`): a window leaves it when it is tiled, minimized, hidden or put fullscreen (`set-window fullscreen` keeps its own window topmost; a float and a fullscreen window then stack by whichever was activated last), on `flow dispatch tiling off`, on `flow stop` and in a fail-back; a window that was already "always on top" on its own keeps that flag. If an app clears the flag itself, FlowWM puts it back within a quarter second. Notification toasts are topmost anyway. `flow query all` reports `on_top` per window. `false` = a focused tile covers the floats (stock behaviour). |
 
 Example:
 
@@ -310,6 +312,7 @@ Example:
 [floating]
 default_width = 1200
 default_height = 800
+always_on_top = true
 ```
 
 ### `[focus]` — foreground reconciliation

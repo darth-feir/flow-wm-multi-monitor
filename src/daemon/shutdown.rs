@@ -17,7 +17,9 @@
 //!    bounded wait in between, so a late frame cannot undo it. The pass
 //!    also maximizes again every window the daemon had un-maximized to
 //!    manage (`Window::adopted_from_maximized`), so the desktop is handed
-//!    back as the user had it.
+//!    back as the user had it, and takes every window out of the floating
+//!    layer (`[floating] always_on_top`, `daemon::top_layer`), putting the
+//!    topmost flag it had back.
 //! 3. Drop every border overlay (`DestroyWindow`).
 //! 4. Stop the hook thread (`WM_QUIT`).
 //! 5. Kill the hotkey script and remove its pidfile, releasing the Win key.
@@ -233,6 +235,10 @@ impl FlowWM {
 
     /// One rescue pass over the current registry and monitor geometry.
     fn rescue_stranded_windows_pass(&mut self) -> usize {
+        // The floating layer: every window the daemon holds in the topmost
+        // band goes back to the flag it had (`daemon::top_layer`), whatever
+        // `[floating] always_on_top` says.
+        let _ = self.release_top_layer();
         // Fullscreen windows: the topmost flag is the daemon's and must not
         // outlive it; the window itself goes back inside its work area.
         for (hwnd, rect) in self.demote_all_fullscreen_to_floats() {

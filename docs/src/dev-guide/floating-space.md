@@ -432,6 +432,58 @@ and the restore hook re-asserts the screen rect and the topmost flag; destroy
 drops it; `tiling off` and the shutdown rescue demote every fullscreen window
 to a float inside its work area and clear the topmost flag.
 
+## The floating layer (`[floating] always_on_top`)
+
+niri keeps its floating windows above the tiled strip at all times. FlowWM
+does the same with `[floating] always_on_top = true` (`src/daemon/top_layer.rs`):
+the only z-order band above ordinary windows on Windows is the **topmost
+band** (`WS_EX_TOPMOST`), so the layer's members are kept there with
+`SetWindowPos(HWND_TOPMOST, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)`. An
+activated tile goes to the top of the *non*-topmost band, so the floats stay
+above it.
+
+**Membership** (`in_top_layer`, pure): a tracked `Floating(Active)` window
+or a tracked `Ignored(ExplicitRule)` window (a dialog or popup the user's
+rules keep out of the strip but still want to see). `layer_wanted` adds the
+daemon conditions: the option on, tiling on, and not a window the daemon put
+fullscreen — the fullscreen code owns that flag, so a float that goes
+fullscreen leaves the layer first and re-enters through `register_float`
+when it comes back; a float and a fullscreen window are both topmost and
+stack by whichever was activated last. Minimized / hidden floats are out
+until restored / shown; `Ignored(Maximized|Fullscreen)` windows and
+untracked windows are never touched.
+
+**Bookkeeping** lives on the `Window` record: `on_top` (the daemon holds the
+window in the layer; `on_top` in `flow query all`) and `was_topmost` (the
+flag the window had before it entered — a window that was topmost on its
+own is left topmost when it leaves; one the daemon raised is lowered with
+`HWND_NOTOPMOST`; the daemon never clears a flag it did not set).
+
+**Transitions** all end in `FlowWM::sync_top_layer(hwnd)`, which compares
+`layer_wanted` with `on_top` and applies the one step `layer_step` decides —
+`Enter { raise }`, `Leave { restore_to }` or `Reassert` — reading the
+ex-style only for a window that is wanted or held:
+
+| Transition | Where | Step |
+|------------|-------|------|
+| Window becomes a float (toggle, rule at creation, startup adoption, adopt from ignored, restore of a float registered minimized, back from fullscreen, moved to another monitor) | `register_float` | enter |
+| Window registered / recovered as `Ignored(ExplicitRule)` | `on_window_created`, `on_window_state_change`, the startup `sync_all_top_layer` | enter |
+| Float restored or shown | `on_window_restored`, `on_window_shown` (after the fullscreen re-assert) | enter |
+| `tiling on`, config reload turning the option on, loadout load, display change | `sync_all_top_layer` | enter |
+| `set-window tile` / `cycle`, adopt an ignored window as a tile | `set_window_to_tile`, `adopt_ignored_as_tile` | leave |
+| Float minimized or hidden | `on_window_minimized`, `on_window_hidden` | leave |
+| Float goes fullscreen | `set_window_to_fullscreen` (before the fullscreen code raises it) | leave |
+| `tiling off`, config reload turning the option off | `sync_all_top_layer` | leave |
+| `flow stop`, fail-back, session end | `release_top_layer` in the shutdown rescue pass | leave, whatever the option says |
+| Destroyed | — | nothing (the record goes) |
+| A member Windows demoted (an app clearing the flag on activation) | `on_focus_changed` for the activated window; `reassert_top_layer` from the main loop once per `[focus] foreground_sync_interval_ms`, over the held windows only | re-assert |
+
+The Win32 side (`is_topmost` / `set_topmost`) is behind `TopmostProbe`; the
+tiling on/off probe extends it, so the pause (`released_on_top`) and the
+resume (`raised_on_top`) are covered by the mock desktop. The startup-failure
+rescue (`rescue_stranded_windows_with`, before a `FlowWM` exists) needs no
+release: the layer is first applied after the initial layout, in `FlowWM::new`.
+
 ## Future Work
 
 Several enhancements are planned but not yet implemented:
@@ -441,9 +493,6 @@ Several enhancements are planned but not yet implemented:
 - **Per-window float size memory** — remember each window's last floating
   rect and restore it on subsequent tile→float transitions, rather than
   re-centering every time.
-- **Z-order raising** — use `place_above` (via `SetWindowPos` with
-  `HWND_TOPMOST` / restore) to bring the focused floating window to the top
-  of the z-order, matching the expected "click to focus" behavior.
 - **Floating gap management** — reserve padding around floating windows so
   they don't visually collide with tiled windows at workspace edges.
 

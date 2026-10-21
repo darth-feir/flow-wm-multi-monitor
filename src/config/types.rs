@@ -838,15 +838,19 @@ impl Default for FocusConfig {
     }
 }
 
-/// Floating window size configuration.
+/// Floating window configuration (`[floating]`).
 ///
-/// Both fields are optional explicit pixel sizes. When a field is `None`, the
-/// daemon falls back to a built-in policy: 60% × 80% of the monitor work area,
-/// capped so ultrawide / 4K monitors don't produce absurdly large popups. The
-/// fallback constants live in `src/daemon/dispatch.rs` (the sole consumer).
+/// The two size fields are optional explicit pixel sizes. When a field is
+/// `None`, the daemon falls back to a built-in policy: 60% × 80% of the
+/// monitor work area, capped so ultrawide / 4K monitors don't produce
+/// absurdly large popups. The fallback constants live in
+/// `src/daemon/dispatch.rs` (the sole consumer).
 ///
 /// An explicit pixel value is always respected as-is — the cap applies only to
 /// the fallback path.
+///
+/// [`always_on_top`](Self::always_on_top) is the niri-style **floating
+/// layer**: floats stay above the tiled strip.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct FloatingConfig {
@@ -856,6 +860,18 @@ pub struct FloatingConfig {
     /// Explicit default float height in pixels. `None` → built-in fallback.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_height: Option<i32>,
+    /// Whether floating windows always sit **above the tiled windows**, as
+    /// in niri: every active float, and every window an explicit rule
+    /// ignores (dialogs and popups the user still wants to see), is kept in
+    /// the topmost band of the z-order (`HWND_TOPMOST`) while tiling is on,
+    /// so a dialog is never hidden behind a tile and never has to be hunted
+    /// for — even when a tiled window has the focus. A window leaves the
+    /// layer when it is tiled, minimized, hidden, put fullscreen, when
+    /// tiling is turned off and when the daemon stops; a window that was
+    /// already topmost on its own keeps that flag. Off by default (upstream
+    /// behaviour: a focused tile covers the floats). Live-reloadable. See
+    /// `daemon::top_layer`.
+    pub always_on_top: bool,
 }
 
 /// Tile-drag configuration.
@@ -1179,6 +1195,7 @@ strategy = "original_slot"
             floating: FloatingConfig {
                 default_width: Some(1200),
                 default_height: Some(800),
+                always_on_top: true,
             },
             focus: FocusConfig {
                 foreground_sync_interval_ms: 400,
@@ -1881,12 +1898,31 @@ default_action = "foobar"
     // omitted keys parse to `None`.
 
     /// Positive: `FloatingConfig::default()` is `{None, None}` — both fields
-    /// are optional, so the daemon's built-in fallback applies.
+    /// are optional, so the daemon's built-in fallback applies — and the
+    /// floating layer is off (upstream behaviour).
     #[test]
     fn floating_config_default_is_none_none() {
         let cfg = FloatingConfig::default();
         assert_eq!(cfg.default_width, None);
         assert_eq!(cfg.default_height, None);
+        assert!(!cfg.always_on_top, "the floating layer is opt-in");
+    }
+
+    /// `[floating] always_on_top` parses, round-trips, and does not disturb
+    /// the size keys.
+    #[test]
+    fn floating_config_always_on_top_parses_and_roundtrips() {
+        let parsed: FlowConfig =
+            toml::from_str("[floating]\nalways_on_top = true\n").expect("parse");
+        assert!(parsed.floating.always_on_top);
+        assert_eq!(parsed.floating.default_width, None);
+        let reserialized = toml::to_string(&parsed).expect("serialize");
+        let reparsed: FlowConfig = toml::from_str(&reserialized).expect("deserialize");
+        assert!(reparsed.floating.always_on_top);
+        // The key belongs to [floating]: at the top level it is not the
+        // same key.
+        let parsed: FlowConfig = toml::from_str("always_on_top = true\n").expect("parse");
+        assert!(!parsed.floating.always_on_top);
     }
 
     /// Positive: explicit `Some(pixel)` values survive TOML serialize →
@@ -1918,6 +1954,7 @@ default_height = 800
         let parsed: FlowConfig = toml::from_str(toml_str).expect("parse");
         assert_eq!(parsed.floating.default_width, None);
         assert_eq!(parsed.floating.default_height, None);
+        assert!(!parsed.floating.always_on_top);
         // The rest of the config still comes from compiled defaults.
         assert_eq!(parsed, FlowConfig::default());
     }

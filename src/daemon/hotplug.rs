@@ -848,6 +848,9 @@ impl FlowWM {
         self.reseat_fullscreen_after_hotplug();
         self.seat_all_monitors_instantly();
         self.rebuild_float_hwnds();
+        // A fullscreen window whose display vanished became a plain float:
+        // it enters the floating layer like any float.
+        self.sync_all_top_layer();
 
         // Restores never activate, but push the foreground once to where the
         // registry says it belongs so a restore cannot have left it elsewhere.

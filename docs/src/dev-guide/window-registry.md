@@ -13,8 +13,11 @@ single struct that owns:
 
 - A `HashMap<isize, Window>` — the authoritative map of HWND values (as `isize`
   for `Send` safety) to per-window metadata: exe name, title, class, process
-  path, classification state, pre-manage rect, invisible bounds, and virtual-slot
-  position.
+  path, classification state, pre-manage rect, invisible bounds, virtual-slot
+  position, and the floating-layer bookkeeping (`on_top`: the daemon holds the
+  window in the topmost band for `[floating] always_on_top`; `was_topmost`:
+  the flag it had before, put back when it leaves — see
+  [Floating Space](./floating-space.md#the-floating-layer-floating-always_on_top)).
 - A `ClassificationPipeline` — pre-compiled user rules, default rules, and a
   fallback action, used to classify every new window.
 - A `focused` field tracking the currently focused window.

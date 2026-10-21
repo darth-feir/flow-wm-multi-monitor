@@ -1750,6 +1750,8 @@ impl FlowWM {
         self.remember_monitor(focused, idx);
         // Syncs the registry's slots and tiled rects too.
         self.animate_layout_on(idx, &applied);
+        // An explicit-rule ignore that was in the floating layer leaves it.
+        self.sync_top_layer(focused.0);
         self.refresh_border_for(focused.0);
         SocketResponse::Ok
     }
@@ -1886,6 +1888,9 @@ impl FlowWM {
         }
         self.remember_monitor(focused, idx);
         add_float_hwnd(focused.0);
+        // The floating layer (`[floating] always_on_top`): every path that
+        // makes a float goes through here, so this is where it enters.
+        self.sync_top_layer(focused.0);
         self.monitors[idx]
             .active_workspace_mut()
             .floating
@@ -1954,6 +1959,10 @@ impl FlowWM {
         //    Tiling(Active { col, row }) — no manual write needed.
         self.registry.update_tiling_slots_from_layout(&dest_virtual);
         self.registry.update_tiled_rects(&dest_actual);
+
+        // A tile is not in the floating layer: out of the topmost band
+        // (back to the flag it had before it floated).
+        self.sync_top_layer(focused.0);
 
         // Re-sync the toggled window's border: the registry state just flipped
         // Floating→Tiling, so refresh_border_for re-resolves color. Tiled
@@ -2032,6 +2041,10 @@ impl FlowWM {
 
         // Re-assert border colors/thickness for the new border config.
         self.refresh_all_border_styles();
+
+        // `[floating] always_on_top` turned on or off: every float and
+        // explicit-rule ignore enters or leaves the floating layer.
+        self.sync_all_top_layer();
 
         // Apply the new animation timing.
         self.animator

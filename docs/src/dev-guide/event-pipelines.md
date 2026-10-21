@@ -281,6 +281,14 @@ Restored windows are appended at the far right of the canvas rather than
 inserted at the old position. This avoids the complexity of tracking and
 restoring saved virtual slots for all cases (minimize + destroy interleaving).
 
+With `[floating] always_on_top`, the minimize / hide handlers take a float out
+of the floating layer and the restore / show handlers put it back
+(`FlowWM::sync_top_layer`, run after the fullscreen re-assert so a fullscreen
+window is left to the fullscreen code); the created and state-change handlers
+put a window registered or recovered as a float or an explicit-rule ignore in,
+and the foreground handler raises an activated member again if its app
+demoted it. See [Floating Space](./floating-space.md#the-floating-layer-floating-always_on_top).
+
 ### Foreground (`EVENT_SYSTEM_FOREGROUND`)
 
 | Condition | Action |

@@ -461,6 +461,7 @@ impl FlowWM {
             float_resume_deadline: None,
             drag_state: None,
             last_foreground_sync: std::time::Instant::now(),
+            last_top_layer_reassert: std::time::Instant::now(),
             topology_deadline: None,
             topology_first_report: None,
             topology_retries: 0,
@@ -480,6 +481,10 @@ impl FlowWM {
         // (InterruptPolicy::RetargetFromCurrent). The windows are already where
         // they should be, so adoption-in-place is both safe and non-disruptive.
         manager.populate_existing_floats();
+        // The floating layer (`[floating] always_on_top`): the floats just
+        // adopted entered it in `register_float`; this picks up the windows
+        // the scan registered as ignored by an explicit rule.
+        manager.sync_all_top_layer();
         // Initial border overlay attach for windows found during the scan.
         // Idempotent and O(N) where N = tracked windows. Runs after
         // populate_existing_floats so float overlays seat at the adopted rect.
@@ -574,6 +579,7 @@ impl FlowWM {
             float_resume_deadline: None,
             drag_state: None,
             last_foreground_sync: std::time::Instant::now(),
+            last_top_layer_reassert: std::time::Instant::now(),
             topology_deadline: None,
             topology_first_report: None,
             topology_retries: 0,

@@ -50,7 +50,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CYSCREEN, SW_MAXIMIZE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SetForegroundWindow, SetWindowPlacement, SetWindowPos, ShowWindow,
     WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT, WM_CLOSE, WS_CAPTION, WS_EX_APPWINDOW,
-    WS_EX_TOOLWINDOW, WS_THICKFRAME,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_THICKFRAME,
 };
 use windows::core::PWSTR;
 
@@ -919,10 +919,27 @@ pub fn close_window(hwnd_val: isize) -> bool {
     queued.is_ok()
 }
 
+/// Whether `hwnd_val` is in the topmost band of the z-order right now
+/// (`WS_EX_TOPMOST` in its extended style). One `GetWindowLongW` read;
+/// `false` for a handle that is gone or from a unit test.
+///
+/// Read before [`set_topmost`] by the floating layer so a window that is
+/// already where it should be costs no `SetWindowPos`, and so the flag a
+/// window had before the daemon touched it can be remembered and put back.
+#[must_use]
+pub fn is_topmost(hwnd_val: isize) -> bool {
+    let hwnd = HWND(hwnd_val as *mut _);
+    // SAFETY: GetWindowLongW on a stale handle returns 0 (and sets the last
+    // error), which reads as "not topmost".
+    let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };
+    WINDOW_EX_STYLE(ex_style as u32) & WS_EX_TOPMOST != WINDOW_EX_STYLE(0)
+}
+
 /// Put `hwnd_val` in (or take it out of) the topmost band of the z-order
 /// (`HWND_TOPMOST` / `HWND_NOTOPMOST`), without moving, resizing or
 /// activating it. Used for `set-window fullscreen`, whose window must stay
-/// above the tiles it covers.
+/// above the tiles it covers, and by the floating layer
+/// (`[floating] always_on_top`, `daemon::top_layer`).
 ///
 /// Returns `false` (logged at `debug`) when `SetWindowPos` fails — a window
 /// that vanished, or a handle from a unit test.
@@ -1989,6 +2006,14 @@ mod tests {
     // --- is_iconic tests ---
 
     /// Positive: `is_iconic` exists and has the correct `fn(HWND) -> bool` signature.
+    #[test]
+    fn is_topmost_is_false_for_an_invalid_handle() {
+        // A dead handle has no ex-style: never "topmost", never a panic.
+        assert!(!is_topmost(0));
+        assert!(!is_topmost(0x1234_5678));
+        let _set: fn(isize, bool) -> bool = set_topmost;
+    }
+
     #[test]
     fn is_iconic_has_correct_signature() {
         let fn_ptr: fn(HWND) -> bool = is_iconic;

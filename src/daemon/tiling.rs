@@ -103,6 +103,7 @@ use crate::workspace::WorkspaceParking;
 
 use super::hotplug::{TopologyProbe, TopologySnapshot, Win32Topology};
 use super::shutdown::RescueMonitor;
+use super::top_layer::TopmostProbe;
 use super::types::{FlowWM, monitor_index_for_rect_in};
 
 /// The error every layout-mutating command is answered with while tiling
@@ -111,8 +112,10 @@ pub const TILING_OFF_MESSAGE: &str = "tiling is off (flow dispatch tiling on)";
 
 /// The Win32 questions the pause and the resume ask, behind a trait so
 /// both passes run against a mock desktop in unit tests. The topology half
-/// ([`TopologyProbe`]) serves the deferred display-change reconcile.
-pub(super) trait TilingProbe: TopologyProbe {
+/// ([`TopologyProbe`]) serves the deferred display-change reconcile, the
+/// topmost half ([`TopmostProbe`]) the floating layer every float leaves
+/// on pause and re-enters on resume.
+pub(super) trait TilingProbe: TopologyProbe + TopmostProbe {
     /// Re-scan the top-level windows into `registry`
     /// ([`WindowRegistry::scan_existing_windows`]).
     fn scan_windows(&self, registry: &mut WindowRegistry) -> Result<(), String>;
@@ -167,6 +170,16 @@ impl TopologyProbe for Win32Tiling {
 
     fn is_window(&self, hwnd: isize) -> bool {
         Win32Topology.is_window(hwnd)
+    }
+}
+
+impl TopmostProbe for Win32Tiling {
+    fn is_topmost(&self, hwnd: isize) -> bool {
+        registry_win32::is_topmost(hwnd)
+    }
+
+    fn set_topmost(&self, hwnd: isize, topmost: bool) -> bool {
+        registry_win32::set_topmost(hwnd, topmost)
     }
 }
 
@@ -230,6 +243,8 @@ pub struct PauseSummary {
     pub minimized_fixed: usize,
     /// Border overlays dropped.
     pub borders: usize,
+    /// Windows taken out of the floating layer (`[floating] always_on_top`).
+    pub released_on_top: usize,
 }
 
 /// What one resume did, for the log line and the tests.
@@ -253,6 +268,8 @@ pub struct ResumeSummary {
     pub unmaximized: usize,
     /// Animator targets submitted by the final instant seating.
     pub targets: usize,
+    /// Windows put into the floating layer (`[floating] always_on_top`).
+    pub raised_on_top: usize,
 }
 
 /// The instant batch a pause submits, plus the counts behind it.
@@ -465,6 +482,9 @@ impl FlowWM {
         // No un-maximizing while the desktop is Windows' to arrange.
         self.registry.set_adopt_maximized(false);
         self.write_tiling_status(false);
+        // 6. The floating layer: every float back in the normal z-order
+        //    (the flag it had before is put back).
+        let released_on_top = self.sync_all_top_layer_with(probe).left;
 
         let summary = PauseSummary {
             already_paused: false,
@@ -474,15 +494,17 @@ impl FlowWM {
             remaximized,
             minimized_fixed,
             borders,
+            released_on_top,
         };
         log::info!(
-            "tiling: off — {} tile(s) moved on-screen ({} to their pre-tiling rect), {} float(s) clamped, {} window(s) maximized again, {} minimized placement(s) fixed, {} border(s) dropped; layout-mutating commands are refused until `flow dispatch tiling on`",
+            "tiling: off — {} tile(s) moved on-screen ({} to their pre-tiling rect), {} float(s) clamped, {} window(s) maximized again, {} minimized placement(s) fixed, {} border(s) dropped, {} window(s) out of the floating layer; layout-mutating commands are refused until `flow dispatch tiling on`",
             summary.tiles,
             summary.restored,
             summary.floats_clamped,
             summary.remaximized,
             summary.minimized_fixed,
-            summary.borders
+            summary.borders,
+            summary.released_on_top
         );
         summary
     }
@@ -788,8 +810,11 @@ impl FlowWM {
 
         self.tiling_paused = false;
         self.write_tiling_status(true);
+        // 7. The floating layer: every float and explicit-rule ignore above
+        //    the tiles again (`[floating] always_on_top`).
+        summary.raised_on_top = self.sync_all_top_layer_with(probe).entered;
         log::info!(
-            "tiling: on — {} monitor(s), {} tile(s) kept their seat, {} appended, {} float(s) seated or refreshed, {} vanished window(s) dropped, {} window(s) un-maximized again, {} target(s) seated{}",
+            "tiling: on — {} monitor(s), {} tile(s) kept their seat, {} appended, {} float(s) seated or refreshed, {} vanished window(s) dropped, {} window(s) un-maximized again, {} target(s) seated, {} window(s) into the floating layer{}",
             summary.monitors,
             summary.kept,
             summary.appended,
@@ -797,6 +822,7 @@ impl FlowWM {
             summary.dropped,
             summary.unmaximized,
             summary.targets,
+            summary.raised_on_top,
             if summary.topology_reconciled {
                 " (display change reconciled first)"
             } else {
@@ -1019,6 +1045,25 @@ mod tests {
         maximized: RefCell<Vec<isize>>,
         /// Every `SW_SHOWNOACTIVATE` restore issued, in order.
         restored: RefCell<Vec<isize>>,
+        /// Handles whose ex-style says `WS_EX_TOPMOST`.
+        topmost: RefCell<HashSet<isize>>,
+        /// Every `HWND_TOPMOST` / `HWND_NOTOPMOST` issued, in order.
+        topmost_calls: RefCell<Vec<(isize, bool)>>,
+    }
+
+    impl TopmostProbe for MockDesktop {
+        fn is_topmost(&self, hwnd: isize) -> bool {
+            self.topmost.borrow().contains(&hwnd)
+        }
+        fn set_topmost(&self, hwnd: isize, topmost: bool) -> bool {
+            self.topmost_calls.borrow_mut().push((hwnd, topmost));
+            if topmost {
+                self.topmost.borrow_mut().insert(hwnd);
+            } else {
+                self.topmost.borrow_mut().remove(&hwnd);
+            }
+            true
+        }
     }
 
     impl TopologyProbe for MockDesktop {
@@ -1198,6 +1243,7 @@ mod tests {
                 remaximized: 0,
                 minimized_fixed: 1,
                 borders: 0,
+                released_on_top: 0,
             }
         );
         assert!(flow.tiling_paused);
@@ -1320,6 +1366,46 @@ mod tests {
                 .iter()
                 .any(|e| e.window_id == WindowId(C))
         );
+    }
+
+    /// With `[floating] always_on_top`, the pause takes every float out of
+    /// the floating layer (a float that was topmost on its own keeps the
+    /// flag) and the resume puts them back, the parked one included.
+    #[test]
+    fn pause_releases_the_floating_layer_and_resume_raises_it_again() {
+        let mut flow = fixture();
+        flow.config.borders.enabled = false;
+        flow.config.floating.always_on_top = true;
+        // G was topmost by itself before the daemon met it.
+        let probe = desktop();
+        probe.topmost.borrow_mut().insert(G);
+        let raised = flow.sync_all_top_layer_with(&probe);
+        assert_eq!(raised.entered, 2, "F and G");
+        assert_eq!(*probe.topmost_calls.borrow(), vec![(F, true)]);
+        let held = |flow: &FlowWM, hwnd: isize| {
+            flow.registry
+                .get_window(HWND(hwnd as *mut _))
+                .is_some_and(|w| w.on_top)
+        };
+        assert!(held(&flow, F) && held(&flow, G) && !held(&flow, A));
+
+        let summary = flow.pause_tiling_with(&probe);
+        assert_eq!(summary.released_on_top, 2);
+        assert!(!held(&flow, F) && !held(&flow, G));
+        assert!(!probe.is_topmost(F), "raised by the daemon: lowered");
+        assert!(probe.is_topmost(G), "topmost on its own: kept");
+        assert_eq!(
+            *probe.topmost_calls.borrow(),
+            vec![(F, true), (F, false)],
+            "G needed no call either way"
+        );
+
+        let d = desktop();
+        d.topmost.borrow_mut().insert(G);
+        let summary = flow.resume_tiling_with(&d);
+        assert_eq!(summary.raised_on_top, 2);
+        assert!(held(&flow, F) && held(&flow, G) && !held(&flow, A));
+        assert_eq!(*d.topmost_calls.borrow(), vec![(F, true)]);
     }
 
     #[test]

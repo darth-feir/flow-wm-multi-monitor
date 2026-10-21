@@ -52,6 +52,9 @@
 //!   on-screen, borders dropped, daemon inert) and resume (rebuild from the
 //!   live desktop) without stopping the daemon
 //!   ([`FlowWM::pause_tiling`], [`FlowWM::resume_tiling`])
+//! - `top_layer` — the floating layer (`[floating] always_on_top`): floats
+//!   and explicit-rule-ignored windows kept in the topmost band above the
+//!   tiles, entered and left with the window's state
 //!
 //! The threading model, the hook/IPC event pipelines, and per-event behavior
 //! tables are documented with sequence diagrams in the developer guide
@@ -75,6 +78,7 @@ pub mod session;
 pub(crate) mod shutdown;
 pub mod startup;
 mod tiling;
+mod top_layer;
 mod types;
 mod width_preset;
 

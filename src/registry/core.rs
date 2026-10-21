@@ -780,6 +780,9 @@ impl WindowRegistry {
     ///   - `pre_manage_rect`: position before flow touched the window
     ///   - `adopted_from_maximized`: whether flow un-maximized the window to
     ///     manage it (it is handed back maximized)
+    ///   - `on_top`: whether the daemon currently holds the window in the
+    ///     floating layer (`[floating] always_on_top`, see
+    ///     [`Window::on_top`])
     /// - `viewport_offset`: camera position on the virtual canvas
     /// - `focused`: the focused HWND value (or null)
     /// - `count`: number of tracked windows
@@ -859,6 +862,7 @@ impl WindowRegistry {
                         "height": w.pre_manage_rect.height,
                     }),
                     "adopted_from_maximized": w.adopted_from_maximized,
+                    "on_top": w.on_top,
                 })
             })
             .collect();
@@ -1840,6 +1844,46 @@ mod tests {
             w["window_rect"].is_null(),
             "window_rect should be null for invalid HWND (GetWindowRect fails)"
         );
+    }
+
+    /// Every entry reports `on_top` — whether the daemon holds the window
+    /// in the floating layer — straight from the record.
+    #[test]
+    fn to_json_value_reports_on_top() {
+        let (user, default) = default_rules();
+        let mut reg = WindowRegistry::new(&user, &default);
+        insert_test_window(
+            &mut reg,
+            0x11,
+            WindowState::Floating(FloatingState::Active {
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 10,
+                    height: 10,
+                },
+            }),
+        );
+        insert_test_window(
+            &mut reg,
+            0x22,
+            WindowState::Tiling(TilingState::Active { col: 0, row: 0 }),
+        );
+        if let Some(w) = reg.get_window_mut(HWND(0x11 as *mut _)) {
+            w.on_top = true;
+        }
+        let json = reg.to_json_value(0);
+        let on_top_of = |hwnd: i64| {
+            json["windows"]
+                .as_array()
+                .expect("windows")
+                .iter()
+                .find(|w| w["hwnd"] == hwnd)
+                .expect("listed")["on_top"]
+                .clone()
+        };
+        assert_eq!(on_top_of(0x11), serde_json::json!(true));
+        assert_eq!(on_top_of(0x22), serde_json::json!(false));
     }
 
     #[test]

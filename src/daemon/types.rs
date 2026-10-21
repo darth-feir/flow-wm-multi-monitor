@@ -235,6 +235,13 @@ pub struct FlowWM {
     /// rapid window churn. (`docs/src/dev-guide/event-pipelines.md`)
     pub(super) last_foreground_sync: std::time::Instant,
 
+    /// When the floating layer was last re-asserted
+    /// ([`reassert_top_layer`](super::FlowWM::reassert_top_layer)): the
+    /// main loop raises again any float Windows demoted from the topmost
+    /// band, once per `[focus] foreground_sync_interval_ms`. See
+    /// `daemon::top_layer`.
+    pub(super) last_top_layer_reassert: std::time::Instant,
+
     /// When the pending display-topology change settles and
     /// [`reconcile_monitors`](super::FlowWM::reconcile_monitors) runs.
     ///

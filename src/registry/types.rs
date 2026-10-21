@@ -245,6 +245,26 @@ pub struct Window {
     /// daemon seats the window. `false` for every window met visible.
     #[serde(default)]
     pub geometry_from_placement: bool,
+
+    /// Whether the daemon currently **holds this window in the floating
+    /// layer** — the topmost band of the z-order (`HWND_TOPMOST`), where
+    /// `[floating] always_on_top` keeps every active float and every
+    /// explicit-rule-ignored window so a dialog is never hidden behind the
+    /// tiles. Set when the window enters the layer and cleared when it
+    /// leaves (tiled, minimized, hidden, fullscreen, `tiling off`, `flow
+    /// stop`, the option turned off); see `daemon::top_layer`. Reported as
+    /// `on_top` by `flow query all`. `false` while the option is off.
+    #[serde(default)]
+    pub on_top: bool,
+
+    /// The `WS_EX_TOPMOST` flag the window had **before** the daemon put it
+    /// in the floating layer, meaningful only while [`on_top`](Self::on_top)
+    /// is set. A window that was topmost on its own (some apps' "always on
+    /// top" option) is left topmost when it leaves the layer; one the daemon
+    /// raised is lowered again (`HWND_NOTOPMOST`). The daemon never clears a
+    /// flag it did not set.
+    #[serde(default)]
+    pub was_topmost: bool,
 }
 
 // SAFETY: `Window` contains `HWND` (a raw pointer), but we treat it as an
@@ -305,6 +325,8 @@ impl Window {
             pre_tiling_rect: None,
             adopted_from_maximized: false,
             geometry_from_placement: false,
+            on_top: false,
+            was_topmost: false,
         }
     }
 }

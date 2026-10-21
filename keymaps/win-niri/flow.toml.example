@@ -31,3 +31,10 @@ max_rows = 4
 # the other screen is reached explicitly with Mod+Ctrl+Arrows (focus) and Mod+Alt+Arrows (move).
 [navigation]
 edge_hop = false
+
+# The floating layer, as in niri: floating windows (Mod+V) and windows your rules ignore (dialogs,
+# popups) always sit above the tiled windows, even when a tile has the focus, so a dialog is never
+# hidden behind the strip. They go back to the normal z-order when tiled, on `tiling off`
+# (Mod+Ctrl+T) and when the daemon stops; a window that was "always on top" by itself keeps that.
+[floating]
+always_on_top = true

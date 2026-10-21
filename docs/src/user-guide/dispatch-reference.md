@@ -259,6 +259,11 @@ flow dispatch set-window cycle
 
 Default hotkey: `Alt + t` (cycle).
 
+With [`[floating] always_on_top = true`](./config-reference.md#floating--floating-windows)
+a floated window sits **above the tiled windows** from then on, even while a
+tile has the focus; `set-window tile` puts it back in the normal z-order (a
+window that was "always on top" by itself keeps that).
+
 **Ignored windows are adopted.** A window FlowWM is not managing — because it
 was maximized or fullscreen when FlowWM met it (`flow query all` shows
 `Ignored::Maximized` / `Ignored::Fullscreen`), or because a rule ignores it
@@ -315,7 +320,10 @@ rect if it was a float, else centred). Closing it forgets it; minimizing and
 restoring brings it back fullscreen. `flow dispatch tiling off` hands it back
 as a plain float inside the work area, and `tiling on` keeps it a float.
 `flow query all` lists it with `"mode": "fullscreen"`. The choice is not
-learned (it never changes an app's tile/float rule).
+learned (it never changes an app's tile/float rule). A fullscreen window is
+topmost by itself; with `[floating] always_on_top` the floats share that
+band, so a float and a fullscreen window stack by whichever was activated
+last.
 
 ```powershell
 flow dispatch set-window fullscreen    # and again to come back
@@ -437,8 +445,9 @@ ignored window) is maximized again instead. Windows you open, close, minimize
 or drag meanwhile are plain Windows windows; a minimized window whose restore
 position was off-screen is fixed so it comes back on-screen. A fullscreen
 window (`set-window fullscreen`) is handed back as a plain float inside its
-work area. The daemon and the hotkey script keep running, so the same chord
-turns tiling back on.
+work area, and with `[floating] always_on_top` every floating window goes
+back to the normal z-order (`tiling on` raises them again). The daemon and
+the hotkey script keep running, so the same chord turns tiling back on.
 
 `tiling on` rebuilds the layout from what is on the desktop now: windows that
 were tiled before go back to the same monitor, workspace, column and row
@@ -500,7 +509,7 @@ A few other top-level commands are worth knowing:
 | `flow config edit` | Open the config directory in your editor. |
 | `flow config path` | Print the resolved config directory path. |
 | `flow config check` | Validate `flow.toml` / `flow-rules.toml` without loading them. |
-| `flow query all` | Dump every tracked window (state, `mode` — `tiled` / `floating` / `fullscreen` / `minimized` / `hidden` / `ignored` —, rect, column/row, …) as JSON, plus the monitors (each with its `width_preset`) and whether tiling is on (`tiling_enabled`). |
+| `flow query all` | Dump every tracked window (state, `mode` — `tiled` / `floating` / `fullscreen` / `minimized` / `hidden` / `ignored` —, `on_top` — whether FlowWM currently keeps it above the tiles (`[floating] always_on_top`) —, rect, column/row, …) as JSON, plus the monitors (each with its `width_preset`) and whether tiling is on (`tiling_enabled`). |
 | `flow enable-autostart [--ahk]` | Create the login shortcut in `shell:startup` (idempotent). |
 | `flow disable-autostart` | Remove the login shortcut (idempotent). |
 

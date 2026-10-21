@@ -22,6 +22,12 @@
 //! turns every fullscreen window into a plain float inside its work area
 //! (the origin is forgotten, so `tiling on` treats it as a float); the
 //! shutdown rescue clears the topmost flag.
+//!
+//! The floating layer (`[floating] always_on_top`, `daemon::top_layer`)
+//! lets go of a float that goes fullscreen — this module owns the topmost
+//! flag while the window is fullscreen — and takes it back when the window
+//! returns to a float (`register_float`). Both sit in the topmost band, so
+//! a float and a fullscreen window are ordered by which was activated last.
 
 use windows::Win32::Foundation::HWND;
 
@@ -160,6 +166,9 @@ impl FlowWM {
         let screen = self.monitors[idx].screen_rect();
         let float_actual = self.seat_fullscreen(focused, idx, ws_id, screen);
         self.fullscreen.insert(hwnd, origin);
+        // A float leaves the floating layer here (its original topmost
+        // flag put back): from now on the fullscreen code owns the flag.
+        self.sync_top_layer(hwnd);
         if !registry_win32::set_topmost(hwnd, true) {
             log::debug!("fullscreen: could not set hwnd {hwnd} topmost");
         }

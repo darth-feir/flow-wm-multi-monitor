@@ -705,6 +705,9 @@ impl FlowWM {
             self.animate_workspaces_on(mi, &batches, PrevRects::Snapshot(&prev_rects));
         }
         self.rebuild_float_hwnds();
+        // A window the loadout turned into a float (or a tile) changes its
+        // place in the floating layer.
+        self.sync_all_top_layer();
         log::info!("loadout load: restored layout from {resolved:?}");
         Ok(())
     }

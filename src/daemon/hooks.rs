@@ -154,6 +154,11 @@ impl FlowWM {
             let float_actual = self.register_float(WindowId(hwnd), float_rect);
             self.animate_workspaces(&[(float_actual, 0)]);
             self.reconcile_new_window_focus(hwnd);
+        } else if !was_tracked {
+            // A window freshly registered as ignored by an explicit rule (a
+            // dialog, a popup) enters the floating layer; the float above
+            // entered it in `register_float`. No-op for anything else.
+            self.sync_top_layer(hwnd);
         }
 
         // Report whether the window ended up tracked (classified) so the caller
@@ -315,6 +320,8 @@ impl FlowWM {
             self.remove_from_layout_and_refocus(WindowId(hwnd));
             self.forget_submitted(hwnd);
         }
+        // A minimized float leaves the floating layer (back in on restore).
+        self.sync_top_layer(hwnd);
         // Border overlay: registry now records Minimized ⇒ refresh detaches.
         self.refresh_border_for(hwnd);
     }
@@ -357,6 +364,8 @@ impl FlowWM {
             self.remove_from_layout_and_refocus(WindowId(hwnd));
             self.forget_submitted(hwnd);
         }
+        // A hidden float leaves the floating layer (back in when shown).
+        self.sync_top_layer(hwnd);
         // Border overlay: registry now records Hidden ⇒ refresh detaches.
         self.refresh_border_for(hwnd);
     }
@@ -557,6 +566,9 @@ impl FlowWM {
         // A fullscreen window comes back fullscreen (the registry restored
         // it as a float at its pre-manage rect).
         self.reassert_fullscreen(hwnd);
+        // A restored float is back in the floating layer (after the
+        // fullscreen check above: a fullscreen window is not a member).
+        self.sync_top_layer(hwnd);
         // Border overlay: registry now records Active ⇒ refresh re-attaches.
         self.refresh_border_for(hwnd);
     }
@@ -673,6 +685,8 @@ impl FlowWM {
         if change == VisibilityChange::Shown {
             self.reassert_fullscreen(hwnd);
         }
+        // A re-shown float is back in the floating layer.
+        self.sync_top_layer(hwnd);
         // Border overlay: registry now records Active ⇒ refresh re-attaches.
         // (The untracked-recovery branch above early-returns after
         // on_window_created, which performs its own refresh_border_for; this
@@ -753,6 +767,11 @@ impl FlowWM {
         let prev_focus = self.registry.focused().map(|id| id.0);
 
         self.registry.set_focused(hwnd);
+
+        // An activated float that an app demoted from the topmost band is
+        // raised again right away (one ex-style read for a member; nothing
+        // for a tile). The periodic pass is the backstop for the rest.
+        self.sync_top_layer(hwnd);
 
         let target = WindowId(hwnd);
 
@@ -885,6 +904,9 @@ impl FlowWM {
         if let ReclassifyResult::Recovered { now_tiling: true } = outcome {
             self.readd_tile_to_home_monitor(hwnd);
         }
+        // A window recovered as a float or as an explicit-rule ignore
+        // enters the floating layer.
+        self.sync_top_layer(hwnd);
         // Border overlay: covers all transitions — Ignored→Tiling (attach),
         // Tiling→Ignored (detach), and no-op cases.
         self.refresh_border_for(hwnd);

@@ -288,6 +288,11 @@ impl FlowWM {
             // wake adds only a microsecond-scale guard clause.
             self.reconcile_foreground();
 
+            // The floating layer's backstop: a float that Windows demoted
+            // from the topmost band is raised again. Rate-limited to the
+            // same interval; walks only the windows held in the layer.
+            self.reassert_top_layer();
+
             // Block until a hook event, an IPC client connection, OR a Win32
             // window message arrives. When there are pending window creations
             // or a float-resume deadline, use the sooner finite timeout so

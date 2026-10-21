@@ -122,15 +122,24 @@ focused_color = "#00AAFF"
 unfocused_color = "#555555"
 floating_color = "#AA00FF"
 
-# Floating window configuration (both fields optional).
+# Floating window configuration.
 #
-# When unset, the daemon falls back to a built-in policy: 60% × 80% of the
-# monitor work area, capped at ~1536 × 1152 (QHD-derived) so ultrawide / 4K
-# monitors don't produce absurdly large popups. An explicit pixel value below
-# is always respected as-is — the cap applies only to the fallback path.
+# Sizes (both optional): when unset, the daemon falls back to a built-in
+# policy: 60% × 80% of the monitor work area, capped at ~1536 × 1152
+# (QHD-derived) so ultrawide / 4K monitors don't produce absurdly large popups.
+# An explicit pixel value below is always respected as-is — the cap applies
+# only to the fallback path.
+#
+# - always_on_top: keep floating windows (and windows your rules ignore, such
+#   as dialogs) above the tiled windows, as niri does — even when a tiled
+#   window has the focus, so a dialog is never hidden behind a tile. They are
+#   put back in the normal z-order when tiled, when tiling is turned off and
+#   when FlowWM stops; a window that was already "always on top" by itself
+#   keeps that. false = a focused tile covers the floats (upstream behaviour).
 [floating]
 # default_width = 1200    # (optional) explicit default float width in pixels
 # default_height = 800    # (optional) explicit default float height in pixels
+always_on_top = false
 
 # Focus reconciliation settings.
 #
