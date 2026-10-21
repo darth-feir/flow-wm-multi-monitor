@@ -76,6 +76,15 @@ impl FlowWM {
         }
         let hwnd_handle = HWND(hwnd as *mut _);
 
+        // A minimize moves the window to its iconic (-32000, -32000) rect
+        // and fires LOCATIONCHANGE for it — sometimes before MINIMIZESTART
+        // has flipped the registry state below. Never record that rect: a
+        // float stored off the virtual screen is "clamped on-screen" at
+        // icon size by `tiling off` and the hotplug reconcile.
+        if registry_win32::is_iconic(hwnd_handle) {
+            return;
+        }
+
         // Read the window-rect (full, including invisible borders).
         let window_rect = match registry_win32::get_window_rect(hwnd_handle) {
             Ok(r) => r,
@@ -333,6 +342,7 @@ mod tests {
             is_visible: true,
             is_maximized: false,
             is_fullscreen: false,
+            is_iconic: false,
         };
         registry.register_window_from_info(&info);
         if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {
