@@ -27,7 +27,8 @@
 ;   Mod+Alt+T / Mod+Alt+Shift+T   Windows Terminal / Windows Terminal as admin (UAC)
 ;   Mod+Shift+/                   key-binding overlay (help.ahk); Esc or the same chord hides it
 ;   Mod+Ctrl+T                    tiling toggle: `flow dispatch tiling toggle`
-;   Mod+Shift+E                   stop FlowWM (and this script)
+;   Mod+Shift+E                   stop FlowWM (and this script); flow-resident.ahk, if it runs,
+;                                 starts FlowWM again with the same chord
 ;
 ; Tiling toggle: while tiling is off every window-management chord above
 ; (focus, move, monitors, workspaces, close, center, float, width, consume/

@@ -27,7 +27,7 @@ Bindings := [
     ["Mod+Alt+T / Mod+Alt+Shift+T", "Windows Terminal / Windows Terminal as admin"],
     ["Mod+Shift+/",                 "this help (Esc or the same chord hides it)"],
     ["Mod+Ctrl+T",                  "toggle tiling (off: Windows manages windows, chords fall through)"],
-    ["Mod+Shift+E",                 "stop FlowWM and this script"]
+    ["Mod+Shift+E",                 "stop FlowWM (same chord starts it again when flow-resident.ahk runs)"]
 ]
 
 ; Two columns: chord padded to the widest chord, then the description.
