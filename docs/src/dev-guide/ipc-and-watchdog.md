@@ -64,8 +64,10 @@ D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;<user SID>)
 
 A protected DACL with exactly three allow entries: SYSTEM and Builtin
 Administrators get full access, the user the daemon runs as gets generic
-read + write (what the client's `CreateFileW` asks for), and nobody else —
-no Everyone, no Authenticated Users — gets anything, so a process under
+read + write (what the client's `CreateFileW` asks for; on a pipe the
+write bit doubles as `FILE_CREATE_PIPE_INSTANCE`, so an ACL viewer shows
+`CreateNewInstance, ReadWrite` for the user), and nobody else — no
+Everyone, no Authenticated Users — gets anything, so a process under
 another local account gets `Access is denied` at open. The user's SID is
 read from the daemon's process token at startup (`OpenProcessToken` →
 `GetTokenInformation(TokenUser)` → `ConvertSidToStringSidW`) rather than

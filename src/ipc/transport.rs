@@ -609,9 +609,10 @@ impl Drop for PipeServer {
 /// - `(A;;GA;;;BA)` — Builtin Administrators: generic all.
 /// - `(A;;GRGW;;;<sid>)` — the daemon's own user: generic read + write,
 ///   which is exactly what `CreateFileW(GENERIC_READ | GENERIC_WRITE)` in
-///   the client asks for. No `FILE_CREATE_PIPE_INSTANCE` for anyone, so
-///   nobody can race the daemon for the name (the server is also
-///   `FIRST_PIPE_INSTANCE`).
+///   the client asks for. (On a named pipe `FILE_WRITE_DATA` is the same
+///   access bit as `FILE_CREATE_PIPE_INSTANCE`, so the user could also
+///   create further instances of the name — the same user the daemon runs
+///   as; the server's `FIRST_PIPE_INSTANCE` makes a second daemon fail.)
 ///
 /// The user is named by the SID of the process token rather than the
 /// creator-owner placeholder (`CO`), which is only substituted during ACL
