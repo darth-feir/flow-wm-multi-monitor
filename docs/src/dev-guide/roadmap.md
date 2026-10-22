@@ -18,7 +18,7 @@ features.
 | Classification + learned rules | ✅ Done | DWM-cloak/iconic/Alt-Tab/owner filters + 4-layer rule pipeline |
 | Animation | ✅ Done | 31 easing curves + `CubicBezier`, `RetargetFromCurrent`, `MockBackend` |
 | Graceful-shutdown rescue | ✅ Done | `rescue_stranded_windows` restores off-screen windows on clean exit |
-| Mouse-drag follow on tiled windows | 🜂 Near-term | tiled windows don't react to user drags today — looks broken |
+| Mouse-drag follow on tiled windows | ✅ Done | title-bar drag reorders live (`src/daemon/drag.rs`, [Tile Drag](./tile-drag.md)); the fork adds Mod + left-button drag anywhere in the window via keymap-driven sessions (`drag begin` / `drag end`, ADR-0011) |
 | `SwapWorkspace` animation | 🜂 Near-term | only workspace command still stubbed |
 | Remaining IPC stubs | 🜂 Near-term | `PlaceAbove`, `QueryState`, `CheckConfig`, `SetConfigValue`, `ForgetApp`/`ForgetAllApps` |
 | Floating enhancements | 🜂 Near-term | smart placement, size memory, z-order, gap mgmt |
@@ -28,7 +28,7 @@ features.
 | Monitor hotplug | ✅ Done | `WM_DISPLAYCHANGE` / `SPI_SETWORKAREA` debounced into one reconcile: monitors matched by handle → rect → primary, survivors re-projected in place, windows of a vanished display migrated to the monitor Windows reports for them (else the primary), owner memory remapped, everything re-seated instantly — see [IPC & fail-back](./ipc-and-watchdog.md#monitor-hotplug) |
 | Cloak parked windows (`DWMWA_CLOAK`) | ◷ Mid-term | read side exists; write side missing |
 | Watchdog + recovery snapshot | ◷ Mid-term | not started; gated on `flow`/`flowd` being complete |
-| Input hooks (DragSession etc.) | ◷ Aspirational | `src/input/` does not exist |
+| Input hooks (DragSession etc.) | ◷ Aspirational | `src/input/` does not exist; drag is covered from the keymap (ADR-0011), resize is not |
 | Coexistence warning | ◷ Aspirational | detect komorebi / GlazeWM at startup |
 
 ## Implemented Baseline
@@ -66,16 +66,14 @@ The wiring-heavy work is finished. The remaining near-term items close gaps
 in the IPC surface, make tiled windows feel responsive to direct
 manipulation, and round out the floating and workspace feature sets.
 
-### React to Mouse Dragging of Tiled Windows
+### React to Mouse Dragging of Tiled Windows (done)
 
-Today the daemon does not react when the user drags a tiled window with the
-mouse: the window is moved by the OS/application, but `flow` neither follows
-the drag live nor re-applies the tiled geometry, so the window visually
-detaches from its column until the next layout-changing command snaps it
-back. This looks broken. The fix is to detect the drag (via the existing
-`WinEvent` surface — `EVENT_OBJECT_LOCATIONCHANGE` on a managed tiled
-window) and either re-assert the tiled position or transition the window to
-floating for the duration of the drag.
+A title-bar drag of a tile is followed live: the other windows reflow to
+show the drop zone and the layout commits on release, entirely inside the
+tiling model ([Tile Drag](./tile-drag.md)). The fork adds niri's Mod +
+left-button drag from anywhere in the window: the keymap moves the window
+and brackets the gesture with `flow dispatch drag begin` / `drag end`, which
+put the daemon in the same drag state (ADR-0011).
 
 ### Workspace: SwapWorkspace
 
@@ -212,9 +210,10 @@ WinEvent hooks.
 
 ### Super+LMB Mouse Gestures
 
-Mouse gestures (drag to tile, drag to edge to snap, etc.) build on the
-`DragSession` infrastructure above and share its dependency on an
-unimplemented input hook.
+Super + left-button drag exists in the fork without an input hook: the
+AutoHotkey keymap owns the gesture and the daemon exposes `drag begin` /
+`drag end` sessions (ADR-0011). Resize gestures and anything that needs the
+daemon to see the mouse itself still depend on the input hook above.
 
 ### Coexistence Warning
 
