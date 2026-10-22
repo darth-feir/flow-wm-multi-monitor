@@ -188,6 +188,32 @@ impl AhkChild {
             AhkChild::Shell(h) => unsafe { WaitForSingleObject(*h, 0) != WAIT_OBJECT_0 },
         }
     }
+
+    /// The process handle we hold (valid while `self` lives).
+    fn handle(&self) -> HANDLE {
+        match self {
+            AhkChild::Job(c) => c.handle(),
+            AhkChild::Shell(h) => *h,
+        }
+    }
+
+    /// Terminate through the handle we already hold — never by re-opening
+    /// the pid, which Windows may have handed to another process by now.
+    /// `Ok(false)` when it had already exited.
+    fn terminate(&self) -> Result<bool, String> {
+        match self {
+            AhkChild::Job(c) => c.terminate(),
+            AhkChild::Shell(h) => {
+                if !self.is_running() {
+                    return Ok(false);
+                }
+                // SAFETY: the handle ShellExecuteExW gave us (full access).
+                unsafe { TerminateProcess(*h, 1) }
+                    .map(|()| true)
+                    .map_err(|e| format!("TerminateProcess failed: {e}"))
+            }
+        }
+    }
 }
 
 impl Drop for AhkChild {
@@ -221,11 +247,11 @@ impl AhkProcess {
 
     /// Terminate the script now and remove the pidfile.
     ///
-    /// Kills by pid (the same path `flow stop` uses) and then drops the job,
-    /// which also terminates anything the script spawned. Returns `true` if
-    /// a process was terminated.
+    /// Kills through the process handle held since the launch — the one
+    /// process this handle can name, whatever its pid means by now — then
+    /// drops the job. Returns `true` if a process was terminated.
     pub fn stop(self) -> bool {
-        let killed = match kill_process(self.pid) {
+        let killed = match self.child.terminate() {
             Ok(k) => k,
             Err(e) => {
                 log::warn!("stopping flow.ahk (pid {}): {e}", self.pid);
@@ -260,7 +286,9 @@ impl AhkProcess {
 ///    association points at a launcher that re-executes the real interpreter
 ///    and exits, that child is not inside the job.
 ///
-/// The pid is written to `<config_dir>/flow.ahk.pid` on both paths.
+/// The pid is written to `<config_dir>/flow.ahk.pid` on both paths, with
+/// the process's image path on a second line (see [`format_pidfile`]) so
+/// that [`stop_ahk_script_in`] only ever terminates that exact image.
 ///
 /// # Errors
 ///
@@ -354,17 +382,55 @@ pub fn launch_ahk_in_job(config_dir: &Path) -> Result<AhkProcess, String> {
         }
     };
 
-    if let Err(e) = fs::write(&pidfile, process.pid.to_string()) {
+    let image = process_image_path(process.child.handle());
+    if image.is_none() {
+        log::warn!(
+            "could not read the image path of flow.ahk's interpreter (pid {}); the pidfile will carry the pid only",
+            process.pid
+        );
+    }
+    if let Err(e) = fs::write(&pidfile, format_pidfile(process.pid, image.as_deref())) {
         log::warn!("failed to write AHK pidfile {}: {e}", pidfile.display());
     }
     Ok(process)
 }
 
+/// The pidfile text: the pid on the first line and, when known, the full
+/// image path of that process on the second. A pidfile with only a pid is
+/// what older daemons wrote; [`stop_ahk_script_in`] still honours it, with
+/// the weaker "is an AutoHotkey image" check.
+#[must_use]
+pub fn format_pidfile(pid: u32, image: Option<&str>) -> String {
+    match image {
+        Some(image) => format!("{pid}\n{image}\n"),
+        None => format!("{pid}\n"),
+    }
+}
+
+/// Parse a pidfile written by [`format_pidfile`] (or an old one holding a
+/// bare pid): `(pid, image path if recorded)`. `None` if the first line is
+/// not a number.
+#[must_use]
+pub fn parse_pidfile(text: &str) -> Option<(u32, Option<String>)> {
+    let mut lines = text.lines().map(str::trim);
+    let pid = lines.next()?.parse::<u32>().ok()?;
+    let image = lines.find(|l| !l.is_empty()).map(str::to_owned);
+    Some((pid, image))
+}
+
+/// `true` when a live process's image path is the one the pidfile recorded
+/// (case-insensitively: NTFS is, and `QueryFullProcessImageNameW` may
+/// report a different case than the launch path).
+#[must_use]
+pub fn image_matches(expected: &str, actual: &str) -> bool {
+    expected.to_lowercase() == actual.to_lowercase()
+}
+
 /// Candidate AutoHotkey v2 executables, in preference order, built from
 /// the places an install can live. Pure: nothing is checked for existence.
 ///
-/// * `install_dirs` — `InstallDir` values from `HKCU`/`HKLM`
-///   `Software\AutoHotkey` (either order the caller prefers).
+/// * `install_dirs` — `InstallDir` values from `HKLM`/`HKCU`
+///   `Software\AutoHotkey` (in the order the caller prefers).
 /// * `local_appdata` — `%LOCALAPPDATA%` (per-user installs live under
 ///   `Programs\AutoHotkey`).
 /// * `program_files` — `%ProgramFiles%` (machine-wide installs).
@@ -404,14 +470,16 @@ pub fn ahk_interpreter_candidates(
 
 /// Find an AutoHotkey v2 interpreter on this machine.
 ///
-/// Checks, in order, the registry `InstallDir` (`HKCU` then `HKLM`
-/// `Software\AutoHotkey`), `%LOCALAPPDATA%\Programs\AutoHotkey`,
+/// Checks, in order, the registry `InstallDir` (`HKLM` then `HKCU`
+/// `Software\AutoHotkey` — the machine-wide key needs administrator
+/// rights to write, the per-user one is writable by anything running as
+/// the user, so the former is trusted first), `%LOCALAPPDATA%\Programs\AutoHotkey`,
 /// `%ProgramFiles%\AutoHotkey` (see [`ahk_interpreter_candidates`]), and
 /// finally `AutoHotkey64.exe` / `AutoHotkey.exe` on `PATH`. Returns the
 /// first candidate that exists.
 #[must_use]
 pub fn resolve_ahk_interpreter() -> Option<PathBuf> {
-    let install_dirs: Vec<PathBuf> = [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE]
+    let install_dirs: Vec<PathBuf> = [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER]
         .into_iter()
         .filter_map(|root| registry_string(root, "Software\\AutoHotkey", "InstallDir"))
         .map(PathBuf::from)
@@ -589,8 +657,9 @@ pub fn spawn_ahk_script_in(config_dir: &Path) -> Result<u32, String> {
 
     // SAFETY: hProcess is valid (checked above) and owned by us until closed.
     let pid = unsafe { GetProcessId(info.hProcess) };
+    let image = process_image_path(info.hProcess);
     // SAFETY: release the handle Windows lent us; the outcome is irrelevant
-    // because we already have the PID.
+    // because we already have the PID and image path.
     let _ = unsafe { CloseHandle(info.hProcess) };
 
     if pid == 0 {
@@ -598,7 +667,7 @@ pub fn spawn_ahk_script_in(config_dir: &Path) -> Result<u32, String> {
     }
 
     let pidfile = ahk_pidfile_path_in(config_dir);
-    if let Err(e) = fs::write(&pidfile, pid.to_string()) {
+    if let Err(e) = fs::write(&pidfile, format_pidfile(pid, image.as_deref())) {
         log::warn!("failed to write AHK pidfile {}: {e}", pidfile.display());
     }
     Ok(pid)
@@ -623,10 +692,12 @@ pub fn stop_ahk_script() -> Result<bool, String> {
 
 /// Terminate the AutoHotkey process recorded in `<config_dir>/flow.ahk.pid`.
 ///
-/// Reads the PID from the pidfile, kills that process via
-/// [`TerminateProcess`], and removes the pidfile regardless of outcome.
-/// Used by `flow stop` (always, no flag needed) and by the daemon's own
-/// fail-back.
+/// Reads the PID (and the image path, when the pidfile has one — see
+/// [`parse_pidfile`]) from the pidfile, kills that process via
+/// [`TerminateProcess`] only if its image is the recorded one (or, for a
+/// pid-only pidfile, any AutoHotkey image), and removes the pidfile
+/// regardless of outcome. Used by `flow stop` (always, no flag needed) and
+/// by the daemon's own fail-back.
 ///
 /// # Returns
 ///
@@ -645,9 +716,9 @@ pub fn stop_ahk_script_in(config_dir: &Path) -> Result<bool, String> {
         Err(e) => return Err(format!("failed to read {}: {e}", pidfile.display())),
     };
 
-    let result = match pid_str.trim().parse::<u32>() {
-        Ok(pid) => kill_process(pid),
-        Err(_) => Ok(false), // Corrupt pidfile — nothing to stop.
+    let result = match parse_pidfile(&pid_str) {
+        Some((pid, image)) => kill_process(pid, image.as_deref()),
+        None => Ok(false), // Corrupt pidfile — nothing to stop.
     };
 
     // Always remove the pidfile; either the process is gone, or it was stale.
@@ -744,7 +815,9 @@ fn process_image_path(handle: HANDLE) -> Option<String> {
 /// fails with `Access is denied`, so liveness is checked first.
 ///
 /// Also `Ok(false)` — with an `info` log — when the pid is alive but its
-/// image is not an AutoHotkey interpreter ([`is_autohotkey_image`]): the
+/// image is not the one the pidfile recorded (`expected_image`, compared
+/// with [`image_matches`]) or, for a pid-only pidfile from an older daemon,
+/// not an AutoHotkey interpreter at all ([`is_autohotkey_image`]): the
 /// pidfile outlived its process and Windows handed the number to someone
 /// else. Killing that process would be the one unforgivable outcome of a
 /// stale pidfile, so the pid is treated as stale instead.
@@ -752,7 +825,7 @@ fn process_image_path(handle: HANDLE) -> Option<String> {
 /// # Errors
 ///
 /// Returns an error string if `TerminateProcess` fails for a live process.
-fn kill_process(pid: u32) -> Result<bool, String> {
+fn kill_process(pid: u32, expected_image: Option<&str>) -> Result<bool, String> {
     // SAFETY: OpenProcess with these rights only queries/terminates the
     // named PID; a stale PID either fails (Ok(false)) or targets a process
     // the user already has permission to terminate. SYNCHRONIZE lets us
@@ -777,12 +850,18 @@ fn kill_process(pid: u32) -> Result<bool, String> {
         return Ok(false);
     }
 
-    // Pid reuse guard: only ever terminate an AutoHotkey interpreter.
+    // Pid reuse guard: only ever terminate the recorded image (or, without
+    // one, an AutoHotkey interpreter).
     let image = process_image_path(handle);
-    if !image.as_deref().is_some_and(is_autohotkey_image) {
+    let is_ours = image.as_deref().is_some_and(|actual| match expected_image {
+        Some(expected) => image_matches(expected, actual),
+        None => is_autohotkey_image(actual),
+    });
+    if !is_ours {
         log::info!(
-            "kill_process: pid {pid} is {} — the AHK pidfile is stale (pid reused); not terminating it",
-            image.as_deref().unwrap_or("<unreadable image name>")
+            "kill_process: pid {pid} is {} (pidfile says {}) — the AHK pidfile is stale (pid reused); not terminating it",
+            image.as_deref().unwrap_or("<unreadable image name>"),
+            expected_image.unwrap_or("any AutoHotkey image")
         );
         // SAFETY: release the handle.
         let _ = unsafe { CloseHandle(handle) };
@@ -1087,7 +1166,73 @@ mod tests {
         // Our own pid is alive; opening it works, but we must not kill it —
         // so only exercise the exited path with a definitely-dead pid: 0 is
         // the idle process and cannot be opened → Ok(false) as well.
-        assert_eq!(kill_process(0), Ok(false));
+        assert_eq!(kill_process(0, None), Ok(false));
+    }
+
+    #[test]
+    fn pidfile_round_trips_pid_and_image_and_accepts_the_old_pid_only_form() {
+        assert_eq!(
+            format_pidfile(
+                4242,
+                Some(r"C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe")
+            ),
+            "4242\nC:\\Program Files\\AutoHotkey\\v2\\AutoHotkey64.exe\n"
+        );
+        assert_eq!(format_pidfile(7, None), "7\n");
+        assert_eq!(
+            parse_pidfile("4242\nC:\\x\\AutoHotkey64.exe\n"),
+            Some((4242, Some("C:\\x\\AutoHotkey64.exe".to_owned())))
+        );
+        assert_eq!(parse_pidfile("1234"), Some((1234, None)));
+        assert_eq!(parse_pidfile(" 12 \r\n\r\n"), Some((12, None)));
+        assert_eq!(parse_pidfile("garbage\nC:\\x.exe"), None);
+        assert_eq!(parse_pidfile(""), None);
+        assert!(image_matches(
+            r"C:\Windows\System32\cmd.exe",
+            r"c:\windows\SYSTEM32\CMD.EXE"
+        ));
+        assert!(!image_matches(
+            r"C:\Windows\System32\cmd.exe",
+            r"C:\Windows\System32\notepad.exe"
+        ));
+    }
+
+    #[test]
+    fn stop_ahk_script_in_only_terminates_the_recorded_image() {
+        // A child of our own (cmd waiting on ping) stands in for a reused pid.
+        let cfg = tempfile::tempdir().expect("tempdir");
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 20 127.0.0.1 >nul"])
+            .spawn()
+            .expect("spawn cmd");
+        let pid = child.id();
+        let pidfile = ahk_pidfile_path_in(cfg.path());
+
+        // Pidfile names a different image: the live pid is left alone.
+        fs::write(
+            &pidfile,
+            format_pidfile(pid, Some(r"C:\Windows\System32\notepad.exe")),
+        )
+        .unwrap();
+        assert_eq!(stop_ahk_script_in(cfg.path()), Ok(false));
+        assert!(child.try_wait().unwrap().is_none(), "cmd must still run");
+        assert!(!pidfile.exists(), "the stale pidfile is removed");
+
+        // Pid-only pidfile: cmd is not an AutoHotkey image, left alone too.
+        fs::write(&pidfile, format_pidfile(pid, None)).unwrap();
+        assert_eq!(stop_ahk_script_in(cfg.path()), Ok(false));
+        assert!(child.try_wait().unwrap().is_none(), "cmd must still run");
+
+        // Pidfile names cmd's own image (any case): terminated.
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+        let cmd_path = format!("{system_root}\\SYSTEM32\\cmd.exe");
+        fs::write(&pidfile, format_pidfile(pid, Some(&cmd_path))).unwrap();
+        assert_eq!(stop_ahk_script_in(cfg.path()), Ok(true));
+        assert!(
+            child.wait().expect("wait").code() == Some(1),
+            "cmd must have been terminated"
+        );
+        let _ = child.kill();
     }
 
     #[test]

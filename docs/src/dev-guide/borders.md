@@ -211,9 +211,14 @@ the user's drag. See (tile-drag.md) for the full explanation.
 ### The overlay is self-sufficient: `WM_SIZE` drives repaint
 
 The overlay's window procedure (`overlay_wnd_proc`) handles `WM_SIZE` by
-retrieving the `BorderInner` back-pointer from `GWLP_USERDATA` and calling
+looking the HWND up in a process-local registry of the overlays this daemon
+created (`OVERLAYS`, HWND → `Weak<BorderInner>`, filled by `Border::create`
+and emptied by `BorderInner::drop` just before `DestroyWindow`) and calling
 `on_wm_size`, which queries the overlay's current rect via `GetWindowRect` and
-calls `paint`. Because the size changed (the precondition for `WM_SIZE`),
+calls `paint`. It used to read a raw `BorderInner` pointer back out of the
+window's `GWLP_USERDATA`; a window word can be written by any process on the
+desktop, so that value is no longer trusted — an HWND the registry does not
+know is passed through to `DefWindowProcW`. Because the size changed (the precondition for `WM_SIZE`),
 `paint` rebuilds the bitmap via `CachedSurface::build` and re-uploads it via
 `UpdateLayeredWindow`.
 

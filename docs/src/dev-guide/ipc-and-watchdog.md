@@ -304,7 +304,8 @@ created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
 ([`src/job.rs`](../../src/job.rs), [`autostart::launch_ahk_in_job`](../../src/autostart.rs)):
 
 1. The AutoHotkey v2 interpreter is resolved directly — `InstallDir` from
-   `HKCU`/`HKLM\Software\AutoHotkey`, then
+   `HKLM\Software\AutoHotkey` then `HKCU` (the machine-wide key needs
+   administrator rights to write; the per-user one does not), then
    `%LOCALAPPDATA%\Programs\AutoHotkey`, `%ProgramFiles%\AutoHotkey`
    (`v2\AutoHotkey64.exe` preferred, then `v2\AutoHotkey32.exe`, then the
    root `AutoHotkey64.exe` / `AutoHotkey.exe` launcher), then `PATH`.
@@ -339,8 +340,14 @@ working directory (`lpDirectory`) but not `FLOW_BIN`.
 The job handle lives in `FlowWM` and is never closed explicitly: process
 teardown closes it — clean stop, panic, `abort`, `taskkill /f` — and the
 kernel terminates the script, releasing the Win key. The pid is also written
-to `<config_dir>/flow.ahk.pid` and reported in `Pong.ahk_pid`; `flow stop`
-and the daemon's own fail-back kill it explicitly and remove the pidfile.
+to `<config_dir>/flow.ahk.pid` — with the interpreter's full image path on
+a second line — and reported in `Pong.ahk_pid`. The daemon's own fail-back
+terminates the script **through the process handle it has held since the
+launch** (`AhkProcess::stop`), never by re-opening the pid; `flow stop`,
+which has only the pidfile, opens the pid and terminates it only if its
+image path equals the recorded one (case-insensitively), falling back to
+the older "is some AutoHotkey image" check only for a pidfile without a
+second line. Either way the pidfile is removed.
 The AHK-side liveness gate in the shipped keymap remains as defence in
 depth: `flow.ahk` refuses to hook the modifier until the daemon's pipe
 answers (10 s at startup), re-checks it every 2 s with a 1 ms

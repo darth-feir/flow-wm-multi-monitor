@@ -18,8 +18,9 @@
 //! See `docs/src/dev-guide/borders.md` for the threading model and the
 //! "daemon commands, border obeys" principle.
 
+use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -29,12 +30,12 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetWindowLongPtrW,
-    GetWindowRect, RegisterClassExW, SPI_SETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSENDCHANGING, SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    ULW_ALPHA, UpdateLayeredWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_DISPLAYCHANGE,
-    WM_ENDSESSION, WM_QUERYENDSESSION, WM_SETTINGCHANGE, WM_SIZE, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, GetWindowRect, RegisterClassExW,
+    SPI_SETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSENDCHANGING,
+    SWP_NOSIZE, SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CLOSE, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_QUERYENDSESSION, WM_SETTINGCHANGE,
+    WM_SIZE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    WS_POPUP,
 };
 use windows::core::PCWSTR;
 use windows::core::w;
@@ -52,6 +53,38 @@ const OVERLAY_CLASS_NAME: PCWSTR = w!("FlowBorderOverlay");
 /// Stores the class atom once `RegisterClassExW` succeeds. Subsequent calls
 /// return the cached atom without touching Win32.
 static OVERLAY_CLASS_ATOM: OnceLock<u16> = OnceLock::new();
+
+/// The overlays this process created, by HWND.
+///
+/// This is how [`overlay_wnd_proc`] finds the [`BorderInner`] behind a
+/// message. It used to read a raw `*const BorderInner` back out of the
+/// window's `GWLP_USERDATA` — but a window word is writable by any process
+/// on the desktop (`SetWindowLongPtr` needs no special rights on another
+/// process's window), so a planted value would have been dereferenced
+/// inside the daemon. The map is process-local and holds only entries
+/// [`Border::create`] put there; a `WM_SIZE` for any other HWND is simply
+/// passed through. Weak references so the map never keeps an overlay
+/// alive: an entry whose `BorderInner` is gone fails to upgrade.
+static OVERLAYS: LazyLock<Mutex<HashMap<isize, Weak<BorderInner>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Record `inner` as the state behind overlay `hwnd`.
+fn register_overlay(hwnd: isize, inner: &Arc<BorderInner>) {
+    lock_tolerant(&OVERLAYS).insert(hwnd, Arc::downgrade(inner));
+}
+
+/// Forget overlay `hwnd` (before it is destroyed, so no message dispatched
+/// by `DestroyWindow` can find it).
+fn unregister_overlay(hwnd: isize) {
+    lock_tolerant(&OVERLAYS).remove(&hwnd);
+}
+
+/// The live `BorderInner` behind overlay `hwnd`, if this process created it
+/// and it has not been dropped. The lock is released before the caller
+/// acts on the result, so the window procedure never holds it.
+fn overlay_for(hwnd: isize) -> Option<Arc<BorderInner>> {
+    lock_tolerant(&OVERLAYS).get(&hwnd).and_then(Weak::upgrade)
+}
 
 /// Window procedure for the overlay class.
 ///
@@ -131,17 +164,9 @@ fn lock_tolerant<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// The body of [`overlay_wnd_proc`], free to panic.
 fn overlay_wnd_proc_body(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_SIZE {
-        // SAFETY: GWLP_USERDATA was set in `Border::create`. The stored
-        // pointer is valid for the HWND's lifetime because `BorderInner::drop`
-        // calls `DestroyWindow` under the overlay mutex before the
-        // `Arc<BorderInner>` can release its memory — after `DestroyWindow`
-        // returns Win32 dispatches no further messages here, so the deref
-        // cannot dangle.
-        let ptr_val = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
-        if ptr_val != 0 {
-            // SAFETY: `ptr_val` is a valid `*const BorderInner` stored in
-            // `Border::create`; see the lifetime note above.
-            let border_inner = unsafe { &*(ptr_val as *const BorderInner) };
+        // Only an overlay this process created and still owns is repainted;
+        // nothing stored in the window itself is trusted (see `OVERLAYS`).
+        if let Some(border_inner) = overlay_for(hwnd.0 as isize) {
             border_inner.on_wm_size();
         }
         return LRESULT(0);
@@ -358,19 +383,11 @@ impl Border {
                 surface: Mutex::new(None),
             }),
         };
-        // Store a back-pointer to BorderInner so `overlay_wnd_proc` can find
-        // it when `WM_SIZE` arrives. `Arc::as_ptr` yields a stable `*const
-        // BorderInner` whose address is unaffected by `Border::clone` or Arc
-        // refcount changes.
-        //
-        // SAFETY: the pointer is valid for the overlay HWND's entire lifetime.
-        // `BorderInner::drop` calls `DestroyWindow` under the overlay mutex
-        // before the `Arc<BorderInner>` releases its allocation, so after the
-        // HWND is destroyed no further `WM_SIZE` messages can arrive and the
-        // pointer can never be dereferenced after free. See
-        // `overlay_wnd_proc`'s SAFETY note for the matching dereference.
-        let inner_ptr = Arc::as_ptr(&border.inner) as isize;
-        let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, inner_ptr) };
+        // Let `overlay_wnd_proc` find this overlay's state when `WM_SIZE`
+        // arrives — through the process-local registry, not a window word.
+        // A WM_SIZE dispatched during CreateWindowExW (before this line)
+        // finds nothing and is ignored; nothing is painted yet anyway.
+        register_overlay(hwnd.0 as isize, &border.inner);
         // Reveal the overlay. Until set_geometry paints a bitmap the layered
         // surface is fully transparent, so this never flashes on screen.
         border.set_visible(true);
@@ -443,6 +460,9 @@ impl Drop for BorderInner {
         if raw == 0 {
             return;
         }
+        // Forget the overlay first (and release that lock) so a message
+        // DestroyWindow dispatches cannot find a half-dropped state.
+        unregister_overlay(raw);
         // SAFETY: `raw` came from a valid HWND created in `Border::create`.
         // After DestroyWindow the handle is invalid; we clear it under the
         // lock so re-entrant calls (or a stray clone dropping later) no-op.
@@ -2175,9 +2195,43 @@ mod tests {
     // safe to call from `overlay_wnd_proc` during shutdown races — when the
     // overlay HWND may already be in the destroyed state (`raw == 0`).
     //
-    // `overlay_wnd_proc` unconditionally dereferences the GWLP_USERDATA
-    // back-pointer and calls `on_wm_size`; these tests pin the no-op contract
-    // that keeps that unconditional call sound.
+    // `overlay_wnd_proc` calls `on_wm_size` on whatever `overlay_for` finds
+    // in the registry; these tests pin the no-op contract that keeps that
+    // call sound during teardown.
+
+    /// The registry hands out only overlays this process registered and
+    /// that are still alive; anything else (an HWND nobody registered, an
+    /// entry whose `BorderInner` was dropped, one unregistered on destroy)
+    /// yields `None`, so a planted or stale HWND is passed through.
+    #[test]
+    fn overlay_registry_finds_only_live_registered_overlays() {
+        // A value no real HWND can take, unique to this test.
+        let hwnd: isize = -0x5151_0001;
+        assert!(overlay_for(hwnd).is_none());
+
+        let inner = Arc::new(destroyed_border_inner());
+        register_overlay(hwnd, &inner);
+        let found = overlay_for(hwnd).expect("registered overlay is found");
+        assert!(Arc::ptr_eq(&found, &inner));
+        assert!(
+            overlay_for(hwnd + 1).is_none(),
+            "neighbouring HWND is unknown"
+        );
+        drop(found);
+
+        unregister_overlay(hwnd);
+        assert!(overlay_for(hwnd).is_none(), "unregistered overlay is gone");
+        unregister_overlay(hwnd); // idempotent
+
+        // A dropped BorderInner leaves a Weak that never upgrades.
+        register_overlay(hwnd, &inner);
+        drop(inner);
+        assert!(
+            overlay_for(hwnd).is_none(),
+            "dropped overlay never upgrades"
+        );
+        unregister_overlay(hwnd);
+    }
 
     /// Build a `BorderInner` whose overlay HWND is `0` (destroyed) and whose
     /// surface cache is empty. No GDI handles are allocated, so constructing

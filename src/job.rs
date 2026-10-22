@@ -247,6 +247,13 @@ impl JobChild {
         unsafe { WaitForSingleObject(self.process, 0) != WAIT_OBJECT_0 }
     }
 
+    /// The owned process handle (full access, from `CreateProcessW`).
+    /// Valid while `self` lives; the caller must not close it.
+    #[must_use]
+    pub fn handle(&self) -> HANDLE {
+        self.process
+    }
+
     /// Terminate the process through the handle this child already holds —
     /// never by re-opening its pid, which Windows may have reused by now.
     /// Returns `Ok(false)` when it had already exited.
