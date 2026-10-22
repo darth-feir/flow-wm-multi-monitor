@@ -158,6 +158,22 @@ removed as redundant with no-partial.
 - `--no-restore` — skip auto-restore at startup, starting completely fresh.
 - `flow loadout load` — manual restore (same code path as auto-restore).
 
+### Where the file may be
+
+Two rules, both in `src/loadout/path.rs` and shared by the CLI and the
+daemon (the daemon does not trust the pipe to have checked):
+
+- `[loadout] default_path` is a **plain file name** inside the config
+  directory — no separators, no `..`, no `:`. `load_app_config` rejects a
+  config that says otherwise as a hard error (`FlowConfig::validate` reports
+  it too), so `flow start`, `config reload` and `config check` all refuse it.
+- An explicit `LoadoutSave { path }` / `LoadoutLoad { path }` must name a
+  `.json` file and may not contain a `..` component. Absolute paths are
+  allowed; a relative one is resolved against the config directory by
+  `daemon::loadout::resolve_loadout_path` — never against the daemon's
+  working directory, which is wherever `flow start` was run. The CLI runs the
+  same check first so a bad path fails without a round trip.
+
 ## What the loadout is (and is not)
 
 The loadout's job is **resilience, not desired-state declaration**. It recovers

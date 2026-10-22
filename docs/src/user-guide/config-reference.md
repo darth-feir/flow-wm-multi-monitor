@@ -335,6 +335,24 @@ Example:
 foreground_sync_interval_ms = 250
 ```
 
+### `[loadout]` — save/restore file
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `default_path` | `String` | `"loadout.json"` | The file `flow loadout save` / `flow loadout load` use when no path is given, and the one saved on `flow stop` and restored at start. A **plain file name inside the config directory**: no directories, no `..`, no drive letter. Anything else is refused when the config is loaded (`flow start`, `flow config reload`, `flow config check` all report `[loadout] default_path must be a plain file name …`). |
+
+An explicit `flow loadout save <path>` / `load <path>` must name a `.json`
+file and may not contain a `..` component; a relative path is taken
+relative to the config directory (not the directory you ran `flow` from),
+an absolute path is used as given.
+
+Example:
+
+```toml
+[loadout]
+default_path = "loadout.json"
+```
+
 ---
 
 ## `flow-rules.toml`

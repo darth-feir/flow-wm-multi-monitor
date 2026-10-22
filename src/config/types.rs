@@ -208,7 +208,10 @@ pub struct LoadoutConfig {
     /// `flow loadout restore`.
     ///
     /// The daemon resolves this relative to the user's config directory
-    /// (`%USERPROFILE%\.config\flow\`). Defaults to `"loadout.json"`.
+    /// (`%USERPROFILE%\.config\flow\`). Defaults to `"loadout.json"`. It
+    /// must be a plain file name — no directories, no `..`, no drive —
+    /// which [`LoadoutConfig::validate`] enforces and config loading
+    /// rejects (`crate::loadout::validate_default_path`).
     pub default_path: String,
 }
 
@@ -217,6 +220,17 @@ impl Default for LoadoutConfig {
         Self {
             default_path: "loadout.json".into(),
         }
+    }
+}
+
+impl LoadoutConfig {
+    /// Validate that `default_path` is a plain file name.
+    ///
+    /// # Errors
+    ///
+    /// Returns the message from [`crate::loadout::validate_default_path`].
+    pub fn validate(&self) -> Result<(), String> {
+        crate::loadout::validate_default_path(&self.default_path)
     }
 }
 
@@ -361,6 +375,7 @@ impl FlowConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.padding.validate()?;
         self.borders.validate()?;
+        self.loadout.validate()?;
         if self.columns_per_screen == 0 {
             return Err("columns_per_screen must be at least 1, got 0".into());
         }

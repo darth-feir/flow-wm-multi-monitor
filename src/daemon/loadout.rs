@@ -39,7 +39,7 @@
 //!    and seated nowhere) are appended as new columns on the active workspace.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::common::{Rect, WindowId};
 use crate::ipc::message::SocketResponse;
@@ -47,7 +47,7 @@ use crate::layout::types::VirtualLayout;
 use crate::layout::types::{ActualLayout, AppliedLayout};
 use crate::loadout::{
     ColumnSnapshot, FloatingEntry, LoadoutFile, MonitorSnapshot, RectJson, RowSnapshot,
-    ScrollingSnapshot, WindowRef, WorkspaceSnapshot,
+    ScrollingSnapshot, WindowRef, WorkspaceSnapshot, validate_loadout_path,
 };
 use crate::registry::types::{FloatingState, TilingState, WindowState};
 use crate::workspace::{Workspace, WorkspaceId, WorkspaceParking};
@@ -304,15 +304,57 @@ pub(super) fn build_seating_batches(
     batches
 }
 
+/// Resolve the file a loadout command names.
+///
+/// `None` is the config default (`config_dir / default_path`, a plain file
+/// name by construction — see `LoadoutConfig::validate`). An explicit path
+/// is checked with [`validate_loadout_path`] (`.json`, no `..`) — the pipe
+/// is not trusted to have done it — and a relative one is taken relative
+/// to the config directory, never to the daemon's working directory.
+///
+/// # Errors
+///
+/// The validation message, for the client.
+pub fn resolve_loadout_path(
+    config_dir: &Path,
+    default_path: &str,
+    explicit: Option<&Path>,
+) -> Result<PathBuf, String> {
+    match explicit {
+        None => Ok(config_dir.join(default_path)),
+        Some(p) => {
+            validate_loadout_path(p)?;
+            Ok(if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                config_dir.join(p)
+            })
+        }
+    }
+}
+
 impl FlowWM {
     /// Save the current workspace arrangement to a loadout file.
     ///
     /// `path` overrides the config-default location; `None` resolves to
-    /// `config_dir / config.loadout.default_path`. Returns [`SocketResponse::Ok`]
-    /// on success, [`SocketResponse::Error`] on failure.
+    /// `config_dir / config.loadout.default_path` (see
+    /// [`resolve_loadout_path`]). Returns [`SocketResponse::Ok`] on success,
+    /// [`SocketResponse::Error`] on failure — including a path that is
+    /// refused before anything is written.
     pub(super) fn dispatch_loadout_save(&self, path: Option<PathBuf>) -> SocketResponse {
-        let resolved =
-            path.unwrap_or_else(|| self.config_dir.join(&self.config.loadout.default_path));
+        let resolved = match resolve_loadout_path(
+            &self.config_dir,
+            &self.config.loadout.default_path,
+            path.as_deref(),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("loadout save refused: {e}");
+                return SocketResponse::Error {
+                    message: format!("loadout save refused: {e}"),
+                };
+            }
+        };
 
         match self.build_and_write_loadout(&resolved) {
             Ok(()) => SocketResponse::Ok,
@@ -382,8 +424,12 @@ impl FlowWM {
     /// loadout slot cannot be matched to a live window (whole load aborted,
     /// zero state touched).
     fn apply_loadout(&mut self, path: Option<PathBuf>) -> Result<(), String> {
-        let resolved =
-            path.unwrap_or_else(|| self.config_dir.join(&self.config.loadout.default_path));
+        let resolved = resolve_loadout_path(
+            &self.config_dir,
+            &self.config.loadout.default_path,
+            path.as_deref(),
+        )
+        .map_err(|e| format!("loadout load refused: {e}"))?;
 
         // 1. Read + parse
         let raw = std::fs::read_to_string(&resolved)
@@ -1579,6 +1625,67 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(file).expect("serialise"))
             .expect("write loadout");
         path
+    }
+
+    #[test]
+    fn resolve_loadout_path_defaults_validates_and_anchors_relative_paths() {
+        let cfg = Path::new("C:\\cfg");
+        assert_eq!(
+            resolve_loadout_path(cfg, "loadout.json", None).unwrap(),
+            PathBuf::from("C:\\cfg\\loadout.json")
+        );
+        // Relative explicit paths live under the config dir, not the cwd.
+        assert_eq!(
+            resolve_loadout_path(cfg, "loadout.json", Some(Path::new("work.json"))).unwrap(),
+            PathBuf::from("C:\\cfg\\work.json")
+        );
+        // Absolute paths are the user's business.
+        assert_eq!(
+            resolve_loadout_path(cfg, "loadout.json", Some(Path::new("D:\\lay\\a.json"))).unwrap(),
+            PathBuf::from("D:\\lay\\a.json")
+        );
+        // Traversal and non-json are refused before any I/O.
+        let err = resolve_loadout_path(cfg, "loadout.json", Some(Path::new("..\\evil.json")))
+            .unwrap_err();
+        assert!(err.contains("'..'"), "{err}");
+        let err =
+            resolve_loadout_path(cfg, "loadout.json", Some(Path::new("evil.txt"))).unwrap_err();
+        assert!(err.contains(".json"), "{err}");
+    }
+
+    /// The dispatch handlers refuse a bad explicit path with an error reply
+    /// and touch no file.
+    #[test]
+    fn dispatch_refuses_traversal_and_non_json_paths() {
+        let mut flow = two_monitor_flow();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        flow.config_dir = tmp.path().to_path_buf();
+        let evil = tmp.path().join("..").join("evil.json");
+        match flow.dispatch_loadout_save(Some(evil.clone())) {
+            SocketResponse::Error { message } => assert!(message.contains("'..'"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        assert!(!tmp.path().parent().unwrap().join("evil.json").exists());
+        match flow.dispatch_loadout_save(Some(PathBuf::from("notes.txt"))) {
+            SocketResponse::Error { message } => assert!(message.contains(".json"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        assert!(!tmp.path().join("notes.txt").exists());
+        match flow.dispatch_loadout_load(Some(PathBuf::from("..\\x.json"))) {
+            SocketResponse::Error { message } => {
+                assert!(
+                    message.contains("refused") && message.contains("'..'"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+        // A plain relative name saves under the config dir.
+        assert_eq!(
+            flow.dispatch_loadout_save(Some(PathBuf::from("work.json"))),
+            SocketResponse::Ok
+        );
+        assert!(tmp.path().join("work.json").is_file());
     }
 
     /// A snapshot naming a workspace no monitor has (workspace 42): its

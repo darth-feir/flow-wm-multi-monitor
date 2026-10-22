@@ -472,13 +472,15 @@ enum MoveDirection {
 enum LoadoutCommands {
     /// Save the current window arrangement to a loadout file.
     Save {
-        /// Optional output path. Defaults to the config `loadout.default_path`.
+        /// Optional output path (a .json file, no `..`; relative to the
+        /// config dir). Defaults to the config `loadout.default_path`.
         #[arg(value_name = "PATH")]
         path: Option<String>,
     },
     /// Restore a previously saved arrangement from a loadout file.
     Load {
-        /// Optional input path. Defaults to the config `loadout.default_path`.
+        /// Optional input path (a .json file, no `..`; relative to the
+        /// config dir). Defaults to the config `loadout.default_path`.
         #[arg(value_name = "PATH")]
         path: Option<String>,
     },
@@ -1037,18 +1039,29 @@ fn cmd_update(check: bool) -> Result<(), String> {
 /// Dispatch a loadout subcommand.
 ///
 /// Routes [`LoadoutCommands::Save`] and [`LoadoutCommands::Load`] to the
-/// daemon via IPC.
+/// daemon via IPC. An explicit path must name a `.json` file and may not
+/// contain `..` (checked here for a prompt error, and again by the daemon);
+/// a relative path is taken relative to the config directory, an absolute
+/// one as given.
 fn cmd_loadout(command: LoadoutCommands) -> Result<(), String> {
+    let checked = |path: Option<String>| -> Result<Option<std::path::PathBuf>, String> {
+        path.map(|p| {
+            let p = std::path::PathBuf::from(p);
+            flow_wm::loadout::validate_loadout_path(&p)?;
+            Ok(p)
+        })
+        .transpose()
+    };
     match command {
         LoadoutCommands::Save { path } => send_command(
             SocketMessage::LoadoutSave {
-                path: path.map(std::path::PathBuf::from),
+                path: checked(path)?,
             },
             "loadout saved",
         ),
         LoadoutCommands::Load { path } => send_command(
             SocketMessage::LoadoutLoad {
-                path: path.map(std::path::PathBuf::from),
+                path: checked(path)?,
             },
             "loadout loaded",
         ),

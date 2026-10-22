@@ -509,6 +509,7 @@ A few other top-level commands are worth knowing:
 | `flow config edit` | Open the config directory in your editor. |
 | `flow config path` | Print the resolved config directory path. |
 | `flow config check` | Validate `flow.toml` / `flow-rules.toml` without loading them. |
+| `flow loadout save [path]` / `flow loadout load [path]` | Save / restore the window arrangement. Without a path the config's `[loadout] default_path` (a plain file name in the config dir) is used. A given path must be a `.json` file with no `..` in it; relative paths are resolved against the config directory, absolute ones used as given. Anything else is refused — by the CLI before sending, and by the daemon for whatever arrives over the pipe. |
 | `flow query all` | Dump every tracked window (state, `mode` — `tiled` / `floating` / `fullscreen` / `minimized` / `hidden` / `ignored` —, `on_top` — whether FlowWM currently keeps it above the tiles (`[floating] always_on_top`) —, rect, column/row, …) as JSON, plus the monitors (each with its `width_preset`) and whether tiling is on (`tiling_enabled`). |
 | `flow enable-autostart [--ahk]` | Create the login shortcut in `shell:startup` (idempotent). |
 | `flow disable-autostart` | Remove the login shortcut (idempotent). |

@@ -185,7 +185,15 @@ fn load_toml<T: DeserializeOwned>(path: &Path) -> Result<T, ConfigLoadError> {
 pub fn load_app_config(path: &Path) -> FlowResult<FlowConfig> {
     match load_toml::<FlowConfig>(path) {
         Ok(config) => {
-            // Validate post-deserialization — log warnings but don't fail.
+            // A loadout default_path that is not a plain file name is a
+            // hard error: the daemon would write wherever it points.
+            if let Err(e) = config.loadout.validate() {
+                return Err(FlowError::Config(format!(
+                    "invalid config {}: {e}",
+                    path.display()
+                )));
+            }
+            // Everything else post-deserialization — log warnings but don't fail.
             if let Err(warning) = config.validate() {
                 log::warn!("config validation warning for {:?}: {warning}", path);
             }
@@ -655,6 +663,30 @@ strategy = "original_slot"
         assert!(
             err.contains("failed to load config"),
             "error should describe the failure: {err}"
+        );
+    }
+
+    /// Negative: a `[loadout] default_path` that is not a plain file name is
+    /// a hard load error (not a logged warning), naming the key.
+    #[test]
+    fn load_app_config_rejects_loadout_default_path_outside_the_config_dir() {
+        for bad in [
+            "..\\\\evil.json",
+            "C:\\\\Users\\\\me\\\\evil.json",
+            "sub/evil.json",
+        ] {
+            let mut f = NamedTempFile::new().unwrap();
+            write!(f, "[loadout]\ndefault_path = \"{bad}\"\n").unwrap();
+            let err = load_app_config(f.path()).expect_err(bad).to_string();
+            assert!(err.contains("[loadout] default_path"), "{bad}: {err}");
+            assert!(err.contains("invalid config"), "{bad}: {err}");
+        }
+        // A plain name still loads.
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, "[loadout]\ndefault_path = \"work.json\"\n").unwrap();
+        assert_eq!(
+            load_app_config(f.path()).unwrap().loadout.default_path,
+            "work.json"
         );
     }
 
