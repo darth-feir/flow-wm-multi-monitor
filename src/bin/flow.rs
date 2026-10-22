@@ -3251,11 +3251,11 @@ mod tests {
     }
 
     /// Positive (edge): an empty config dir (fresh install, no `flow.toml`) yields
-    /// the compiled defaults, so `check_for_updates` is ON and the notification
-    /// fires by default. Confirms the feature is opt-out, not opt-in, on a clean
+    /// the compiled defaults, so `check_for_updates` is OFF and nothing is
+    /// contacted at start. Confirms the fork's opt-in policy on a clean
     /// install.
     #[test]
-    fn preflight_config_check_missing_flow_toml_yields_default_enabled() {
+    fn preflight_config_check_missing_flow_toml_yields_default_disabled() {
         // Arrange: empty config dir (neither config file present).
         let tmp = tempfile::tempdir().expect("tempdir");
 
@@ -3263,8 +3263,18 @@ mod tests {
         let config = preflight_config_check(tmp.path()).expect("missing flow.toml is benign");
 
         // Assert: compiled defaults apply verbatim.
-        assert!(config.check_for_updates);
+        assert!(!config.check_for_updates);
         assert_eq!(config, config::FlowConfig::default());
+    }
+
+    /// Positive: a `flow.toml` that opts IN is honoured — the key still works.
+    #[test]
+    fn preflight_config_check_honours_opt_in() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        fs::write(tmp.path().join("flow.toml"), "check_for_updates = true\n")
+            .expect("write flow.toml");
+        let config = preflight_config_check(tmp.path()).expect("valid config should load");
+        assert!(config.check_for_updates);
     }
 
     /// Negative: a `flow.toml` that exists but cannot parse is fatal -- startup

@@ -42,6 +42,27 @@ By the time the shim renames anything, `flow.exe` has exited and `flowd.exe` is
 guaranteed absent (see [Refuse-if-running](#refuse-if-running) below), so the
 rename window is contention-free.
 
+### Hardening
+
+- **HTTPS only.** Every request — the release metadata, the sha256 sidecar
+  and the archive — goes through one `ureq` agent built with
+  `https_only(true)` and a global timeout (2 s for the start-time check,
+  5 min for `flow update`). An asset URL that names `http://` (a tampered
+  release listing) is refused, never followed, and a stalled download fails
+  instead of hanging the terminal.
+- **Absolute shim host.** The shim is run by
+  `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`
+  (`shim::powershell_path`), never by a `powershell.exe` found on `PATH` or
+  in the current directory.
+- **No overwrite of the shim file.** `.flow-update-shim.ps1` is created with
+  `create_new`: if a file is already there (a leftover, or something planted
+  in the install dir) the update fails with `AlreadyExists` rather than
+  overwriting it or running it.
+- **`zip` 9 with default features off** (`deflate-flate2` only): the release
+  archive is stored/deflated and the updater reads two named entries into
+  memory — it never calls `extract`, which is where the 8.x advisories
+  (RUSTSEC-2026-0367/0368/0369) lived.
+
 ```mermaid
 sequenceDiagram
     participant User
@@ -83,11 +104,14 @@ including while the daemon is actively tiling.
 
 `flow start` can optionally check GitHub for a newer release on each launch and
 print a one-line notification prompting `flow update` when one exists. It is
-**on by default** and controlled by the top-level `check_for_updates` field in
+**off by default in this fork** (upstream ships it on): a window manager has
+no reason to contact the network at every start, and the fork is built from
+source rather than installed from the upstream releases the check would
+offer. It is controlled by the top-level `check_for_updates` field in
 `flow.toml` (see [Config Reference](../user-guide/config-reference.md)):
 
 ```toml
-check_for_updates = true   # set to false to silence the start-time notification
+check_for_updates = true   # opt in to the start-time notification
 ```
 
 The notification is deliberately non-intrusive:

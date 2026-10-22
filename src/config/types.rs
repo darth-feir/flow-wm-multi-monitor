@@ -176,10 +176,14 @@ pub struct FlowConfig {
     /// Whether `flow start` should query GitHub for a newer release and print a
     /// one-line notification prompting `flow update` when one exists.
     ///
-    /// On by default. The check runs *after* the daemon is ready, is bounded by
-    /// a short network timeout, and silences all errors — it never blocks or
-    /// aborts startup. The explicit `flow update --check` command is unaffected
-    /// by this flag. See (`docs/src/dev-guide/updater.md`).
+    /// **Off by default in this fork**: a window manager has no business
+    /// phoning out at every start, and the fork's binaries are built from
+    /// source rather than installed from the upstream releases the check
+    /// would offer. The key is kept so a user can opt in. When on, the check
+    /// runs *after* the daemon is ready, is bounded by a short network
+    /// timeout, and silences all errors — it never blocks or aborts
+    /// startup. The explicit `flow update --check` command is unaffected by
+    /// this flag. See (`docs/src/dev-guide/updater.md`).
     pub check_for_updates: bool,
 
     /// Whether a **maximized** window the daemon meets — in the startup
@@ -255,7 +259,9 @@ impl Default for FlowConfig {
             loadout: LoadoutConfig::default(),
             navigation: NavigationConfig::default(),
             columns: None,
-            check_for_updates: true,
+            // The fork opts out of the start-time update check (see the
+            // field docs); users opt in with `check_for_updates = true`.
+            check_for_updates: false,
             adopt_maximized: false,
         }
     }
@@ -1218,7 +1224,7 @@ default = \"1/2\"",
                 )
                 .expect("columns"),
             ),
-            check_for_updates: false,
+            check_for_updates: true,
             adopt_maximized: true,
         };
 
@@ -1260,17 +1266,17 @@ default = \"1/2\"",
         let columns = parsed.columns.as_ref().expect("columns round-trips");
         assert_eq!(columns.labels(), vec!["1/3", "1/2"]);
         assert_eq!(columns.default_index(), 1);
-        assert!(!parsed.check_for_updates);
+        assert!(parsed.check_for_updates);
     }
 
-    /// Positive: `check_for_updates` ships enabled by default so the start-time
-    /// notification is opt-out, not opt-in. Mirrors the focused
+    /// Positive: `check_for_updates` ships **disabled** in this fork — the
+    /// start-time GitHub check is opt-in, not opt-out. Mirrors the focused
     /// default-value guards (`focus_config_default_interval_is_250ms`,
     /// `border_config_default_overlap_is_one`); the `default-config.toml` sync
     /// test covers the example-file side.
     #[test]
-    fn check_for_updates_defaults_to_true() {
-        assert!(FlowConfig::default().check_for_updates);
+    fn check_for_updates_defaults_to_false() {
+        assert!(!FlowConfig::default().check_for_updates);
     }
 
     // --- Edge-scroll auto-repeat timing defaults & clamps ---

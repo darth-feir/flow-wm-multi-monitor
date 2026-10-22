@@ -10,7 +10,7 @@
 //! that waits for `flow.exe` to exit, then renames the old binary and moves
 //! the staged replacement into place.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::updater::UpdateError;
 
@@ -133,19 +133,37 @@ try {{
     )
 }
 
+/// The Windows PowerShell host the shim runs in, by absolute path: a
+/// `powershell.exe` planted in the current directory or earlier on `PATH`
+/// must never be what finishes the update.
+#[must_use]
+pub fn powershell_path() -> PathBuf {
+    let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    PathBuf::from(system_root)
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe")
+}
+
 /// Write the shim script to disk and spawn it fully detached.
 ///
 /// The script lives at `<install_dir>\.flow-update-shim.ps1` — same volume as
-/// the binaries, so `Move-Item` is atomic on NTFS. Spawned with
+/// the binaries, so `Move-Item` is atomic on NTFS. It is created with
+/// `create_new`, so a file already at that path (a leftover shim, or
+/// something planted there) fails the update instead of being overwritten
+/// or executed in its place. Spawned via [`powershell_path`] with
 /// `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW` to match the existing
 /// `spawn_daemon` pattern in `src/bin/flow.rs` and ensure the script survives
 /// the parent `flow.exe` exiting.
 ///
 /// # Errors
 ///
-/// - [`UpdateError::Io`] if the script file can't be written.
+/// - [`UpdateError::Io`] if the script file can't be created — including
+///   `AlreadyExists` when a `.flow-update-shim.ps1` is already there.
 /// - [`UpdateError::ShimSpawn`] if spawning `powershell.exe` fails.
 pub fn spawn_swap_shim(install_dir: &Path, flow_pid: u32) -> Result<(), UpdateError> {
+    use std::io::Write;
     use std::os::windows::process::CommandExt;
 
     // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW — matches the existing
@@ -154,9 +172,13 @@ pub fn spawn_swap_shim(install_dir: &Path, flow_pid: u32) -> Result<(), UpdateEr
 
     let script_path = install_dir.join(".flow-update-shim.ps1");
     let script_body = build_shim_script(install_dir, flow_pid);
-    std::fs::write(&script_path, &script_body)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&script_path)?
+        .write_all(script_body.as_bytes())?;
 
-    let mut cmd = std::process::Command::new("powershell.exe");
+    let mut cmd = std::process::Command::new(powershell_path());
     cmd.args([
         "-NoProfile",
         "-NonInteractive",
@@ -258,6 +280,37 @@ mod tests {
         assert!(
             script.contains(".flow-update-shim.ps1") || script.contains("$MyInvocation"),
             "shim should self-delete on completion"
+        );
+    }
+
+    #[test]
+    fn powershell_path_is_absolute_under_system_root() {
+        // The shim host is never resolved through PATH or the cwd.
+        let p = powershell_path();
+        assert!(p.is_absolute(), "{p:?}");
+        assert!(
+            p.ends_with(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+            "{p:?}"
+        );
+        assert!(p.is_file(), "Windows PowerShell must exist at {p:?}");
+    }
+
+    #[test]
+    fn spawn_swap_shim_refuses_an_existing_shim_file() {
+        // A `.flow-update-shim.ps1` already in the install dir must fail the
+        // update (AlreadyExists) rather than be overwritten or run as-is.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let planted = dir.path().join(".flow-update-shim.ps1");
+        std::fs::write(&planted, "Write-Host planted").unwrap();
+        let err = spawn_swap_shim(dir.path(), 1).expect_err("must refuse");
+        match err {
+            UpdateError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists),
+            other => panic!("expected an AlreadyExists I/O error, got {other}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&planted).unwrap(),
+            "Write-Host planted",
+            "the planted file must be left untouched"
         );
     }
 

@@ -21,11 +21,27 @@ const SHA_SUFFIX: &str = "-x86_64.zip.sha256";
 /// Upper bound on the version-check network call.
 ///
 /// `check_for_update` can fire automatically from `flow start` (when
-/// `check_for_updates` is enabled). A bounded timeout guarantees a dead or slow
-/// network never blocks startup beyond this long. The download path in
-/// `perform_update` is intentionally left unbounded — that path is interactive
-/// and transfers a multi-MB archive.
+/// `check_for_updates` is enabled, which the fork no longer does by
+/// default). A bounded timeout guarantees a dead or slow network never
+/// blocks startup beyond this long.
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Upper bound on the whole of `flow update` (metadata, sidecar and the
+/// multi-MB archive, each request bounded by this on its own). Interactive,
+/// so generous — but never unbounded: a stalled download must fail rather
+/// than hang the terminal.
+const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// A ureq agent that only ever speaks HTTPS (a `http://` URL — from a
+/// tampered release listing, say — is refused rather than followed) with
+/// every request bounded by `timeout`.
+fn https_agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .https_only(true)
+        .timeout_global(Some(timeout))
+        .build()
+        .into()
+}
 
 /// Errors that can occur during a self-update.
 #[derive(Debug, Error)]
@@ -104,11 +120,7 @@ fn is_newer(a: (u32, u32, u32), b: (u32, u32, u32)) -> bool {
     a > b
 }
 
-fn fetch_latest() -> Result<Release, UpdateError> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(UPDATE_CHECK_TIMEOUT))
-        .build()
-        .into();
+fn fetch_latest(agent: &ureq::Agent) -> Result<Release, UpdateError> {
     let mut resp = agent
         .get(GH_LATEST)
         .header("User-Agent", USER_AGENT)
@@ -117,8 +129,11 @@ fn fetch_latest() -> Result<Release, UpdateError> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn download(url: &str) -> Result<Vec<u8>, UpdateError> {
-    let mut resp = ureq::get(url).header("User-Agent", USER_AGENT).call()?;
+/// Fetch a release asset through the same HTTPS-only, bounded agent as the
+/// metadata — never through a bare `ureq::get`, which would accept whatever
+/// scheme the asset URL names.
+fn download(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, UpdateError> {
+    let mut resp = agent.get(url).header("User-Agent", USER_AGENT).call()?;
     Ok(resp.body_mut().read_to_vec()?)
 }
 
@@ -203,7 +218,7 @@ pub fn install_dir() -> Result<PathBuf, UpdateError> {
 /// `None` if the running version is current. Safe to call while the daemon is
 /// running — performs network + version comparison only.
 pub fn check_for_update() -> Result<Option<String>, UpdateError> {
-    let release = fetch_latest()?;
+    let release = fetch_latest(&https_agent(UPDATE_CHECK_TIMEOUT))?;
     let latest = parse_version(&release.tag_name)
         .ok_or_else(|| UpdateError::Network(format!("unparseable tag: {}", release.tag_name)))?;
     let current = parse_version(env!("CARGO_PKG_VERSION"))
@@ -222,7 +237,8 @@ pub fn check_for_update() -> Result<Option<String>, UpdateError> {
 /// On success the new version tag is returned and a detached shim has been
 /// spawned to finish the swap after this process exits.
 pub fn perform_update() -> Result<String, UpdateError> {
-    let release = fetch_latest()?;
+    let agent = https_agent(UPDATE_DOWNLOAD_TIMEOUT);
+    let release = fetch_latest(&agent)?;
     let latest = parse_version(&release.tag_name)
         .ok_or_else(|| UpdateError::Network(format!("unparseable tag: {}", release.tag_name)))?;
     let current = parse_version(env!("CARGO_PKG_VERSION"))
@@ -236,10 +252,10 @@ pub fn perform_update() -> Result<String, UpdateError> {
     let sha_url = find_asset(&release, |n| n.ends_with(SHA_SUFFIX))
         .ok_or(UpdateError::AssetMissing("sha256 sidecar"))?;
 
-    let sha_text = String::from_utf8_lossy(&download(&sha_url)?).into_owned();
+    let sha_text = String::from_utf8_lossy(&download(&agent, &sha_url)?).into_owned();
     let expected = parse_sidecar(&sha_text).ok_or(UpdateError::UnparseableSidecar)?;
 
-    let zip_bytes = download(&zip_url)?;
+    let zip_bytes = download(&agent, &zip_url)?;
     let computed = sha256_hex(&zip_bytes);
     if computed != expected {
         return Err(UpdateError::ShaMismatch { expected, computed });

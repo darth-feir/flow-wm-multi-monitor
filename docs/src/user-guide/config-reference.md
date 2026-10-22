@@ -94,7 +94,7 @@ in the repo root — `flow config init` copies it verbatim.
 | `column_width` | `Option<u32>` | `None` | Optional fixed pixel width per column. When set, ignores `columns_per_screen`. Useful on ultrawide monitors where you want consistent column sizes regardless of monitor count. Both are ignored when a [`[columns]`](#columns--column-width-presets) section is present. |
 | `min_column_width_px` | `u32` | `640` | Floor for column width in pixels. Columns cannot be resized below this. |
 | `min_window_height_px` | `u32` | `100` | Minimum row height in pixels — the floor for any single window's allocated height inside a column. Bounds the maximum number of rows that can stack inside one column. |
-| `check_for_updates` | `bool` | `true` | Whether `flow start` checks GitHub for a newer release and prints a one-line notification prompting `flow update` when one exists. Runs after the daemon is ready, is bounded by a short timeout, and never blocks startup. The explicit `flow update --check` command is unaffected by this flag. |
+| `check_for_updates` | `bool` | `false` | Whether `flow start` checks GitHub for a newer release and prints a one-line notification prompting `flow update` when one exists. **Off by default in this fork** — nothing is contacted at start unless you opt in with `true`. When on it runs after the daemon is ready, is bounded by a short timeout, and never blocks startup. The explicit `flow update --check` command is unaffected by this flag. |
 | `adopt_maximized` | `bool` | `false` | Whether a window that is **maximized** when FlowWM meets it — in the startup scan, when it opens, when tiling is turned back on — is un-maximized and classified through your rules (tiled or floated like any other window) instead of being left alone as "ignored: maximized" until you restore it. Fullscreen windows (video, games) are never adopted, nor is a window your rules ignore. An adopted window is maximized again when FlowWM hands the desktop back: `flow dispatch tiling off`, `flow stop`, a fail-back. With `false` (the stock behaviour) a maximized window stays ignored until you restore it or run [`set-window`](./dispatch-reference.md#set-window-mode) on it, which adopts it either way. |
 
 Example:
@@ -104,7 +104,7 @@ columns_per_screen = 4
 # column_width = 1280          # optional fixed width; ignores columns_per_screen
 min_column_width_px = 640
 min_window_height_px = 100
-check_for_updates = true       # set false to silence the start-time update notification
+check_for_updates = false      # the fork's default; true opts in to the start-time GitHub check
 adopt_maximized = false        # true: un-maximize and tile/float windows found maximized
 ```
 

@@ -62,11 +62,12 @@ min_window_height_px = 100
 min_row_height_px = 100
 
 # Whether `flow start` checks GitHub for a newer release and, if one exists,
-# prints a one-line notification prompting `flow update`. The check runs after
-# the daemon is ready, is bounded by a short timeout, and never blocks or
-# aborts startup. Explicit `flow update --check` is always available regardless
-# of this flag. Set to false to silence the start-time notification.
-check_for_updates = true
+# prints a one-line notification prompting `flow update`. This fork opts out
+# of the start-time check (off by default): nothing is contacted unless you
+# set this to true. When on, the check runs after the daemon is ready, is
+# bounded by a short timeout, and never blocks or aborts startup. Explicit
+# `flow update --check` is always available regardless of this flag.
+check_for_updates = false
 
 # Whether a window that is maximized when FlowWM meets it (at startup, when it
 # opens, when tiling is turned back on) is un-maximized and classified through
