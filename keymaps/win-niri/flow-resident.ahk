@@ -12,23 +12,15 @@
 ; whose #HotIf condition is false lets it pass through to the other, and the
 ; conditions are exclusive (daemon pipe absent / present).
 ;
-; flow.exe is found via the FLOW_BIN environment variable (a directory), then
-; %LOCALAPPDATA%\Programs\flow, then PATH. Its directory is put on PATH before
-; the start so the daemon's keymap (which runs plain `flow`) inherits it.
+; flow.exe is resolved by flow-exe.ahk (shared with flow.ahk): the FLOW_BIN
+; environment variable (a directory), then %LOCALAPPDATA%\Programs\flow, then
+; PATH. The daemon sets FLOW_BIN for the keymap it launches itself.
 ; ════════════════════════════════════════════════════════════════════════════
+
+#Include %A_ScriptDir%\flow-exe.ahk
 
 PipeName := EnvGet("FLOW_PIPE_NAME") || "\\.\pipe\flow"
 FlowExe := ResolveFlowExe()
-
-ResolveFlowExe() {
-    dir := EnvGet("FLOW_BIN")
-    if (dir != "" && FileExist(dir "\flow.exe"))
-        return dir "\flow.exe"
-    perUser := EnvGet("LOCALAPPDATA") "\Programs\flow\flow.exe"
-    if FileExist(perUser)
-        return perUser
-    return "flow"
-}
 
 ; True when nothing answers on the daemon's pipe. ERROR_SEM_TIMEOUT (121)
 ; means the pipe exists but is busy, i.e. a daemon is there.
@@ -46,12 +38,10 @@ Note(msg, ms := 2500) {
 
 StartFlow() {
     global FlowExe
-    if (FlowExe != "flow") {
-        SplitPath(FlowExe, , &dir)
-        EnvSet("Path", dir ";" EnvGet("Path"))
-    }
     Note("Starting FlowWM…")
-    try Run('"' FlowExe '" start --ahk', , "Hide")
+    ; Started from the home folder: the daemon must not inherit this script's
+    ; working directory either (it passes its own to the keymap it launches).
+    try Run('"' FlowExe '" start --ahk', EnvGet("USERPROFILE"), "Hide")
     catch as e {
         Note("could not run flow start: " e.Message, 5000)
         return

@@ -322,6 +322,20 @@ created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
    effect (a launcher that re-executes the real interpreter and exits
    leaves the child outside the job, since breakaway is allowed).
 
+The script is started with the **config directory as its working
+directory** and **`FLOW_BIN`** (the directory of the running `flowd.exe`,
+`autostart::flow_bin_dir`) in its environment — an explicit
+`CREATE_UNICODE_ENVIRONMENT` block, the daemon's own environment is not
+modified. `CreateProcess` searches the working directory before `PATH`, and
+the daemon's cwd is wherever `flow start` was run from, so a keymap that ran
+`flow` by bare name could have picked up a `flow.exe` planted there. The
+shipped keymaps (`keymaps/win-niri/flow-exe.ahk`, included by `flow.ahk`
+and `flow-resident.ahk`) resolve `%FLOW_BIN%\flow.exe`, then
+`%LOCALAPPDATA%\Programs\flow\flow.exe`, then plain `flow`, and run the
+result by absolute path everywhere; the resolved path is the first line
+of the `FLOW_AHK_LOG` trace. The shell-association fallback gets the
+working directory (`lpDirectory`) but not `FLOW_BIN`.
+
 The job handle lives in `FlowWM` and is never closed explicitly: process
 teardown closes it — clean stop, panic, `abort`, `taskkill /f` — and the
 kernel terminates the script, releasing the Win key. The pid is also written

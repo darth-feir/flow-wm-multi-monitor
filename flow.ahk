@@ -27,9 +27,14 @@
 ;                 firmware — physically you press Win, the OS sees the sacrificial
 ;                 key. See the README's "Can I use the Win key?" section.
 ;
-;   2. flowExe  — path to flow.exe. Defaults to "flow" (resolved from PATH).
-;                 If FlowWM isn't on your PATH, set the full path, e.g.
-;                 "C:\Users\you\flow.exe".
+;   2. flowExe  — path to flow.exe. Resolved by ResolveFlowExe() below:
+;                 %FLOW_BIN%\flow.exe first — FLOW_BIN is the directory of the
+;                 running flowd.exe, which the daemon puts in this script's
+;                 environment when it launches it (`flow start --ahk`), so the
+;                 keymap always drives the daemon it belongs to —, then
+;                 %LOCALAPPDATA%\Programs\flow\flow.exe, then plain "flow" from
+;                 PATH (never the working directory). To pin it, replace the
+;                 call with the full path, e.g. flowExe := "C:\Users\you\flow.exe".
 ;
 ; Run at login:  `flow enable-autostart --ahk` (creates a single shell:startup
 ;                shortcut that runs `flow.exe start --ahk`; idempotent).
@@ -60,7 +65,7 @@
 
 ; --- Config ------------------------------------------------------------------
 ModKey   := "Alt"                 ; the modifier every binding is held with
-flowExe := "flow"                ; path to flow.exe (PATH by default)
+flowExe := ResolveFlowExe()      ; absolute path to flow.exe (see the header)
 PipeName := EnvGet("FLOW_PIPE_NAME") || "\\.\pipe\flow"
 DaemonUp := false
 DownTicks := 0
@@ -68,6 +73,18 @@ BusyPolls := 0          ; consecutive polls that found the pipe busy (121)
 MaxBusyPolls := 5       ; after this many, "busy" means wedged, not alive
 
 ; --- Flow command helpers ----------------------------------------------------
+; Where flow.exe is: %FLOW_BIN% (set by the daemon that launched this script),
+; the usual per-user install, else PATH. Keep in sync with keymaps/win-niri/flow-exe.ahk.
+ResolveFlowExe() {
+    dir := EnvGet("FLOW_BIN")
+    if (dir != "" && FileExist(dir "\flow.exe"))
+        return dir "\flow.exe"
+    perUser := EnvGet("LOCALAPPDATA") "\Programs\flow\flow.exe"
+    if FileExist(perUser)
+        return perUser
+    return "flow"
+}
+
 Flow(cmd) {
     global flowExe
     try Run('"' flowExe '" ' cmd, , 'Hide')

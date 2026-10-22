@@ -25,7 +25,7 @@
 //!
 //! See (`docs/src/dev-guide/ipc-and-watchdog.md`) for the command reference.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
@@ -289,14 +289,32 @@ pub fn launch_ahk_in_job(config_dir: &Path) -> Result<AhkProcess, String> {
         ),
     }
 
+    // The script runs `flow` by name. CreateProcess searches the working
+    // directory before PATH, and the daemon's own cwd is wherever `flow
+    // start` happened to be run from — so the script gets the config dir
+    // as its working directory and FLOW_BIN (this flowd.exe's directory)
+    // in its environment, which the keymap resolves to an absolute
+    // `flow.exe` before anything else.
+    let flow_bin = flow_bin_dir();
     let process = match resolve_ahk_interpreter() {
         Some(exe) => {
-            let opts = crate::job::SpawnOptions::default();
+            let opts = crate::job::SpawnOptions {
+                no_window: false,
+                current_dir: Some(config_dir.to_path_buf()),
+                env: flow_bin
+                    .iter()
+                    .map(|d| (OsString::from(FLOW_BIN_ENV), d.as_os_str().to_owned()))
+                    .collect(),
+            };
             let child = job.spawn(&exe, &[script.as_os_str()], &opts)?;
             let pid = child.pid();
             log::info!(
-                "launched flow.ahk with {} (pid {pid}) inside a kill-on-close job",
-                exe.display()
+                "launched flow.ahk with {} (pid {pid}) inside a kill-on-close job; cwd {}, {FLOW_BIN_ENV}={}",
+                exe.display(),
+                config_dir.display(),
+                flow_bin
+                    .as_deref()
+                    .map_or_else(|| "<unset>".to_owned(), |d| d.display().to_string())
             );
             AhkProcess {
                 _job: job,
@@ -309,9 +327,9 @@ pub fn launch_ahk_in_job(config_dir: &Path) -> Result<AhkProcess, String> {
         None => {
             log::warn!(
                 "no AutoHotkey v2 interpreter found (registry InstallDir, %LOCALAPPDATA%\\Programs\\AutoHotkey, %ProgramFiles%\\AutoHotkey, PATH); \
-                 falling back to the .ahk shell association — the job tie-in may not be in effect"
+                 falling back to the .ahk shell association — the job tie-in may not be in effect and {FLOW_BIN_ENV} is not set"
             );
-            let (pid, handle) = shell_execute_ahk(&script)?;
+            let (pid, handle) = shell_execute_ahk(&script, config_dir)?;
             let job_tied = match job.assign(handle) {
                 Ok(()) => {
                     log::info!(
@@ -459,17 +477,33 @@ fn registry_string(root: HKEY, subkey: &str, value: &str) -> Option<String> {
     (!s.trim().is_empty()).then(|| s.trim().to_owned())
 }
 
-/// Launch `script` via the `.ahk` shell association; returns the pid and
-/// the process handle (`SEE_MASK_NOCLOSEPROCESS`), which the caller owns.
-fn shell_execute_ahk(script: &Path) -> Result<(u32, HANDLE), String> {
+/// Name of the environment variable the daemon sets for the hotkey script:
+/// the directory of the running `flowd.exe`, where `flow.exe` lives too.
+pub const FLOW_BIN_ENV: &str = "FLOW_BIN";
+
+/// The directory of the running executable (`flowd.exe`), which is also
+/// where `flow.exe` is installed. `None` only if `current_exe` fails.
+#[must_use]
+pub fn flow_bin_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+}
+
+/// Launch `script` via the `.ahk` shell association with `working_dir` as
+/// its directory; returns the pid and the process handle
+/// (`SEE_MASK_NOCLOSEPROCESS`), which the caller owns.
+fn shell_execute_ahk(script: &Path, working_dir: &Path) -> Result<(u32, HANDLE), String> {
     let script_w = Wide::from_os(script.as_os_str());
     let verb_w = Wide::from_str("open");
+    let dir_w = Wide::from_os(working_dir.as_os_str());
 
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS,
         lpVerb: verb_w.pcwstr(),
         lpFile: script_w.pcwstr(),
+        lpDirectory: dir_w.pcwstr(),
         nShow: SW_HIDE.0,
         ..Default::default()
     };
@@ -1084,6 +1118,17 @@ mod tests {
             Duration::from_millis(50)
         ));
         assert!(t0.elapsed() >= Duration::from_millis(40));
+    }
+
+    #[test]
+    fn flow_bin_dir_is_the_running_exe_directory() {
+        let dir = flow_bin_dir().expect("current_exe has a parent");
+        assert!(dir.is_dir(), "{dir:?}");
+        assert_eq!(
+            Some(dir.as_path()),
+            std::env::current_exe().unwrap().parent()
+        );
+        assert_eq!(FLOW_BIN_ENV, "FLOW_BIN");
     }
 
     #[test]

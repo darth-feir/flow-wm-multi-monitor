@@ -5,8 +5,13 @@
 ;
 ; Mirrors niri's default binds (https://github.com/YaLTeR/niri/wiki/Configuration:-Key-Bindings)
 ; onto `flow dispatch` commands. Install at %USERPROFILE%\.config\flow\flow.ahk
-; (together with launcher.ahk and help.ahk, which it #Includes) and start with
-; `flow start --ahk`.
+; (together with flow-exe.ahk, launcher.ahk and help.ahk, which it #Includes)
+; and start with `flow start --ahk`.
+;
+; flow.exe is run by absolute path (flow-exe.ahk): %FLOW_BIN%\flow.exe - the
+; daemon sets FLOW_BIN to its own directory when it launches this script -,
+; else %LOCALAPPDATA%\Programs\flow\flow.exe, else plain `flow` from PATH.
+; Never the working directory. The resolved path is the first FLOW_AHK_LOG line.
 ;
 ;   Mod+Left/Down/Up/Right        focus the next window on this screen
 ;   Mod+Shift+Arrows              move the window along the strip (up/down inside a stacked column)
@@ -63,7 +68,9 @@
 ; edge_hop = false) is in flow.toml.example next to this file.
 ; ════════════════════════════════════════════════════════════════════════════
 
-flowExe := "flow"      ; path to flow.exe (PATH by default); quote-safe below
+#Include %A_ScriptDir%\flow-exe.ahk
+
+flowExe := ResolveFlowExe()   ; absolute path to flow.exe (see flow-exe.ahk); quote-safe below
 PipeName := EnvGet("FLOW_PIPE_NAME") || "\\.\pipe\flow"
 DaemonUp := false
 TilingOn := true        ; refined from `flow ping` after the startup gate
@@ -257,19 +264,20 @@ ShowCentered(gui) {
 
 ; Terminals. Mod+T Alacritty, Mod+Shift+T Alacritty as admin, Mod+Alt+T
 ; Windows Terminal, Mod+Alt+Shift+T Windows Terminal as admin. Admin uses the
-; shell's RunAs verb, so UAC prompts as usual. Alacritty is looked up in its
-; usual install folders and then on PATH.
+; shell's RunAs verb, so UAC prompts as usual - which is why both are run by
+; fixed absolute paths first: the machine-wide install (%ProgramFiles%) before
+; the per-user one, and a PATH lookup (where.exe) only as the last resort.
 Alacritty(admin := false) {
     static exe := ""
     if (exe = "") {
-        for p in [A_AppData "\..\Local\Programs\Alacritty\alacritty.exe", A_ProgramFiles "\Alacritty\alacritty.exe"]
+        for p in [A_ProgramFiles "\Alacritty\alacritty.exe", EnvGet("LOCALAPPDATA") "\Programs\Alacritty\alacritty.exe"]
             if FileExist(p) {
                 exe := p
                 break
             }
         if (exe = "") {
             try {
-                out := ComObject("WScript.Shell").Exec("where.exe alacritty.exe").StdOut.ReadAll()
+                out := ComObject("WScript.Shell").Exec(A_ComSpec " /c where.exe alacritty.exe").StdOut.ReadAll()
                 if (Trim(out, " `t`r`n") != "")
                     exe := Trim(StrSplit(out, "`n")[1], " `t`r")
             }
@@ -277,13 +285,16 @@ Alacritty(admin := false) {
     }
     if (exe = "") {
         AhkLog("alacritty not found")
-        Osd("Alacritty not found (%LOCALAPPDATA%\Programs\Alacritty, Program Files, PATH).")
+        Osd("Alacritty not found (Program Files, %LOCALAPPDATA%\Programs\Alacritty, PATH).")
         return
     }
     Launch(exe, admin)
 }
 WindowsTerminal(admin := false) {
-    Launch("wt.exe", admin)
+    ; The Store app's execution alias is a fixed per-user path; only if it is
+    ; absent is `wt.exe` left to the shell's own lookup.
+    alias := EnvGet("LOCALAPPDATA") "\Microsoft\WindowsApps\wt.exe"
+    Launch(FileExist(alias) ? alias : "wt.exe", admin)
 }
 Launch(exe, admin) {
     AhkLog("launch " (admin ? "(admin) " : "") exe)
@@ -293,6 +304,8 @@ Launch(exe, admin) {
         if !InStr(e.Message, "cancel")       ; a declined UAC prompt is not worth a popup
             Osd("could not start " exe ": " e.Message)
 }
+
+AhkLog("flow: " flowExe (EnvGet("FLOW_BIN") != "" ? " (FLOW_BIN=" EnvGet("FLOW_BIN") ")" : " (FLOW_BIN unset)") " cwd=" A_WorkingDir)
 
 ; Startup gate: refuse to hook the Win key unless the daemon answers within 10 s.
 Loop 20 {
