@@ -309,3 +309,44 @@ remain split at the animation step:
 The split is load-bearing and the divergence is the point, not an accident to
 clean up. The pre-parked-vs-not precondition is the single fact that decides
 which policy is correct, and it differs between the two call sites.
+
+## Decisions Made in the Multi-Monitor Fork
+
+The fork (`feat/multi-monitor`) records its own decisions as ADRs in
+`docs/adr/`, in the same shape as ADR-0006: a summary, the context, the
+options considered and the consequences. Numbers were assigned on the fork;
+if upstream's unmerged branches land first with the same numbers, these are
+renumbered at merge time, the way ADR-0007 (cursor) already was once.
+
+- **ADR-0007 — One scrolling space per monitor, parking beyond the virtual
+  screen.** Each display owns a strip and ten workspaces; parked windows go
+  beyond the Win32 virtual screen on a side with no neighbour and any move
+  into or out of such a slot is instant, so a window is never drawn over the
+  adjacent display. Display changes are reconciled in one debounced pass.
+  `docs/adr/0007-one-scrolling-space-per-monitor.md`
+- **ADR-0008 — Tiling on/off is a pause inside the daemon, not a stop.**
+  Pause returns every tile to its pre-tiling rect and refuses layout
+  commands; resume rebuilds from the live desktop with remembered seats.
+  `docs/adr/0008-tiling-pause-is-not-a-stop.md`
+- **ADR-0009 — Every exit fails back to the plain Windows desktop.** One
+  ordered teardown for every exit path, the hotkey script in a kill-on-close
+  job object, staged startup, and a daemon-less `flow rescue`.
+  `docs/adr/0009-every-exit-fails-back-to-windows.md`
+- **ADR-0010 — Windows that exist before the daemon are adopted, not
+  skipped.** Minimized windows are classified from their placement,
+  maximized ones un-maximized when `adopt_maximized` is on, cloaked UWP
+  frames registered on uncloak; every recovery hook registers an untracked
+  window first. `docs/adr/0010-pre-existing-windows-are-adopted.md`
+- **ADR-0011 — Mod + left-button drag: the keymap moves, the daemon
+  brackets.** No native move loop survives a hook hotkey, so the keymap
+  moves the window and `drag begin` / `drag end` put the daemon in the
+  native drag's state. `docs/adr/0011-keymap-driven-drag-sessions.md`
+- **ADR-0012 — The daemon trusts its own user only, and nothing it did not
+  write.** Pipe DACL and client QoS, bounded lines, validated loadout paths,
+  `FLOW_BIN`, image-checked pidfile kills, an overlay registry instead of
+  `GWLP_USERDATA`, no titles on disk, and an update *checker* in place of the
+  self-updater. `docs/adr/0012-local-user-trust-boundary.md`
+- **ADR-0013 — The floating layer follows ADR-0003's invariant.** Floats
+  are topmost only while flow owns the foreground; see the file for the two
+  deviations (a config knob, and shell surfaces that leave the state alone).
+  `docs/adr/0013-floating-layer-follows-adr-0003.md`
