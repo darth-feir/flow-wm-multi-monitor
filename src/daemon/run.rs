@@ -635,11 +635,17 @@ impl FlowWM {
                         self.on_float_location_changed(hwnd);
                     }
                 }
+                // A keymap session (`drag begin`) owns its window's drag
+                // lifecycle: native move-size events for it are ignored.
                 HookEvent::MoveSizeStart { hwnd } => {
-                    self.on_drag_start(hwnd);
+                    if !self.native_drag_event_shadowed(hwnd) {
+                        self.on_drag_start(hwnd);
+                    }
                 }
                 HookEvent::MoveSizeEnd { hwnd } => {
-                    self.on_drag_end(hwnd);
+                    if !self.native_drag_event_shadowed(hwnd) {
+                        self.on_drag_end(hwnd);
+                    }
                 }
             }
         }

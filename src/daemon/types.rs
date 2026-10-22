@@ -224,6 +224,14 @@ pub struct FlowWM {
     /// this covers resize automatically because it lives in the same field.
     pub(super) drag_state: Option<super::drag::DragMode>,
 
+    /// The keymap-driven drag session (`flow dispatch drag begin`), or
+    /// `None`. A tile session also holds `drag_state`; a float session
+    /// holds back the float-sync writes and keeps the animator off that
+    /// window. Native move-size events for the session's window are
+    /// ignored, and the busy gate applies as for a native drag. See
+    /// `daemon::drag_session`.
+    pub(super) manual_drag: Option<super::drag_session::ManualDrag>,
+
     /// Timestamp of the most recent foreground-reconciliation pass.
     ///
     /// The main loop folds `last_foreground_sync + foreground_sync_interval_ms`

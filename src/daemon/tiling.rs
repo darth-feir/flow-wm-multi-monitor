@@ -295,6 +295,10 @@ impl FlowWM {
             };
         }
 
+        // 0. A keymap drag session (`drag begin`) ends here: the dispatch
+        //    path has already committed it; any other caller drops it.
+        self.abandon_manual_drag();
+
         // 1. No tween may land after the windows have been put back.
         self.animator.cancel_and_wait();
 

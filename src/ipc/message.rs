@@ -130,6 +130,23 @@ pub enum SocketMessage {
     /// client learns which state it landed in.
     ToggleTiling,
 
+    // --- Keymap drag sessions ---
+    /// Begin a keymap-driven drag of the focused window (`flow dispatch
+    /// drag begin`): the daemon enters the state a `MoveSizeStart` would
+    /// give that window and the keymap moves it until
+    /// [`DragEnd`](Self::DragEnd). Answered with
+    /// [`SocketResponse::Data`] `{"drag": "tile" | "float", "hwnd"}`, or an
+    /// error when a drag is already in progress, nothing draggable has the
+    /// focus, or tiling is off. Not layout-mutating itself, so it is not
+    /// subject to the busy gate (it *is* the drag).
+    DragBegin,
+    /// End the keymap-driven drag (`flow dispatch drag end`): the
+    /// `MoveSizeEnd` path runs — a tile commits its drop zone or snaps
+    /// back, a float records its final rect. Answered with
+    /// [`SocketResponse::Data`] `{"ended": true, "drag": kind}`, or
+    /// `{"ended": false}` when no session is open (a no-op, not an error).
+    DragEnd,
+
     // --- Focus ---
     /// Move focus left.
     FocusLeft,
@@ -440,7 +457,8 @@ impl SocketMessage {
     /// save keep working.
     #[must_use]
     pub fn is_rejected_while_tiling_paused(&self) -> bool {
-        self.is_layout_mutating() && !matches!(self, Self::SetTiling { .. } | Self::ToggleTiling)
+        (self.is_layout_mutating() && !matches!(self, Self::SetTiling { .. } | Self::ToggleTiling))
+            || matches!(self, Self::DragBegin)
     }
 }
 
@@ -1232,6 +1250,31 @@ mod tests {
             resp, None,
             "message-shaped JSON should not parse as SocketResponse"
         );
+    }
+
+    // ── Keymap drag sessions ──────────────────────────────────────────────
+
+    #[test]
+    fn drag_begin_and_end_round_trip_as_snake_case() {
+        for (msg, wire) in [
+            (SocketMessage::DragBegin, r#"{"type":"drag_begin"}"#),
+            (SocketMessage::DragEnd, r#"{"type":"drag_end"}"#),
+        ] {
+            assert_eq!(serde_json::to_string(&msg).unwrap(), wire);
+            let parsed: SocketMessage = serde_json::from_str(wire).unwrap();
+            assert_eq!(parsed, msg);
+        }
+    }
+
+    #[test]
+    fn drag_session_commands_are_not_layout_mutating_but_begin_needs_tiling() {
+        // They manage the drag the busy gate protects, so the gate must let
+        // them through; `drag end` must also work while tiling is off (the
+        // pause already ended the session, the reply says so).
+        assert!(!SocketMessage::DragBegin.is_layout_mutating());
+        assert!(!SocketMessage::DragEnd.is_layout_mutating());
+        assert!(SocketMessage::DragBegin.is_rejected_while_tiling_paused());
+        assert!(!SocketMessage::DragEnd.is_rejected_while_tiling_paused());
     }
 
     // ── SocketResponse::Busy serialization ───────────────────────────────

@@ -177,6 +177,7 @@ format with a `"type"` field and snake_case variant names.
 | Control | `Stop`, `ReloadConfig`, `CheckConfig` | Daemon lifecycle and config |
 | Liveness | `Ping` | Answered with `Pong` (version, pid, monitor count, registered hooks, tiling on/off); not layout-mutating, so it works mid-drag. Used by `flow start` and `flow ping` |
 | Tiling on/off | `SetTiling { enabled }`, `ToggleTiling` | Pause / resume tiling without stopping the daemon (see [Tiling on/off](#tiling-onoff-pause-and-resume)); layout-mutating (rejected mid-drag) but the only mutating commands accepted while tiling is off. Answered with `Data { "tiling_enabled": bool }` — the resulting state |
+| Keymap drag session | `DragBegin`, `DragEnd` | Bracket a drag the hotkey script performs itself (Mod + left-button drag, see [Tile Drag](./tile-drag.md), *Keymap-driven sessions*). `DragBegin` puts the focused window into the `MoveSizeStart` state and answers `Data { "drag": "tile" or "float", "hwnd" }` (error: a drag already active, nothing draggable focused, tiling off); `DragEnd` runs the `MoveSizeEnd` path and answers `Data { "ended": true, "drag" }`, or `Data { "ended": false }` with no session. Neither is layout-mutating |
 | Focus | `FocusLeft/Right/Up/Down` | Move focus between windows |
 | Swap (per-window) | `SwapLeft/Right/Up/Down` | Swap focused window with neighbour |
 | Swap (column) | `SwapColumn { direction }` | Swap entire focused column |
@@ -503,6 +504,8 @@ owning monitor the registry remembers for a minimized or hidden window), or
 | `flow dispatch move-to-monitor left/right/up/down` | `MoveWindowToMonitor` |
 | `flow dispatch tiling on/off` | `SetTiling { enabled }` — prints `flow: tiling on` / `flow: tiling off` |
 | `flow dispatch tiling toggle` | `ToggleTiling` — prints the state it landed in |
+| `flow dispatch drag begin` | `DragBegin` — prints `flow: drag begun (tile)` / `(float)`; exit 1 when refused |
+| `flow dispatch drag end` | `DragEnd` — prints `flow: drag ended (tile)` / `(float)`, or `flow: no drag session to end` |
 
 The dispatch commands that change layout flow through the daemon's 3-stage
 pipeline (mutate, project, animate) as described in

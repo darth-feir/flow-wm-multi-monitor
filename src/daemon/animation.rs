@@ -25,6 +25,7 @@ use crate::registry::WindowRegistry;
 use crate::registry::types::{FloatingState, Window, WindowState};
 use crate::workspace::WorkspaceParking;
 
+use super::borders::float_border_rect;
 use super::types::FlowWM;
 
 /// Where the bridge reads each window's **pre-batch** rect from when it
@@ -315,6 +316,7 @@ impl FlowWM {
                 prev_rect,
                 entry.rect,
                 window_rect,
+                entry.rect,
                 border_hwnd,
             );
         }
@@ -504,6 +506,9 @@ impl FlowWM {
         let border_thickness = self.config.borders.thickness as i32;
         let border_overlap = self.config.borders.overlap as i32;
         let monitor_info = *self.monitors[monitor_idx].active_scrolling().monitor();
+        // A float the keymap is moving (`drag begin`) is the user's, not the
+        // animator's: left out like the dragged tile in `submit_animation`.
+        let excluded_float = self.manual_float_drag_hwnd();
 
         // Build the combined target list. Iterating with explicit loops
         // (rather than `flat_map`) lets us hold one `&self.registry` borrow
@@ -516,6 +521,9 @@ impl FlowWM {
         let mut has_float_target = false;
         for (layout, y_offset) in batches {
             for entry in &layout.entries {
+                if Some(entry.window_id.0) == excluded_float {
+                    continue;
+                }
                 if !has_float_target && crate::registry::hooks::is_float_hwnd(entry.window_id.0) {
                     has_float_target = true;
                 }
@@ -534,17 +542,20 @@ impl FlowWM {
                     y: r.y + y_offset,
                     ..r
                 };
-                // A fullscreen window has no ring to make room for: it
-                // covers the screen rect exactly.
-                let inset = if self.is_fullscreen(entry.window_id.0) {
-                    0
-                } else {
-                    border_thickness - border_overlap
-                };
-                let window_rect =
-                    shift(invisible_bounds.visible_to_window(entry.rect).inset(inset));
-                // The border overlay sits at the visible rect (same y_offset)
-                // so it moves in lockstep with the window across the switch.
+                // A float's stored rect IS its visible rect (the float-sync
+                // path reads it back from the window), so it is never inset:
+                // its ring is seated around it instead. A fullscreen window
+                // (a float in the registry) has no ring at all. See
+                // `float_geometry` and `docs/src/dev-guide/floating-space.md`.
+                let (window_rect, border_rect) = float_geometry(
+                    is_active_float(window),
+                    invisible_bounds,
+                    shift(entry.rect),
+                    border_thickness,
+                    border_overlap,
+                );
+                // The border overlay moves in lockstep with the window across
+                // the switch (same y_offset).
                 let next = shift(entry.rect);
                 let prev_rect = self
                     .last_submitted_rect(entry.window_id.0)
@@ -557,6 +568,7 @@ impl FlowWM {
                     prev_rect,
                     next,
                     window_rect,
+                    border_rect,
                     border_hwnd,
                 );
             }
@@ -605,31 +617,40 @@ impl FlowWM {
     pub(super) fn teleport_workspaces(&mut self, batches: &[(ActualLayout, i32)]) {
         let border_thickness = self.config.borders.thickness as i32;
         let border_overlap = self.config.borders.overlap as i32;
+        let excluded_float = self.manual_float_drag_hwnd();
         let mut submitted: Vec<(isize, Rect)> = Vec::new();
         for (layout, y_offset) in batches {
             for entry in &layout.entries {
+                if Some(entry.window_id.0) == excluded_float {
+                    continue;
+                }
                 let window = self.registry.get_window(HWND(entry.window_id.0 as *mut _));
                 let invisible_bounds = window.map(|w| w.invisible_bounds).unwrap_or_default();
 
-                let window_rect = invisible_bounds
-                    .visible_to_window(entry.rect)
-                    .inset(border_thickness - border_overlap);
-                let target_y = window_rect.y + y_offset;
-
-                // Direct SetWindowPos — bypass the animator entirely.
-                // Teleport is best-effort: a single failure must not abort
-                // the rest of the batch, it only keeps the window out of the
-                // submitted-rect record.
                 let visible = Rect {
                     x: entry.rect.x,
                     y: entry.rect.y + y_offset,
                     width: entry.rect.width,
                     height: entry.rect.height,
                 };
+                // Floats keep their visible rect (ring seated around it);
+                // tiles are inset for the ring. See `float_geometry`.
+                let (window_rect, border_rect) = float_geometry(
+                    is_active_float(window),
+                    invisible_bounds,
+                    visible,
+                    border_thickness,
+                    border_overlap,
+                );
+
+                // Direct SetWindowPos — bypass the animator entirely.
+                // Teleport is best-effort: a single failure must not abort
+                // the rest of the batch, it only keeps the window out of the
+                // submitted-rect record.
                 if crate::registry::win32::set_window_rect(
                     entry.window_id.0,
                     window_rect.x,
-                    target_y,
+                    window_rect.y,
                     window_rect.width,
                     window_rect.height,
                 ) {
@@ -641,7 +662,7 @@ impl FlowWM {
                 // changed, keeping the bitmap in sync on instant repositioning.
                 // Option<&Window> is Copy so re-using `window` here is sound.
                 if let Some(border) = window.and_then(|w| w.border.as_ref()) {
-                    border.set_geometry(visible);
+                    border.set_geometry(border_rect);
                 }
             }
         }
@@ -797,6 +818,7 @@ pub(super) fn animate_layout_raw(
             None,
             entry.rect,
             window_rect,
+            entry.rect,
             border_hwnd,
         );
     }
@@ -968,6 +990,7 @@ fn push_targets(
     prev: Option<Rect>,
     next: Rect,
     window_rect: Rect,
+    border_rect: Rect,
     border_hwnd: Option<isize>,
 ) -> Move {
     let decision = plan_move(monitor, prev, next);
@@ -1000,13 +1023,48 @@ fn push_targets(
         targets.push(
             WindowTarget::new(
                 WindowRef(b_hwnd),
-                IVec2::new(next.x, next.y),
-                IVec2::new(next.width, next.height),
+                IVec2::new(border_rect.x, border_rect.y),
+                IVec2::new(border_rect.width, border_rect.height),
             )
             .with_instant(instant),
         );
     }
     decision
+}
+
+/// Whether `window` is an active float (fullscreen windows included: they
+/// are floats in the registry).
+fn is_active_float(window: Option<&Window>) -> bool {
+    window.is_some_and(|w| matches!(w.state, WindowState::Floating(FloatingState::Active { .. })))
+}
+
+/// The `(window rect, border rect)` to command for a window whose layout
+/// rect is `visible`.
+///
+/// A tile is inset by `thickness − overlap` so its ring sits in the slot;
+/// a float's stored rect is its visible rect — the float-sync path reads it
+/// back from `GetWindowRect` — so it is placed as-is and its ring is seated
+/// around it ([`float_border_rect`]). Insetting a float here made every
+/// re-animation of a floating space shrink its floats by `2·(thickness −
+/// overlap)` px (`docs/src/dev-guide/floating-space.md`, *Float geometry*).
+fn float_geometry(
+    is_float: bool,
+    bounds: crate::common::InvisibleBounds,
+    visible: Rect,
+    thickness: i32,
+    overlap: i32,
+) -> (Rect, Rect) {
+    if is_float {
+        (
+            bounds.visible_to_window(visible),
+            float_border_rect(visible, thickness as u32, overlap as u32),
+        )
+    } else {
+        (
+            bounds.visible_to_window(visible).inset(thickness - overlap),
+            visible,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1124,6 +1182,7 @@ mod tests {
             Some(parked_left),
             parked_left,
             parked_left.inset(2),
+            parked_left,
             Some(8),
         );
         assert_eq!(decision, Move::Stay);
@@ -1154,6 +1213,7 @@ mod tests {
             Some(col(11)),
             next,
             next.inset(2),
+            next,
             Some(8),
         );
         assert_eq!(decision, Move::Instant);
@@ -1171,6 +1231,7 @@ mod tests {
             &m,
             7,
             Some(col(11)),
+            col(487),
             col(487),
             col(487),
             None,
@@ -1283,6 +1344,7 @@ mod tests {
             Some(parked),
             on_screen,
             on_screen.inset(2),
+            on_screen,
             Some(8),
         );
         assert_eq!(decision, Move::Instant);
@@ -1673,5 +1735,153 @@ mod tests {
         assert!(!m.neighbour_left && !m.neighbour_right);
         assert_eq!(plan_move(&m, Some(col(11)), col(-476)), Move::Tween);
         assert_eq!(plan_move(&m, Some(col(11)), col(2560 + 16)), Move::Tween);
+    }
+}
+
+#[cfg(test)]
+mod float_geometry_tests {
+    //! Regression for the float shrink: every re-animation of a floating
+    //! space used to inset its floats by `thickness − overlap` like tiles,
+    //! and the float-sync path then read the smaller window back as the
+    //! new visible rect — 4 px lost per batch with the default ring.
+    use super::{FlowWM, PrevRects, float_geometry};
+    use crate::common::{InvisibleBounds, Rect, WindowId};
+    use crate::config::types::WindowRulesConfig;
+    use crate::layout::types::{MonitorInfo, Padding};
+    use crate::registry::WindowRegistry;
+    use crate::registry::types::{FloatingState, TilingState, WindowState};
+    use crate::registry::win32 as registry_win32;
+    use crate::workspace::{Monitor, ScrollingSpace, Workspace, WorkspaceId};
+    use windows::Win32::Foundation::HWND;
+
+    const TILE: isize = 0x7001;
+    const FLOAT: isize = 0x7002;
+    const FRAME: InvisibleBounds = InvisibleBounds {
+        left: 7,
+        top: 0,
+        right: 7,
+        bottom: 7,
+    };
+
+    fn r(x: i32, y: i32, w: i32, h: i32) -> Rect {
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    fn register(registry: &mut WindowRegistry, hwnd: isize, state: WindowState) {
+        let info = registry_win32::WindowInfo {
+            hwnd: HWND(hwnd as *mut _),
+            title: "W".into(),
+            class: "C".into(),
+            rect: r(0, 0, 10, 10),
+            exe: "w.exe".into(),
+            process_path: r"C:\w.exe".into(),
+            is_visible: true,
+            is_maximized: false,
+            is_fullscreen: false,
+            is_iconic: false,
+        };
+        registry.register_window_from_info(&info);
+        if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {
+            w.state = state;
+            w.invisible_bounds = FRAME;
+        }
+    }
+
+    /// One tile and one float at `float_rect`, ring thickness 3 / overlap 1.
+    fn flow_with_a_float(float_rect: Rect) -> FlowWM {
+        let rules = WindowRulesConfig::default();
+        let mut registry = WindowRegistry::new(&rules, &rules);
+        register(
+            &mut registry,
+            TILE,
+            WindowState::Tiling(TilingState::Active { col: 0, row: 0 }),
+        );
+        register(
+            &mut registry,
+            FLOAT,
+            WindowState::Floating(FloatingState::Active { rect: float_rect }),
+        );
+        let screen = r(0, 0, 1920, 1080);
+        let padding = Padding {
+            window_gap: 4,
+            up: 0,
+            down: 0,
+        };
+        let mut scrolling =
+            ScrollingSpace::new(MonitorInfo::single(screen), 960, 320, 100, 100, padding, 4);
+        scrolling.add_window(WindowId(TILE));
+        let mut ws = Workspace::new(WorkspaceId(1), scrolling);
+        ws.floating.add(WindowId(FLOAT), float_rect);
+        let monitor = Monitor::new(screen, screen, vec![ws], 0);
+        let mut flow = FlowWM::new_for_test(registry, vec![monitor]);
+        flow.config.borders.thickness = 3;
+        flow.config.borders.overlap = 1;
+        flow
+    }
+
+    #[test]
+    fn a_float_is_placed_at_its_visible_rect_and_ringed_around_it() {
+        let visible = r(655, 318, 610, 403);
+        let (window, border) = float_geometry(true, FRAME, visible, 3, 1);
+        assert_eq!(window, FRAME.visible_to_window(visible));
+        assert_eq!(
+            border,
+            visible.inset(-2),
+            "ring outset by thickness − overlap"
+        );
+        // Reading the window back the way the float-sync path does gives
+        // the stored rect again: no drift, however often it is re-animated.
+        let mut rect = visible;
+        for _ in 0..5 {
+            let (window, _) = float_geometry(true, FRAME, rect, 3, 1);
+            rect = FRAME.window_to_visible(window);
+        }
+        assert_eq!(rect, visible);
+    }
+
+    #[test]
+    fn a_tile_is_still_inset_for_its_ring() {
+        let slot = r(16, 16, 936, 1000);
+        let (window, border) = float_geometry(false, FRAME, slot, 3, 1);
+        assert_eq!(window, FRAME.visible_to_window(slot).inset(2));
+        assert_eq!(border, slot);
+    }
+
+    #[test]
+    fn workspace_batch_targets_keep_the_float_size_and_inset_the_tile() {
+        let float_rect = r(655, 318, 610, 403);
+        let flow = flow_with_a_float(float_rect);
+        let floats = flow.monitors[0]
+            .active_workspace()
+            .floating
+            .to_actual_layout();
+        let tiles = flow.monitors[0].active_scrolling().actual_layout().clone();
+        let out =
+            flow.workspace_targets(0, &[(tiles.clone(), 0), (floats, 0)], PrevRects::Registry);
+        let target = |hwnd: isize| {
+            out.targets
+                .iter()
+                .find(|t| t.window_ref.0 == hwnd)
+                .map(|t| {
+                    let a = t.as_rect();
+                    r(a.x, a.y, a.w, a.h)
+                })
+                .expect("target emitted")
+        };
+        let float_target = target(FLOAT);
+        assert_eq!(float_target, FRAME.visible_to_window(float_rect));
+        assert_eq!(
+            FRAME.window_to_visible(float_target),
+            float_rect,
+            "the float-sync read-back of the commanded rect is the stored rect"
+        );
+        let slot = tiles.find(WindowId(TILE)).expect("tile projected").rect;
+        assert_eq!(target(TILE), FRAME.visible_to_window(slot).inset(2));
+        assert!(out.submitted.contains(&(FLOAT, float_rect)));
     }
 }

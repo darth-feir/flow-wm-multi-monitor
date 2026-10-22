@@ -228,6 +228,28 @@ tiles slide to fill the gap while the floated window simultaneously moves to
 center (or vice versa). Submitting them separately would cause a visible
 desynchronisation where one side animates before the other.
 
+### Float geometry
+
+The animation bridge commands a float at `visible_to_window(rect)` — its
+stored rect expanded by the invisible frame, never inset for the border
+ring — and seats the ring around it (`float_border_rect`), the mirror image
+of a tile whose content is inset inside its slot. The two must agree because
+the float's rect is a **round trip**: `store_float_rect` reads
+`GetWindowRect` back through `window_to_visible` on every `LOCATIONCHANGE`
+and that becomes the next batch's input. With the tile inset applied to
+floats, every re-animation of a floating space (a float appearing, a
+workspace switch, `set-window float`) lost `2·(thickness − overlap)` px —
+4 px with the default ring — and a float dragged a few times visibly shrank.
+`float_geometry` (`src/daemon/animation.rs`) is the single rule, covered by
+`float_geometry_tests` and the drag-session round-trip test.
+
+During a keymap drag session on a float (`flow dispatch drag begin`, see
+[Tile Drag](./tile-drag.md), *Keymap-driven sessions*) `store_float_rect`
+moves only the ring: the `FloatingSpace` entry and the registry mirror are
+written once, by `drag end`, and the bridge leaves the window out of every
+batch meanwhile, so a float appearing mid-drag cannot snap the dragged one
+back to a stale rect.
+
 ## Workspace Switching with Floats
 
 `dispatch_switch_workspace` extends naturally: for each workspace on the active

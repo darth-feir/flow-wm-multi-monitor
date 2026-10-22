@@ -427,6 +427,12 @@ swaps, scroll, column resize, mode toggles, workspace switch, promote/merge,
 through normally. The client receives `{"status":"busy"}` and may retry once
 the drag ends.
 
+A keymap drag session (next section) is gated the same way — `manual_drag`
+counts like `drag_state` — with one difference: `tiling off|on|toggle` and
+`stop` end the session first (committing it) instead of being refused,
+because they take the desktop away from it anyway. `drag begin` / `drag
+end` are not layout-mutating themselves: they *are* the drag.
+
 ## Config
 
 The `[drag]` section (`DragConfig` in (`src/config/types.rs`)) has three
@@ -488,6 +494,54 @@ about a "free" window, which is exactly the complexity the no-conversion rule
 exists to avoid. A single discrete commit on release is the only mutation
 point, which makes the drag trivially atomic: either the layout changed
 exactly once, in the way the preview promised, or it did not change at all.
+
+## Keymap-driven sessions (`drag begin` / `drag end`)
+
+niri's Mod + left-button drag grabs a window anywhere, not just by its title
+bar. On Windows a hook hotkey (`#LButton`) swallows the button-down, and
+nothing starts Windows' own move loop afterwards: `WM_NCLBUTTONDOWN` /
+`HTCAPTION`, `WM_SYSCOMMAND SC_MOVE`, a re-injected button-down and a decoy
+window taking the click were all tried and the loop ends before the first
+movement. So the keymap moves the window itself (`WinMove` at ~10 ms while
+the button is held) and the daemon is told where the gesture begins and
+ends — `src/daemon/drag_session.rs`:
+
+- **`drag begin`** acts on the focused window (the keymap activates it
+  first; the OS foreground is read like `set-window` does) and enters
+  exactly the state a `MoveSizeStart` would give it. A tile goes through
+  `on_drag_start` — `Classifying`, `DRAGGED_HWND` set, the border recolored
+  — and the keymap's `WinMove`s arrive as the same `LOCATIONCHANGE` stream a
+  native drag produces, so classification, border following, drop-zone
+  preview and edge-scroll are untouched. A float gets nothing from
+  `MoveSizeStart` today, so the session only **holds its float-sync
+  writes**: `store_float_rect` keeps moving the ring but leaves the
+  `FloatingSpace` entry and registry mirror alone, and the animation bridge
+  leaves the window out of every batch (a float appearing mid-drag would
+  otherwise re-apply the stale rect under the cursor).
+- **`drag end`** runs the `MoveSizeEnd` path: a tile commits its zone or
+  snaps back (`on_drag_end`), a float records its final rect once and the
+  ring is re-seated.
+- **Rules.** `drag begin` while any drag is active (native `drag_state` or
+  a session) is an error, as is a focus that is not an active tile or float
+  (minimized, hidden, fullscreen, ignored, untracked) or tiling off. `drag
+  end` without a session answers `{"ended": false}` — a no-op, not an
+  error, because the keymap always sends it. A native `MoveSizeStart` /
+  `MoveSizeEnd` for the session's own window is ignored (the keymap owns
+  that lifecycle). A window destroyed, minimized or hidden mid-session
+  abandons the session (drag state and `DRAGGED_HWND` released, nothing
+  committed). `tiling off`, `flow stop` and the fail-back end it too — the
+  dispatch path commits first, `pause_tiling` and `fail_back` abandon.
+
+The decisions are pure (`decide_begin`, `native_event_is_shadowed`,
+`ends_manual_drag`) and the Win32 reads of the drag and float-sync handlers go
+through the `DragProbe` trait (`window_rect`, `cursor_pos`, `is_iconic`;
+`Win32Drag` on the live desktop), so the tests in `drag_session.rs` script
+a desktop and run begin → location changes → end on a tile (the strip
+reorders on release, nothing commits before) and on a float (writes held,
+final rect recorded, size kept across repeated empty sessions).
+
+The keymap side — window under the cursor, Win-key masking, the move loop —
+is described in `keymaps/win-niri/README.md`.
 
 ## Cross-References
 

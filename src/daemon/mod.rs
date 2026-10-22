@@ -65,6 +65,7 @@ mod borders;
 mod config_derive;
 mod dispatch;
 mod drag;
+mod drag_session;
 mod edge_scroll;
 mod floating_sync;
 mod fullscreen;

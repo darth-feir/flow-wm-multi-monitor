@@ -260,6 +260,9 @@ impl FlowWM {
     /// The tiling check happens before removal because `remove_window`
     /// deletes the entry from the registry.
     pub(super) fn on_window_destroyed(&mut self, hwnd: isize) {
+        // A keymap drag session on this window ends with it.
+        self.abandon_manual_drag_for(hwnd);
+
         // Tiling off: bookkeeping only — out of every strip and floating
         // space (no animation, no successor focus) and out of the registry.
         if self.tiling_paused {
@@ -301,6 +304,9 @@ impl FlowWM {
     ///    [`remove_from_layout_and_refocus`] — removes from layout, pushes
     ///    focus to the successor, and animates remaining windows filling the gap.
     pub(super) fn on_window_minimized(&mut self, hwnd: isize) {
+        // A window minimized under a keymap drag session leaves it.
+        self.abandon_manual_drag_for(hwnd);
+
         // Tiling off: registry only. The strip keeps the window as the
         // memory of its seat; the resume drops it if it is still minimized
         // then, and the later restore hook re-adds it as usual.
@@ -348,6 +354,8 @@ impl FlowWM {
     /// or hide) removes the window, and the second event sees `is_tiling_active`
     /// as `false` and is a no-op.
     pub(super) fn on_window_hidden(&mut self, hwnd: isize) {
+        self.abandon_manual_drag_for(hwnd);
+
         // Tiling off: registry only (see `on_window_minimized`).
         if self.tiling_paused {
             let _ = self.registry.reconcile_visibility(hwnd);

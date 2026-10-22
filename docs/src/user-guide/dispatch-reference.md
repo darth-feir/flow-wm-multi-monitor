@@ -475,6 +475,45 @@ flow dispatch tiling on       # flow: tiling on   (already on: no-op)
 The command prints the state it landed in, so `toggle` tells you where you
 are. Default hotkey: `Alt + Shift + t` (toggle).
 
+## Keymap drag sessions
+
+### `drag begin` / `drag end`
+
+For a hotkey script that moves a window **itself** — the win-niri keymap's
+Mod + left-button drag grabs a window anywhere, not just by its title bar,
+and Windows' own move loop cannot be started from a hook hotkey. The script
+activates the window, sends `drag begin`, moves the window while the button
+is held, then sends `drag end`:
+
+- `drag begin` acts on the focused window and puts it into the state a
+  title-bar grab would: a **tiled** window previews its drop zone as it
+  moves (the other tiles reflow, the strip edge-scrolls), a **floating**
+  window is simply left to the script, its recorded position frozen until
+  the end. Prints `flow: drag begun (tile)` / `(float)`. It is an **error**
+  — exit code 1, so the script does not start its move loop — when a drag
+  is already in progress (a title-bar drag or another session), when the
+  focused window is not a tile or a float (minimized, hidden, fullscreen,
+  not managed) or when tiling is off.
+- `drag end` finishes it: the tile drops into the zone under the cursor
+  (or snaps back to its own slot if released over nothing), the float's
+  final position is recorded. Prints `flow: drag ended (tile)` /
+  `(float)`. Without a session it prints `flow: no drag session to end`
+  and exits 0 — a no-op, since a script always sends it.
+
+While a session is open the layout commands are refused with `busy`, like
+during a title-bar drag; `tiling off|on|toggle` and `flow stop` end the
+session first. A window that closes mid-drag ends it on its own. A native
+title-bar grab of the same window during a session is ignored.
+
+```powershell
+flow dispatch drag begin      # flow: drag begun (tile)
+flow dispatch drag end        # flow: drag ended (tile)
+flow dispatch drag end        # flow: no drag session to end
+```
+
+No default hotkey in the bundled `flow.ahk`; the win-niri keymap binds
+Mod + left-button drag (see `keymaps/win-niri/README.md`).
+
 ## Window & daemon lifecycle
 
 ### `close-window`

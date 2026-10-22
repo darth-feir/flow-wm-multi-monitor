@@ -416,6 +416,30 @@ enum DispatchCommands {
         #[command(subcommand)]
         state: TilingSwitch,
     },
+    /// Begin or end a keymap-driven drag of the focused window.
+    ///
+    /// Maps to [`SocketMessage::DragBegin`] / [`SocketMessage::DragEnd`].
+    /// A hotkey script that moves a window itself (Mod + left-button drag)
+    /// brackets the gesture with `drag begin` (the daemon enters the state a
+    /// title-bar grab would give the focused window: a tile previews its
+    /// drop zone, a float is left to the script) and `drag end` (the drop is
+    /// committed or snapped back, a float's final position recorded).
+    /// `begin` fails while another drag is in progress, when nothing
+    /// draggable has the focus or while tiling is off; `end` without a
+    /// session is a no-op that says so.
+    Drag {
+        #[command(subcommand)]
+        action: DragAction,
+    },
+}
+
+/// `flow dispatch drag <begin|end>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+enum DragAction {
+    /// Start a session on the focused window; prints `flow: drag begun (tile|float)`.
+    Begin,
+    /// End the session; prints `flow: drag ended (tile|float)` or `flow: no drag session to end`.
+    End,
 }
 
 /// Target state for `flow dispatch tiling <on|off|toggle>`.
@@ -1288,6 +1312,61 @@ fn cmd_dispatch(command: DispatchCommands) -> Result<(), String> {
             "window moved to workspace",
         ),
         DispatchCommands::Tiling { state } => cmd_dispatch_tiling(state),
+        DispatchCommands::Drag { action } => cmd_dispatch_drag(action),
+    }
+}
+
+/// Send `drag begin` / `drag end` and print what the daemon did.
+///
+/// `begin` answers `{"drag": kind}` (printed as `flow: drag begun (kind)`)
+/// or an error, which is the exit code the hotkey script keys its move
+/// loop on. `end` answers `{"ended": true, "drag": kind}` or
+/// `{"ended": false}` (`flow: no drag session to end`, still exit 0).
+fn cmd_dispatch_drag(action: DragAction) -> Result<(), String> {
+    let msg = match action {
+        DragAction::Begin => SocketMessage::DragBegin,
+        DragAction::End => SocketMessage::DragEnd,
+    };
+    grant_foreground_permission();
+    let response =
+        transport::send_message(&msg).map_err(|e| format!("failed to send command: {e}"))?;
+    match response {
+        SocketResponse::Data { payload } => {
+            println!("flow: {}", describe_drag_reply(action, &payload));
+            Ok(())
+        }
+        SocketResponse::Ok => {
+            println!(
+                "flow: drag {}",
+                if action == DragAction::Begin {
+                    "begun"
+                } else {
+                    "ended"
+                }
+            );
+            Ok(())
+        }
+        SocketResponse::Error { message } => Err(format!("daemon error: {message}")),
+        SocketResponse::Busy => Err("daemon is busy (drag in progress), retry shortly".to_string()),
+        SocketResponse::Pong { .. } => Err("unexpected pong reply to a command".to_string()),
+    }
+}
+
+/// The line printed for a `drag begin` / `drag end` reply payload.
+fn describe_drag_reply(action: DragAction, payload: &serde_json::Value) -> String {
+    let kind = payload
+        .get("drag")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("window");
+    match action {
+        DragAction::Begin => format!("drag begun ({kind})"),
+        DragAction::End => {
+            if payload.get("ended").and_then(serde_json::Value::as_bool) == Some(false) {
+                "no drag session to end".to_owned()
+            } else {
+                format!("drag ended ({kind})")
+            }
+        }
     }
 }
 
@@ -2423,6 +2502,40 @@ mod tests {
     }
 
     // --- Dispatch command parsing ---
+
+    #[test]
+    fn parse_dispatch_drag_begin_and_end() {
+        for (word, action) in [("begin", DragAction::Begin), ("end", DragAction::End)] {
+            let cli = Cli::try_parse_from(["flow", "dispatch", "drag", word]).unwrap();
+            match cli.command {
+                Commands::Dispatch {
+                    command: DispatchCommands::Drag { action: got },
+                } => assert_eq!(got, action),
+                other => panic!("expected Dispatch::Drag::{word}, got: {other:?}"),
+            }
+        }
+        assert!(Cli::try_parse_from(["flow", "dispatch", "drag"]).is_err());
+        assert!(Cli::try_parse_from(["flow", "dispatch", "drag", "cancel"]).is_err());
+    }
+
+    #[test]
+    fn drag_reply_lines_name_the_kind_and_the_no_session_case() {
+        let begin = serde_json::json!({ "drag": "tile", "hwnd": 7 });
+        assert_eq!(
+            describe_drag_reply(DragAction::Begin, &begin),
+            "drag begun (tile)"
+        );
+        let ended = serde_json::json!({ "ended": true, "drag": "float" });
+        assert_eq!(
+            describe_drag_reply(DragAction::End, &ended),
+            "drag ended (float)"
+        );
+        let none = serde_json::json!({ "ended": false });
+        assert_eq!(
+            describe_drag_reply(DragAction::End, &none),
+            "no drag session to end"
+        );
+    }
 
     #[test]
     fn parse_dispatch_focus_left() {

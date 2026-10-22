@@ -109,6 +109,19 @@ The old design drew the ring at the HWND rect's outer edge (the invisible
 border), producing a visible gap between the colored ring and the window
 content.
 
+**Floats are the other way round.** A float's stored rect *is* its visible
+content rect — the float-sync path reads it back from `GetWindowRect` on
+every `LOCATIONCHANGE` — so the window is placed at
+`visible_to_window(rect)` with **no inset**, and the ring is seated *around*
+it, outset by `thickness − overlap` (`float_border_rect`). Every path that
+commands a float's geometry (`workspace_targets`, `teleport_workspaces`,
+`store_float_rect`, `refresh_border_for`) uses this one rule
+(`float_geometry` in `src/daemon/animation.rs`). Insetting a float like a
+tile made each re-animation of a floating space shrink its floats by
+`2·(thickness − overlap)` px: the inset window was read back as the new
+visible rect and inset again next time (see [Floating Space](./floating-space.md),
+*Float geometry*).
+
 ## Lifecycle
 
 A `Border` is created, recolored, repositioned, and destroyed entirely from the

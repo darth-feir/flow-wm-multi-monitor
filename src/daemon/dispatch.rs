@@ -83,10 +83,17 @@ impl FlowWM {
     pub(super) fn dispatch(&mut self, msg: &SocketMessage) -> SocketResponse {
         log::debug!("ipc: dispatching {msg:?}");
 
-        // Reject layout-mutating commands while a tile drag is active — the
-        // layout is in a transient state and concurrent mutations would
-        // corrupt it.
-        if self.drag_state.is_some() && msg.is_layout_mutating() {
+        // A keymap drag session is ended (committed) by the commands that
+        // take the desktop away from it, before the busy gate below could
+        // refuse them. See `daemon::drag_session`.
+        if self.manual_drag.is_some() && super::drag_session::ends_manual_drag(msg) {
+            self.end_manual_drag();
+        }
+
+        // Reject layout-mutating commands while a drag (native or keymap
+        // session) is active — the layout is in a transient state and
+        // concurrent mutations would corrupt it.
+        if (self.drag_state.is_some() || self.manual_drag.is_some()) && msg.is_layout_mutating() {
             return SocketResponse::Busy;
         }
 
@@ -124,6 +131,10 @@ impl FlowWM {
             // --- Tiling on/off ---
             SocketMessage::SetTiling { enabled } => self.dispatch_set_tiling(*enabled),
             SocketMessage::ToggleTiling => self.dispatch_set_tiling(self.tiling_paused),
+
+            // --- Keymap drag sessions (`daemon::drag_session`) ---
+            SocketMessage::DragBegin => self.dispatch_drag_begin(),
+            SocketMessage::DragEnd => self.dispatch_drag_end(),
 
             // --- Focus ---
             SocketMessage::FocusLeft => self.dispatch_focus(Direction::Left),
@@ -1666,13 +1677,13 @@ impl FlowWM {
     /// registering it into a test registry would seat it (and draw a
     /// border on it); the tests set the registry's focus instead.
     #[cfg(not(test))]
-    fn os_foreground_for_dispatch(&self) -> Option<isize> {
+    pub(super) fn os_foreground_for_dispatch(&self) -> Option<isize> {
         registry_win32::get_foreground_window()
     }
 
     /// See the non-test variant: the tests drive the registry's focus.
     #[cfg(test)]
-    fn os_foreground_for_dispatch(&self) -> Option<isize> {
+    pub(super) fn os_foreground_for_dispatch(&self) -> Option<isize> {
         None
     }
 

@@ -39,7 +39,12 @@
 //! daemon's event loop; the hook callback remains stateless — it only
 //! signals via [`set_dragged_hwnd`](crate::registry::hooks::set_dragged_hwnd)
 //! / [`clear_dragged_hwnd`](crate::registry::hooks::clear_dragged_hwnd)
-//! from the main thread.
+//! from the main thread. A keymap-driven session (`flow dispatch drag
+//! begin|end`, `daemon::drag_session`) enters the same state machine.
+//!
+//! The Win32 reads the handlers need (window rect, cursor) go through
+//! [`DragProbe`] so the `_with` variants run against a scripted desktop in
+//! the unit tests.
 //!
 //! (`docs/src/dev-guide/tile-drag.md`, `docs/adr/0004-tile-resize-contract.md`)
 
@@ -64,6 +69,37 @@ use crate::registry::win32 as registry_win32;
 use super::borders::float_border_rect;
 use super::edge_scroll::{EdgeScrollAction, EdgeScrollScheduler, EdgeScrollTimings};
 use super::types::FlowWM;
+
+/// The Win32 reads the drag and float-sync handlers make, behind a trait so
+/// the unit tests can script a desktop (`docs/src/dev-guide/tile-drag.md`,
+/// *Testing*).
+pub(super) trait DragProbe {
+    /// `GetWindowRect`: the full window rect, or `None` when it cannot be read.
+    fn window_rect(&self, hwnd: isize) -> Option<Rect>;
+    /// `GetCursorPos` in screen pixels.
+    fn cursor_pos(&self) -> Option<(i32, i32)>;
+    /// `IsIconic`.
+    fn is_iconic(&self, hwnd: isize) -> bool;
+}
+
+/// The live desktop.
+pub(super) struct Win32Drag;
+
+impl DragProbe for Win32Drag {
+    fn window_rect(&self, hwnd: isize) -> Option<Rect> {
+        registry_win32::get_window_rect(HWND(hwnd as *mut _))
+            .map_err(|e| log::debug!("drag: GetWindowRect failed for {hwnd}: {e}"))
+            .ok()
+    }
+    fn cursor_pos(&self) -> Option<(i32, i32)> {
+        registry_win32::get_cursor_pos()
+            .map_err(|e| log::debug!("drag: GetCursorPos failed: {e}"))
+            .ok()
+    }
+    fn is_iconic(&self, hwnd: isize) -> bool {
+        registry_win32::is_iconic(HWND(hwnd as *mut _))
+    }
+}
 
 /// The 4-state drag state machine, or `None` when idle.
 ///
@@ -218,6 +254,11 @@ impl FlowWM {
     ///
     /// No-op if the window is not found or is not an active tile.
     pub(super) fn on_drag_start(&mut self, hwnd: isize) {
+        self.on_drag_start_with(&Win32Drag, hwnd);
+    }
+
+    /// [`on_drag_start`](Self::on_drag_start) against `probe`.
+    pub(super) fn on_drag_start_with<P: DragProbe>(&mut self, probe: &P, hwnd: isize) {
         // Tiling off: a drag is a plain Windows drag, nothing to classify
         // or preview (and `drag_state` stays `None`, so edge-scroll and the
         // dragged-window routing stay inert too).
@@ -242,7 +283,7 @@ impl FlowWM {
         // zero rect on failure (classify_drag will then see the first move as a
         // pure translate/resize from origin — a degenerate but safe behavior;
         // GetWindowRect on a live window does not fail in practice).
-        let start_rect = registry_win32::get_window_rect(hwnd_handle).unwrap_or(Rect {
+        let start_rect = probe.window_rect(hwnd).unwrap_or(Rect {
             x: 0,
             y: 0,
             width: 0,
@@ -280,15 +321,20 @@ impl FlowWM {
     /// - [`DragMode::Resize`] → [`Self::on_resize_move`] (the boundary-move
     ///   teleport preview).
     pub(super) fn on_drag_move(&mut self, hwnd: isize) {
+        self.on_drag_move_with(&Win32Drag, hwnd);
+    }
+
+    /// [`on_drag_move`](Self::on_drag_move) against `probe`.
+    pub(super) fn on_drag_move_with<P: DragProbe>(&mut self, probe: &P, hwnd: isize) {
         // First, classify if we are still in the provisional state. Promotion
         // may install a Translate or Resize state; we then dispatch the move to
         // whichever variant is active afterwards.
         if matches!(self.drag_state.as_ref(), Some(DragMode::Classifying(_))) {
-            self.classify_and_promote(hwnd);
+            self.classify_and_promote(probe, hwnd);
         }
         match self.drag_state.as_ref() {
-            Some(DragMode::Translate(_)) => self.on_translate_move(hwnd),
-            Some(DragMode::Resize(_)) => self.on_resize_move(hwnd),
+            Some(DragMode::Translate(_)) => self.on_translate_move(probe, hwnd),
+            Some(DragMode::Resize(_)) => self.on_resize_move(probe, hwnd),
             // Still Classifying (no movement yet), or None — nothing to do.
             _ => {}
         }
@@ -311,7 +357,7 @@ impl FlowWM {
     ///   degenerate size-only change with no identified grip) stays
     ///   `Classifying`: the native geometry is shown mid-drag and the layout
     ///   snaps back on release (a no-op commit).
-    fn classify_and_promote(&mut self, hwnd: isize) {
+    fn classify_and_promote<P: DragProbe>(&mut self, probe: &P, hwnd: isize) {
         let classifying = match self.drag_state.take() {
             Some(DragMode::Classifying(c)) => c,
             // Not classifying — restore and return (caller should not have
@@ -321,15 +367,10 @@ impl FlowWM {
                 return;
             }
         };
-        let hwnd_handle = HWND(hwnd as *mut _);
-        let current_rect = match registry_win32::get_window_rect(hwnd_handle) {
-            Ok(r) => r,
-            Err(e) => {
-                log::debug!("classify: GetWindowRect failed for {hwnd}: {e}");
-                // Put the Classifying state back so the next move retries.
-                self.drag_state = Some(DragMode::Classifying(classifying));
-                return;
-            }
+        let Some(current_rect) = probe.window_rect(hwnd) else {
+            // Put the Classifying state back so the next move retries.
+            self.drag_state = Some(DragMode::Classifying(classifying));
+            return;
         };
         match classify_drag(classifying.start_rect, current_rect) {
             DragKind::None => {
@@ -421,7 +462,7 @@ impl FlowWM {
     /// animator) so the moving boundary stays fused to the cursor. The dragged
     /// window is excluded from the teleport — Win32 is already placing it. The
     /// viewport never scrolls mid-grab.
-    fn on_resize_move(&mut self, hwnd: isize) {
+    fn on_resize_move<P: DragProbe>(&mut self, probe: &P, hwnd: isize) {
         let (dragged_hwnd, grip_h, grip_v, col, row) = match self.drag_state.as_ref() {
             Some(DragMode::Resize(r)) => (r.dragged_hwnd, r.grip_h, r.grip_v, r.col, r.row),
             _ => return,
@@ -433,8 +474,8 @@ impl FlowWM {
         // the layout: column widths / row heights are visible quantities, and
         // feeding the window-rect dimensions would grow them by the per-edge
         // invisible borders on every drag.
-        let (visible_rect, border) = match registry_win32::get_window_rect(hwnd_handle) {
-            Ok(r) => {
+        let (visible_rect, border) = match probe.window_rect(dragged_hwnd) {
+            Some(r) => {
                 let window = self.registry.get_window(hwnd_handle);
                 let invisible_bounds = window.map(|w| w.invisible_bounds).unwrap_or_default();
                 let visible_rect = invisible_bounds.window_to_visible(r);
@@ -444,8 +485,8 @@ impl FlowWM {
                 let border = window.and_then(|w| w.border.clone());
                 (visible_rect, border)
             }
-            Err(e) => {
-                log::debug!("resize move: GetWindowRect failed for {hwnd}: {e}");
+            None => {
+                log::debug!("resize move: no window rect for {hwnd}");
                 return;
             }
         };
@@ -551,7 +592,7 @@ impl FlowWM {
     /// (committed live). See the historical `on_drag_move` doc for the full
     /// flow; only the dispatch shell changed — this body is identical to the
     /// pre-resize translate-drag handler.
-    fn on_translate_move(&mut self, hwnd: isize) {
+    fn on_translate_move<P: DragProbe>(&mut self, probe: &P, hwnd: isize) {
         let Some(drag) = self.drag_state.as_ref() else {
             return;
         };
@@ -559,12 +600,8 @@ impl FlowWM {
         let hwnd_handle = HWND(hwnd as *mut _);
 
         // 1. Border follows the window (direct set_geometry, not the animator).
-        let window_rect = match registry_win32::get_window_rect(hwnd_handle) {
-            Ok(r) => r,
-            Err(e) => {
-                log::debug!("drag move: GetWindowRect failed for {hwnd}: {e}");
-                return;
-            }
+        let Some(window_rect) = probe.window_rect(hwnd) else {
+            return;
         };
         {
             let Some(window) = self.registry.get_window(hwnd_handle) else {
@@ -582,12 +619,8 @@ impl FlowWM {
         }
 
         // 2. Cursor position.
-        let (cx, cy) = match registry_win32::get_cursor_pos() {
-            Ok(pos) => pos,
-            Err(e) => {
-                log::debug!("drag move: GetCursorPos failed: {e}");
-                return;
-            }
+        let Some((cx, cy)) = probe.cursor_pos() else {
+            return;
         };
 
         // 3. Snapshot the committed layout of the strip that holds the dragged
@@ -732,6 +765,11 @@ impl FlowWM {
     /// armed deadline (translate variant), tearing down the auto-repeat timer —
     /// no leftover scroll continues after release.
     pub(super) fn on_drag_end(&mut self, hwnd: isize) {
+        self.on_drag_end_with(&Win32Drag, hwnd);
+    }
+
+    /// [`on_drag_end`](Self::on_drag_end) against `probe`.
+    pub(super) fn on_drag_end_with<P: DragProbe>(&mut self, probe: &P, hwnd: isize) {
         // Dragging a maximized window by its title bar un-maximizes it and
         // ends in MOVESIZEEND, sometimes without a STATECHANGE: an
         // OS-ignored window gets the recovery here (cheap gate first).
@@ -762,7 +800,7 @@ impl FlowWM {
 
         match drag {
             DragMode::Translate(t) => self.on_translate_end(t),
-            DragMode::Resize(r) => self.on_resize_end(r),
+            DragMode::Resize(r) => self.on_resize_end(probe, r),
             DragMode::Classifying(c) => self.on_classifying_end(c),
         }
     }
@@ -822,7 +860,7 @@ impl FlowWM {
     /// already `take()`n, so [`animate_layout`] includes the dragged window —
     /// it visibly snaps from its native overshoot rect into its clamped tile
     /// (the elastic-pin snap-back).
-    fn on_resize_end(&mut self, drag: ResizeDrag) {
+    fn on_resize_end<P: DragProbe>(&mut self, probe: &P, drag: ResizeDrag) {
         let mi = self.monitor_index_for_window(drag.dragged_id);
         let (vl, config) = {
             let space = self.monitors[mi].active_scrolling();
@@ -840,8 +878,8 @@ impl FlowWM {
             .and_then(|c| c.rows.get(drag.row))
             .map(|r| (vl.columns[drag.col].width_px, r.height))
             .unwrap_or((config.column_width as i32, config.available_height()));
-        let visible_rect = match registry_win32::get_window_rect(hwnd_handle) {
-            Ok(r) => {
+        let visible_rect = match probe.window_rect(drag.dragged_hwnd) {
+            Some(r) => {
                 let invisible_bounds = self
                     .registry
                     .get_window(hwnd_handle)
@@ -849,9 +887,9 @@ impl FlowWM {
                     .unwrap_or_default();
                 invisible_bounds.window_to_visible(r)
             }
-            Err(e) => {
+            None => {
                 log::debug!(
-                    "resize end: GetWindowRect failed for {}: {e}; committing layout as-is",
+                    "resize end: no window rect for {}; committing layout as-is",
                     drag.dragged_hwnd
                 );
                 // Fall back to the column/row's current geometry so the commit
@@ -1060,9 +1098,10 @@ impl FlowWM {
     }
 }
 
-// NOTE: drag lifecycle is Win32 orchestration; coverage via the pure
-// resolve_drop_zone tests in layout::preview, the should_submit_preview unit
-// tests below, and manual interactive testing.
+// NOTE: the Win32 side of the drag lifecycle is covered through `DragProbe`
+// by the session tests in `daemon::drag_session` (begin → moves → end on a
+// tile and on a float); the pure pieces by the resolve_drop_zone tests in
+// layout::preview and the should_submit_preview unit tests below.
 
 /// Decide whether a new drop zone warrants a fresh preview animation during a
 /// tile drag.

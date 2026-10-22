@@ -22,10 +22,10 @@ use crate::registry::hooks::{
     set_float_tracking_active,
 };
 use crate::registry::types::{FloatingState, WindowState};
-use crate::registry::win32 as registry_win32;
 use crate::workspace::Monitor;
 
 use super::borders::float_border_rect;
+use super::drag::{DragProbe, Win32Drag};
 use super::types::FlowWM;
 
 impl FlowWM {
@@ -69,6 +69,11 @@ impl FlowWM {
     /// [`relocate_float`](Self::relocate_float), which also re-homes a float
     /// dragged onto another monitor).
     pub(super) fn store_float_rect(&mut self, hwnd: isize) {
+        self.store_float_rect_with(&Win32Drag, hwnd);
+    }
+
+    /// [`store_float_rect`](Self::store_float_rect) against `probe`.
+    pub(super) fn store_float_rect_with<P: DragProbe>(&mut self, probe: &P, hwnd: isize) {
         // Tiling off: floats are Windows' to place; the bookkeeping rect is
         // refreshed from the desktop when tiling resumes (`daemon::tiling`).
         if self.tiling_paused {
@@ -81,17 +86,13 @@ impl FlowWM {
         // has flipped the registry state below. Never record that rect: a
         // float stored off the virtual screen is "clamped on-screen" at
         // icon size by `tiling off` and the hotplug reconcile.
-        if registry_win32::is_iconic(hwnd_handle) {
+        if probe.is_iconic(hwnd) {
             return;
         }
 
         // Read the window-rect (full, including invisible borders).
-        let window_rect = match registry_win32::get_window_rect(hwnd_handle) {
-            Ok(r) => r,
-            Err(e) => {
-                log::debug!("float location: GetWindowRect failed for {hwnd}: {e}");
-                return;
-            }
+        let Some(window_rect) = probe.window_rect(hwnd) else {
+            return;
         };
 
         // Bounds + state come from the registry. A non-Active float (minimized
@@ -122,6 +123,16 @@ impl FlowWM {
             self.config.borders.thickness,
             self.config.borders.overlap,
         );
+
+        // A float the keymap is moving (`drag begin`): the ring follows the
+        // window, the bookkeeping waits for `drag end`, which records the
+        // final rect once (`daemon::drag_session`).
+        if self.manual_float_drag_hwnd() == Some(hwnd) {
+            if let Some(border) = window.border.as_ref() {
+                border.set_geometry(border_rect);
+            }
+            return;
+        }
 
         // FLOAT_HWNS holds the active-workspace floats of every monitor, so
         // the window must be in SOME monitor's active-workspace FloatingSpace.
@@ -301,6 +312,7 @@ mod tests {
     use crate::config::types::WindowRulesConfig;
     use crate::layout::types::{MonitorInfo, Padding};
     use crate::registry::WindowRegistry;
+    use crate::registry::win32 as registry_win32;
     use crate::workspace::{ScrollingSpace, Workspace, WorkspaceId};
     use windows::Win32::Foundation::HWND;
 

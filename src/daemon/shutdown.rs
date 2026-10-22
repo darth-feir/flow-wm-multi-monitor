@@ -258,6 +258,10 @@ impl FlowWM {
         }
         self.shutting_down = true;
 
+        // 0. A keymap drag session is dropped (nothing commits during a
+        //    teardown); the rescue below puts the window back like any other.
+        self.abandon_manual_drag();
+
         // 1 + 2. Stop the animator and bring stranded windows back.
         let rescued = self.rescue_stranded_windows();
 
