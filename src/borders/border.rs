@@ -54,17 +54,12 @@ const OVERLAY_CLASS_NAME: PCWSTR = w!("FlowBorderOverlay");
 /// return the cached atom without touching Win32.
 static OVERLAY_CLASS_ATOM: OnceLock<u16> = OnceLock::new();
 
-/// The overlays this process created, by HWND.
-///
-/// This is how [`overlay_wnd_proc`] finds the [`BorderInner`] behind a
-/// message. It used to read a raw `*const BorderInner` back out of the
-/// window's `GWLP_USERDATA` — but a window word is writable by any process
-/// on the desktop (`SetWindowLongPtr` needs no special rights on another
-/// process's window), so a planted value would have been dereferenced
-/// inside the daemon. The map is process-local and holds only entries
-/// [`Border::create`] put there; a `WM_SIZE` for any other HWND is simply
-/// passed through. Weak references so the map never keeps an overlay
-/// alive: an entry whose `BorderInner` is gone fails to upgrade.
+/// The overlays this process created, by HWND: how [`overlay_wnd_proc`]
+/// finds the [`BorderInner`] behind a message. Process-local and filled only
+/// by [`Border::create`], so nothing stored in the window itself is trusted;
+/// weak references so the map never keeps an overlay alive. Why it replaced
+/// `GWLP_USERDATA` is in `docs/src/dev-guide/borders.md`, *The overlay is
+/// self-sufficient*.
 static OVERLAYS: LazyLock<Mutex<HashMap<isize, Weak<BorderInner>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -96,18 +91,15 @@ fn overlay_for(hwnd: isize) -> Option<Arc<BorderInner>> {
 /// special-casing needed.
 ///
 /// `WM_CLOSE`, `WM_QUERYENDSESSION` and `WM_ENDSESSION` are the daemon's
-/// graceful-exit signals: each one calls
-/// [`request_shutdown`](crate::registry::hooks::request_shutdown) so the
-/// main loop runs the normal rescue path instead of letting logoff strand
-/// parked windows. `WM_QUERYENDSESSION` first runs the synchronous phase-1
-/// rescue ([`rescue_on_session_end`](crate::daemon::session::rescue_on_session_end),
-/// once per process) and answers `TRUE` (we never veto a logoff);
-/// `WM_CLOSE` returns without destroying the overlay (the daemon drops it
-/// during fail-back). `WM_DISPLAYCHANGE` and
-/// `WM_SETTINGCHANGE(SPI_SETWORKAREA)` report a display-topology change via
-/// [`request_topology_refresh`](crate::registry::hooks::request_topology_refresh)
-/// — an overlay may receive them before the session sink does, and the
-/// main loop debounces either way. All other messages are passed through to
+/// graceful-exit signals (each calls
+/// [`request_shutdown`](crate::registry::hooks::request_shutdown);
+/// `WM_QUERYENDSESSION` first runs the synchronous
+/// [`rescue_on_session_end`](crate::daemon::session::rescue_on_session_end)
+/// and answers `TRUE`), and `WM_DISPLAYCHANGE` /
+/// `WM_SETTINGCHANGE(SPI_SETWORKAREA)` call
+/// [`request_topology_refresh`](crate::registry::hooks::request_topology_refresh).
+/// See `docs/src/dev-guide/ipc-and-watchdog.md`, *Fail-back* and *Monitor
+/// hotplug*. All other messages are passed through to
 /// `DefWindowProcW`.
 ///
 /// # Threading

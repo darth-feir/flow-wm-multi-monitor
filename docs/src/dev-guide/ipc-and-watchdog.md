@@ -89,26 +89,77 @@ trickle of synchronous completions cannot stretch it either. A line that
 arrives but does not decode is logged with a ~200-byte preview, never in
 full.
 
-### Client-Side Timeout
+### Overlapped I/O and deadlines
 
-The client opens the pipe with `FILE_FLAG_OVERLAPPED` so every read/write is
-bounded by a 30-second deadline (`IPC_TIMEOUT` in
-[`src/ipc/transport.rs`](../../src/ipc/transport.rs)). If the daemon accepts the
-connection but never replies, `CancelIo` fires and the CLI returns a `TimedOut`
-error instead of hanging forever. Each overlapped operation uses a Win32 manual-
-reset event and `WaitForSingleObject` to await completion or cancellation. This
-prevents integration tests from stalling when the daemon is stuck in layout
-computation.
+A synchronous `ReadFile` on a byte-mode pipe returns only when data arrives
+or the peer disconnects, with no timeout. That is dangerous on **both** ends:
+a daemon that accepts a connection yet never replies hangs the CLI — or a
+test's cleanup path — indefinitely, and a client that connects yet never
+writes wedged the daemon's main loop (every hotkey dead until that client
+went away; upstream's server used synchronous I/O on the assumption that
+`flow` invocations always send immediately). Both handles are therefore
+opened with `FILE_FLAG_OVERLAPPED` (`connect_to_named_pipe`,
+`PipeServer::create_named`), every I/O is started asynchronously and awaited
+with a deadline through a manual-reset event and `WaitForSingleObject`, and
+on expiry it is cancelled. The deadlines:
+
+| Constant | Side | Value | Bounds |
+|----------|------|-------|--------|
+| `IPC_TIMEOUT` | client | 30 s | the whole request/response of `send_message_to`; an unresponsive daemon yields `TimedOut` instead of a hung CLI or a stuck `DaemonGuard` drop in the tests |
+| `SERVER_READ_TIMEOUT` | daemon | 2 s | a connected client's silence in `read_message`; a `flow` invocation writes its line the instant it connects, so a client still silent after this (a stuck process, a port scanner, `is_daemon_running`'s probe, which never writes) is disconnected so the next one can be served |
+| `SERVER_WRITE_TIMEOUT` | daemon | — | a client that does not drain the response |
+| `BUSY_CONNECT_TIMEOUT` | client | 2 s | retrying a connect that fails with `ERROR_PIPE_BUSY` (below) |
+
+`read_line_overlapped` re-checks the deadline before every chunk, so a peer
+whose reads keep completing synchronously (data trickling in with no
+newline) cannot hold the call past it either.
+
+**Cancelling.** `CancelIo` only *requests* the cancel; the operation
+finishes asynchronously with `ERROR_OPERATION_ABORTED`, and until then the
+kernel may still write through the `OVERLAPPED` and the buffer the I/O was
+started with. `cancel_and_reap` therefore blocks in
+`GetOverlappedResult(bWait = TRUE)` before either is freed (a cancel lands
+within microseconds).
+
+**Busy pipes.** The daemon serves one client at a time on a single pipe
+instance. Between `DisconnectNamedPipe` of the previous client and the
+re-armed `ConnectNamedPipe` (a thread spawn away), and for the whole of
+another client's session, `CreateFileW` fails with `ERROR_PIPE_BUSY`. A
+`flow stop` right after `flow start`'s ping, or two dispatches back to
+back, land in exactly that window, so the client waits for a free instance
+with `WaitNamedPipeW` and retries for up to `BUSY_CONNECT_TIMEOUT` instead
+of failing; only after that does it report `ResourceBusy` ("daemon is
+busy"). `is_daemon_running` applies the same reading: a pipe that exists but
+has no free instance (`ERROR_PIPE_BUSY`, then `ERROR_SEM_TIMEOUT`, 121, from
+`WaitNamedPipeW`) counts as **running**, because only a live daemon can hold
+the pipe busy. The shipped AutoHotkey keymaps use the same rule with a cap on
+consecutive busy polls (see `keymaps/win-niri/README.md`), since a wedged
+daemon holds the pipe busy forever.
 
 ### Server-Side Architecture
 
-The server side in [`src/ipc/transport.rs`](../../src/ipc/transport.rs) uses
-synchronous (blocking) I/O -- appropriate because the daemon's clients are one-
-shot `flow` invocations that always send immediately. The `PipeServer` struct
-manages a background accept thread: `start_accept()` spawns a short-lived thread
-that blocks in `ConnectNamedPipe`, then signals a Win32 event to wake the main
-thread's `WaitForMultipleObjects`. See [threading model](threading-model.md) for
-how the connected event coexists with the hook signal in the main loop.
+The `PipeServer` struct in [`src/ipc/transport.rs`](../../src/ipc/transport.rs)
+manages a background accept thread: `start_accept()` spawns a short-lived
+thread that issues an overlapped `ConnectNamedPipe`, waits for it while
+polling a `stopping` flag every `ACCEPT_POLL`, then signals a Win32 event to
+wake the main thread's `WaitForMultipleObjects`. See [threading
+model](threading-model.md) for how the connected event coexists with the
+hook signal in the main loop.
+
+`PipeServer::shutdown` exists because `CloseHandle` on a pipe with a pending
+`ConnectNamedPipe` does not cancel that I/O — it blocks until the connect
+completes. Dropping a `PipeServer` with an accept pending therefore hung
+`flowd` on every exit path where no client had just connected (session end,
+signals, a dead thread) until the next client happened to connect; `flow
+stop` never hit it because the stopping client *was* the last connection.
+The shutdown sets `stopping` (the thread exits instead of re-arming),
+re-issues `CancelIoEx` on the pipe every 10 ms (to cover the window before
+the thread has entered `ConnectNamedPipe`), and if the thread is still there
+after a third of `ACCEPT_SHUTDOWN_TIMEOUT` connects a throwaway client to
+its own pipe so the accept completes normally. If the thread cannot be
+joined within the budget the pipe handle is deliberately **leaked** rather
+than closed, so dropping the server can no longer block — the process is
+exiting anyway.
 
 All pipe handles are wrapped in `PipeHandle` (RAII, closes on drop) and a
 similar `EventHandle` wrapper manages Win32 event handles, preventing kernel
@@ -186,7 +237,7 @@ a command arrives.
 | Command | Action |
 |---------|--------|
 | `flow start [--config <dir>] [--log-file <path>] [--ahk] [--no-restore] [--verbose] [--log-level <lvl>]` | Run the daemon-less rescue (below), spawn `flowd.exe` detached, wait until it reports `ready` **and** answers `Ping`; `--ahk` is forwarded to the daemon, which launches `flow.ahk` inside a kill-on-close job object |
-| `flow stop` | Send `Stop` via named pipe; wait (≤ 5 s) for the daemon's status file to leave `ready` (the daemon kills its own hotkey script during fail-back); then terminate a still-live AutoHotkey process recorded in `flow.ahk.pid`, if any (`--ahk` is still accepted and ignored) |
+| `flow stop` | Send `Stop` via named pipe; wait (≤ 5 s) for the daemon's status file to leave `ready` (the daemon kills its own hotkey script during fail-back) and then for the daemon **process** to exit — the status flips a moment before the pipe handle is closed, and a `flow start` right after needs the pipe gone; then terminate a still-live AutoHotkey process recorded in `flow.ahk.pid`, if any (`--ahk` is still accepted and ignored) |
 | `flow rescue [--force]` | Without a daemon: move every off-screen top-level window back onto a monitor and print the titles. Refuses while a daemon answers unless `--force` |
 | `flow ping` | Send `Ping`; print the daemon's version, pid, monitor count, registered-hook count, the hotkey script's pid and `tiling on` / `tiling off`. Non-zero exit if nothing answers |
 
@@ -357,7 +408,27 @@ launch** (`AhkProcess::stop`), never by re-opening the pid; `flow stop`,
 which has only the pidfile, opens the pid and terminates it only if its
 image path equals the recorded one (case-insensitively), falling back to
 the older "is some AutoHotkey image" check only for a pidfile without a
-second line. Either way the pidfile is removed.
+second line. Either way the pidfile is removed. Two outcomes of that kill
+are deliberately *not* errors: a pid that no longer runs (the job object or
+the daemon's fail-back got there first — `TerminateProcess` on an exited
+process fails with `Access is denied`, so liveness is checked first), and a
+live pid whose image is not the recorded one (Windows reuses process ids; a
+pidfile written by a daemon that died an hour ago may now name anything at
+all, and killing that process would be the one unforgivable outcome of a
+stale pidfile — it is treated as stale instead, with an `info` log).
+
+##### Testing the hotkey lifecycle
+
+`stop_ahk_script()` — the wrapper that resolves the *real* config directory
+(`FLOW_CONFIG_DIR`, else `%USERPROFILE%\.config\flow`) — has no unit test on
+purpose. The test suite runs in parallel threads that set and unset
+`FLOW_CONFIG_DIR`; under that race a test calling the wrapper once read the
+developer's live `flow.ahk.pid`, terminated their running keymap and deleted
+the pidfile. Every test goes through `stop_ahk_script_in(&tempdir)`; the
+wrapper is one line of path resolution over the `_in` variant. The same
+isolation rule applies to the whole suite: point `FLOW_CONFIG_DIR` and
+`APPDATA` at scratch directories before running it on a machine where
+FlowWM is installed.
 The AHK-side liveness gate in the shipped keymap remains as defence in
 depth: `flow.ahk` refuses to hook the modifier until the daemon's pipe
 answers (10 s at startup), re-checks it every 2 s with a 1 ms
@@ -559,7 +630,7 @@ teardown every exit path runs, in this fixed order:
 | 3 | Drop every border overlay | `DestroyWindow` on each; nothing of the daemon stays on screen. |
 | 4 | Stop the hook thread | `WM_QUIT`; it unhooks and exits. |
 | 5 | Kill the hotkey script, remove `flow.ahk.pid` | The Win key is free before the function returns; the job object is the backstop for exits that never get here. An already-exited pid (the job or `flow stop` got there first) is the normal case and only logged at `debug`. |
-| 6 | `PipeServer::shutdown()` — cancel the pending accept, join its thread (≤ 1 s) | `CloseHandle` on a pipe whose accept thread is blocked in a **synchronous** `ConnectNamedPipe` does not cancel it — it blocks until a client connects. Without this step every exit that did not come through IPC kept `flowd` alive until the next `flow` invocation touched the pipe. The accept thread is freed with `CancelSynchronousIo` (re-issued until it exits), with a throwaway self-connect as fallback; if it still will not exit the handle is leaked rather than closed. |
+| 6 | `PipeServer::shutdown()` — cancel the pending accept, join its thread (≤ 1 s) | `CloseHandle` on a pipe with a pending `ConnectNamedPipe` does not cancel it — it blocks until a client connects. Without this step every exit that did not come through IPC kept `flowd` alive until the next `flow` invocation touched the pipe. The accept thread is freed with `CancelIoEx` (re-issued until it exits), with a throwaway self-connect as fallback; if it still will not exit the handle is leaked rather than closed. See [Server-Side Architecture](#server-side-architecture). |
 
 `main` then rewrites the status file (`stopped` or `error`/`runtime`),
 drops the `FlowWM`, and leaves through an explicit `std::process::exit(code)`
@@ -578,8 +649,12 @@ that reach it:
 The event loop checks the shutdown flag and both thread liveness flags on
 every wake, and again right after pumping window messages (which is where a
 `WM_ENDSESSION` is dispatched), so a logoff reaches the rescue within one
-loop iteration. The fail-back itself runs under `catch_unwind` too: a second
-panic cannot skip the status write or the exit code.
+loop iteration. A dead animator worker sets no event, so the loop never
+sleeps longer than `LIVENESS_TICK_MS` (one second) even with nothing
+scheduled and `foreground_sync_interval_ms = 0`: one wake per second is the
+cost of noticing a dead helper thread. The fail-back itself runs under
+`catch_unwind` too: a second panic cannot skip the status write or the exit
+code.
 
 **Signals.** The daemon's only windows are the border overlays, which exist
 only while there are windows to decorate — and message-only windows never

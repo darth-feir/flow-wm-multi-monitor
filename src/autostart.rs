@@ -5,18 +5,11 @@
 //! - **AHK lifecycle** — the **daemon** launches the user's `flow.ahk`
 //!   keybinding script (`flowd --ahk`, forwarded by `flow start --ahk`) once
 //!   it is ready, inside a kill-on-close `JobObject` so the kernel
-//!   terminates the script whenever the daemon dies — however it dies. The
-//!   job allows silent breakaway, so the terminals and applications the
-//!   script itself launches are **not** job members and survive `flow stop`
-//!   and daemon crashes (they used to die with the daemon). The AutoHotkey
-//!   v2 interpreter is resolved directly ([`resolve_ahk_interpreter`]) and
-//!   started suspended so it is a job member before its first instruction;
-//!   only if no interpreter can be found does the launch fall back to the
-//!   `.ahk` shell association (with a best-effort job assignment after the
-//!   fact — and, with breakaway allowed, a launcher that re-executes the
-//!   interpreter leaves it outside the job). A pidfile records the launched
-//!   PID so `flow stop` (and the daemon's own fail-back) can kill exactly
-//!   that process.
+//!   terminates the script whenever the daemon dies; the script's own
+//!   children break away and survive. A pidfile records the launched PID so
+//!   `flow stop` (and the daemon's own fail-back) can kill exactly that
+//!   process. See `docs/src/dev-guide/ipc-and-watchdog.md`, *The hotkey
+//!   script is tied to the daemon*.
 //! - **Login autostart** — `flow enable-autostart [--ahk]` writes a single
 //!   `flow.lnk` into the user's `shell:startup` folder whose target is
 //!   `flow.exe start [--ahk]`. Login therefore reuses the interactive startup
@@ -148,11 +141,9 @@ pub fn disable_autostart() -> Result<AutostartReport, String> {
 
 /// The running hotkey script, as launched by [`launch_ahk_in_job`].
 ///
-/// Owns the `JobObject` whose closing kills the script. The daemon keeps
-/// this inside `FlowWM` for its whole life and never closes it explicitly;
-/// process teardown (clean or not) closes the handle and the kernel does the
-/// rest. [`AhkProcess::stop`] is the explicit, orderly kill used by
-/// fail-back and `flow stop`.
+/// Owns the `JobObject` whose closing kills the script; the daemon never
+/// closes it explicitly, process teardown does. [`AhkProcess::stop`] is the
+/// explicit, orderly kill used by fail-back and `flow stop`.
 #[derive(Debug)]
 pub struct AhkProcess {
     /// Kill-on-close job the script lives in.
@@ -273,22 +264,15 @@ impl AhkProcess {
 
 /// Launch `<config_dir>/flow.ahk` inside a kill-on-close job object.
 ///
-/// Resolution order:
-///
-/// 1. [`resolve_ahk_interpreter`] finds an AutoHotkey v2 executable → it is
-///    started with `JobObject::spawn` (suspended, assigned, resumed), so
-///    the script is a job member from its first instruction. The children
-///    the script creates (terminals, launched apps) break away from the job
-///    silently and outlive the daemon.
-/// 2. No interpreter found → the `.ahk` shell association is used (see
-///    [`spawn_ahk_script_in`]) and the returned process is assigned to the
-///    job **after** creation. A warning is logged, because if the
-///    association points at a launcher that re-executes the real interpreter
-///    and exits, that child is not inside the job.
-///
-/// The pid is written to `<config_dir>/flow.ahk.pid` on both paths, with
-/// the process's image path on a second line (see [`format_pidfile`]) so
-/// that [`stop_ahk_script_in`] only ever terminates that exact image.
+/// [`resolve_ahk_interpreter`] finds an AutoHotkey v2 executable and
+/// `JobObject::spawn` starts it suspended, assigned and resumed, so the
+/// script is a job member from its first instruction; with no interpreter
+/// found the `.ahk` shell association is used ([`spawn_ahk_script_in`]) and
+/// the process assigned after the fact, with a warning. The pid and image
+/// path are written to `<config_dir>/flow.ahk.pid` ([`format_pidfile`]) so
+/// [`stop_ahk_script_in`] only ever terminates that exact image. See
+/// `docs/src/dev-guide/ipc-and-watchdog.md`, *The hotkey script is tied to
+/// the daemon*.
 ///
 /// # Errors
 ///
@@ -317,12 +301,9 @@ pub fn launch_ahk_in_job(config_dir: &Path) -> Result<AhkProcess, String> {
         ),
     }
 
-    // The script runs `flow` by name. CreateProcess searches the working
-    // directory before PATH, and the daemon's own cwd is wherever `flow
-    // start` happened to be run from — so the script gets the config dir
-    // as its working directory and FLOW_BIN (this flowd.exe's directory)
-    // in its environment, which the keymap resolves to an absolute
-    // `flow.exe` before anything else.
+    // The script gets the config dir as cwd and FLOW_BIN in its environment
+    // so it never resolves `flow` through the daemon's inherited cwd
+    // (`CreateProcess` searches it before PATH).
     let flow_bin = flow_bin_dir();
     let process = match resolve_ahk_interpreter() {
         Some(exe) => {
@@ -436,8 +417,7 @@ pub fn image_matches(expected: &str, actual: &str) -> bool {
 /// * `program_files` — `%ProgramFiles%` (machine-wide installs).
 ///
 /// Within each root the 64-bit v2 interpreter is preferred, then the 32-bit
-/// one, then the root-level `AutoHotkey.exe` (the v2 launcher, which still
-/// ends up in the job because children inherit it).
+/// one, then the root-level `AutoHotkey.exe` launcher.
 #[must_use]
 pub fn ahk_interpreter_candidates(
     install_dirs: &[PathBuf],
@@ -677,15 +657,9 @@ pub fn spawn_ahk_script_in(config_dir: &Path) -> Result<u32, String> {
 /// directory's pidfile. See [`stop_ahk_script_in`].
 ///
 /// Deliberately a one-line wrapper with **no unit test**: it resolves the
-/// real config directory (`FLOW_CONFIG_DIR`, else `%USERPROFILE%\.config\flow`)
-/// and kills whatever pid is recorded there, so a test calling it on a
-/// developer's box — even one that sets `FLOW_CONFIG_DIR` under a lock —
-/// can, under the env-var race, kill their live keymap. Test
-/// [`stop_ahk_script_in`] with a tempdir instead.
-///
-/// # Errors
-///
-/// See [`stop_ahk_script_in`].
+/// real config directory and kills whatever pid is recorded there (see
+/// `docs/src/dev-guide/ipc-and-watchdog.md`, *Testing the hotkey
+/// lifecycle*). Test [`stop_ahk_script_in`] with a tempdir instead.
 pub fn stop_ahk_script() -> Result<bool, String> {
     stop_ahk_script_in(&config_dir())
 }
@@ -769,15 +743,10 @@ pub fn ahk_pidfile_path_in(config_dir: &Path) -> PathBuf {
 
 // ── Win32: process kill ────────────────────────────────────────────────────
 
-/// `true` when a process image path names an AutoHotkey interpreter
-/// (`AutoHotkey64.exe`, `AutoHotkey32.exe`, `AutoHotkeyUX.exe`, a
-/// `…\AutoHotkey\v2\…` install, …): the file name or any path component
-/// contains `autohotkey`, case-insensitively.
-///
-/// The pidfile only records a number, and Windows reuses process ids. A
-/// pid written by a daemon that died an hour ago may now belong to anything
-/// at all, so `kill_process` refuses to terminate a process whose image
-/// does not pass this predicate.
+/// `true` when a process image path names an AutoHotkey interpreter: the
+/// file name or any path component contains `autohotkey`, case-insensitively.
+/// The guard against a reused pid for pidfiles that record no image path
+/// (see `kill_process`).
 #[must_use]
 pub fn is_autohotkey_image(image_path: &str) -> bool {
     image_path.to_ascii_lowercase().contains("autohotkey")
@@ -809,18 +778,13 @@ fn process_image_path(handle: HANDLE) -> Option<String> {
 ///
 /// `Ok(true)` if the process was terminated, `Ok(false)` if the PID does not
 /// refer to a running process (stale pidfile) **or** the process has already
-/// exited — e.g. the daemon's fail-back and `flow stop` both reaching for the
-/// same hotkey script, or the job object having killed it first. That is
-/// the normal case, not an error: `TerminateProcess` on an exited process
-/// fails with `Access is denied`, so liveness is checked first.
-///
-/// Also `Ok(false)` — with an `info` log — when the pid is alive but its
-/// image is not the one the pidfile recorded (`expected_image`, compared
-/// with [`image_matches`]) or, for a pid-only pidfile from an older daemon,
-/// not an AutoHotkey interpreter at all ([`is_autohotkey_image`]): the
-/// pidfile outlived its process and Windows handed the number to someone
-/// else. Killing that process would be the one unforgivable outcome of a
-/// stale pidfile, so the pid is treated as stale instead.
+/// exited (the normal case when the job object or the daemon's fail-back got
+/// there first; `TerminateProcess` on an exited process fails with `Access
+/// is denied`, so liveness is checked first). Also `Ok(false)`, with an
+/// `info` log, when the pid is alive but its image is not the recorded one
+/// ([`image_matches`]) or, for a pid-only pidfile, not an AutoHotkey
+/// interpreter ([`is_autohotkey_image`]): Windows reuses pids, and killing
+/// a stranger would be the one unforgivable outcome of a stale pidfile.
 ///
 /// # Errors
 ///
@@ -1341,13 +1305,10 @@ mod tests {
 
     // ── stop_ahk_script ────────────────────────────────────────────────────
     //
-    // These exercise `stop_ahk_script_in` against a tempdir and NEVER the
-    // default-dir wrapper `stop_ahk_script()`: that one resolves the real
-    // `%USERPROFILE%\.config\flow` unless `FLOW_CONFIG_DIR` is set, and the
-    // env-var race between test threads once let a run of this suite read
-    // the developer's live `flow.ahk.pid`, TerminateProcess their running
-    // keymap and delete the pidfile. The wrapper is one line of path
-    // resolution over the `_in` variant and is not tested on purpose.
+    // Only `stop_ahk_script_in` against a tempdir, never the default-dir
+    // wrapper: under the env-var race it once killed the developer's live
+    // keymap (see `docs/src/dev-guide/ipc-and-watchdog.md`, *Testing the
+    // hotkey lifecycle*).
 
     #[test]
     fn stop_ahk_script_returns_false_when_pidfile_missing() {

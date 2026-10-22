@@ -613,23 +613,11 @@ struct StartSummary {
 /// and the test-only `FLOW_FAIL_AT` fault injector all reach the daemon).
 ///
 /// `--log-file`, `--no-restore`, `--verbose` and `--log-level` are forwarded
-/// to the daemon as CLI arguments (see [`spawn_daemon`]).
-///
-/// Readiness is decided by [`wait_for_daemon`]: the spawned child is kept and
-/// polled, the daemon's `flowd.status` file is read (pid-checked), and a
-/// `Ping` round-trip must succeed. On failure the exact line
-/// `flow: FlowWM failed to start at step '<stage>': <reason> (log: <path>)`
-/// is printed and the process exits with the daemon's stage exit code.
-///
-/// Before spawning, the daemon-less rescue ([`rescue::rescue_offscreen_windows`])
-/// runs so windows a crashed previous daemon left off-screen are brought
-/// back; a line is printed if it moved anything.
-///
-/// When `ahk` is true, `flow.ahk` must exist (checked here, so a missing
-/// script is reported before anything starts) and `--ahk` is forwarded to
-/// the daemon, which launches the script inside a kill-on-close job object
-/// once it is ready. The `Pong` reports the script's pid; if the daemon
-/// could not launch it a warning is printed.
+/// to the daemon as CLI arguments (see [`spawn_daemon`]); `--ahk` is
+/// forwarded too, after checking that `flow.ahk` exists. Readiness is
+/// decided by [`wait_for_daemon`]; the daemon-less rescue
+/// ([`rescue::rescue_offscreen_windows`]) runs before spawning. See
+/// `docs/src/dev-guide/ipc-and-watchdog.md`, *The `flow` CLI Client*.
 ///
 /// # Design Decision
 ///
@@ -771,13 +759,9 @@ fn cmd_ping() -> Result<(), String> {
 }
 
 /// Best-effort start-time update notice, gated by `check_for_updates`.
-///
-/// Fires only when the user opted in. Runs *after* the daemon is ready so
-/// startup is never delayed by the network; the check is bounded by a short
-/// timeout and silences all errors (offline, a bogus `[update] repo`, a
-/// GitHub outage) — a failed check never blocks or aborts startup. Prints one
-/// line, only when the checker's verdict is "newer", and never downloads or
-/// installs. Explicit `flow update` is unaffected by the flag.
+/// Runs after the daemon is ready, bounded by a short timeout, silent on
+/// every failure, prints one line only when something newer exists. See
+/// `docs/src/dev-guide/updater.md`, *Start-time notice*.
 fn maybe_notify_update(config: &config::FlowConfig) {
     if !config.check_for_updates {
         return;
@@ -825,20 +809,14 @@ const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Send a Stop message to the daemon, wait for it to be gone, then clean
 /// up a leftover hotkey script.
 ///
-/// `config` is resolved exactly like `flow start --config` (flag, then
-/// `FLOW_CONFIG_DIR`, then the default), so the status file and pidfile
-/// consulted are the running daemon's.
-///
-/// The daemon is the one that kills its script (during fail-back, which runs
-/// after it has acknowledged `Stop`). So this waits — up to
-/// [`DAEMON_STOP_TIMEOUT`] — for the daemon's status file to leave `ready`
-/// (it becomes `stopped`), then for the daemon **process** itself to exit
-/// (the status flips a moment before the pipe handle is closed, and `flow
-/// start` right after needs the pipe gone), and only then runs
-/// [`autostart::stop_ahk_script_in`]: that finds a pidfile only if the
-/// daemon did not launch the script itself (an older `flow start --ahk`) or
-/// died before removing it, and it treats an already-exited or reused pid
-/// as nothing to do. Nothing is printed when there was nothing to stop.
+/// `config` is resolved exactly like `flow start --config`, so the status
+/// file and pidfile consulted are the running daemon's. The daemon kills its
+/// own script during fail-back, so this waits (up to [`DAEMON_STOP_TIMEOUT`])
+/// for its status to leave `ready` and then for the process to exit, and
+/// only then runs [`autostart::stop_ahk_script_in`] for a pidfile the daemon
+/// did not own or could not remove. See
+/// `docs/src/dev-guide/ipc-and-watchdog.md`, *The hotkey script is tied to
+/// the daemon*.
 ///
 /// # Errors
 ///
@@ -1659,20 +1637,13 @@ fn find_daemon_exe() -> Result<std::path::PathBuf, String> {
 /// Wait for the spawned daemon to finish initialization, or explain why it
 /// did not.
 ///
-/// Every [`DAEMON_POLL_INTERVAL`] this checks, in order:
-///
-/// 1. `child.try_wait()` — the daemon exited. Its status file (if it got
-///    that far and the pid matches) names the stage; the exit code is
-///    reused for `flow`'s own exit.
-/// 2. `<config_dir>/flowd.status` with `pid == child.id()` — a stale file
-///    from an earlier daemon is ignored. `state: error` fails immediately
-///    with the reported stage; `state: ready` moves on to step 3. No file
-///    of ours at all (the daemon could not write it) also moves on to step
-///    3: a `Pong` carrying the child's pid is proof enough on its own.
-/// 3. A `Ping` round-trip whose `Pong.pid` matches the child — only then is
-///    the daemon considered started.
-///
-/// Times out after [`DAEMON_START_TIMEOUT`], naming the last stage seen.
+/// Every [`DAEMON_POLL_INTERVAL`] this checks `child.try_wait()`, then the
+/// daemon's status file (only with `pid == child.id()`), then a `Ping` whose
+/// `Pong.pid` matches the child; the daemon counts as started only after
+/// the ping. A reported `state: error` fails at once with the stage and the
+/// daemon's exit code. Times out after [`DAEMON_START_TIMEOUT`], naming the
+/// last stage seen. See `docs/src/dev-guide/ipc-and-watchdog.md`, *The
+/// `flow` CLI Client*.
 fn wait_for_daemon(
     child: &mut Child,
     config_dir: &Path,

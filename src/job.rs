@@ -1,25 +1,14 @@
 //! Win32 Job Objects: tie a child process's lifetime to this process.
 //!
-//! A `JobObject` created with `JobObject::kill_on_close` carries the
-//! `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` limit: when the **last handle** to
-//! the job is closed, the kernel terminates every process in it. The daemon
-//! keeps the handle open for its whole life and never closes it explicitly,
-//! so *any* exit — clean stop, panic, abort, `taskkill /f`, a crash in a
-//! Win32 callback — closes the handle through normal process teardown and
-//! the kernel kills the hotkey script with it. That is what releases the
-//! Win key after the daemon dies (see `docs/src/dev-guide/ipc-and-watchdog.md`).
-//!
-//! The job also carries `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`: a process a
-//! job member creates is **not** associated with the job. The member we
-//! care about — the hotkey script — is spawned by the daemon itself (see
-//! [`JobObject::spawn`]), so it is always in the job; but the terminals and
-//! applications the script launches (Mod+T, the launcher) are the user's,
-//! not the daemon's, and must survive `flow stop` and a daemon crash. Before
-//! this flag every such child inherited the job and died with the daemon.
-//! The trade-off: a launcher that re-executes the real interpreter and
-//! exits leaves that interpreter outside the job, which is why the daemon
-//! resolves the interpreter directly instead of going through the `.ahk`
-//! shell association (see `autostart::launch_ahk_in_job`).
+//! A `JobObject` created with `JobObject::kill_on_close` carries
+//! `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (the kernel terminates every member
+//! when the last handle closes — which process teardown does on *any* exit)
+//! and `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK` (a member's own children are
+//! not members). The daemon uses it to keep the hotkey script alive exactly
+//! as long as itself while the terminals and apps the script launches
+//! survive; why, and the trade-off with the `.ahk` shell association, are in
+//! `docs/src/dev-guide/ipc-and-watchdog.md`, *The hotkey script is tied to
+//! the daemon*.
 
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;

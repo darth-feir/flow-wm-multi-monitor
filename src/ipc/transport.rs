@@ -46,13 +46,9 @@ use super::message::{self, SocketMessage, SocketResponse};
 /// Read buffer size for pipe I/O (8 KiB).
 const BUF_SIZE: u32 = 8192;
 
-/// Longest line either side accepts before giving up on the peer.
-///
-/// A command or reply is a few hundred bytes; `flow query all` on a busy
-/// desktop is tens of KiB. A peer that has sent this much without a newline
-/// is not speaking the protocol (or is trying to make the daemon buffer
-/// without bound), so the read fails with `InvalidData` and the daemon
-/// disconnects that client.
+/// Longest line either side accepts before giving up on the peer: a reply
+/// is at most tens of KiB (`flow query all`), so more without a newline is
+/// not the protocol, and the read fails with `InvalidData`.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// Longest slice of a bad line the daemon puts in its log.
@@ -76,13 +72,10 @@ const LOG_LINE_PREVIEW: usize = 200;
 /// the daemon is genuinely stuck, at which point failing fast beats hanging.
 const IPC_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Longest the daemon waits for a connected client to send its command.
-///
-/// A `flow` invocation writes its line the instant it connects, so two
-/// seconds is generous; a client that is still silent after that (a stuck
-/// process, a port scanner, `is_daemon_running`'s probe that never writes)
-/// is disconnected so the next client can be served. Without this the
-/// daemon's main loop sat in a `ReadFile` with no deadline.
+/// Longest the daemon waits for a connected client to send its command. A
+/// `flow` invocation writes its line the instant it connects; a client that
+/// is still silent after this is disconnected so the next one can be served
+/// (without it the main loop sat in a `ReadFile` with no deadline).
 pub const SERVER_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Longest the daemon waits for a client to drain a response.
@@ -93,15 +86,10 @@ const SERVER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
 
 /// Longest a client keeps retrying a connect that fails with
-/// `ERROR_PIPE_BUSY`.
-///
-/// The daemon serves one client at a time on a single pipe instance: between
-/// `DisconnectNamedPipe` of the previous client and the re-armed
-/// `ConnectNamedPipe` (a thread spawn away), and for the whole of another
-/// client's session, `CreateFileW` fails with `ERROR_PIPE_BUSY`. A `flow
-/// stop` right after `flow start`'s ping, or two dispatches back to back,
-/// land in exactly that window, so the client waits for a free instance
-/// (`WaitNamedPipeW`) and retries instead of failing.
+/// `ERROR_PIPE_BUSY`: the daemon serves one client at a time, so a second
+/// `flow` right behind another lands between its disconnect and the next
+/// accept (see `docs/src/dev-guide/ipc-and-watchdog.md`, *Overlapped I/O
+/// and deadlines*).
 const BUSY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Win32 `ERROR_IO_PENDING` (997 / `0x3E5`) expressed as the `HRESULT`
@@ -257,12 +245,9 @@ impl PipeServer {
     pub fn create_named(pipe_name: &str) -> io::Result<Self> {
         let name = wide(pipe_name);
 
-        // The pipe's DACL (see `PipeSecurity`): SYSTEM and Administrators
-        // get full access, the user the daemon runs as gets read + write,
-        // nobody else gets anything — another local account cannot open
-        // the pipe at all. Remote clients are rejected outright. Overlapped
-        // so the server's reads, writes and accepts can all be bounded (see
-        // `read_message`) and cancelled (see `shutdown`).
+        // DACL from `PipeSecurity` (daemon's user, SYSTEM, Administrators
+        // only), remote clients rejected, overlapped so every server I/O
+        // can be bounded (`read_message`) and cancelled (`shutdown`).
         let security = PipeSecurity::for_current_user()?;
         let attrs = security.attributes();
         // SAFETY: `name` is NUL-terminated; `attrs` points at a descriptor
@@ -316,23 +301,14 @@ impl PipeServer {
     /// Stop accepting: cancel a pending `ConnectNamedPipe` and join the
     /// accept thread, bounded by `ACCEPT_SHUTDOWN_TIMEOUT`.
     ///
-    /// **Why this exists.** `CloseHandle` on a pipe with a pending
-    /// `ConnectNamedPipe` does not cancel that I/O — it blocks until the
-    /// connect completes. Dropping a `PipeServer` with an accept pending
-    /// therefore hung `flowd` on every exit path where no client had just
-    /// connected (session end, signals, a dead thread) until the next client
-    /// happened to connect. `flow stop` never hit it because the stopping
-    /// client *was* the last connection.
-    ///
-    /// Steps: set `stopping` (the thread exits instead of retrying — it polls
-    /// the flag every `ACCEPT_POLL` while its overlapped connect is
-    /// pending), then repeatedly `CancelIoEx` the pipe (re-issued every 10 ms
-    /// to cover the window before the thread enters `ConnectNamedPipe`), and
-    /// if that still has not freed it after a third of the budget, connect a
-    /// throwaway client to our own pipe so the accept completes normally.
-    /// Returns `true` if the thread was joined in time. If not, the pipe
-    /// handle is deliberately **leaked** (not closed) so that dropping the
-    /// server can no longer block; the process is exiting anyway.
+    /// `CloseHandle` on a pipe with a pending `ConnectNamedPipe` blocks until
+    /// the connect completes, which used to hang `flowd` on every exit path
+    /// where no client had just connected. Sets `stopping`, re-issues
+    /// `CancelIoEx` until the thread leaves, then connects a throwaway client
+    /// to its own pipe as the fallback. Returns `true` if the thread was
+    /// joined in time; if not, the pipe handle is deliberately **leaked** so
+    /// dropping the server can no longer block. See
+    /// `docs/src/dev-guide/ipc-and-watchdog.md`, *Fail-back*.
     pub fn shutdown(&mut self) -> bool {
         self.stopping.store(true, Ordering::Release);
         let Some(thread) = self.accept_thread.take() else {
@@ -599,26 +575,12 @@ impl Drop for PipeServer {
 
 // ── Pipe security ───────────────────────────────────────────────────
 
-/// The SDDL string for the server pipe's security descriptor.
-///
-/// `D:P` — a protected DACL (no inherited entries), with three allow ACEs
-/// and nothing else, so Everyone / Authenticated Users / other local
-/// accounts are denied by default:
-///
-/// - `(A;;GA;;;SY)` — SYSTEM: generic all.
-/// - `(A;;GA;;;BA)` — Builtin Administrators: generic all.
-/// - `(A;;GRGW;;;<sid>)` — the daemon's own user: generic read + write,
-///   which is exactly what `CreateFileW(GENERIC_READ | GENERIC_WRITE)` in
-///   the client asks for. (On a named pipe `FILE_WRITE_DATA` is the same
-///   access bit as `FILE_CREATE_PIPE_INSTANCE`, so the user could also
-///   create further instances of the name — the same user the daemon runs
-///   as; the server's `FIRST_PIPE_INSTANCE` makes a second daemon fail.)
-///
-/// The user is named by the SID of the process token rather than the
-/// creator-owner placeholder (`CO`), which is only substituted during ACL
-/// *inheritance* and has no meaning in a pipe's own DACL, or `OW` (owner
-/// rights), which would also silently depend on the pipe's owner being
-/// set as expected. Resolving the SID at runtime is explicit and testable.
+/// The SDDL string for the server pipe's security descriptor: a protected
+/// DACL (`D:P`) that allows SYSTEM and Builtin Administrators generic all
+/// and `user_sid` — the daemon's own user, read from the process token —
+/// generic read + write, and nobody else anything. Why the SID is resolved
+/// at runtime rather than written as `CO` / `OW` is in
+/// `docs/src/dev-guide/ipc-and-watchdog.md`, *Pipe security*.
 #[must_use]
 pub fn pipe_sddl(user_sid: &str) -> String {
     format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;{user_sid})")
@@ -732,19 +694,13 @@ pub fn truncate_for_log(s: &str, max: usize) -> String {
 
 // ── Overlapped (deadline-bounded) I/O ───────────────────────────────
 //
-// A synchronous `ReadFile` on a byte-mode pipe returns only when data arrives
-// or the peer disconnects, with no timeout. That is dangerous on both ends:
-// a daemon that accepts a connection yet never replies hangs the CLI — or a
-// test's cleanup path — indefinitely, and a client that connects yet never
-// writes wedged the daemon's main loop (every hotkey dead until that client
-// went away).
+// A synchronous `ReadFile` on a byte-mode pipe has no timeout: an
+// unresponsive peer hangs the other end for good (the CLI, a test's
+// cleanup, or the daemon's main loop).
 //
-// Both handles are therefore opened with `FILE_FLAG_OVERLAPPED` (see
-// [`connect_to_named_pipe`] and [`PipeServer::create_named`]), so each I/O
-// can be initiated asynchronously and then awaited with a deadline. On
-// timeout the outstanding operation is cancelled via `CancelIo` and reaped,
-// so the unresponsive peer yields a `TimedOut` error instead of a permanent
-// hang.
+// Both handles are therefore opened with `FILE_FLAG_OVERLAPPED` and every
+// I/O is awaited with a deadline and cancelled on expiry. See
+// `docs/src/dev-guide/ipc-and-watchdog.md`, *Overlapped I/O and deadlines*.
 
 /// Convert a deadline (`Instant`) into the millisecond argument expected by
 /// [`WaitForSingleObject`], clamped at zero. Returns `None` if the deadline
@@ -1055,11 +1011,9 @@ pub fn send_message_to(pipe_name: &str, msg: &SocketMessage) -> io::Result<Socke
 /// the brief window after a previous connect + drop cycle where the
 /// daemon may be between `DisconnectNamedPipe` and the next `ConnectNamedPipe`.
 ///
-/// A pipe that exists but has no free instance — the daemon is serving
-/// another client, so `CreateFileW` fails with `ERROR_PIPE_BUSY` and
-/// `WaitNamedPipeW` with `ERROR_SEM_TIMEOUT` (121) — counts as **running**:
-/// only a live daemon can hold the pipe busy. (The AHK keymaps apply the
-/// same rule, with a cap on consecutive busy polls.)
+/// A pipe that exists but has no free instance (`ERROR_PIPE_BUSY`, then
+/// `ERROR_SEM_TIMEOUT` from `WaitNamedPipeW`) counts as **running**: only a
+/// live daemon can hold the pipe busy.
 ///
 /// The handle is RAII-wrapped and closed immediately when dropped — no kernel
 /// handle leak.
@@ -1106,15 +1060,11 @@ fn pipe_exists(pipe_name: &str) -> bool {
 /// hanging the CLI/test forever: overlapped operations are awaited with
 /// [`WaitForSingleObject`] and cancelled with [`CancelIo`] on timeout.
 ///
-/// It is opened with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`: the
-/// server may learn who the client is but may not impersonate it. Without
-/// an explicit quality of service the default is `SecurityImpersonation`,
-/// which would let whoever managed to own `\\.\pipe\flow` first act under
-/// the CLI user's identity.
-///
-/// A busy pipe (every instance serving another client, or the daemon
-/// between one client's disconnect and the next accept) is waited for with
-/// `WaitNamedPipeW` and retried for up to `BUSY_CONNECT_TIMEOUT`.
+/// It is also opened with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`
+/// (the server may learn who the client is but not impersonate it), and a
+/// busy pipe is waited for with `WaitNamedPipeW` and retried for up to
+/// `BUSY_CONNECT_TIMEOUT`. See `docs/src/dev-guide/ipc-and-watchdog.md`,
+/// *Pipe security* and *Overlapped I/O and deadlines*.
 ///
 /// # Errors
 ///
