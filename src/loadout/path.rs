@@ -1,18 +1,11 @@
 //! Where a loadout file may live.
 //!
-//! Two different rules, both pure and shared by the CLI (so a bad path is
-//! refused before anything is sent) and the daemon (which trusts nothing
-//! that arrives over the pipe):
-//!
-//! - [`validate_default_path`] — the `[loadout] default_path` config key is
-//!   a **plain file name** inside the config directory: no directory
-//!   components, no `..`, no drive or stream separator. A config that says
-//!   otherwise is rejected at load.
-//! - [`validate_loadout_path`] — an explicit `flow loadout save|load <path>`
-//!   must name a `.json` file and may not contain a `..` component. Absolute
-//!   paths are allowed (the user is naming their own file); a relative path
-//!   is resolved by the daemon against the config directory, never against
-//!   its working directory.
+//! Two pure rules shared by the CLI (a bad path is refused before anything
+//! is sent) and the daemon (which trusts nothing that arrives over the
+//! pipe): [`validate_default_path`] for the `[loadout] default_path` config
+//! key (a plain file name) and [`validate_loadout_path`] for an explicit
+//! `flow loadout save|load <path>` (`.json`, no `..`). See
+//! `docs/src/dev-guide/loadout.md`, *Where the file may be*.
 
 use std::path::{Component, Path};
 

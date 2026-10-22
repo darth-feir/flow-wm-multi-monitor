@@ -232,15 +232,11 @@ fn is_repo_slug(s: &str) -> bool {
 }
 
 /// Ask GitHub and report. Every request goes through one HTTPS-only agent
-/// bounded by [`TIMEOUT`], identified as `flow-wm/<version>`, without a
-/// token; the `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` environment is
-/// honoured by `ureq` itself.
-///
-/// Branch mode compares the embedded commit with the branch head. When the
-/// commit is unknown to the remote (not pushed yet, or rewritten) GitHub
-/// answers 404 and the check falls back to the branch head alone, judged by
-/// commit date. Release mode compares the latest release tag with the crate
-/// version.
+/// bounded by `TIMEOUT`, identified as `flow-wm/<version>`, without a
+/// token. Branch mode compares the embedded commit with the branch head
+/// (falling back to the head alone, judged by commit date, when GitHub
+/// does not know the commit); release mode compares the latest release tag
+/// with the crate version. See `docs/src/dev-guide/updater.md`, *The check*.
 ///
 /// # Errors
 ///

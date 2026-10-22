@@ -109,11 +109,10 @@ pub struct FloatingEntry {
 /// save time, so it must be persisted to name the missing window at load
 /// time).
 ///
-/// `title` used to be written for the same reason. It is personal
-/// (document names, chat partners, URLs) and the file sits in the config
-/// directory for as long as the user keeps it, so the daemon **no longer
-/// writes it**; it is still read from files that have it, and shown in the
-/// abort message when present.
+/// `title` used to be written for the same reason; it is personal data in a
+/// long-lived file, so the daemon **no longer writes it** (still read from
+/// files that have it). See `docs/src/dev-guide/loadout.md`, *Window
+/// identity across a restart*.
 ///
 /// See the design-decision record (`docs/src/dev-guide/design-decisions.md`,
 /// "Loadout Window Identity: HWND-Exact (Not Fuzzy Matching)").

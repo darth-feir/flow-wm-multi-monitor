@@ -6,13 +6,11 @@
 //! phase (not build-time), `panic!` in `build.rs` is the correct approach to
 //! halt the build early.
 //!
-//! It also embeds the git state of the checkout being built — commit, branch,
-//! dirty flag, commit date and the `origin` URL — as `FLOW_BUILD_*`
-//! environment variables read by `src/build_info.rs`. `flow --version` prints
-//! them and `flow update` compares the embedded commit against the remote
-//! branch. Every variable is always set (to the empty string when `git` is
-//! not installed or the source is not a git checkout, e.g. a crates.io
-//! tarball), so the crate reads them with `env!` and never fails to build.
+//! It also embeds the git state of the checkout being built as `FLOW_BUILD_*`
+//! environment variables read by `src/build_info.rs`. Every variable is
+//! always set (empty when `git` or a checkout is unavailable), so the crate
+//! reads them with `env!` and never fails to build. See
+//! `docs/src/dev-guide/updater.md`, *Build metadata*.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
