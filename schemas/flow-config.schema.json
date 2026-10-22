@@ -1,24 +1,26 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "FlowConfig",
-  "description": "Top-level application configuration structure.\n\nLoaded from `%USERPROFILE%\\.config\\flow\\flow.toml` (see [`config::dirs`](crate::config::dirs) for the full resolution chain including `--config` flag and `FLOW_CONFIG_DIR` env var overrides). The struct carries `#[serde(default)]`, so the file may be partial or even empty — serde fills missing fields from the [`Default`] impl.\n\nThe canonical default values live in the `Default` impl below. The `default-config.toml` file is a hand-written **example** copied to users by `flow config init` — it is not read at runtime.\n\nThis struct contains **application settings only** — padding, animation, etc. Window classification rules live in a separate file ([`WindowRulesConfig`]) to allow independent editing.\n\n# Column Sizing\n\nThe primary column sizing mode is [`columns_per_screen`](FlowConfig::columns_per_screen): the user specifies how many columns fit on one monitor, and the daemon computes the actual pixel width at runtime from the monitor resolution and [`window_gap`](Padding::window_gap).\n\nPower users can override this by setting [`column_width`](FlowConfig::column_width) to a fixed pixel value. When `column_width` is `Some`, it takes priority over `columns_per_screen` — the auto-computation is skipped entirely.\n\n# Example\n\n```toml columns_per_screen = 4 min_column_width_px = 640\n\n[padding] window_gap = 16 up = 16 down = 16\n\n[animation] enabled = true duration_ms = 240 easing = \"ease-out-expo\" ```\n\nSee `docs/spec/04-config-and-persistence.md` for the full schema.",
+  "description": "Top-level application configuration structure.\n\nLoaded from `%USERPROFILE%\\.config\\flow\\flow.toml` (see [`config::dirs`](crate::config::dirs)\nfor the full resolution chain including `--config` flag and `FLOW_CONFIG_DIR` env var\noverrides). The struct carries `#[serde(default)]`, so the file may be partial or even empty —\nserde fills missing fields from the [`Default`] impl.\n\nThe canonical default values live in the `Default` impl below. The `default-config.toml` file is\na hand-written **example** copied to users by `flow config init` — it is not read at runtime.\n\nThis struct contains **application settings only** — padding,\nanimation, etc. Window classification rules live in a separate file\n([`WindowRulesConfig`]) to allow independent editing.\n\n# Column Sizing\n\nThe primary column sizing mode is [`columns_per_screen`](FlowConfig::columns_per_screen):\nthe user specifies how many columns fit on one monitor, and the daemon computes\nthe actual pixel width at runtime from the monitor resolution and [`window_gap`](Padding::window_gap).\n\nPower users can override this by setting [`column_width`](FlowConfig::column_width)\nto a fixed pixel value. When `column_width` is `Some`, it takes priority over\n`columns_per_screen` — the auto-computation is skipped entirely.\n\n# Example\n\n```toml\ncolumns_per_screen = 4\nmin_column_width_px = 640\n\n[padding]\nwindow_gap = 16\nup = 16\ndown = 16\n\n[animation]\nenabled = true\nduration_ms = 240\neasing = \"ease-out-expo\"\n```\n\nSee `docs/spec/04-config-and-persistence.md` for the full schema.",
   "type": "object",
   "properties": {
+    "adopt_maximized": {
+      "description": "Whether a **maximized** window the daemon meets — in the startup\nscan, when it opens, on `tiling on` — is un-maximized and classified\nthrough the rules (tiled or floated as they say) instead of being\nleft alone as `Ignored(Maximized)`. Fullscreen windows (games,\nvideos) are never adopted, and neither is a window the rules\nignore. An adopted window is handed back maximized by `tiling off`,\n`flow stop` and the fail-back. Off by default (upstream behaviour: a\nmaximized window is ignored until it is restored or `set-window` is\nrun on it, which adopts it either way). Live-reloadable.",
+      "type": "boolean",
+      "default": false
+    },
     "animation": {
       "description": "Animation settings.",
+      "$ref": "#/$defs/AnimationConfig",
       "default": {
         "duration_ms": 240,
         "easing": "ease-out-expo",
         "enabled": true
-      },
-      "allOf": [
-        {
-          "$ref": "#/definitions/AnimationConfig"
-        }
-      ]
+      }
     },
     "borders": {
       "description": "Window border overlay configuration.",
+      "$ref": "#/$defs/BorderConfig",
       "default": {
         "enabled": true,
         "floating_color": "#AA00FF",
@@ -26,388 +28,445 @@
         "overlap": 1,
         "thickness": 3,
         "unfocused_color": "#555555"
-      },
-      "allOf": [
-        {
-          "$ref": "#/definitions/BorderConfig"
-        }
-      ]
+      }
+    },
+    "check_for_updates": {
+      "description": "Whether `flow start` runs the update checker (the same one behind\n`flow update`, see [`UpdateConfig`]) and prints a one-line notice\nwhen something newer exists on GitHub.\n\n**Off by default in this fork**: a window manager has no business\nphoning out at every start. The key is kept so a user can opt in.\nWhen on, the check runs *after* the daemon is ready, is bounded by\na short network timeout, and silences all errors — it never blocks\nor aborts startup, and it never downloads anything. The explicit\n`flow update` command is unaffected by this flag. See\n(`docs/src/dev-guide/updater.md`).",
+      "type": "boolean",
+      "default": false
     },
     "column_width": {
-      "description": "Fixed column width in pixels — power-user override.\n\nWhen `Some`, this overrides the auto-computation from [`columns_per_screen`](FlowConfig::columns_per_screen). When `None`, the daemon computes the width from the monitor resolution, `columns_per_screen`, and `window_gap`.\n\nThis field is **optional** in TOML — most users should rely on `columns_per_screen`. A missing `Option` field deserializes to `None` automatically.",
+      "description": "Fixed column width in pixels — power-user override.\n\nWhen `Some`, this overrides the auto-computation from [`columns_per_screen`](FlowConfig::columns_per_screen).\nWhen `None`, the daemon computes the width from the monitor resolution, `columns_per_screen`,\nand `window_gap`.\n\nThis field is **optional** in TOML — most users should rely on `columns_per_screen`.\nA missing `Option` field deserializes to `None` automatically.",
       "type": [
         "integer",
         "null"
       ],
       "format": "uint32",
-      "minimum": 0.0
+      "minimum": 0
+    },
+    "columns": {
+      "description": "Column width presets (`[columns]`). `None` when the section is absent:\ncolumns are then sized from [`columns_per_screen`](Self::columns_per_screen)\n/ [`column_width`](Self::column_width) as before. When present, every\nmonitor starts on `columns.default` and `flow dispatch width` walks\nthe presets — see [`ColumnsConfig`].",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ColumnsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "columns_per_screen": {
-      "description": "Number of columns that fit side-by-side on one monitor screen.\n\nThe daemon computes the actual pixel width at startup: `base_content_width = (monitor_width - (N+1) * window_gap) / N` where `N = columns_per_screen`.\n\nIf [`column_width`](FlowConfig::column_width) is also set, that value takes priority and this field is ignored.",
-      "default": 4,
+      "description": "Number of columns that fit side-by-side on one monitor screen.\n\nThe daemon computes the actual pixel width at startup:\n`base_content_width = (monitor_width - (N+1) * window_gap) / N`\nwhere `N = columns_per_screen`.\n\nIf [`column_width`](FlowConfig::column_width) is also set, that value\ntakes priority and this field is ignored.",
       "type": "integer",
       "format": "uint32",
-      "minimum": 0.0
+      "default": 4,
+      "minimum": 0
+    },
+    "drag": {
+      "description": "Tile-drag configuration.",
+      "$ref": "#/$defs/DragConfig",
+      "default": {
+        "col_edge_max_px": 120,
+        "col_edge_ratio": 0.18000000715255737,
+        "edge_scroll_initial_delay_ms": 500,
+        "edge_scroll_repeat_interval_ms": 240,
+        "edge_scroll_width": 30
+      }
     },
     "floating": {
       "description": "Floating window default-size configuration.",
-      "default": {},
-      "allOf": [
-        {
-          "$ref": "#/definitions/FloatingConfig"
-        }
-      ]
+      "$ref": "#/$defs/FloatingConfig",
+      "default": {
+        "always_on_top": false
+      }
     },
     "focus": {
       "description": "Focus reconciliation configuration.",
+      "$ref": "#/$defs/FocusConfig",
       "default": {
         "foreground_sync_interval_ms": 250
-      },
-      "allOf": [
-        {
-          "$ref": "#/definitions/FocusConfig"
-        }
-      ]
+      }
+    },
+    "loadout": {
+      "description": "Loadout save/restore configuration.",
+      "$ref": "#/$defs/LoadoutConfig",
+      "default": {
+        "default_path": "loadout.json"
+      }
+    },
+    "logging": {
+      "description": "Daemon log retention (`[logging]`).",
+      "$ref": "#/$defs/LoggingConfig",
+      "default": {
+        "keep_days": 14
+      }
     },
     "min_column_width_px": {
       "description": "Minimum column width in pixels. Columns cannot be resized below this.",
-      "default": 640,
       "type": "integer",
       "format": "uint32",
-      "minimum": 0.0
+      "default": 640,
+      "minimum": 0
+    },
+    "min_row_height_px": {
+      "description": "Minimum row height in pixels — the dedicated vertical floor for\ndrag-resize of a single row (ticket #10). Mirrors\n[`min_column_width_px`](Self::min_column_width_px) on the vertical axis:\ndragging a row boundary cannot shrink either row below this value, and\nonce the shrinking neighbor hits it the edge elastically pins (overshoot\nduring the drag, snap back on release).\n\nThis is distinct from [`min_window_height_px`](Self::min_window_height_px),\nwhich is the row-stack-count cap consulted by the add/remove/merge\nmutations. The two are independent: a power user may want a higher\ndrag-floor than the stack cap, or vice versa. Both default to `100`.",
+      "type": "integer",
+      "format": "uint32",
+      "default": 100,
+      "minimum": 0
     },
     "min_window_height_px": {
-      "description": "Minimum row height in pixels — the floor for any single window's allocated height inside a column.\n\nThis bounds the maximum number of rows (windows) that can stack inside one column: a column cannot grow rows beyond `available_height / min_window_height_px`. It is also the lower clamp for future drag-resize / IPC continuous-height adjustment of individual rows.\n\nSee (`docs/src/dev-guide/layout/mutations.md`) for the height- distribution formula and the `merge-column` / `promote` operations.",
-      "default": 100,
+      "description": "Minimum row height in pixels — the floor for any single window's\nallocated height inside a column.\n\nThis bounds the maximum number of rows (windows) that can stack inside\none column: a column cannot grow rows beyond `available_height /\nmin_window_height_px`. It is also the lower clamp for future\ndrag-resize / IPC continuous-height adjustment of individual rows.\n\nSee (`docs/src/dev-guide/layout/mutations.md`) for the height-\ndistribution formula and the `merge-column` / `promote` operations.",
       "type": "integer",
       "format": "uint32",
-      "minimum": 0.0
+      "default": 100,
+      "minimum": 0
     },
     "minimize_restore": {
       "description": "Behavior when a minimized tiling window is restored.",
+      "$ref": "#/$defs/MinimizeRestore",
       "default": {
         "strategy": "original_slot"
-      },
-      "allOf": [
-        {
-          "$ref": "#/definitions/MinimizeRestore"
-        }
-      ]
+      }
+    },
+    "navigation": {
+      "description": "Navigation behaviour at the edges of a strip (`[navigation]`).",
+      "$ref": "#/$defs/NavigationConfig",
+      "default": {
+        "edge_hop": true
+      }
     },
     "padding": {
       "description": "Padding settings.",
+      "$ref": "#/$defs/Padding",
       "default": {
         "down": 0,
         "up": 0,
         "window_gap": 16
-      },
-      "allOf": [
-        {
-          "$ref": "#/definitions/Padding"
-        }
-      ]
+      }
+    },
+    "update": {
+      "description": "What `flow update` (and the start-time notice) compares this build\nagainst (`[update]`). See [`UpdateConfig`].",
+      "$ref": "#/$defs/UpdateConfig",
+      "default": {}
     }
   },
-  "definitions": {
+  "$defs": {
     "AnimationConfig": {
-      "description": "Animation configuration for layout transitions.\n\nWhen disabled, all window position changes are applied instantly without animation.",
+      "description": "Animation configuration for layout transitions.\n\nWhen disabled, all window position changes are applied instantly\nwithout animation.",
       "type": "object",
       "properties": {
         "duration_ms": {
           "description": "Animation duration in milliseconds.",
-          "default": 240,
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "default": 240,
+          "minimum": 0
         },
         "easing": {
-          "description": "Easing curve applied to window position channels (x, y).\n\nSee [`ConfigEasing`] for the full list of supported curves. Defaults to [`ConfigEasing::EaseOutExpo`].",
-          "default": "ease-out-expo",
-          "allOf": [
-            {
-              "$ref": "#/definitions/ConfigEasing"
-            }
-          ]
+          "description": "Easing curve applied to window position channels (x, y).\n\nSee [`ConfigEasing`] for the full list of supported curves.\nDefaults to [`ConfigEasing::EaseOutExpo`].",
+          "$ref": "#/$defs/ConfigEasing",
+          "default": "ease-out-expo"
         },
         "enabled": {
           "description": "Whether layout transitions are animated.",
-          "default": true,
-          "type": "boolean"
+          "type": "boolean",
+          "default": true
         }
       }
     },
     "BorderConfig": {
-      "description": "Window border overlay configuration.\n\nThe border crate draws a thin colored ring around each managed window as a separate layered overlay window that follows the target HWND's geometry (driven by `EVENT_OBJECT_LOCATIONCHANGE`). The daemon shrinks the actual window rect by `(thickness - overlap)` pixels on each side so the colored ring sits in the surrounding gap and overlaps the visible content by `overlap` px (closing the DWM hairline gap). See `docs/src/dev-guide/borders.md` for the full coordinate-space model.\n\n# Example\n\n```toml [borders] enabled = true thickness = 3 overlap = 1 focused_color = \"#00AAFF\" unfocused_color = \"#555555\" floating_color = \"#AA00FF\" ```",
+      "description": "Window border overlay configuration.\n\nThe border crate draws a thin colored ring around each managed window as a\nseparate layered overlay window that follows the target HWND's geometry\n(driven by `EVENT_OBJECT_LOCATIONCHANGE`). The daemon shrinks the actual\nwindow rect by `(thickness - overlap)` pixels on each side so the colored\nring sits in the surrounding gap and overlaps the visible content by\n`overlap` px (closing the DWM hairline gap). See\n`docs/src/dev-guide/borders.md` for the full coordinate-space model.\n\n# Example\n\n```toml\n[borders]\nenabled = true\nthickness = 3\noverlap = 1\nfocused_color = \"#00AAFF\"\nunfocused_color = \"#555555\"\nfloating_color = \"#AA00FF\"\n```",
       "type": "object",
       "properties": {
         "enabled": {
-          "description": "Master switch. When `false`, no overlay windows are created and any existing overlays are detached.",
-          "default": true,
-          "type": "boolean"
+          "description": "Master switch. When `false`, no overlay windows are created and any\nexisting overlays are detached.",
+          "type": "boolean",
+          "default": true
         },
         "floating_color": {
           "description": "Border color for floating windows.",
-          "default": "#AA00FF",
           "type": "string",
           "format": "hex-color",
+          "default": "#AA00FF",
           "pattern": "^#[0-9A-Fa-f]{6}$"
         },
         "focused_color": {
           "description": "Border color for the focused/active window.",
-          "default": "#00AAFF",
           "type": "string",
           "format": "hex-color",
+          "default": "#00AAFF",
           "pattern": "^#[0-9A-Fa-f]{6}$"
         },
         "overlap": {
-          "description": "How many pixels the border ring overlaps the window's visible content.\n\nKomorebi-style overlap. `0` keeps the ring entirely in the reserved gap (window shrinks by the full `thickness`); higher values pull the content edge outward until, at `overlap == thickness`, the content fills the whole layout slot and the ring sits fully on top of it. The default of `1` closes the 1px DWM-client-edge hairline that otherwise shows between an unfocused ring and the window content. Capped at `thickness` by [`BorderConfig::validate`]. (`docs/src/dev-guide/borders.md`)",
-          "default": 1,
+          "description": "How many pixels the border ring overlaps the window's visible content.\n\nKomorebi-style overlap. `0` keeps the ring entirely in the reserved\ngap (window shrinks by the full `thickness`); higher values pull the\ncontent edge outward until, at `overlap == thickness`, the content\nfills the whole layout slot and the ring sits fully on top of it. The\ndefault of `1` closes the 1px DWM-client-edge hairline that otherwise\nshows between an unfocused ring and the window content. Capped at\n`thickness` by [`BorderConfig::validate`]. (`docs/src/dev-guide/borders.md`)",
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "default": 1,
+          "minimum": 0
         },
         "thickness": {
-          "description": "Border ring thickness in pixels, applied uniformly on all four sides.\n\nThe ring is drawn in the outer `thickness` px of each window's layout slot. The visible window content shrinks by `(thickness - overlap)` px per edge (see `overlap`), so the ring overlaps the content by `overlap` px rather than leaving a gap. (`docs/src/dev-guide/borders.md`)",
-          "default": 3,
+          "description": "Border ring thickness in pixels, applied uniformly on all four sides.\n\nThe ring is drawn in the outer `thickness` px of each window's layout\nslot. The visible window content shrinks by `(thickness - overlap)` px\nper edge (see `overlap`), so the ring overlaps the content by `overlap`\npx rather than leaving a gap. (`docs/src/dev-guide/borders.md`)",
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "default": 3,
+          "minimum": 0
         },
         "unfocused_color": {
           "description": "Border color for tiled-but-not-focused windows.",
-          "default": "#555555",
           "type": "string",
           "format": "hex-color",
+          "default": "#555555",
           "pattern": "^#[0-9A-Fa-f]{6}$"
         }
       }
     },
+    "ColumnsConfig": {
+      "description": "The `[columns]` section: an ordered list of width presets and the one\nevery monitor starts on. Absent from `flow.toml` (`FlowConfig::columns`\nis `None`) the daemon sizes columns from `columns_per_screen` /\n`column_width` exactly as before.",
+      "type": "object",
+      "properties": {
+        "default": {
+          "description": "The preset every monitor starts on. Must be one of `presets`; when\nomitted the first preset is the default.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_rows": {
+          "description": "The most rows a column may hold; `0` (the default) is unlimited.\nMerging into a full column moves the window past it instead. Must be\nat least `visible_rows` when both are set.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "presets": {
+          "description": "Ordered presets; `flow dispatch width next|prev|cycle` walks this\nlist and wraps around.",
+          "type": "array",
+          "default": [
+            "1/3",
+            "1/2",
+            "1/1"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "visible_rows": {
+          "description": "How many rows of a stacked column are on screen at once. `0` (the\ndefault) shows every row sharing the height, as before. With\n`visible_rows = 2` a column of four windows shows two, and\n`focus up/down` scrolls through the stack.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        }
+      }
+    },
     "ConfigEasing": {
-      "description": "Named easing curves available in user configuration.\n\nEach variant corresponds to an easing function implemented in [`crate::animation::easing::EasingStyle`]. The variant names use CSS-like kebab-case when serialized to TOML (e.g. `EaseOutExpo` → `\"ease-out-expo\"`).\n\nThe full set mirrors the 31 named curves in the animation engine. `CubicBezier` is excluded because it requires four `f64` parameters that cannot be expressed as a simple serde enum variant.\n\n# Design Decision\n\nThis enum lives in the `config/` layer (not `animation/`) to honour the module dependency hierarchy: `config/` may only import from `common/`, never from `animation/`. The conversion from `ConfigEasing` → `EasingStyle` is performed in the `daemon/` layer (see [`crate::daemon::config_derive`]).\n\n# Example\n\n```toml [animation] easing = \"ease-in-out-cubic\" ```",
+      "description": "Named easing curves available in user configuration.\n\nEach variant corresponds to an easing function implemented in\n[`crate::animation::easing::EasingStyle`]. The variant names use\nCSS-like kebab-case when serialized to TOML (e.g. `EaseOutExpo` →\n`\"ease-out-expo\"`).\n\nThe full set mirrors the 31 named curves in the animation engine.\n`CubicBezier` is excluded because it requires four `f64` parameters\nthat cannot be expressed as a simple serde enum variant.\n\n# Design Decision\n\nThis enum lives in the `config/` layer (not `animation/`) to honour\nthe module dependency hierarchy: `config/` may only import from\n`common/`, never from `animation/`. The conversion from\n`ConfigEasing` → `EasingStyle` is performed in the `daemon/` layer\n(see [`crate::daemon::config_derive`]).\n\n# Example\n\n```toml\n[animation]\neasing = \"ease-in-out-cubic\"\n```",
       "oneOf": [
         {
           "description": "Constant-velocity linear interpolation.",
           "type": "string",
-          "enum": [
-            "linear"
-          ]
+          "const": "linear"
         },
         {
           "description": "Accelerating sine curve.",
           "type": "string",
-          "enum": [
-            "ease-in-sine"
-          ]
+          "const": "ease-in-sine"
         },
         {
           "description": "Decelerating sine curve.",
           "type": "string",
-          "enum": [
-            "ease-out-sine"
-          ]
+          "const": "ease-out-sine"
         },
         {
           "description": "Symmetric sine ease-in-out.",
           "type": "string",
-          "enum": [
-            "ease-in-out-sine"
-          ]
+          "const": "ease-in-out-sine"
         },
         {
           "description": "Accelerating quadratic curve.",
           "type": "string",
-          "enum": [
-            "ease-in-quad"
-          ]
+          "const": "ease-in-quad"
         },
         {
           "description": "Decelerating quadratic curve.",
           "type": "string",
-          "enum": [
-            "ease-out-quad"
-          ]
+          "const": "ease-out-quad"
         },
         {
           "description": "Symmetric quadratic ease-in-out.",
           "type": "string",
-          "enum": [
-            "ease-in-out-quad"
-          ]
+          "const": "ease-in-out-quad"
         },
         {
           "description": "Accelerating cubic curve.",
           "type": "string",
-          "enum": [
-            "ease-in-cubic"
-          ]
+          "const": "ease-in-cubic"
         },
         {
           "description": "Decelerating cubic curve.",
           "type": "string",
-          "enum": [
-            "ease-out-cubic"
-          ]
+          "const": "ease-out-cubic"
         },
         {
           "description": "Symmetric cubic ease-in-out.",
           "type": "string",
-          "enum": [
-            "ease-in-out-cubic"
-          ]
+          "const": "ease-in-out-cubic"
         },
         {
           "description": "Accelerating quartic curve.",
           "type": "string",
-          "enum": [
-            "ease-in-quart"
-          ]
+          "const": "ease-in-quart"
         },
         {
           "description": "Decelerating quartic curve.",
           "type": "string",
-          "enum": [
-            "ease-out-quart"
-          ]
+          "const": "ease-out-quart"
         },
         {
           "description": "Symmetric quartic ease-in-out.",
           "type": "string",
-          "enum": [
-            "ease-in-out-quart"
-          ]
+          "const": "ease-in-out-quart"
         },
         {
           "description": "Accelerating quintic curve.",
           "type": "string",
-          "enum": [
-            "ease-in-quint"
-          ]
+          "const": "ease-in-quint"
         },
         {
           "description": "Decelerating quintic curve.",
           "type": "string",
-          "enum": [
-            "ease-out-quint"
-          ]
+          "const": "ease-out-quint"
         },
         {
           "description": "Symmetric quintic ease-in-out.",
           "type": "string",
-          "enum": [
-            "ease-in-out-quint"
-          ]
+          "const": "ease-in-out-quint"
         },
         {
           "description": "Accelerating exponential curve.",
           "type": "string",
-          "enum": [
-            "ease-in-expo"
-          ]
+          "const": "ease-in-expo"
         },
         {
           "description": "Decelerating exponential curve.",
           "type": "string",
-          "enum": [
-            "ease-out-expo"
-          ]
+          "const": "ease-out-expo"
         },
         {
           "description": "Symmetric exponential ease-in-out.",
           "type": "string",
-          "enum": [
-            "ease-in-out-expo"
-          ]
+          "const": "ease-in-out-expo"
         },
         {
           "description": "Accelerating circular curve.",
           "type": "string",
-          "enum": [
-            "ease-in-circ"
-          ]
+          "const": "ease-in-circ"
         },
         {
           "description": "Decelerating circular curve.",
           "type": "string",
-          "enum": [
-            "ease-out-circ"
-          ]
+          "const": "ease-out-circ"
         },
         {
           "description": "Symmetric circular ease-in-out.",
           "type": "string",
-          "enum": [
-            "ease-in-out-circ"
-          ]
+          "const": "ease-in-out-circ"
         },
         {
           "description": "Slight pull-back before departure.",
           "type": "string",
-          "enum": [
-            "ease-in-back"
-          ]
+          "const": "ease-in-back"
         },
         {
           "description": "Slight overshoot past the target.",
           "type": "string",
-          "enum": [
-            "ease-out-back"
-          ]
+          "const": "ease-out-back"
         },
         {
           "description": "Symmetric back ease-in-out.",
           "type": "string",
-          "enum": [
-            "ease-in-out-back"
-          ]
+          "const": "ease-in-out-back"
         },
         {
           "description": "Elastic oscillation on departure.",
           "type": "string",
-          "enum": [
-            "ease-in-elastic"
-          ]
+          "const": "ease-in-elastic"
         },
         {
           "description": "Elastic oscillation on arrival.",
           "type": "string",
-          "enum": [
-            "ease-out-elastic"
-          ]
+          "const": "ease-out-elastic"
         },
         {
           "description": "Symmetric elastic ease-in-out.",
           "type": "string",
-          "enum": [
-            "ease-in-out-elastic"
-          ]
+          "const": "ease-in-out-elastic"
         },
         {
           "description": "Bounce on departure.",
           "type": "string",
-          "enum": [
-            "ease-in-bounce"
-          ]
+          "const": "ease-in-bounce"
         },
         {
           "description": "Bounce on arrival.",
           "type": "string",
-          "enum": [
-            "ease-out-bounce"
-          ]
+          "const": "ease-out-bounce"
         },
         {
           "description": "Symmetric bounce ease-in-out.",
           "type": "string",
-          "enum": [
-            "ease-in-out-bounce"
-          ]
+          "const": "ease-in-out-bounce"
         }
       ]
     },
-    "FloatingConfig": {
-      "description": "Floating window size configuration.\n\nBoth fields are optional explicit pixel sizes. When a field is `None`, the daemon falls back to a built-in policy: 60% × 80% of the monitor work area, capped so ultrawide / 4K monitors don't produce absurdly large popups. The fallback constants live in `src/daemon/dispatch.rs` (the sole consumer).\n\nAn explicit pixel value is always respected as-is — the cap applies only to the fallback path.",
+    "DragConfig": {
+      "description": "Tile-drag configuration.\n\nControls the behavior of drag-and-drop repositioning of tiled windows.\nWhen a user drags a tiled window by its title bar, a live non-committing\npreview reflows the other windows to the prospective layout on each zone\nchange; on release the move commits and the dragged window snaps into its\nslot. Floating windows never enter the drag state machine. See\n(`docs/src/dev-guide/tile-drag.md`).\n\n# Example\n\n```toml\n[drag]\nedge_scroll_width = 30\ncol_edge_ratio = 0.18\ncol_edge_max_px = 120\nedge_scroll_initial_delay_ms = 500\nedge_scroll_repeat_interval_ms = 240\n```",
       "type": "object",
       "properties": {
+        "col_edge_max_px": {
+          "description": "Pixel cap on the column-insert hit band. The effective band is\n`min(col_edge_ratio * column_width, col_edge_max_px)`.",
+          "type": "integer",
+          "format": "int32",
+          "default": 120
+        },
+        "col_edge_ratio": {
+          "description": "Fraction of column width used as the column-insert hit-band floor;\ncombined with `col_edge_max_px` to size the left/right edge bands\nthat trigger a column-insert drop.",
+          "type": "number",
+          "format": "float",
+          "default": 0.18000000715255737
+        },
+        "edge_scroll_initial_delay_ms": {
+          "description": "Edge-scroll auto-repeat **initial delay** in milliseconds — the gap\nbetween the immediate scroll fired on entering the band and the first\nrepeat. Clamped up to the effective repeat interval at runtime, so `0`\ncleanly means \"glide at the normal cadence with no special pause.\"",
+          "type": "integer",
+          "format": "uint32",
+          "default": 500,
+          "minimum": 0
+        },
+        "edge_scroll_repeat_interval_ms": {
+          "description": "Edge-scroll auto-repeat **repeat interval** in milliseconds — the gap\nbetween successive column scrolls while the cursor is held in the band.\nClamped up to the enabled animation duration and the spam-guard floor at\nruntime; a sub-floor value additionally logs a startup warning.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 240,
+          "minimum": 0
+        },
+        "edge_scroll_width": {
+          "description": "Width in pixels of the left/right edge-scroll bands. When the cursor\nenters this band at the screen edge during a tile drag, the viewport\nscrolls by one column (committed live, not deferred to release).",
+          "type": "integer",
+          "format": "int32",
+          "default": 30
+        }
+      }
+    },
+    "FloatingConfig": {
+      "description": "Floating window configuration (`[floating]`).\n\nThe two size fields are optional explicit pixel sizes. When a field is\n`None`, the daemon falls back to a built-in policy: 60% × 80% of the\nmonitor work area, capped so ultrawide / 4K monitors don't produce\nabsurdly large popups. The fallback constants live in\n`src/daemon/dispatch.rs` (the sole consumer).\n\nAn explicit pixel value is always respected as-is — the cap applies only to\nthe fallback path.\n\n[`always_on_top`](Self::always_on_top) is the niri-style **floating\nlayer**: floats stay above the tiled strip.",
+      "type": "object",
+      "properties": {
+        "always_on_top": {
+          "description": "Whether floating windows always sit **above the tiled windows**, as\nin niri: every active float, and every window an explicit rule\nignores (dialogs and popups the user still wants to see), is kept in\nthe topmost band of the z-order (`HWND_TOPMOST`) while tiling is on,\nso a dialog is never hidden behind a tile and never has to be hunted\nfor — even when a tiled window has the focus. A window leaves the\nlayer when it is tiled, minimized, hidden, put fullscreen, when\ntiling is turned off and when the daemon stops; a window that was\nalready topmost on its own keeps that flag. Off by default (upstream\nbehaviour: a focused tile covers the floats). Live-reloadable. See\n`daemon::top_layer`.",
+          "type": "boolean",
+          "default": false
+        },
         "default_height": {
           "description": "Explicit default float height in pixels. `None` → built-in fallback.",
           "type": [
@@ -427,30 +486,50 @@
       }
     },
     "FocusConfig": {
-      "description": "Focus reconciliation configuration.\n\n`EVENT_SYSTEM_FOREGROUND` is a best-effort stream: under rapid window churn (e.g. a browser tearing down tabs on close) the OS may settle the foreground without emitting the final foreground event, leaving flow's internal focus stranded on a stale window. To close that gap, the daemon periodically reconciles its tracked focus against the authoritative `GetForegroundWindow()` query on the main loop. (`docs/src/dev-guide/event-pipelines.md`)",
+      "description": "Focus reconciliation configuration.\n\n`EVENT_SYSTEM_FOREGROUND` is a best-effort stream: under rapid window churn\n(e.g. a browser tearing down tabs on close) the OS may settle the foreground\nwithout emitting the final foreground event, leaving flow's internal focus\nstranded on a stale window. To close that gap, the daemon periodically\nreconciles its tracked focus against the authoritative `GetForegroundWindow()`\nquery on the main loop. (`docs/src/dev-guide/event-pipelines.md`)",
       "type": "object",
       "properties": {
         "foreground_sync_interval_ms": {
-          "description": "Interval between foreground-reconciliation passes, in milliseconds.\n\nLower values catch drift sooner at the cost of more wakeups; the per-pass work is a single `GetForegroundWindow()` read (~microseconds) that no-ops when the tracked focus already matches reality. Tunable at runtime via config hot-reload.",
-          "default": 250,
+          "description": "Interval between foreground-reconciliation passes, in milliseconds.\n\nLower values catch drift sooner at the cost of more wakeups; the\nper-pass work is a single `GetForegroundWindow()` read (~microseconds)\nthat no-ops when the tracked focus already matches reality. Tunable at\nruntime via config hot-reload.",
           "type": "integer",
           "format": "uint64",
-          "minimum": 0.0
+          "default": 250,
+          "minimum": 0
+        }
+      }
+    },
+    "LoadoutConfig": {
+      "description": "Loadout save/restore configuration.\n\nControls the file path used when saving or restoring workspace loadouts.",
+      "type": "object",
+      "properties": {
+        "default_path": {
+          "description": "File name (not a full path) used by `flow loadout save` and\n`flow loadout restore`.\n\nThe daemon resolves this relative to the user's config directory\n(`%USERPROFILE%\\.config\\flow\\`). Defaults to `\"loadout.json\"`. It\nmust be a plain file name — no directories, no `..`, no drive —\nwhich [`LoadoutConfig::validate`] enforces and config loading\nrejects (`crate::loadout::validate_default_path`).",
+          "type": "string",
+          "default": "loadout.json"
+        }
+      }
+    },
+    "LoggingConfig": {
+      "description": "Daemon log retention (`[logging]`).\n\nThe daemon writes one `logs/flowd-YYYY-MM-DD.log` per day under the\nconfig directory and, at every start, deletes the ones older than\n`keep_days` days (by the date in the file name). Those files record\nevery window the daemon met — executable, class and, at `debug` level,\nthe title — so they should not pile up forever by default.",
+      "type": "object",
+      "properties": {
+        "keep_days": {
+          "description": "How many days of daily log files to keep; older ones are deleted at\ndaemon start. `0` keeps every file forever (the upstream behaviour).",
+          "type": "integer",
+          "format": "uint32",
+          "default": 14,
+          "minimum": 0
         }
       }
     },
     "MinimizeRestore": {
-      "description": "Strategy for restoring minimized tiling windows.\n\n- `OriginalSlot` — put the window back where it was before minimize - `RightOfFocused` — insert as a new column to the right of focused - `AppendRight` — append as the rightmost column on the canvas",
+      "description": "Strategy for restoring minimized tiling windows.\n\n- `OriginalSlot` — put the window back where it was before minimize\n- `RightOfFocused` — insert as a new column to the right of focused\n- `AppendRight` — append as the rightmost column on the canvas",
       "type": "object",
       "properties": {
         "strategy": {
           "description": "Strategy for placing restored windows.",
-          "default": "original_slot",
-          "allOf": [
-            {
-              "$ref": "#/definitions/MinimizeRestoreStrategy"
-            }
-          ]
+          "$ref": "#/$defs/MinimizeRestoreStrategy",
+          "default": "original_slot"
         }
       }
     },
@@ -460,47 +539,72 @@
         {
           "description": "Put the window back where it was before minimize.",
           "type": "string",
-          "enum": [
-            "original_slot"
-          ]
+          "const": "original_slot"
         },
         {
           "description": "Insert as a new column to the right of focused.",
           "type": "string",
-          "enum": [
-            "right_of_focused"
-          ]
+          "const": "right_of_focused"
         },
         {
           "description": "Append as the rightmost column on the canvas.",
           "type": "string",
-          "enum": [
-            "append_right"
-          ]
+          "const": "append_right"
         }
       ]
     },
+    "NavigationConfig": {
+      "description": "Navigation behaviour at the edges of a strip.",
+      "type": "object",
+      "properties": {
+        "edge_hop": {
+          "description": "Whether `focus <dir>` and `move-window <dir>` at the end of a strip\nhop to the monitor in that direction (niri behaviour). `false` makes\nthem stop at the edge; `focus-monitor` and `move-to-monitor` still\ncross monitors.",
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
     "Padding": {
-      "description": "Gap and margin configuration in pixels.\n\nGap is applied during the projection step (see [`projection`](crate::layout::projection)), not stored inside window structs. This means [`ActualEntry`](crate::layout::ActualEntry) rects are the **final HWND rects** — they can be passed directly to `SetWindowPos`.\n\n# Uniform Gap Model\n\n`window_gap` creates **uniform spacing** everywhere:\n\n```text Edge | window_gap | [Window 1] | window_gap | [Window 2] | window_gap | Edge ```\n\n- `window_gap`: uniform gap between all elements (windows, screen edges) - `up`: top screen margin (reserved space above tiling area) - `down`: bottom screen margin (reserved space below tiling area, e.g., taskbar)\n\nThe slot-based canvas model ensures that expanding a column consumes the inter-column gap so the layout always fills the screen.\n\n```text ┌─────────────────── monitor work area ────────────────────┐ │ ↑ padding.up                                             │ │ ↑ window_gap                                             │ │ ┌──── window (HWND) ────┐   ┌──── window (HWND) ────┐    │ │ │                       │   │                       │    │ │ └───────────────────────┘   └───────────────────────┘    │ │ ↓ window_gap                                             │ │ ↓ padding.down                                           │ └──────────────────────────────────────────────────────────┘ ```",
+      "description": "Gap and margin configuration in pixels.\n\nGap is applied during the projection step (see [`projection`](crate::layout::projection)),\nnot stored inside window structs. This means [`ActualEntry`](crate::layout::ActualEntry) rects\nare the **final HWND rects** — they can be passed directly to `SetWindowPos`.\n\n# Uniform Gap Model\n\n`window_gap` creates **uniform spacing** everywhere:\n\n```text\nEdge | window_gap | [Window 1] | window_gap | [Window 2] | window_gap | Edge\n```\n\n- `window_gap`: uniform gap between all elements (windows, screen edges)\n- `up`: top screen margin (reserved space above tiling area)\n- `down`: bottom screen margin (reserved space below tiling area, e.g., taskbar)\n\nThe slot-based canvas model ensures that expanding a column consumes the\ninter-column gap so the layout always fills the screen.\n\n```text\n┌─────────────────── monitor work area ────────────────────┐\n│ ↑ padding.up                                             │\n│ ↑ window_gap                                             │\n│ ┌──── window (HWND) ────┐   ┌──── window (HWND) ────┐    │\n│ │                       │   │                       │    │\n│ └───────────────────────┘   └───────────────────────┘    │\n│ ↓ window_gap                                             │\n│ ↓ padding.down                                           │\n└──────────────────────────────────────────────────────────┘\n```",
       "type": "object",
       "properties": {
         "down": {
           "description": "Bottom screen margin — reserved space below the tiling area (e.g., taskbar).",
-          "default": 0,
           "type": "integer",
-          "format": "int32"
+          "format": "int32",
+          "default": 0
         },
         "up": {
           "description": "Top screen margin — reserved space above the tiling area.",
-          "default": 0,
           "type": "integer",
-          "format": "int32"
+          "format": "int32",
+          "default": 0
         },
         "window_gap": {
-          "description": "Uniform gap between all elements (windows and screen edges), in pixels.\n\nThis single value controls horizontal (inter-column), vertical (inter-row), and edge-to-window spacing. Setting `window_gap = 16` means every gap everywhere is 16 pixels.",
-          "default": 16,
+          "description": "Uniform gap between all elements (windows and screen edges), in pixels.\n\nThis single value controls horizontal (inter-column), vertical (inter-row),\nand edge-to-window spacing. Setting `window_gap = 16` means every gap\neverywhere is 16 pixels.",
           "type": "integer",
-          "format": "int32"
+          "format": "int32",
+          "default": 16
+        }
+      }
+    },
+    "UpdateConfig": {
+      "description": "Where `flow update` looks for something newer (`[update]`).\n\n`flow update` is a **checker**: it asks the GitHub API how this build\nrelates to a branch or to the latest release and prints the answer; it\nnever downloads or replaces anything. Both keys are optional and fall\nback to what the build script embedded (`crate::build_info`):\n\n- `repo`: `\"owner/name\"` on github.com. Absent: parsed from the\n  checkout's `origin` URL at build time when that is a github.com URL\n  (https or ssh), else the upstream `CCpcalvin/flow-wm`.\n- `branch`: the branch to compare the embedded commit against. Absent:\n  the branch checked out at build time. An **empty string** (or no\n  build branch to fall back to) switches to *release mode*: the latest\n  release's tag is compared with the crate version instead.",
+      "type": "object",
+      "properties": {
+        "branch": {
+          "description": "Branch to compare against; `None` = the build's branch; `Some(\"\")`\n= compare against releases instead.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "description": "GitHub repository as `\"owner/name\"`; `None` = derived from the\nbuild's `origin` URL, else upstream.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     }
