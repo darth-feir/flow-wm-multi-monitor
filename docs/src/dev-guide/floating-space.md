@@ -388,20 +388,52 @@ flowchart TB
     CCHECK -- No --> MT2["MakeTiling"]
 ```
 
-Full decision table (fullscreen aside — see below):
+Full decision table:
 
-| mode | currently tiling | currently floating | ignored | result |
-|------|------------------|--------------------|---------|--------|
-| Float | true | false | false | MakeFloating |
-| Float | false | true | false | NoOp |
-| Tile | true | false | false | NoOp |
-| Tile | false | true | false | MakeTiling |
-| Cycle | true | false | false | MakeFloating |
-| Cycle | false | true | false | MakeTiling |
-| Tile / Cycle | false | false | true | AdoptTiling |
-| Float | false | false | true | AdoptFloating |
-| Fullscreen | false | false | true | AdoptFullscreen |
-| *any* | false | false | false | Err (minimized / hidden) |
+| mode | currently tiling | currently floating | fullscreen | ignored | result |
+|------|------------------|--------------------|------------|---------|--------|
+| Float | true | false | false | false | MakeFloating |
+| Float | false | true | false | false | NoOp |
+| Tile | true | false | false | false | NoOp |
+| Tile | false | true | false | false | MakeTiling |
+| Cycle | true | false | false | false | MakeFloating |
+| Cycle | false | true | false | false | MakeTiling |
+| Fullscreen | either | | false | false | MakeFullscreen |
+| Fullscreen | (floating) | | true | false | LeaveFullscreen(Origin) |
+| Tile / Cycle | (floating) | | true | false | LeaveFullscreen(Tile) |
+| Float | (floating) | | true | false | LeaveFullscreen(Float) |
+| Tile / Cycle | false | false | false | true | AdoptTiling |
+| Float | false | false | false | true | AdoptFloating |
+| Fullscreen | false | false | false | true | AdoptFullscreen |
+| *any* | false | false | false | false | Err (minimized / hidden) |
+
+A fullscreen window is recorded as a float, so "fullscreen" implies
+"currently floating" and is checked first. `cycle` keeps its float/tile
+meaning for everything else — on a fullscreen window it only ever leads back
+to tiled, and on an ignored window (which has no float/tile state to flip)
+it means `tile`. Adoption covers every ignore reason: maximized and
+fullscreen at creation, and an explicit rule. A no-op transition is never
+recorded as a learned rule (`action_to_learned` returns `None`: the window
+was already in the requested mode, so there is no user intent to learn);
+an adoption records the mode the window was adopted into, and adopting
+into fullscreen records `Tile`, because the window entered the tiled
+layout and fullscreen itself is a view, never learned.
+
+#### Unknown foreground windows
+
+The OS foreground is the truth about which window the user means
+(`resolve_set_window_target`). When it is a window the registry never met —
+the user's Outlook, minimized when the daemon started and restored behind a
+cloak; a window that failed a creation gate at creation and passes it now —
+it is registered through the creation pipeline first (seated as a tile or a
+float by the rules, or tracked as ignored) and the requested mode is then
+applied by the table above, with one adjustment (`resolve_unknown_focus`):
+`cycle` on a window that was unknown a moment ago means `tile`, as it does
+on an ignored window — the rules may just have seated it as a tile, and
+`cycle` must not flip it straight back out. A window that cannot be
+registered (a tool window, no title, cloaked, owned) is refused with the
+gate it failed, in place of the old "focused window not found in registry".
+Without an OS foreground the registry's tracked focus is used as before.
 
 An adoption (`adopt_ignored_as_tile` / `adopt_ignored_as_float` in
 `dispatch.rs`) asks the registry to un-maximize the window if it is maximized

@@ -1,57 +1,15 @@
 //! The floating layer — `[floating] always_on_top`.
 //!
-//! niri keeps its floating windows above the tiled strip at all times: a
-//! dialog or a window the manager does not tile is never hidden behind a
-//! tile, even when a tile has the focus. On Windows the only z-order band
-//! above the ordinary windows is the **topmost band** (`WS_EX_TOPMOST`,
-//! `HWND_TOPMOST`), so the layer is implemented by keeping its members in
-//! that band: a tile that is activated goes to the top of the *non*-topmost
-//! band and the floats stay above it.
-//!
-//! # Membership
-//!
-//! A window is in the layer ([`in_top_layer`]) when it is a tracked
-//! `Floating(Active)` window or a tracked `Ignored(ExplicitRule)` window (a
-//! dialog or popup the user's rules keep out of the strip but still want to
-//! see); and only while the option is on, tiling is on and the window is
-//! not one the daemon put fullscreen ([`layer_wanted`]). Minimized and
-//! hidden windows are out (they come back in when restored or shown),
-//! `Ignored(Maximized|Fullscreen)` windows are out, untracked windows are
-//! never touched, and a daemon-fullscreen window is already topmost through
-//! `daemon::fullscreen`, which owns that flag — a float and a fullscreen
-//! window are both in the topmost band, so whichever was activated last is
-//! on top. Toasts are topmost on their own.
-//!
-//! # Mechanism
-//!
-//! Every transition that can change a window's membership ends in
-//! [`FlowWM::sync_top_layer`]: it computes whether the window is wanted in
-//! the layer, compares that with [`Window::on_top`] (whether the daemon
-//! holds it there) and applies the one step [`layer_step`] decides:
-//!
-//! - **enter** — remember the `WS_EX_TOPMOST` flag the window already has
-//!   ([`Window::was_topmost`]) and raise it (`HWND_TOPMOST`,
-//!   `SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE`) unless it is topmost
-//!   already;
-//! - **leave** — put the remembered flag back: lower a window the daemon
-//!   raised (`HWND_NOTOPMOST`), leave alone one that was topmost on its own;
-//! - **re-assert** — a member Windows demoted (some apps clear the flag on
-//!   activation) is raised again.
-//!
-//! Enter happens when a window is registered or classified as a float or an
-//! explicit-rule ignore, on `set-window float`, when a float is restored or
-//! shown, on `tiling on`, and on a config reload that turns the option on.
-//! Leave happens on `set-window tile|cycle`, when a float goes fullscreen,
-//! when it is minimized or hidden, on `tiling off`, on a reload that turns
-//! the option off, and — through [`FlowWM::release_top_layer`] — wherever
-//! the daemon hands the windows back (`flow stop`, the fail-back, session
-//! end). A destroyed window needs nothing. `flow query all` reports
-//! `on_top` per window.
-//!
-//! The periodic [`FlowWM::reassert_top_layer`] (once per
-//! `[focus] foreground_sync_interval_ms`, from the main loop) walks only the
-//! windows the daemon holds in the layer, reads each ex-style and calls
-//! `SetWindowPos` only when the flag is gone — idempotent and O(members).
+//! niri keeps its floating windows above the tiled strip at all times; on
+//! Windows the only z-order band above ordinary windows is the topmost band
+//! (`WS_EX_TOPMOST`), so the layer's members — active floats and
+//! explicit-rule-ignored windows, while the option and tiling are on — are
+//! kept there. Every transition that can change a window's membership ends
+//! in [`FlowWM::sync_top_layer`], which compares what is wanted
+//! ([`layer_wanted`]) with what the daemon holds ([`Window::on_top`]) and
+//! applies the one step [`layer_step`] decides. Membership, the transition
+//! table and the interplay with `daemon::fullscreen` are in
+//! `docs/src/dev-guide/floating-space.md`, *The floating layer*.
 //!
 //! The Win32 questions are behind [`TopmostProbe`] so the transitions run
 //! against a mock in the unit tests; the tiling on/off probe extends it.

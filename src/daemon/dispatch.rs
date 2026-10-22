@@ -580,12 +580,8 @@ impl FlowWM {
     /// Make `target` the active monitor and push OS focus to the window the
     /// user last used there (tiled first, else the top float). With nothing
     /// to focus the monitor still becomes active, the tracked focus is
-    /// cleared (so a later command cannot act on the window we came from),
-    /// and OS focus is handed to the shell.
-    ///
-    /// A remembered window that has died without a `DESTROY` reaching the
-    /// layout (the VM log's `SetForegroundWindow failed ... 0x6`) is purged
-    /// from the monitor's bookkeeping and the next candidate is tried — see
+    /// cleared and OS focus is handed to the shell. A remembered window that
+    /// has died is purged and the next candidate tried — see
     /// [`resolve_monitor_focus_target`](Self::resolve_monitor_focus_target).
     pub(super) fn focus_monitor(&mut self, target: usize) {
         if target >= self.monitors.len() {
@@ -646,24 +642,14 @@ impl FlowWM {
     }
 
     /// Make `target` active, then walk its active workspace's focus
-    /// candidates ([`focus_candidates`]: the strip's last-focused window,
-    /// then every tile in column/row order, then the floats top-most first)
-    /// and push the first one that takes the foreground:
-    ///
-    /// - a candidate that is not in the registry or for which `is_live`
-    ///   (`IsWindow`) is false is **purged** from the strip / floating space
-    ///   / float-tracking set and the walk continues;
-    /// - a candidate for which `is_visible` (`IsWindowVisible && !cloaked`)
-    ///   is false is **skipped without purging** — a tray-hidden or cloaked
-    ///   window may come back;
-    /// - `push` (`SetForegroundWindow`) answering
-    ///   [`ForegroundPush::InvalidHandle`] — a window of a process that was
-    ///   exiting, which `IsWindow` still vouched for a moment earlier — is
-    ///   treated exactly like a dead window: logged with the window's
-    ///   title, class and exe, purged, next candidate;
-    /// - any other push failure (the foreground lock) is logged the same
-    ///   way and the candidate is still returned: the window exists and is
-    ///   what the user should be on.
+    /// candidates ([`focus_candidates`]) and push the first one that takes
+    /// the foreground: a dead candidate (`is_live` false, or a push refused
+    /// with [`ForegroundPush::InvalidHandle`]) is purged from its space and
+    /// the walk continues; a hidden / cloaked one (`is_visible` false) is
+    /// skipped without purging; any other refused push keeps the candidate.
+    /// The rules and the Win32 lessons behind them are in
+    /// `docs/src/dev-guide/event-pipelines.md`, *Focus after a removal or a
+    /// monitor switch*.
     ///
     /// Returns the window that was pushed (or kept after a refused push),
     /// `None` when nothing live and visible is left — logged at `debug`,
@@ -711,12 +697,9 @@ impl FlowWM {
             match push(hwnd) {
                 ForegroundPush::Focused => return Some(candidate),
                 ForegroundPush::InvalidHandle => {
-                    // Windows reports ERROR_INVALID_HANDLE loosely: a window
-                    // that is genuinely gone, but also a live window it simply
-                    // refuses to activate (seen right after Windows snapped
-                    // it). Only a window that fails the liveness check is
-                    // purged; a live one keeps its seat and merely does not
-                    // get the foreground this time.
+                    // ERROR_INVALID_HANDLE also comes back for a live window
+                    // Windows merely refuses to activate (seen right after a
+                    // snap), so only a window that fails `is_live` is purged.
                     if is_live(hwnd) {
                         log::debug!(
                             "focus_monitor: SetForegroundWindow rejected live hwnd {hwnd} ({}); leaving it seated and trying the next window",
@@ -1322,16 +1305,12 @@ impl FlowWM {
     ///
     /// The foreground push is [`focus_monitor`](Self::focus_monitor) on the
     /// (unchanged) active monitor, whose active workspace the destination
-    /// now is: the strip's remembered `last_focused_window` is used only if
-    /// it is still a tracked, live window (`IsWindow`); a remembered window
-    /// that died without its `DESTROY` reaching the layout — the VM log's
-    /// `SetForegroundWindow failed ... 0x6` on a workspace switch — is
-    /// purged from the strip / floating space / float-tracking set and the
-    /// next candidate is tried (focused column window, first tile, top
-    /// float), see [`resolve_monitor_focus_target`](Self::resolve_monitor_focus_target).
-    /// `focus_monitor` sets the registry focus and recolours the previous
-    /// and new borders itself, so the `EVENT_SYSTEM_FOREGROUND` that
-    /// `on_focus_changed` later consumes finds nothing left to change.
+    /// now is; a remembered window that died without its `DESTROY` reaching
+    /// the layout is purged and the next candidate tried (see
+    /// [`resolve_monitor_focus_target`](Self::resolve_monitor_focus_target)).
+    /// `focus_monitor` sets the registry focus and recolours the borders
+    /// itself, so the `EVENT_SYSTEM_FOREGROUND` that `on_focus_changed`
+    /// later consumes finds nothing left to change.
     ///
     /// # Empty destination
     ///
@@ -1546,13 +1525,10 @@ impl FlowWM {
     ///
     /// # Ignored windows
     ///
-    /// An `Ignored` focused window — maximized or fullscreen at creation,
-    /// or ignored by a rule — is **adopted** rather than refused: `tile` and
-    /// `cycle` un-maximize it and tile it like a window created tiling
-    /// ([`adopt_ignored_as_tile`](Self::adopt_ignored_as_tile)), `float`
-    /// un-maximizes and floats it, `fullscreen` adopts it as a tile and then
-    /// puts it fullscreen. The decision is learned like a float↔tile
-    /// transition. See `WindowRegistry::adopt_ignored_window`.
+    /// An `Ignored` focused window is **adopted** rather than refused
+    /// ([`adopt_ignored_as_tile`](Self::adopt_ignored_as_tile) and its float
+    /// counterpart); see `docs/src/dev-guide/floating-space.md`, *The
+    /// Decision Function*.
     ///
     /// # Errors
     ///
@@ -1650,18 +1626,11 @@ impl FlowWM {
 
     /// The window `set-window` acts on, and the mode to apply to it.
     ///
-    /// The OS foreground is the truth: when it is a window the registry
-    /// never met (the user's Outlook, minimized when the daemon started
-    /// and restored behind a cloak; a window that failed a gate at
-    /// creation and passes it now), it is registered through the creation
-    /// pipeline first — seated as a tile or a float by the rules, or
-    /// tracked as ignored — and the requested mode is then applied to it by
-    /// the normal decision table, with one adjustment from
-    /// [`resolve_unknown_focus`]: `cycle` on a window that was unknown a
-    /// moment ago means `tile`, as it does on an ignored window. A window
-    /// that cannot be registered (a tool window, no title, cloaked, owned)
-    /// is refused with the gate it failed. Without an OS foreground the
-    /// registry's tracked focus is used as before.
+    /// The OS foreground is the truth: a foreground window the registry never
+    /// met is registered through the creation pipeline first and the mode is
+    /// then adjusted by [`resolve_unknown_focus`]; without an OS foreground
+    /// the registry's tracked focus is used. See
+    /// `docs/src/dev-guide/floating-space.md`, *The Decision Function*.
     ///
     /// # Errors
     ///
@@ -1728,16 +1697,10 @@ impl FlowWM {
     }
 
     /// Adopt the ignored focused window as a **tile** (`set-window tile|cycle`
-    /// on it, and the first half of `fullscreen`).
-    ///
-    /// The registry un-maximizes it if needed and re-measures it
-    /// (`WindowRegistry::adopt_ignored_window`); then it is seated exactly
-    /// like a window created tiling: on the monitor it is on, next to that
-    /// strip's focused column, at the monitor's current width preset, with
-    /// a border. The window is already the OS foreground, so no focus push
-    /// is needed. Its pre-tiling anchor is the rect it was restored to, and
-    /// a window that was maximized is handed back maximized by `tiling
-    /// off` / `flow stop` (`Window::adopted_from_maximized`).
+    /// on it, and the first half of `fullscreen`): the registry un-maximizes
+    /// and re-measures it (`WindowRegistry::adopt_ignored_window`), then it
+    /// is seated exactly like a window created tiling. See
+    /// `docs/src/dev-guide/floating-space.md`, *The Decision Function*.
     fn adopt_ignored_as_tile(&mut self, focused: WindowId) -> SocketResponse {
         if let Err(message) = self.registry.adopt_ignored_window(focused.0, true) {
             return SocketResponse::Error { message };
@@ -2263,19 +2226,14 @@ const fn resolve_set_window_action(
 /// foreground window the registry did not track when the command arrived.
 ///
 /// `was_tracked` is whether the foreground was already in the registry
-/// (then nothing was attempted and `mode` is returned as is); `outcome` is
-/// the result of the registration attempt otherwise: `Ok` when the window
-/// is tracked now, `Err(gate)` naming the creation gate it failed. A
-/// freshly registered window gets `mode` — except `cycle`, which means
-/// `tile` on a window that had no tile/float state a moment ago (the
-/// window may have been registered as a tile by a rule; `cycle` must not
-/// flip it straight back out). A window that could not be registered is
-/// refused with a message that names the gate, in place of the old
-/// "focused window not found in registry".
+/// (then `mode` is returned as is); `outcome` is the result of the
+/// registration attempt otherwise. A freshly registered window gets `mode`,
+/// except that `cycle` means `tile` on it (see
+/// `docs/src/dev-guide/floating-space.md`, *The Decision Function*).
 ///
 /// # Errors
 ///
-/// The error message for the CLI when the window failed a gate.
+/// The error message for the CLI when the window failed a creation gate.
 fn resolve_unknown_focus(
     mode: WindowMode,
     was_tracked: bool,

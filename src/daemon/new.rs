@@ -15,23 +15,17 @@
 //!    turns logoff / shutdown / close into a graceful stop.
 //! 5. **`animator`** — creates [`WindowAnimator`] with the Win32 backend and
 //!    the user's configured animation duration.
-//! 6. **`initial_layout`** — with `adopt_maximized`, first un-maximizes the
-//!    maximized windows the scan parked as `Ignored(Maximized)` and
-//!    classifies them through the rules (this is the first window move of
-//!    the boot, so it sits after the pipe and hook checks); then
-//!    batch-initializes each monitor's layout from its existing tiling
-//!    windows (sorted by x coordinate for deterministic column assignment;
-//!    viewport centered on the focused column) and animates the windows to
-//!    their tiling positions.
+//! 6. **`initial_layout`** — adopts maximized windows when `adopt_maximized`
+//!    is on, then batch-initializes each monitor's layout from its existing
+//!    tiling windows and animates them into place. **Windows move from here
+//!    on.**
 //! 7. **`borders`** — adopts pre-existing floats and attaches border
 //!    overlays.
 //!
-//! The pipe and hooks come **before** the initial layout on purpose: those
-//! are the steps most likely to fail (another daemon, a deaf hook thread),
-//! and until the initial layout runs no window has been moved, so a failure
-//! there leaves the desktop exactly as it was. Once windows have moved,
-//! every later failure path rescues them (see
-//! [`rescue_stranded_windows_with`]) before returning the error.
+//! Why the pipe and hooks come before the initial layout, and how a failure
+//! after windows have moved is rescued ([`rescue_stranded_windows_with`]),
+//! is in `docs/src/dev-guide/ipc-and-watchdog.md`, *Startup stages, status
+//! file and exit codes*.
 //!
 //! # Config Model
 //!
@@ -110,11 +104,9 @@ impl FlowWM {
         );
 
         // ── 1. monitors ──────────────────────────────────────────────
-        // Get monitor geometry via Win32 — both the full physical screen
-        // rect (for parking workspaces off-screen) and the taskbar-excluded
-        // work area (for in-workspace window placement). See
-        // registry::win32::MonitorGeometry for why both are needed.
-        // One scrolling space per monitor, each sized to its own work area.
+        // Both the full screen rect (parking) and the work area (placement)
+        // are needed; see registry::win32::MonitorGeometry. One scrolling
+        // space per monitor, each sized to its own work area.
         reporter.begin(S::Monitors)?;
         let geometries = registry_win32::enumerate_monitors().at(S::Monitors)?;
         if geometries.is_empty() {
@@ -259,12 +251,9 @@ impl FlowWM {
         // ── 6. initial_layout ────────────────────────────────────────
         reporter.begin(S::InitialLayout)?;
 
-        // `adopt_maximized`: the scan registered maximized windows as
-        // `Ignored(Maximized)` without touching them; now that the pipe and
-        // the hooks are up (nothing before this point may move a window),
-        // un-maximize the ones the rules would manage so they join the
-        // initial layout. A failure from here on rescues them back
-        // maximized (`rescue_stranded_windows_with`).
+        // `adopt_maximized`: now that the pipe and the hooks are up (nothing
+        // before this point may move a window), un-maximize the windows the
+        // scan parked as `Ignored(Maximized)` that the rules would manage.
         registry.set_adopt_maximized(app_config.adopt_maximized);
         if app_config.adopt_maximized {
             let adopted = registry.adopt_ignored_maximized();

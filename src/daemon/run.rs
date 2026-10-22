@@ -152,14 +152,10 @@ impl FlowWM {
     ///
     /// # Liveness
     ///
-    /// On every wake the loop also checks that the two helper threads are
-    /// still alive — the animator worker
-    /// ([`is_alive`](crate::animation::WindowAnimator::is_alive)) and the
-    /// hook thread ([`is_alive`](crate::registry::hooks::HookThreadHandle::is_alive))
-    /// — and whether [`request_shutdown`](crate::registry::hooks::request_shutdown)
-    /// has fired. A dead thread means the daemon is deaf or cannot move
-    /// windows, so it returns `RunExit::FailBack` rather than running
-    /// half-broken.
+    /// On every wake the loop also checks that the animator worker and the
+    /// hook thread are still alive and whether a shutdown was requested; a
+    /// dead thread returns `RunExit::FailBack` rather than running
+    /// half-broken. See `docs/src/dev-guide/ipc-and-watchdog.md`, *Fail-back*.
     ///
     /// # Loop Structure
     ///
@@ -416,13 +412,10 @@ impl FlowWM {
                             break;
                         }
                         Err(e) => {
-                            // A line we could not decode (a newer CLI?) gets
-                            // an error reply so the client does not just see
-                            // a closed pipe; a disconnect or I/O error has
-                            // nobody to answer. Either way the session ends.
-                            // The error carries at most a ~200-byte preview
-                            // of the line (`transport::truncate_for_log`),
-                            // and none of it for an over-long one.
+                            // An undecodable line (a newer CLI?) gets an error
+                            // reply with a short preview of the line; a
+                            // disconnect has nobody to answer. Either way the
+                            // session ends.
                             if let Some(reply) =
                                 crate::ipc::transport::unrecognised_message_response(&e)
                             {

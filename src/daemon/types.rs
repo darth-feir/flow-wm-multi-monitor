@@ -271,18 +271,11 @@ pub struct FlowWM {
     /// The last rect every submit path commanded for each window, keyed by
     /// HWND value: the layout's **visible** rect with any workspace parking
     /// offset applied — the coordinates [`plan_move`](super::animation::plan_move)
-    /// reasons in.
-    ///
-    /// The registry's tiled rect only changes when a layout is *committed*,
-    /// but drag and resize previews, bystander teleports and the hotplug
-    /// re-seat all move windows without committing. The neighbour-teleport
-    /// rule needs the window's real last commanded position (a column that a
-    /// preview brought on-screen must not be told to `Stay` parked by the
-    /// next preview, nor tween from a far slot it no longer occupies), so
-    /// every submit path records here and reads it back first, falling back
-    /// to the registry rect for a window never submitted since start-up. An
-    /// entry is dropped when the window leaves the layout (destroyed,
-    /// minimized, hidden).
+    /// reasons in. Written by every submit path (previews and teleports
+    /// included, which never commit to the registry), read first by every
+    /// target builder, dropped when the window leaves the layout. See
+    /// `docs/src/dev-guide/animation.md`, *Instant targets and the
+    /// neighbour-teleport rule*.
     pub(super) submitted_rects: std::collections::HashMap<isize, crate::common::Rect>,
 
     /// `true` while tiling is paused (`flow dispatch tiling off`, see
@@ -554,18 +547,12 @@ impl FlowWM {
 /// Pure rule behind [`FlowWM::home_monitor_for_hwnd`]: which monitor a
 /// window that is coming back into a layout belongs to.
 ///
-/// Order of trust:
-/// 1. `remembered` — the owning-monitor memory recorded when the window was
-///    last seated. Survives minimize/hide, during which the window may have
-///    been parked beyond the virtual screen.
-/// 2. `by_handle` — `MonitorFromWindow` matched to a known `HMONITOR`.
-///    Authoritative for a window the daemon has never seated, but for a
-///    parked window it is merely the *nearest* monitor to a far-off rect.
-/// 3. `by_rect` — the monitor whose bounds contain the window's rect centre.
-/// 4. `active` — the monitor that owns keyboard focus.
-///
-/// Each candidate is only used when it is a valid index below
-/// `monitor_count`.
+/// Order of trust: `remembered` (the owning-monitor memory), `by_handle`
+/// (`MonitorFromWindow`), `by_rect` (the monitor containing the rect's
+/// centre), `active`. Each candidate is only used when it is a valid index
+/// below `monitor_count`. Why the memory comes first is in
+/// `docs/src/dev-guide/event-pipelines.md`, *Focus after a removal or a
+/// monitor switch*.
 #[must_use]
 pub(super) fn resolve_home_monitor(
     remembered: Option<usize>,

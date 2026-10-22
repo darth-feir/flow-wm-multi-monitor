@@ -226,6 +226,87 @@ rects) from the new layout on every call, even when no pixel-level movement
 occurred — a logical swap can change a window's position without triggering an
 animation if the columns are the same width.
 
+## Focus after a removal or a monitor switch
+
+Two multi-monitor rules decide where the OS foreground goes when the daemon
+has to pick a window itself. Both are pure functions with the Win32
+questions injected, so they are unit-tested without a desktop.
+
+### Which removal pushes a successor
+
+`remove_from_layout_and_refocus` (destroy, minimize, hide, cloak) removes the
+window from the strip that actually holds it — a tile minimized or hidden
+while its workspace is parked (a taskbar minimize, Windows minimizing it on
+a display change) leaves that *parked* strip, which is then re-seated at its
+parking offset with no focus push; leaving it in place would seat it twice
+when it comes back. Whether the strip's successor gets the OS foreground is
+decided by `should_refocus_after_removal`: only when the removed window held
+the user's focus (registry focus or OS foreground), or when it lived on the
+active monitor *and* the registry's focus — read before the removal — was
+nobody, the removed window or a tile of that strip. A window closing on a
+monitor the user is not working on, or on the active monitor while the user
+is in a float or a window elsewhere, must not drag the foreground over
+(review finding B6); then only the strip's bookkeeping changes.
+
+### Landing on a monitor's active workspace
+
+`focus_monitor` (the `focus-monitor` command, a `move-to-monitor`, and the
+foreground push after every workspace switch) walks the active workspace's
+candidates in order — the strip's last-focused window, then every tile in
+column/row order, then the floats top-most first (`focus_candidates`) — and
+pushes the first one that takes the foreground (`resolve_focus_target_with`):
+
+- a candidate that is not in the registry, or for which `IsWindow` is false,
+  is **purged** from the strip, the floating space and the float-tracking
+  set, and the walk continues. This is the fix for the VM log's
+  `SetForegroundWindow failed ... 0x6` on a workspace switch: a window that
+  died without its `DESTROY` reaching the layout stayed in the strip's
+  memory and was pushed forever;
+- a candidate that is hidden or cloaked (`IsWindowVisible && !cloaked`
+  false) is **skipped without purging** — a tray-hidden or suspended UWP
+  window may come back;
+- a push answered with `ERROR_INVALID_HANDLE` is treated like a dead window
+  — logged with title, class and exe, purged, next candidate — but only
+  when `IsWindow` agrees. Windows reports that error loosely: it also comes
+  back for a live window it merely refuses to activate (seen right after
+  Windows snapped it), and such a window keeps its seat and simply does not
+  get the foreground this time;
+- any other refused push (the foreground lock) keeps the candidate: the
+  window exists and is what the user should be on.
+
+With nothing live and visible left, the monitor still becomes active, the
+tracked focus is cleared (so a later command cannot act on the window the
+user came from) and the OS foreground goes to the shell's desktop window
+("Progman", then `GetDesktopWindow`) — the Win32 idiom for clicking empty
+desktop space, since there is no "clear foreground" API — so keystrokes no
+longer reach the previous workspace's window. That is logged at `debug`,
+never `warn`: an empty workspace is a normal state. `focus_monitor` sets the
+registry focus and recolours the borders itself, so the
+`EVENT_SYSTEM_FOREGROUND` that `on_focus_changed` later consumes finds
+nothing left to change.
+
+### Which monitor a returning window belongs to
+
+A window coming back into a layout (restored, re-shown, recovered from
+maximized) is appended to its *home* monitor (`home_monitor_for_hwnd`,
+`readd_tile_to_home_monitor`), resolved in this order of trust:
+
+1. the **owning-monitor memory** (`Window::owner_monitor`), recorded whenever
+   the daemon seats the window and surviving minimize / hide;
+2. `MonitorFromWindow` matched to a known `HMONITOR` — authoritative for a
+   window the daemon never seated, but for a window that was parked beyond
+   the virtual screen when it was minimized it is merely the monitor
+   *nearest* to a far-off rect, which is why the memory comes first;
+3. the monitor whose bounds contain the window rect's centre;
+4. the active monitor.
+
+A window that is already seated somewhere (the hotplug reconcile seats the
+windows it restores itself, ahead of their `MINIMIZEEND`) is left where it
+is; only its registry slot and rect are re-synced, so no second column is
+ever created. The same fallback chain answers every "which monitor does this
+window belong to" question that must produce an answer, such as the
+`monitor` field of `flow query all` for a minimized window.
+
 ## Per-Event Behavior
 
 ### Created (`EVENT_OBJECT_CREATE`)
@@ -280,6 +361,8 @@ synced.
 Restored windows are appended at the far right of the canvas rather than
 inserted at the old position. This avoids the complexity of tracking and
 restoring saved virtual slots for all cases (minimize + destroy interleaving).
+On a multi-monitor desktop the strip they are appended to is the home
+monitor's — see [Which monitor a returning window belongs to](#which-monitor-a-returning-window-belongs-to).
 
 With `[floating] always_on_top`, the minimize / hide handlers take a float out
 of the floating layer and the restore / show handlers put it back

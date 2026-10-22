@@ -119,7 +119,11 @@ offset, focus) with per-window registry metadata, swaps `WindowId` for
 `WindowRef`, and writes pretty-printed JSON. Ignored windows (maximized,
 fullscreen, or rule-ignored) are excluded from both save and restore. A
 minimized window is in no strip or floating space, so it is never saved
-either — including one the startup scan registered minimized.
+either — including one the startup scan registered minimized. A fullscreen
+window (`set-window fullscreen`) is written as the float it comes back as
+after a restart: at the rect it was floating at before, else its screen
+rect clamped into the work area — never the taskbar-covering screen rect
+itself.
 
 ### Restore
 

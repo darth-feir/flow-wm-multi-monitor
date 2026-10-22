@@ -1,94 +1,16 @@
 //! Tiling on/off — pause and resume the window manager without stopping
-//! the daemon.
+//! the daemon (`flow dispatch tiling on|off|toggle`).
 //!
-//! The user's requirement: *a toggle to turn tiling on and off; when it is
-//! off the desktop goes back to plain Windows and the apps are moved back
-//! on screen.* The hotkey script owns the toggle key and keeps running, so
-//! this is a pause inside the daemon, not a stop: the pipe keeps answering,
-//! the hooks keep the registry consistent, and `flow dispatch tiling on`
-//! brings everything back without a restart.
-//!
-//! # Pause ([`FlowWM::pause_tiling`])
-//!
-//! 1. The animator is cancelled synchronously, so no tween can land after
-//!    the windows have been put back.
-//! 2. Every **tiled** window of every workspace of every monitor — active
-//!    and parked alike, the parked ones being the "apps moved on screen"
-//!    case — is sent an instant target: the window rect it had when it was
-//!    first tiled this run ([`Window::pre_tiling_rect`]) when the registry
-//!    has one (clamped into the work area of the monitor it lies on), else
-//!    its workspace-local layout rect clamped into its monitor's work area
-//!    ([`pause_target`]). A **float** is left where it is unless it sits off
-//!    the virtual screen (a float of a parked workspace), in which case it
-//!    is clamped into its monitor's work area. A tile or float the daemon
-//!    **un-maximized to manage** ([`Window::adopted_from_maximized`]) is
-//!    not moved but maximized again (`SW_MAXIMIZE`, on the monitor it is
-//!    nearest to), and the foreground is put back afterwards since
-//!    maximizing activates.
-//! 3. Minimized windows get the stage-7B placement rescue: a restore
-//!    position parked beyond the screen is rewritten so the window comes
-//!    back on-screen when the user restores it.
-//! 4. Every border overlay is dropped.
-//! 5. `tiling_paused` is set, the status file flips to `tiling: off`, and
-//!    one summary line is logged. **Nothing else is destroyed**: monitors,
-//!    workspaces, strips and floating spaces stay exactly as they were —
-//!    they are the memory the resume rebuilds from.
-//!
-//! # While paused
-//!
-//! Hook events only keep the registry consistent (created → classified and
-//! registered, destroyed → forgotten, minimize / restore / hide / show /
-//! state and name changes → registry transitions, foreground → tracked
-//! focus); nothing moves a window, seats a new one or pushes focus.
-//! Drag handling, edge-scroll and float-location sync are no-ops. Every
-//! layout-mutating command (focus, swap, scroll, resize, set-window,
-//! workspace and monitor moves, config reload, loadout load) is answered
-//! with [`TILING_OFF_MESSAGE`]; `SetTiling` / `ToggleTiling`, `Ping`, the
-//! queries, `Stop` and the loadout save keep working. A display-topology
-//! change is **deferred**: the geometry is left alone (a re-seat would move
-//! windows that are Windows' to arrange) and reconciled first thing on
-//! resume.
-//!
-//! # Resume ([`FlowWM::resume_tiling`])
-//!
-//! Rebuilds from the live desktop the way startup does:
-//!
-//! 1. A deferred display change is reconciled (`reconcile_monitors`).
-//! 2. The top-level windows are re-scanned (`scan_existing_windows`), so
-//!    windows created during the pause are classified through the rules
-//!    (with `adopt_maximized`, maximized ones are un-maximized and
-//!    classified too — the adoption is off during the pause and switched
-//!    back on here); windows that no longer exist are dropped from the
-//!    registry and every space, the minimized state is re-synced with
-//!    `IsIconic`, and a window the pause handed back maximized is
-//!    un-maximized again before it is seated.
-//! 3. Every strip keeps the windows that are still live `Tiling(Active)` in
-//!    their remembered (monitor, workspace, column, row) seats — row
-//!    heights and column widths included — and drops the others; a float
-//!    of an active workspace has its rect refreshed from the desktop (the
-//!    user may have dragged it), a float that is no longer an active float
-//!    leaves its space.
-//! 4. The foreground window becomes the tracked focus; its monitor becomes
-//!    active and, if it lives on a parked workspace, that workspace becomes
-//!    the monitor's active one so the user keeps looking at it.
-//! 5. Tiles seated nowhere (new, or restored from a state that had emptied
-//!    their seat) are appended to the active workspace of the monitor
-//!    Windows reports for them (`MonitorFromWindow`), else their remembered
-//!    monitor, else the active one — the workspace step 4 just made
-//!    visible, so a window that appeared during the pause stays on-screen;
-//!    unseated floats go to the same monitor at their current rect, clamped
-//!    into its work area. A foreground window seated here takes the focus
-//!    as in step 4.
-//! 6. Every monitor is re-projected and seated as one **instant** batch
-//!    (the hotplug seating), the float-tracking set is rebuilt, the borders
-//!    are reattached, `tiling_paused` clears, the status file flips back to
-//!    `tiling: on`, and one summary line is logged.
-//!
-//! Resuming while already tiling (or pausing while already paused) does
-//! nothing. The Win32 questions both passes ask are behind [`TilingProbe`]
+//! [`FlowWM::pause_tiling`] hands every window back to Windows (tiles to
+//! their pre-tiling rect, parked windows on-screen, adopted windows
+//! maximized again) and keeps the monitors, workspaces and strips as the
+//! memory [`FlowWM::resume_tiling`] rebuilds from; while paused the hooks
+//! only keep the registry consistent and every layout-mutating command is
+//! refused with [`TILING_OFF_MESSAGE`]. The full pause / resume sequence,
+//! what happens while paused and why a display change is deferred are in
+//! `docs/src/dev-guide/ipc-and-watchdog.md`, *Tiling on/off (pause and
+//! resume)*. The Win32 questions both passes ask are behind [`TilingProbe`]
 //! so the whole thing is unit-tested against a mock desktop.
-//!
-//! [`Window::pre_tiling_rect`]: crate::registry::types::Window::pre_tiling_rect
 
 use windows::Win32::Foundation::HWND;
 
@@ -294,14 +216,11 @@ pub(super) struct PauseTargets {
 /// Where a tiled window goes when tiling is turned off, as a **visible**
 /// rect, and whether that is its pre-tiling rect.
 ///
-/// `pre_tiling_visible` is the window's pre-tiling anchor translated to
-/// visible space, if the registry has one: it is restored, clamped into the
-/// work area of the monitor whose screen holds its centre (so a window
-/// that came from a display that has since been unplugged still lands
-/// on-screen), falling back to the owning monitor's. Without an anchor the
-/// window's workspace-local `layout_rect` is clamped into the owning
-/// monitor's work area — a visible tile stays put, a parked one (parked
-/// column, parked workspace) comes to the nearest edge.
+/// The pre-tiling anchor (`pre_tiling_visible`) when the registry has one,
+/// clamped into the work area of the monitor whose screen holds its centre,
+/// else the owning monitor's; without an anchor, the workspace-local
+/// `layout_rect` clamped into the owning monitor's work area. See
+/// `docs/src/dev-guide/ipc-and-watchdog.md`, *Tiling on/off*.
 ///
 /// `screens` / `work_areas` are indexed like the daemon's monitor list;
 /// `owner` must be a valid index into both.

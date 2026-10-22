@@ -1,33 +1,14 @@
 //! `set-window fullscreen` — a managed fullscreen mode for the focused window.
 //!
-//! A fullscreen window leaves the layout the way a float does and is placed
-//! over its monitor's **full screen rect** (taskbar included), kept above the
-//! tiles with `HWND_TOPMOST` and shown without a border. It stays a member of
-//! its workspace — it sits in that workspace's [`FloatingSpace`] at the screen
-//! rect, so a workspace switch parks and unparks it with the workspace like
-//! any float — while [`FlowWM::fullscreen`] remembers where it came from
-//! ([`FullscreenOrigin`]): the monitor, workspace, column, row and column
-//! width of a tile, or the rect of a float. Issuing the command again puts
-//! it back there (same column and row when that column still exists, else
-//! appended; a float goes back to its rect).
-//!
-//! The registry records a fullscreen window as `Floating(Active { rect:
-//! screen_rect })`; the daemon-side map is what tells it apart from a float:
-//! no border ([`border_style_for`](super::FlowWM::border_style_for)), no
-//! float-location tracking, `mode: "fullscreen"` in `flow query all`, and
-//! no inset for the border ring in the animation bridge.
-//!
-//! Lifecycle: closing the window drops its origin with it; minimizing or
-//! hiding keeps the origin so the window comes back fullscreen; `tiling off`
-//! turns every fullscreen window into a plain float inside its work area
-//! (the origin is forgotten, so `tiling on` treats it as a float); the
-//! shutdown rescue clears the topmost flag.
-//!
-//! The floating layer (`[floating] always_on_top`, `daemon::top_layer`)
-//! lets go of a float that goes fullscreen — this module owns the topmost
-//! flag while the window is fullscreen — and takes it back when the window
-//! returns to a float (`register_float`). Both sit in the topmost band, so
-//! a float and a fullscreen window are ordered by which was activated last.
+//! A fullscreen window leaves the layout the way a float does, sits in its
+//! workspace's [`FloatingSpace`] at the monitor's full screen rect (so a
+//! workspace switch parks it with the workspace), is kept above the tiles
+//! with `HWND_TOPMOST` and shown without a border; [`FlowWM::fullscreen`]
+//! remembers where it came from ([`FullscreenOrigin`]) so the next toggle
+//! puts it back. What distinguishes it from a float, its lifecycle
+//! (minimize, hide, destroy, `tiling off`, the shutdown rescue) and how it
+//! hands the topmost flag over to the floating layer are in
+//! `docs/src/dev-guide/floating-space.md`, *Fullscreen windows*.
 
 use windows::Win32::Foundation::HWND;
 

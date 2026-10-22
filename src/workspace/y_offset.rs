@@ -10,21 +10,12 @@
 //!
 //! # Vertical neighbours: the far parking slot
 //!
-//! `±y_unit` keeps a parked workspace off its *own* monitor. On a desktop
-//! where another monitor sits directly above or below this one (a laptop
-//! under an external display, say), one monitor height up is squarely *on*
-//! that neighbour. [`WorkspaceParking`] therefore mirrors the horizontal
-//! column rule ([`layout::projection`](crate::layout::projection)): a side
-//! with a neighbour ([`MonitorInfo::neighbour_up`] /
-//! [`MonitorInfo::neighbour_down`]) parks the workspace **beyond the Win32
-//! virtual screen** — the strip's bottom at `virtual_screen.y - PARK_MARGIN`
-//! above, its top at `virtual_screen.bottom() + PARK_MARGIN` below — while a
-//! free side keeps the `±y_unit` slot so the switch still reads as the
-//! workspace strip sliding up or down. Every workspace on the same side
-//! shares one slot either way (see the ±1-unit model below). The animation
-//! bridge turns a move to or from a blocked side into an instant one, exactly
-//! as it does for columns parked behind a left/right neighbour; see
-//! `daemon::animation::plan_move`.
+//! `±y_unit` keeps a parked workspace off its *own* monitor; when another
+//! monitor sits directly above or below, [`WorkspaceParking`] parks the
+//! workspace **beyond the Win32 virtual screen** on that side instead,
+//! mirroring the horizontal column rule, and the animation bridge moves it
+//! instantly. The rule table is in
+//! `docs/src/dev-guide/layout/projection.md`, *Neighbours on four sides*.
 //!
 //! # The ±1-Unit Model
 //!
@@ -138,37 +129,12 @@ pub fn workspace_y_offset(
 /// Built once per switch or seating pass from the monitor's
 /// [`MonitorInfo`] (virtual screen and vertical neighbours), its full
 /// physical screen rect and the configured gap, then asked for each
-/// workspace's offset via [`offset`](Self::offset).
-///
-/// # The rule
-///
-/// For a workspace parked **above** the active one (`id < active`):
-///
-/// | `neighbour_up` | strip position                                     | offset                                                  |
-/// |----------------|----------------------------------------------------|---------------------------------------------------------|
-/// | `false`        | one monitor height up (free side, keeps the slide) | `-(screen_rect.height + window_gap)`                    |
-/// | `true`         | bottom flush with `virtual_screen.y - PARK_MARGIN` | `virtual_screen.y - PARK_MARGIN - screen_rect.bottom()` |
-///
-/// and symmetrically for one parked **below** (`id > active`):
-///
-/// | `neighbour_down` | strip position                                         | offset                                                  |
-/// |------------------|--------------------------------------------------------|---------------------------------------------------------|
-/// | `false`          | one monitor height down                                | `+(screen_rect.height + window_gap)`                    |
-/// | `true`           | top flush with `virtual_screen.bottom() + PARK_MARGIN` | `virtual_screen.bottom() + PARK_MARGIN - screen_rect.y` |
-///
-/// The active workspace is always at `0`. Every workspace on one side shares
-/// that side's single slot (the ±1-unit model), so the blocked-side slot is
-/// simply further out than the free-side one — never closer, because a
-/// neighbour above implies `virtual_screen.y < screen_rect.y` by at least
-/// that neighbour's height. Which slot a side uses is decided per side, so a
-/// monitor with a display above it and nothing below slides workspaces in
-/// from below and teleports them out above.
-///
-/// The offset is relative to each window's projected rect, which lies inside
-/// `screen_rect`; a window inside the monitor therefore ends up wholly beyond
-/// the virtual screen on a blocked side. (A floating window that already
-/// overhangs the monitor edge by more than `PARK_MARGIN` is the one case
-/// that can still peek, exactly as with the free-side slot and the gap.)
+/// workspace's offset via [`offset`](Self::offset): the active workspace is
+/// at `0`; a side without a neighbour uses the one-monitor-height slot
+/// (`±(screen_rect.height + window_gap)`), a side with one parks the strip
+/// `PARK_MARGIN` beyond the virtual screen. The rule table and why the
+/// blocked-side slot is never closer than the free-side one are in
+/// `docs/src/dev-guide/layout/projection.md`, *Neighbours on four sides*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkspaceParking {
     /// Full physical screen rect of the monitor (taskbar included).

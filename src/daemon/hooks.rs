@@ -186,14 +186,10 @@ impl FlowWM {
 
     /// Give an untracked window a chance to register before `event` is
     /// handled: the restore, foreground and show hooks all reach windows
-    /// the scan and `CREATE` never classified (a window minimized when the
-    /// daemon started used to be skipped outright; a window created
-    /// invisible or titled late is missed by `CREATE`). Runs the full
-    /// creation pipeline ([`on_window_created`](Self::on_window_created)):
-    /// a tile is seated next to the focused column, a float is placed, an
-    /// ignored window is tracked as such. Returns whether the window is
-    /// tracked afterwards. For a tracked window this is one `HashMap` hit;
-    /// for the rest, the creation gates decide.
+    /// the scan and `CREATE` never classified. Runs the full creation
+    /// pipeline ([`on_window_created`](Self::on_window_created)) and returns
+    /// whether the window is tracked afterwards. For a tracked window this
+    /// is one `HashMap` hit; for the rest, the creation gates decide.
     fn register_if_untracked(&mut self, hwnd: isize, event: &str) -> bool {
         if self.registry.is_tracked(hwnd) {
             return true;
@@ -397,24 +393,14 @@ impl FlowWM {
     ///
     /// # Non-active monitors and foreign focus
     ///
-    /// A window closing on a monitor the user is *not* working on must not
-    /// drag the foreground over there, and neither must one closing on the
-    /// active monitor while the user is in a float or a window elsewhere:
-    /// the successor is only pushed when the removed window held the user's
-    /// focus (registry focus or OS foreground), or lived on the active
-    /// monitor *and* the registry's focus was nowhere else than that strip
-    /// — see [`should_refocus_after_removal`]. Otherwise the strip's
-    /// bookkeeping is updated and nothing else moves.
-    ///
-    /// # Parked workspaces
-    ///
-    /// The window is removed from the workspace that actually holds it. A
-    /// tile minimized or hidden while its workspace is parked (a minimize
-    /// from the taskbar, Windows minimizing it with a display change) leaves
-    /// that parked strip — never the active one, which does not contain it
-    /// — and the parked strip is re-seated at its parking offset with no
-    /// focus push. Leaving it in place would seat it twice when it comes
-    /// back.
+    /// The successor is only pushed when the removed window held the user's
+    /// focus, or lived on the active monitor while the user's focus was on
+    /// that strip ([`should_refocus_after_removal`]); otherwise only the
+    /// strip's bookkeeping changes. A tile minimized or hidden while its
+    /// workspace is parked leaves that parked strip, which is re-seated at
+    /// its parking offset with no focus push. See
+    /// `docs/src/dev-guide/event-pipelines.md`, *Focus after a removal or a
+    /// monitor switch*.
     fn remove_from_layout_and_refocus(&mut self, window: WindowId) {
         let idx = self.monitor_index_for_window(window);
         let active_id = self.monitors[idx].active_workspace_id();
@@ -514,18 +500,16 @@ impl FlowWM {
     ///
     /// Pipeline:
     /// 0. An untracked window gets the creation pipeline first
-    ///    ([`register_if_untracked`](Self::register_if_untracked)): a
-    ///    window the scan never met (minimized behind a cloak, created
-    ///    while tiling was off and gone before the resume, …) is seated as
-    ///    a new window and the steps below find it in place.
+    ///    ([`register_if_untracked`](Self::register_if_untracked)) and is
+    ///    seated by it; the steps below find it in place.
     /// 1. `registry.restore_window(hwnd)` — updates state back to `Tiling::Active`
     ///    (re-measuring the geometry of a window registered minimized).
     /// 2. If the window is now tiling-active (after restore):
     ///    - `layout.add_window(id)` — re-adds to layout on its home monitor.
     ///    - `animate_layout(applied)` — animates the new window appearing.
     /// 3. A float registered minimized was never placed in a floating
-    ///    space: it is placed now, where it reappeared, like a float met at
-    ///    startup (`populate_existing_floats`).
+    ///    space: it is placed now, where it reappeared
+    ///    (`populate_existing_floats`).
     pub(super) fn on_window_restored(&mut self, hwnd: isize) {
         if !self.registry.is_tracked(hwnd) {
             // MINIMIZEEND can arrive while GetWindowRect still reports the
@@ -695,28 +679,18 @@ impl FlowWM {
     }
 
     /// Handle `EVENT_OBJECT_CLOAKED` — DWM stopped rendering a window that
-    /// is still `WS_VISIBLE`. A UWP app that is suspended, and one that is
-    /// minimized without going iconic, arrives here and nowhere else. It is
-    /// treated exactly like [`on_window_hidden`](Self::on_window_hidden):
-    /// `reconcile_visibility` already counts a cloaked window as not
-    /// user-visible, so a tracked active tile leaves the layout (focus to
-    /// the successor) and keeps its record for the uncloak; an untracked
-    /// window is a no-op.
+    /// is still `WS_VISIBLE` (a suspended UWP app). Treated exactly like
+    /// [`on_window_hidden`](Self::on_window_hidden); see
+    /// `docs/src/dev-guide/event-pipelines.md`, *Cloaked / Uncloaked*.
     pub(super) fn on_window_cloaked(&mut self, hwnd: isize) {
         self.on_window_hidden(hwnd);
     }
 
     /// Handle `EVENT_OBJECT_UNCLOAKED` — DWM started rendering a window.
-    ///
-    /// A UWP frame (`ApplicationFrameHost.exe` / `ApplicationFrameWindow`)
-    /// is created **cloaked** and uncloaked once its content is ready, with
-    /// no `SHOW` and no further `CREATE`; the creation gates had rejected it
-    /// as not Alt+Tab visible, so this is the first event at which it can be
-    /// registered. Treated exactly like [`on_window_shown`](Self::on_window_shown):
-    /// an untracked window gets the full creation pipeline (seated like a
-    /// new window), a tracked one that was `Hidden` (cloaked) is re-added.
-    /// The foreground hook would usually catch the opened app too (it takes
-    /// focus), but not when it is still cloaked at that moment.
+    /// A UWP frame is created cloaked and never `SHOW`n, so this is the
+    /// first event at which it can be registered. Treated exactly like
+    /// [`on_window_shown`](Self::on_window_shown); see
+    /// `docs/src/dev-guide/event-pipelines.md`, *Cloaked / Uncloaked*.
     pub(super) fn on_window_uncloaked(&mut self, hwnd: isize) {
         if !self.registry.is_tracked(hwnd) {
             let _ = self.register_if_untracked(hwnd, "on_window_uncloaked");
@@ -732,14 +706,9 @@ impl FlowWM {
     /// natural no-op: the focused column is already visible, so
     /// `ensure_focused_visible` returns `None`.
     pub(super) fn on_focus_changed(&mut self, hwnd: isize) {
-        // A window the registry never met taking the foreground (restored
-        // from a state the scan could not classify, created while the
-        // daemon was not listening) is registered first — seated as a new
-        // window by the creation pipeline — so the bookkeeping below finds
-        // it. The gates reject the taskbar, menus and dialogs cheaply; a
-        // tracked window costs one HashMap hit.
-        // An unregistrable window (taskbar, menu, dialog) falls through:
-        // `set_focused` ignores untracked handles and the rest no-ops.
+        // An untracked window taking the foreground is registered first so
+        // the bookkeeping below finds it; one that fails a creation gate
+        // (taskbar, menu, dialog) falls through and the rest no-ops.
         let _ = self.register_if_untracked(hwnd, "on_focus_changed");
 
         // An OS-ignored window taking the foreground may have been
@@ -868,11 +837,10 @@ impl FlowWM {
     }
 
     /// Handle `EVENT_OBJECT_STATECHANGE` — Option D recovery for windows that
-    /// launched maximized or fullscreen. Also run by
-    /// [`on_focus_changed`](Self::on_focus_changed),
-    /// [`on_window_shown`](Self::on_window_shown) and the move-size-end
-    /// handler when their window is still OS-ignored, since the
-    /// `STATECHANGE` for an un-maximize does not always arrive.
+    /// launched maximized or fullscreen. Also run from the foreground, show
+    /// and move-size-end handlers for a window that is still OS-ignored (the
+    /// `STATECHANGE` for an un-maximize does not always arrive; see
+    /// `docs/src/dev-guide/event-pipelines.md`, *State Change*).
     ///
     /// Pipeline:
     /// 1. `registry.reclassify_os_state(hwnd)` — re-queries the live OS state.
@@ -913,19 +881,11 @@ impl FlowWM {
     }
 
     /// Append a returning tiled window (restored, re-shown, or recovered
-    /// from maximized) to the strip of its home monitor and animate it in.
-    ///
-    /// The home monitor is resolved by
-    /// [`home_monitor_for_hwnd`](Self::home_monitor_for_hwnd): the owning
-    /// monitor remembered when the window was last seated, then
-    /// `MonitorFromWindow`, then the rect, then the active monitor. A window
-    /// that was parked beyond the virtual screen when it was minimized has a
-    /// rect that points nowhere useful, which is why the memory comes first.
-    ///
-    /// A window that is **already seated** somewhere (the hotplug reconcile
-    /// seats the windows it restores itself, ahead of their `MINIMIZEEND`)
-    /// is left where it is: only the registry's slot and rect are re-synced
-    /// from that strip, so no second column is ever created.
+    /// from maximized) to the strip of its home monitor
+    /// ([`home_monitor_for_hwnd`](Self::home_monitor_for_hwnd)) and animate
+    /// it in. A window that is already seated somewhere (the hotplug
+    /// reconcile seats the windows it restores itself) is left where it is
+    /// and only its registry slot and rect are re-synced.
     pub(super) fn readd_tile_to_home_monitor(&mut self, hwnd: isize) {
         let wid = WindowId(hwnd);
         if let Some(idx) = self.monitor_index_containing(wid) {
@@ -996,16 +956,13 @@ impl FlowWM {
 /// strip's successor.
 ///
 /// `prev_focus` / `new_focus` are the strip's last-focused window before and
-/// after the removal — they differ only when the removed window was the
-/// strip's focus cursor. `held_focus` says the removed window was the user's
-/// focus (registry focus or OS foreground). `on_active_monitor` says it lived
-/// on the monitor that owns keyboard focus, and `focus_on_strip` that the
-/// registry's focused window, read before the removal, was nobody, the
-/// removed window or a tile of that strip — not a float and not a window on
-/// another strip. The successor is pushed when the removed window held the
-/// focus, or when it lived on the active monitor and the user's focus was
-/// on that strip; otherwise the user is working elsewhere and the successor
-/// must not steal the foreground (B6).
+/// after the removal; `held_focus` says the removed window was the user's
+/// focus (registry focus or OS foreground); `on_active_monitor` that it
+/// lived on the monitor that owns keyboard focus; `focus_on_strip` that the
+/// registry's focus, read before the removal, was nobody, the removed window
+/// or a tile of that strip. The rule and why it exists are in
+/// `docs/src/dev-guide/event-pipelines.md`, *Focus after a removal or a
+/// monitor switch*.
 #[must_use]
 pub(super) fn should_refocus_after_removal(
     prev_focus: Option<WindowId>,

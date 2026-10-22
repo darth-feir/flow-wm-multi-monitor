@@ -7,32 +7,13 @@
 //! disturbing windows the user can currently see.
 //!
 //! [`FlowWM::fail_back`] is the one teardown every exit path goes through —
-//! clean `flow stop`, session end, a dead worker thread, a panic — and it
-//! hands the desktop back to plain Windows in a fixed order:
-//!
-//! 1. `animator.cancel_and_wait()` — no further `SetWindowPos` from the
-//!    worker, so step 2 cannot be overwritten by a still-running tween.
-//! 2. [`rescue_stranded_windows`](FlowWM::rescue_stranded_windows) — if
-//!    step 1 was not acknowledged in time, the pass runs twice with another
-//!    bounded wait in between, so a late frame cannot undo it. The pass
-//!    also maximizes again every window the daemon had un-maximized to
-//!    manage (`Window::adopted_from_maximized`), so the desktop is handed
-//!    back as the user had it, and takes every window out of the floating
-//!    layer (`[floating] always_on_top`, `daemon::top_layer`), putting the
-//!    topmost flag it had back.
-//! 3. Drop every border overlay (`DestroyWindow`).
-//! 4. Stop the hook thread (`WM_QUIT`).
-//! 5. Kill the hotkey script and remove its pidfile, releasing the Win key.
-//!    (The kill-on-close job object is the backstop for the exits that never
-//!    reach this function.)
-//! 6. Stop the IPC server's pending accept
-//!    ([`PipeServer::shutdown`](crate::ipc::transport::PipeServer::shutdown)):
-//!    a synchronous `ConnectNamedPipe` left pending would make closing the
-//!    pipe handle block until the next client connected, keeping the process
-//!    alive after the teardown.
-//!
-//! The status file is rewritten by `main` afterwards (`stopped` or
-//! `error`/`runtime`), which also owns the exit code.
+//! clean `flow stop`, session end, a dead worker thread, a panic — and hands
+//! the desktop back to plain Windows in a fixed order: cancel the animator
+//! and wait, rescue (twice if the cancel was not acknowledged), drop the
+//! border overlays, stop the hook thread, kill the hotkey script, stop the
+//! pipe server's pending accept. The order and the reason for each step are
+//! in `docs/src/dev-guide/ipc-and-watchdog.md`, *Fail-back*. The status
+//! file is rewritten by `main` afterwards, which also owns the exit code.
 //!
 //! See `docs/src/dev-guide/ipc-and-watchdog.md` for the design rationale
 //! (why visible windows are left untouched, and the "pre-this-run" contract
@@ -60,10 +41,13 @@ pub struct RescueMonitor {
 
 /// Rescue windows stranded off-screen without a `FlowWM`.
 ///
-/// This is the rescue pass itself (see
-/// [`FlowWM::rescue_stranded_windows`] for the rules). It is a free function
-/// so that a startup failure *after* the initial layout has moved windows can
-/// still bring them back — at that point no `FlowWM` exists yet.
+/// The rescue pass itself (rules in [`FlowWM::rescue_stranded_windows`] and
+/// `docs/src/dev-guide/ipc-and-watchdog.md`, *Graceful-Shutdown Window
+/// Rescue*), as a free function so a startup failure *after* the initial
+/// layout has moved windows can still bring them back. Three passes: the
+/// controlled windows, the minimized windows' `WINDOWPLACEMENT` (re-anchored
+/// without un-minimizing), and the windows adopted from maximized
+/// (maximized again, foreground put back since `SW_MAXIMIZE` activates).
 ///
 /// * `registry` — supplies the controlled windows and their rescue anchors.
 /// * `virtual_screen` — union of all monitors; a window whose visible content
@@ -74,16 +58,6 @@ pub struct RescueMonitor {
 /// * `owner_of` — monitor index owning a window by workspace membership, or
 ///   `None` to fall back to the anchor's monitor. Before `FlowWM` exists no
 ///   workspace bookkeeping is available, so pass `|_| None`.
-///
-/// Minimized windows ([`minimized_windows`](WindowRegistry::minimized_windows))
-/// get a second pass: their `WINDOWPLACEMENT` normal position is clamped
-/// on-screen (see
-/// [`rescue_minimized_placement`](crate::rescue::rescue_minimized_placement))
-/// without un-minimizing them. A third pass maximizes again every window
-/// the daemon un-maximized to manage
-/// ([`adopted_maximized_windows`](WindowRegistry::adopted_maximized_windows)),
-/// after it has been brought on-screen, and puts the foreground back
-/// (`SW_MAXIMIZE` activates).
 ///
 /// Returns the number of windows moved, re-anchored or re-maximized.
 pub fn rescue_stranded_windows_with(
@@ -206,10 +180,8 @@ impl FlowWM {
     ///
     /// Failures (window vanished mid-loop, `SetWindowPos` rejected) are logged
     /// at `warn` and skipped: one bad window must not abort the rescue pass.
-    ///
-    /// If the animator does not acknowledge the cancel within its timeout, a
-    /// frame may still land after the first pass; the pass is then run a
-    /// second time after another bounded wait.
+    /// If the animator does not acknowledge the cancel in time, the pass runs
+    /// a second time after another bounded wait.
     pub fn rescue_stranded_windows(&mut self) -> usize {
         // Stop the worker first: a tween still in flight would otherwise
         // re-apply its interpolated rects over the rescued positions.

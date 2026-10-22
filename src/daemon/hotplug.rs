@@ -1,53 +1,18 @@
 //! Display-topology changes: monitor hotplug and work-area changes.
 //!
-//! The daemon enumerates monitors once at startup. Every parked column and
-//! every parked workspace is positioned relative to that enumeration
-//! (beyond the virtual screen, one monitor height away, …), so attaching or
-//! detaching a display, changing a resolution, or moving the taskbar
-//! invalidates all of it: windows keep being animated to a dead rect, or a
-//! "parked" slot ends up inside a new neighbour. This module keeps the
-//! monitor list in step with the desktop in three steps:
-//!
-//! 1. **Detect.** The session-sink window and the border overlays receive
-//!    `WM_DISPLAYCHANGE` and `WM_SETTINGCHANGE(SPI_SETWORKAREA)` and call
-//!    [`request_topology_refresh`](crate::registry::hooks::request_topology_refresh),
-//!    which sets a flag and wakes the main loop. Windows sends several such
-//!    messages per change, so the loop only re-arms a settle timer
-//!    ([`TOPOLOGY_SETTLE`]) on each report and reconciles once the messages
-//!    have stopped ([`FlowWM::poll_topology_change`]).
-//! 2. **Reconcile** ([`FlowWM::reconcile_monitors`]). Re-enumerate, match the
-//!    old monitors to the new ones ([`match_monitors`]: by `HMONITOR`, then
-//!    by identical screen rect, then primary-to-primary), rebuild every
-//!    survivor's [`MonitorInfo`] and re-project all of its workspaces in
-//!    place, create fresh monitors with ten empty workspaces for added
-//!    displays.
-//! 3. **Migrate** ([`plan_migration`]). Every window of a vanished monitor —
-//!    all ten workspaces — moves to the active workspace of its fallback
-//!    monitor: the one Windows now reports for it (`MonitorFromWindow`),
-//!    else the primary. Tiles are appended as columns; floats are clamped
-//!    into the fallback's work area. Owner memory in the registry is
-//!    remapped for every tracked window ([`remap_owner`]), including the
-//!    minimized and hidden ones that live in no space.
-//! 4. **Restore casualties.** Windows minimizes every window whose nearest
-//!    display vanished — the vanished monitor's own strip, but also a
-//!    *surviving* monitor's columns parked beyond that neighbour. Any window
-//!    of ours minimized since the first topology report
-//!    ([`is_hotplug_casualty`]) and still iconic is restored without
-//!    activation (`SW_SHOWNOACTIVATE`) and seated right here, in its old
-//!    `(monitor, column, row)` order: back into its old column slot when
-//!    its strip survived, appended in order otherwise. The later
-//!    `MINIMIZEEND` hook then finds the window already seated and does
-//!    nothing. A window the user minimized *before* the change is left
-//!    minimized (its owner memory is remapped like everyone else's).
-//!
-//! Afterwards every monitor's workspaces are re-seated as **instant**
-//! animator targets: the old parked slots are meaningless under the new
-//! geometry and a tween from one of them would sweep across the screen.
-//! If anything was restored, OS focus is pushed once to the registry's
-//! focused window so the restores cannot have moved it.
-//!
-//! A failed enumeration re-arms the settle timer and retries up to
-//! [`MAX_RECONCILE_RETRIES`] times before giving up until the next report.
+//! Every parked column and workspace is positioned relative to the monitor
+//! list enumerated at startup, so attaching or detaching a display, changing
+//! a resolution or moving the taskbar invalidates all of it. This module
+//! keeps the list in step with the desktop: **detect** (the window
+//! procedures report `WM_DISPLAYCHANGE` / `SPI_SETWORKAREA`, debounced by
+//! [`TOPOLOGY_SETTLE`] in [`FlowWM::poll_topology_change`]), **reconcile**
+//! ([`FlowWM::reconcile_monitors`], matching old to new monitors with
+//! [`match_monitors`]), **migrate** the windows of vanished monitors
+//! ([`plan_migration`], [`remap_owner`]) and **restore the casualties**
+//! Windows minimized ([`is_hotplug_casualty`]) — then re-seat everything as
+//! instant animator targets. The full pass, the retry policy
+//! ([`MAX_RECONCILE_RETRIES`]) and why restores use `SW_SHOWNOACTIVATE` are
+//! in `docs/src/dev-guide/ipc-and-watchdog.md`, *Monitor hotplug*.
 //!
 //! The Win32 questions the reconcile asks are behind [`TopologyProbe`] so
 //! the whole pass is unit-tested with a mock desktop.
@@ -746,15 +711,10 @@ impl FlowWM {
                 .set_monitor(hwnd, remap_owner(old_idx, &matching, nearest, primary_new));
         }
 
-        // Hotplug casualties: windows Windows minimized because the display
-        // nearest to them went away — the vanished monitor's strip, but also
-        // a survivor's columns parked beyond that neighbour. They are the
-        // windows minimized since the first topology report that are still
-        // iconic; a window the user minimized before the change stays
-        // minimized. Restored without activation and seated here, in their
-        // old (monitor, column, row) order, so the strip comes back as it
-        // was instead of in whatever order the MINIMIZEEND hooks arrive
-        // (those find the window already seated and do nothing).
+        // Hotplug casualties (windows Windows minimized because their nearest
+        // display vanished) are restored without activation and seated here,
+        // in their old (monitor, column, row) order, so the strip comes back
+        // as it was; the later MINIMIZEEND hooks find them seated.
         let first_report = self.topology_first_report;
         let old_owner: HashMap<isize, usize> = remembered.iter().copied().collect();
         let mut casualties: Vec<Casualty> = self
