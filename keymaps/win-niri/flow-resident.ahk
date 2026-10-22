@@ -8,13 +8,8 @@
 ;   Mod+Ctrl+T    start FlowWM (`flow start --ahk`) when no daemon is running
 ;
 ; While the daemon runs, flow.ahk owns the same chord and stops FlowWM, so
-; Mod+Ctrl+T is a plain on/off switch. Both scripts hook the key; the one
-; whose #HotIf condition is false lets it pass through to the other, and the
-; conditions are exclusive (daemon pipe absent / present).
-;
-; flow.exe is resolved by flow-exe.ahk (shared with flow.ahk): the FLOW_BIN
-; environment variable (a directory), then %LOCALAPPDATA%\Programs\flow, then
-; PATH. The daemon sets FLOW_BIN for the keymap it launches itself.
+; Mod+Ctrl+T is an on/off switch (see README.md). flow.exe is resolved by
+; flow-exe.ahk; set FLOW_BIN if flow is installed somewhere unusual.
 ; ════════════════════════════════════════════════════════════════════════════
 
 #Include %A_ScriptDir%\flow-exe.ahk

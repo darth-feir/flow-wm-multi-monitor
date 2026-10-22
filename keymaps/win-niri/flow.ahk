@@ -6,12 +6,9 @@
 ; Mirrors niri's default binds (https://github.com/YaLTeR/niri/wiki/Configuration:-Key-Bindings)
 ; onto `flow dispatch` commands. Install at %USERPROFILE%\.config\flow\flow.ahk
 ; (together with flow-exe.ahk, launcher.ahk and help.ahk, which it #Includes)
-; and start with `flow start --ahk`.
-;
-; flow.exe is run by absolute path (flow-exe.ahk): %FLOW_BIN%\flow.exe - the
-; daemon sets FLOW_BIN to its own directory when it launches this script -,
-; else %LOCALAPPDATA%\Programs\flow\flow.exe, else plain `flow` from PATH.
-; Never the working directory. The resolved path is the first FLOW_AHK_LOG line.
+; and start with `flow start --ahk`. Design notes, the daemon-liveness gate,
+; the tiling toggle, which Windows keys are shadowed and the AutoHotkey
+; lessons are in README.md next to this file.
 ;
 ;   Mod+Left/Down/Up/Right        focus the next window on this screen
 ;   Mod+Shift+Arrows              move the window along the strip (up/down inside a stacked column)
@@ -36,36 +33,8 @@
 ;   Mod+Ctrl+Shift+T              pause toggle: `flow dispatch tiling toggle` (daemon keeps running)
 ;   Mod+Shift+E                   stop FlowWM (same as Mod+Ctrl+T; niri's quit chord)
 ;
-; Tiling toggle: while tiling is off every window-management chord above
-; (focus, move, monitors, workspaces, close, center, float, width, consume/
-; expel) is released to Windows, so Win+Arrows snap, Win+1..9 launch from the
-; taskbar, and so on. Only the toggle itself, the launcher, the help overlay
-; and the stop chords stay bound. The state is read from `flow ping` at startup
-; ("tiling off" in its output) and flipped locally whenever the toggle
-; dispatch exits 0; an on-screen message reports each flip.
-;
-; Fail-back: every binding above is only active while the flowd daemon's named
-; pipe exists. If the daemon dies, the Win key and all chords revert to stock
-; Windows within one poll (2 s) — or at once, because a chord whose dispatch
-; fails re-checks the daemon on the spot — and after ~10 s the script exits
-; itself. A pipe that stays busy for 5 consecutive polls (a wedged daemon)
-; counts as down too. At startup the script refuses to hook anything unless
-; the daemon answers.
-;
-; Win+L (lock) is handled by Windows below the hook layer and is untouched;
-; the only ways around that are a keyboard-firmware or registry remap of the
-; left Win key (the FlowWM README's "sacrificial key" setup), neither of which
-; is used here. Not bound here, so still Windows: Win+Tab, Win+E, Win+Shift+S,
-; Win+A/I/X/S/N/W/P, Win+Comma (peek), Win+Period (emoji), Win+Ctrl+Space.
-; Shadowed while the daemon runs: Win+1..9/0 (taskbar launch), Win+C, Win+Q,
-; Win+V, Win+R (Run: use the right Win key or the launcher), Win+F (Feedback
-; Hub), Win+D (show desktop), Win+T (taskbar cycle), Win+Minus/Equal
-; (Magnifier), Win+Arrows (Snap), Win+Ctrl+Left/Right (virtual desktops),
-; Win+Shift+Left/Right (Windows' own move-to-monitor), Win+Space (Windows'
-; input-language switcher; Win+Ctrl+Space, which cycles the other way, still
-; works). With tiling off only Win+Space, Win+D, Win+Shift+/, Win+Ctrl+T,
-; Win+Ctrl+Shift+T and Win+Shift+E remain shadowed. The daemon side of this map (width presets,
-; edge_hop = false) is in flow.toml.example next to this file.
+; All chords are bound only while the daemon's pipe answers (and the
+; window-management ones only while tiling is on); Win+L stays Windows.
 ; ════════════════════════════════════════════════════════════════════════════
 
 #Include %A_ScriptDir%\flow-exe.ahk
@@ -96,9 +65,8 @@ AhkLog(msg) {
 }
 
 ; Short on-screen message in the bottom-right corner of the primary screen,
-; gone after `ms`. Never TrayTip: Windows 11 turns it into a toast that stays
-; until dismissed and holds the foreground lock, so neither this script's
-; windows nor the daemon's focus pushes can take the foreground meanwhile.
+; gone after `ms`. Never TrayTip: on Windows 11 the toast holds the
+; foreground lock until dismissed (see README.md).
 Osd(msg, ms := 2500) {
     static gui := 0
     AhkLog("osd: " msg)
@@ -197,10 +165,9 @@ TilingToggled(code) {
 ; --- Daemon liveness --------------------------------------------------------
 DaemonAlive() {
     global PipeName, BusyPolls, MaxBusyPolls
-    ; 1 ms wait: nonzero = an instance is free. A_LastError 2 = no such pipe
-    ; (daemon gone); 121 (ERROR_SEM_TIMEOUT) = pipe exists but busy. Busy is
-    ; alive only for a bounded run of polls: a wedged daemon holds the pipe
-    ; busy forever, and must count as down so the Win key is released.
+    ; 1 ms wait: nonzero = an instance is free. A_LastError 2 = no such pipe;
+    ; 121 (ERROR_SEM_TIMEOUT) = exists but busy, alive only for a bounded run
+    ; of polls (a wedged daemon holds the pipe busy forever; see README.md).
     if DllCall("WaitNamedPipe", "Str", PipeName, "UInt", 1) {
         BusyPolls := 0
         return true
@@ -230,10 +197,8 @@ CheckDaemon() {
 
 ; --- Shared GUI helper (used by launcher.ahk and help.ahk) ------------------
 ; Show a Gui centred on the work area of the monitor that holds the active
-; window (primary monitor if there is none), then make sure it is the active
-; window: Windows does not always grant the foreground to a window shown from
-; a chord while the Win key is still held, so retry for ~0.5 s. Measures the
-; window first via a hidden Show so auto-sized controls are already laid out.
+; window, then make sure it is active: Windows does not always grant the
+; foreground to a window shown from a chord while Win is still held.
 ShowCentered(gui) {
     mon := MonitorGetPrimary()
     try {
@@ -262,11 +227,8 @@ ShowCentered(gui) {
     AhkLog("ShowCentered: could not activate " gui.Title)
 }
 
-; Terminals. Mod+T Alacritty, Mod+Shift+T Alacritty as admin, Mod+Alt+T
-; Windows Terminal, Mod+Alt+Shift+T Windows Terminal as admin. Admin uses the
-; shell's RunAs verb, so UAC prompts as usual - which is why both are run by
-; fixed absolute paths first: the machine-wide install (%ProgramFiles%) before
-; the per-user one, and a PATH lookup (where.exe) only as the last resort.
+; Terminals. Admin uses the shell's RunAs verb (UAC prompts as usual), so both
+; are run by fixed absolute paths first and a PATH lookup only as the last resort.
 Alacritty(admin := false) {
     static exe := ""
     if (exe = "") {
@@ -324,10 +286,8 @@ SetTimer(CheckDaemon, 2000)
 HotIf((*) => DaemonUp && TilingOn)   ; criterion for the Hotkey() registrations below
 #HotIf DaemonUp && TilingOn          ; criterion for the window-management `::` hotkeys
 
-; No bare-Win-tap swallow on purpose: AutoHotkey already masks the Start menu
-; after every Win chord, and the `~LWin::Send "{Blind}{vkE8}"` trick dropped
-; roughly one chord in eight in testing (its own key send lands between the
-; Win press and the arrow). A bare Win tap therefore still opens Start.
+; No bare-Win-tap swallow on purpose: the `~LWin::Send "{Blind}{vkE8}"` trick
+; dropped about one chord in eight in testing (see README.md).
 
 ; --- Focus / move on this screen (Mod, Mod+Shift) --------------------------
 #Left::D("focus left")

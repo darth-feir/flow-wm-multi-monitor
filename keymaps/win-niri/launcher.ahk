@@ -1,19 +1,11 @@
 ; ════════════════════════════════════════════════════════════════════════════
 ; FlowWM application launcher (Mod+Space, Mod+D). Included from flow.ahk.
 ;
-; Fuzzy-finds Start-menu shortcuts (.lnk under the user and common Start
-; menus), a few built-ins (Settings, Lock, Task Manager) and the currently
-; open top-level windows. Enter runs / activates the selection; if nothing
-; matched, the typed text is passed to Run as a command or path. Esc hides.
-; Showing it again while it is open hides it.
-;
-; Needs nothing from the daemon: it only uses ShowCentered() and AhkLog()
-; from flow.ahk and still works when `flow` itself is unavailable.
-;
-; Keys while the launcher is active: Up/Down/PgUp/PgDn move the selection
-; (Tab / Shift+Tab too), Enter runs, Esc hides, double-click runs.
-;
-; Set FLOW_AHK_LOG=<path> to trace the fuzzy self-check and every refilter.
+; Fuzzy-finds Start-menu shortcuts, a few built-ins (Settings, Lock, Task
+; Manager) and the open top-level windows. Enter runs / activates the
+; selection or, with nothing matched, passes the typed text to Run; Esc
+; hides. Needs nothing from the daemon (only ShowCentered() and AhkLog()
+; from flow.ahk). Keys, index rules and the scoring are in README.md.
 ; ════════════════════════════════════════════════════════════════════════════
 
 ; --- State -----------------------------------------------------------------
@@ -36,25 +28,11 @@ LauncherList.OnEvent("DoubleClick", LauncherRun)
 LauncherGui.OnEvent("Escape", LauncherHide)
 
 ; --- Fuzzy matching --------------------------------------------------------
-; Case-insensitive subsequence match. 0 = no match (the query is not a
-; subsequence of the text), otherwise a score:
-;   +10 per matched character,
-;   +25 if it is the first character of the text,
-;   +15 if it starts a word (after space - _ . / \ ( ) [ ] : , or a
-;       camelCase hump),
-;   +12 if it directly follows the previous match,
-;   -1 per character skipped since the previous match (at most -8),
-;   +30 if the whole query is a prefix of the text,
-;   +0..10 for short texts (10 - len/8).
-; When a character would match mid-word without continuing the previous
-; match, a later word-start occurrence is preferred, but only if the rest of
-; the query still matches after it (so a valid match is never lost).
-;
-; Expected for the query "edge":
-;   Microsoft Edge   92  (e@11 word start 17, d g e consecutive 22 each, +9)
-;   Registry Editor   0  (the only g comes before the only d: not a subsequence)
-;   Event Viewer      0  (no d, no g)
-;   File Explorer     0  (no d, no g)
+; Case-insensitive subsequence match. 0 = no match, otherwise a score that
+; rewards first-character, word-start and consecutive matches and a prefix
+; match, and penalises skipped characters; a later word-start occurrence is
+; preferred over a mid-word one when the rest of the query still matches.
+; The point table and worked examples are in README.md.
 FuzzyScore(query, text) {
     q := StrLower(query), t := StrLower(text)
     qlen := StrLen(q), tlen := StrLen(t)
