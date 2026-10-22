@@ -264,10 +264,7 @@ pub fn check_target(target: &Target, local: &LocalBuild) -> Result<Report, Updat
                     let head = format!("{API}/repos/{repo}/commits/{branch}");
                     match get(&agent, &head) {
                         Ok(body) => head_report(&body, local, repo, branch),
-                        Err(e) if should_fall_back(&e) => Err(UpdateError::NotFound(format!(
-                            "{repo} has no branch {branch:?} (or the repository does not exist)"
-                        ))),
-                        Err(e) => Err(e),
+                        Err(e) => Err(head_not_found(&e, repo, branch).unwrap_or(e)),
                     }
                 }
                 Err(e) => Err(e),
@@ -292,6 +289,22 @@ pub fn check_target(target: &Target, local: &LocalBuild) -> Result<Report, Updat
 /// then reports as such).
 fn should_fall_back(err: &UpdateError) -> bool {
     matches!(err, UpdateError::Http { status: 404, .. })
+}
+
+/// What a failed branch-head request means, when it means "not found":
+/// GitHub answers 422 (`No commit found for SHA`) for a branch the
+/// repository does not have, and 404 for a repository that does not exist
+/// (or is private). Any other failure is `None` and reported as is.
+fn head_not_found(err: &UpdateError, repo: &str, branch: &str) -> Option<UpdateError> {
+    match err {
+        UpdateError::Http { status: 422, .. } => Some(UpdateError::NotFound(format!(
+            "{repo} has no branch {branch:?}"
+        ))),
+        UpdateError::Http { status: 404, .. } => Some(UpdateError::NotFound(format!(
+            "repository {repo} not found on GitHub (or private)"
+        ))),
+        _ => None,
+    }
 }
 
 /// A ureq agent that only ever speaks HTTPS, with every request bounded by
@@ -731,6 +744,39 @@ mod tests {
         assert!(!should_fall_back(&http(500)));
         assert!(!should_fall_back(&UpdateError::Network("x".into())));
         assert!(!should_fall_back(&UpdateError::Malformed("x".into())));
+    }
+
+    #[test]
+    fn fallback_failure_names_the_missing_branch_or_repository() {
+        // 422 is GitHub's answer for a ref the repository does not have.
+        assert_eq!(
+            head_not_found(&http(422), "me/f", "feat/x"),
+            Some(UpdateError::NotFound(
+                "me/f has no branch \"feat/x\"".into()
+            ))
+        );
+        // 404 is a repository that does not exist (or is private).
+        assert_eq!(
+            head_not_found(&http(404), "owner/nope", "main"),
+            Some(UpdateError::NotFound(
+                "repository owner/nope not found on GitHub (or private)".into()
+            ))
+        );
+        // Anything else is reported as it is.
+        assert_eq!(head_not_found(&http(403), "me/f", "main"), None);
+        assert_eq!(head_not_found(&http(500), "me/f", "main"), None);
+        assert_eq!(
+            head_not_found(&UpdateError::Network("x".into()), "me/f", "main"),
+            None
+        );
+        for status in [404, 422] {
+            assert_eq!(
+                head_not_found(&http(status), "me/f", "main")
+                    .unwrap()
+                    .exit_code(),
+                EXIT_NOT_FOUND
+            );
+        }
     }
 
     // --- compare status -> report ---

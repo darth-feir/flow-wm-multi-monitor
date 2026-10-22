@@ -99,8 +99,12 @@ reported with that hint). `ureq` reads `HTTPS_PROXY` / `HTTP_PROXY` /
    day than the build's commit. Output:
    `update available: {repo} {branch} head is 2a179c3, committed 2026-11-01;
    your build is cf54b88 from 2026-10-22, not found on the remote (not pushed
-   yet, or rewritten)` (or `nothing newer by date: …`). A second 404 means the
-   branch or the repository does not exist and is reported as such.
+   yet, or rewritten)` (or `nothing newer by date: …`). When that second
+   request fails too, GitHub's status says why (`head_not_found`): **422**
+   (`No commit found for SHA: <branch>`) is a branch the repository does not
+   have — `{repo} has no branch "{branch}"` — and **404** is a repository
+   that does not exist or is private — `repository {repo} not found on
+   GitHub (or private)`. Both exit 3.
 
    Only a 404 falls back (`should_fall_back`); a 403, a 5xx or a network error
    is reported directly.
@@ -141,7 +145,7 @@ Errors go to stderr as `flow: update check failed: <reason>`.
 | `0` | `EXIT_UP_TO_DATE` | Nothing newer: identical, ahead, same or newer than the latest release, or not newer by date in the fallback. |
 | `10` | `EXIT_NEWER` | Something newer exists (behind, diverged, the fallback head is newer by date, or a newer release). |
 | `2` | `EXIT_NETWORK` | `could not reach api.github.com: …` — offline, DNS, TLS or the 5 s timeout. |
-| `3` | `EXIT_NOT_FOUND` | The repository, branch or release does not exist (404 twice, or on the release endpoint); `[update] repo` is not `owner/name`; `flow.toml` could not be read. |
+| `3` | `EXIT_NOT_FOUND` | The repository, branch or release does not exist (a 404 or 422 on the branch head after the compare's 404, or a 404 on the release endpoint); `[update] repo` is not `owner/name`; `flow.toml` could not be read. |
 | `4` | `EXIT_GITHUB` | GitHub answered with another status (403 rate limit, 5xx) or something that did not parse. |
 | `5` | `EXIT_NO_BUILD_INFO` | Branch mode on a build with no embedded commit. |
 
