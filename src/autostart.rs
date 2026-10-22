@@ -6,13 +6,17 @@
 //!   keybinding script (`flowd --ahk`, forwarded by `flow start --ahk`) once
 //!   it is ready, inside a kill-on-close `JobObject` so the kernel
 //!   terminates the script whenever the daemon dies — however it dies. The
-//!   AutoHotkey v2 interpreter is resolved directly
-//!   ([`resolve_ahk_interpreter`]) and started suspended so it is a job
-//!   member before its first instruction; only if no interpreter can be
-//!   found does the launch fall back to the `.ahk` shell association (with
-//!   a best-effort job assignment after the fact). A pidfile records the
-//!   launched PID so `flow stop` (and the daemon's own fail-back) can kill
-//!   exactly that process.
+//!   job allows silent breakaway, so the terminals and applications the
+//!   script itself launches are **not** job members and survive `flow stop`
+//!   and daemon crashes (they used to die with the daemon). The AutoHotkey
+//!   v2 interpreter is resolved directly ([`resolve_ahk_interpreter`]) and
+//!   started suspended so it is a job member before its first instruction;
+//!   only if no interpreter can be found does the launch fall back to the
+//!   `.ahk` shell association (with a best-effort job assignment after the
+//!   fact — and, with breakaway allowed, a launcher that re-executes the
+//!   interpreter leaves it outside the job). A pidfile records the launched
+//!   PID so `flow stop` (and the daemon's own fail-back) can kill exactly
+//!   that process.
 //! - **Login autostart** — `flow enable-autostart [--ahk]` writes a single
 //!   `flow.lnk` into the user's `shell:startup` folder whose target is
 //!   `flow.exe start [--ahk]`. Login therefore reuses the interactive startup
@@ -247,13 +251,14 @@ impl AhkProcess {
 ///
 /// 1. [`resolve_ahk_interpreter`] finds an AutoHotkey v2 executable → it is
 ///    started with `JobObject::spawn` (suspended, assigned, resumed), so
-///    the script is a job member from its first instruction and every child
-///    it creates inherits the job.
+///    the script is a job member from its first instruction. The children
+///    the script creates (terminals, launched apps) break away from the job
+///    silently and outlive the daemon.
 /// 2. No interpreter found → the `.ahk` shell association is used (see
 ///    [`spawn_ahk_script_in`]) and the returned process is assigned to the
 ///    job **after** creation. A warning is logged, because if the
 ///    association points at a launcher that re-executes the real interpreter
-///    and exits, that child may not be inside the job.
+///    and exits, that child is not inside the job.
 ///
 /// The pid is written to `<config_dir>/flow.ahk.pid` on both paths.
 ///
@@ -286,7 +291,8 @@ pub fn launch_ahk_in_job(config_dir: &Path) -> Result<AhkProcess, String> {
 
     let process = match resolve_ahk_interpreter() {
         Some(exe) => {
-            let child = job.spawn(&exe, &[script.as_os_str()], false)?;
+            let opts = crate::job::SpawnOptions::default();
+            let child = job.spawn(&exe, &[script.as_os_str()], &opts)?;
             let pid = child.pid();
             log::info!(
                 "launched flow.ahk with {} (pid {pid}) inside a kill-on-close job",

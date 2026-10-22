@@ -277,12 +277,17 @@ created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
    root `AutoHotkey64.exe` / `AutoHotkey.exe` launcher), then `PATH`.
 2. It is started with `CreateProcessW(CREATE_SUSPENDED)`, assigned to the
    job with `AssignProcessToJobObject`, then resumed — so it is a job member
-   from its first instruction, and every child it spawns inherits the job.
+   from its first instruction. The job also sets
+   `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`: the processes the **script**
+   starts — the Mod+T terminals, everything the launcher runs — are not
+   job members and survive `flow stop` and a daemon crash. (Without it they
+   inherited the job and died with the daemon: a `cmd.exe` opened through
+   the launcher was gone after `flow stop`.)
 3. Only if no interpreter is found does the launch fall back to the `.ahk`
    shell association (`ShellExecuteExW`), with the returned process assigned
    to the job after the fact; a warning says the tie-in may not be in
-   effect (a launcher that re-executes the real interpreter and exits may
-   leave the child outside the job).
+   effect (a launcher that re-executes the real interpreter and exits
+   leaves the child outside the job, since breakaway is allowed).
 
 The job handle lives in `FlowWM` and is never closed explicitly: process
 teardown closes it — clean stop, panic, `abort`, `taskkill /f` — and the
