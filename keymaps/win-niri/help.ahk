@@ -11,6 +11,7 @@
 Bindings := [
     ["Mod+Left/Down/Up/Right",      "focus the next window on this screen"],
     ["Mod+Shift+Arrows",            "move window along the strip (up/down inside a stacked column)"],
+    ["Alt+H/J/K/L, Alt+Shift+...",  "the same two, vim-style"],
     ["Mod+Ctrl+Arrows",             "focus the other screen"],
     ["Mod+Alt+Arrows",              "move window to the other screen"],
     ["Mod+1..9, Mod+0",             "switch to workspace 1..10"],

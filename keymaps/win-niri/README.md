@@ -106,6 +106,11 @@ is used here.
 Not bound here, so still Windows: Win+Tab, Win+E, Win+Shift+S,
 Win+A/I/X/S/N/W/P, Win+Comma (peek), Win+Period (emoji), Win+Ctrl+Space.
 
+Alt+H/J/K/L and Alt+Shift+H/J/K/L duplicate Mod+Arrows and Mod+Shift+Arrows
+(upstream's vim-style defaults). While tiling is on they shadow any app menu
+accelerator on those letters (Alt+H opens Help in some apps); tiling off
+releases them like every other window-management chord.
+
 Shadowed while the daemon runs: Win+1..9/0 (taskbar launch), Win+C, Win+Q,
 Win+V (clipboard history), Win+R (Run: use the right Win key or the
 launcher), Win+F (Feedback Hub), Win+D (show desktop), Win+T (taskbar

@@ -12,6 +12,7 @@
 ;
 ;   Mod+Left/Down/Up/Right        focus the next window on this screen
 ;   Mod+Shift+Arrows              move the window along the strip (up/down inside a stacked column)
+;   Alt+H/J/K/L, Alt+Shift+H/J/K/L  the same two, vim-style (upstream's default chords)
 ;   Mod+Ctrl+Arrows               focus the other screen
 ;   Mod+Alt+Arrows                move the window to the other screen (it takes that screen's width)
 ;   Mod+1..9, Mod+0               switch workspace 1..10
@@ -298,6 +299,16 @@ HotIf((*) => DaemonUp && TilingOn)   ; criterion for the Hotkey() registrations 
 #+Down::D("move-window down")
 #+Up::D("move-window up")
 #+Right::D("move-window right")
+; Vim-style duplicates of the two rows above, as in upstream's bundled keymap.
+; Alt+<letter> can collide with an app's menu accelerator (Alt+H = Help in some apps) while tiling is on.
+!h::D("focus left")
+!j::D("focus down")
+!k::D("focus up")
+!l::D("focus right")
+!+h::D("move-window left")
+!+j::D("move-window down")
+!+k::D("move-window up")
+!+l::D("move-window right")
 
 ; --- Screens (Mod+Ctrl focus, Mod+Alt move) ---------------------------------
 #^Left::D("focus-monitor left")
