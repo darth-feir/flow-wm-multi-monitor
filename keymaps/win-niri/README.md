@@ -150,6 +150,60 @@ Win+Shift+/, Win+Ctrl+T, Win+Ctrl+Shift+T and Win+Shift+E remain shadowed.
   process with `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE` (enough to
   read the exit code) and polls `WaitForSingleObject` with a zero timeout.
 
+## Mod + left-button drag
+
+Hold Mod and press the left button anywhere inside a window, then move: a
+tiled window drops into the zone under the cursor when the button is
+released (the other tiles reflow while you drag, as with a title-bar drag),
+a floating window just moves. The Win key may be released before the button;
+the drag goes on until the button is up.
+
+How it works (`ModDrag()` in `flow.ahk`):
+
+1. **The window under the cursor** is the first entry of `WinGetList()`
+   (top-down z-order) whose rect contains the point, skipping the daemon's
+   `FlowBorderOverlay` windows (they sit above every managed window, so
+   `MouseGetPos` / `WindowFromPoint` would return one of them), click-through
+   windows (`WS_EX_TRANSPARENT`, e.g. the OSD), DWM-cloaked windows (other
+   virtual desktops), the desktop (`Progman`, `WorkerW`) and the taskbar. A
+   maximized window is not dragged.
+2. The window is activated and **`flow dispatch drag begin`** is run
+   synchronously (`RunWait`, hidden). The daemon puts the focused window into
+   the state a title-bar grab would give it; a non-zero exit (a drag already
+   in progress, nothing draggable focused, tiling off, daemon gone) means no
+   move loop — the click is simply swallowed.
+3. **The script moves the window itself:** `while GetKeyState("LButton",
+   "P")` it `WinMove`s the window by the cursor delta every ~10 ms. Windows'
+   own move loop cannot be used — see the lesson below.
+4. **`flow dispatch drag end`** commits the drop (or snaps the tile back) and
+   records a float's final position.
+
+Lessons:
+
+- **A hook hotkey cannot hand the gesture to Windows.** `#LButton` swallows
+  the button-down, and every way of starting the native title-bar move loop
+  afterwards ends it before any movement: `WM_NCLBUTTONDOWN` / `HTCAPTION`,
+  `WM_SYSCOMMAND` `SC_MOVE` (`0xF010` and `0xF012`), re-injecting a
+  button-down once the window holds capture, a decoy window taking the
+  injected click. Windows checks the physical button state as the loop
+  starts and sees it up. A manual `WinMove` loop is the only thing that
+  moves the window, hence `drag begin` / `drag end` in the daemon.
+- **Start menu.** AutoHotkey's automatic Win-key masking covers keyboard
+  chords; for a mouse hotkey the script sends its own masking key
+  (`Send "{Blind}{vkE8}"`, an unassigned virtual key) as the very first thing,
+  so Windows has seen "another key" between Win-down and Win-up and does not
+  open Start on release — whether the Win key goes up before or after the
+  button.
+- **Screen coordinates.** AutoHotkey v2 defaults mouse coordinates to the
+  active window's client area, so `ModDrag()` sets `CoordMode("Mouse",
+  "Screen")` before `MouseGetPos`: `WindowAt()` and `WinMove` reason in the
+  same screen space as `WinGetPos`. Without it the grab point is read
+  relative to the focused window and lands in the wrong window (it
+  happened to work only when the active window sat near the screen origin).
+- **Elevated windows** (UIPI) cannot be moved by this script unless it runs
+  elevated too; the daemon still answers `drag begin`, the window stays put
+  and `drag end` snaps the tile back.
+
 ## Launcher
 
 Needs nothing from the daemon — it only uses `ShowCentered()` and

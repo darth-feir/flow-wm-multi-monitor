@@ -13,6 +13,7 @@
 ;   Mod+Left/Down/Up/Right        focus the next window on this screen
 ;   Mod+Shift+Arrows              move the window along the strip (up/down inside a stacked column)
 ;   Alt+H/J/K/L, Alt+Shift+H/J/K/L  the same two, vim-style (upstream's default chords)
+;   Mod + left-button drag        move a window grabbed anywhere (a tile drops into the zone under the cursor, a float moves)
 ;   Mod+Ctrl+Arrows               focus the other screen
 ;   Mod+Alt+Arrows                move the window to the other screen (it takes that screen's width)
 ;   Mod+1..9, Mod+0               switch workspace 1..10
@@ -309,6 +310,72 @@ HotIf((*) => DaemonUp && TilingOn)   ; criterion for the Hotkey() registrations 
 !+j::D("move-window down")
 !+k::D("move-window up")
 !+l::D("move-window right")
+
+; --- Mod + left-button drag: move a window grabbed anywhere ----------------
+; The script moves the window itself while the button is held (Windows' own
+; move loop cannot be started from a hook hotkey, see README.md) and brackets
+; the gesture with `flow dispatch drag begin` / `drag end`, so the daemon
+; previews and commits a tile's drop zone and records a float's final rect.
+#LButton::ModDrag()
+ModDrag() {
+    global flowExe
+    ; Screen coordinates throughout: WindowAt() and WinMove compare against
+    ; WinGetPos (screen) rects, and AutoHotkey v2 defaults mouse coords to the
+    ; active window's client area, which would resolve the grab point inside
+    ; the wrong window.
+    CoordMode("Mouse", "Screen")
+    ; A key between Win-down and Win-up: Windows must not open Start when the
+    ; Win key is released, whenever that happens (before or after the button).
+    Send "{Blind}{vkE8}"
+    MouseGetPos(&mx0, &my0)
+    hwnd := WindowAt(mx0, my0)
+    if !hwnd
+        return
+    AhkLog("mod-drag " hwnd)
+    try WinActivate("ahk_id " hwnd)
+    WinWaitActive("ahk_id " hwnd, , 0.3)
+    code := RunWait('"' flowExe '" dispatch drag begin', , "Hide")
+    if (code != 0) {
+        AhkLog("mod-drag " hwnd " refused: drag begin exit " code)
+        CheckDaemon()
+        return
+    }
+    try {
+        WinGetPos(&wx, &wy, , , "ahk_id " hwnd)
+        while GetKeyState("LButton", "P") {          ; until the button is released, Win key or not
+            MouseGetPos(&mx, &my)
+            WinMove(wx + mx - mx0, wy + my - my0, , , "ahk_id " hwnd)
+            Sleep 10
+        }
+    } catch as e
+        AhkLog("mod-drag " hwnd " stopped: " e.Message)  ; the window went away mid-drag
+    code := RunWait('"' flowExe '" dispatch drag end', , "Hide")
+    AhkLog("mod-drag " hwnd " end exit " code)
+}
+
+; The top-level window under the point, skipping the daemon's border overlays
+; (they sit above every managed window), click-through and cloaked windows,
+; the desktop and the taskbar. A maximized window is not draggable: 0.
+WindowAt(x, y) {
+    static skip := Map("FlowBorderOverlay", 1, "Progman", 1, "WorkerW", 1, "Shell_TrayWnd", 1, "Shell_SecondaryTrayWnd", 1)
+    for w in WinGetList() {
+        try {
+            if skip.Has(WinGetClass("ahk_id " w))
+                continue
+            if (WinGetExStyle("ahk_id " w) & 0x20)      ; WS_EX_TRANSPARENT: click-through (the OSD)
+                continue
+            cloaked := 0
+            DllCall("dwmapi\DwmGetWindowAttribute", "Ptr", w, "UInt", 14, "UInt*", &cloaked, "UInt", 4)
+            if cloaked                                   ; another virtual desktop, a suspended UWP app
+                continue
+            WinGetPos(&wx, &wy, &ww, &wh, "ahk_id " w)
+            if (x < wx || x >= wx + ww || y < wy || y >= wy + wh)
+                continue
+            return WinGetMinMax("ahk_id " w) = 1 ? 0 : w  ; the first hit decides
+        }
+    }
+    return 0
+}
 
 ; --- Screens (Mod+Ctrl focus, Mod+Alt move) ---------------------------------
 #^Left::D("focus-monitor left")
