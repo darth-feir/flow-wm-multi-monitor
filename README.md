@@ -12,6 +12,39 @@ Windows live as **columns on a canvas** that stretches wider than your monitor. 
 >
 > **Docs:** The full [User Guide](https://ccpcalvin.github.io/flow-wm/user-guide/index.html) and [Developer Guide](https://ccpcalvin.github.io/flow-wm/dev-guide/index.html) are also published as a searchable mdBook at <https://ccpcalvin.github.io/flow-wm/>.
 
+## About this fork
+
+This is a fork of [CCpcalvin/flow-wm](https://github.com/CCpcalvin/flow-wm) (MIT, see [License](#license)). Upstream is built around one ultrawide monitor; this branch (`feat/multi-monitor`) makes FlowWM work on a two-monitor desktop and adds a niri-style Windows-key keymap. Everything below the fork section is upstream's README and still applies.
+
+What the fork adds, each with a page in the Developer Guide (`docs/src/dev-guide/`):
+
+| Area | What changed |
+|---|---|
+| **Multiple monitors** | Every monitor has its own scrolling strip and workspaces. `focus-monitor` / `move-to-monitor` cross screens; parked columns never land on the neighbour monitor. Each screen's work area is measured separately, so a vertical taskbar on one screen is respected. Monitor hot-plug and the lock screen are handled. |
+| **Column widths** | `[columns] presets = ["1/3", "1/2", "1/1"]`: `width cycle` switches every column on the focused screen; a window moved to another screen takes that screen's width. |
+| **Stacked columns** | `[columns] visible_rows` / `max_rows`: a column shows two rows at a time and scrolls through up to four; merging into a full column moves the window past it. `consume-or-expel` merges into, or pops out of, the neighbouring column. |
+| **Fullscreen** | `set-window fullscreen` toggles a real fullscreen (over the taskbar) and puts the window back where it was. |
+| **Floating layer** | `[floating] always_on_top`: floating windows and rule-ignored dialogs stay above the tiled strip, niri style, so nothing hides behind the tiles. |
+| **Windows that were already open** | Maximized windows are adopted (`adopt_maximized`), minimized windows are registered from their restore position, Store apps (created cloaked) are picked up when uncloaked, and `set-window` registers an unknown window before acting on it. No more reopening apps so the tiler sees them. |
+| **Update checker** | `flow update` only reports whether the remote branch or release is newer than the commit the binaries were built from (`flow --version` shows it). The self-installer is gone. |
+| **Hardening** | Apps launched from the keymap survive the daemon stopping; the IPC pipe has a real ACL, rejects remote clients and caps message size; loadout paths are validated; window titles are logged only at debug level and logs are pruned (`[logging] keep_days`); dependencies audited clean. |
+| **Keymap** | `keymaps/win-niri/`: the Windows key as Mod with arrow keys, matching niri's defaults, plus a fuzzy launcher (`Mod+Space`), a key-binding overlay (`Mod+Shift+/`), terminal chords, a tiling pause (`Mod+Ctrl+Shift+T`) and an on/off switch (`Mod+Ctrl+T`, via a small resident starter). |
+
+### Using the fork
+
+Build from this checkout (same toolchain as upstream, below), then:
+
+```powershell
+cargo build --release
+flow config init                 # writes %USERPROFILE%\.config\flow\flow.toml
+```
+
+Copy `flow.exe` and `flowd.exe` somewhere permanent (for example `%LOCALAPPDATA%\Programs\flow`), copy every `.ahk` file from `keymaps\win-niri\` into `%USERPROFILE%\.config\flow\`, and merge `keymaps\win-niri\flow.toml.example` into your `flow.toml`: it carries the presets, the stack rows, the width floor for 1920-px screens, `adopt_maximized`, `always_on_top` and `edge_hop = false`. Then `flow start --ahk`, or put a shortcut to `flow-resident.ahk` in your Startup folder and press `Mod+Ctrl+T`. The keymap's header lists every chord; `Mod+Shift+/` shows them on screen.
+
+The keymap uses the Windows key directly, so the few chords Windows reserves below the hook layer stay with Windows: `Win+L` always locks. Upstream's firmware-remap advice under [Can I use the Win key?](#can-i-use-the-win-key) still applies if you want those too.
+
+Every stage of the fork was developed and tested in a Hyper-V guest with two virtual 1920×1080 displays before touching a real desktop; the daemon never needs to run on a developer's own machine to be verified.
+
 ## How it compares
 
 FlowWM exists because the existing Windows tiling managers didn't scroll the way I wanted.
@@ -89,6 +122,8 @@ The daemon launches in the background, and once it's listening your `flow.ahk` f
 | `1`…`9`, `0` | Switch to **workspace** 1…10 (`Shift` sends the focused window there) |
 | `q` | **Close** the focused window |
 | `p` | **Stop** the daemon (and exit the script) |
+
+(That is upstream's bundled `flow.ahk`. The fork's `keymaps\win-niri\flow.ahk` uses the Windows key and the arrow keys instead; see [About this fork](#about-this-fork).)
 
 That's the whole game. FlowWM uses `Alt` by default; if it collides with an app's menu shortcuts, see [Can I use the Win key?](#can-i-use-the-win-key) below. For the complete, annotated list, see the [Command Reference](https://ccpcalvin.github.io/flow-wm/user-guide/dispatch-reference.html).
 
