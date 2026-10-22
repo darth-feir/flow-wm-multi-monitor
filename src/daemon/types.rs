@@ -250,6 +250,26 @@ pub struct FlowWM {
     /// `daemon::top_layer`.
     pub(super) last_top_layer_reassert: std::time::Instant,
 
+    /// The floating layer's current decision: `true` while flow owns the
+    /// foreground (members are kept topmost), `false` after the foreground
+    /// moved to a fullscreen or non-flow window (members dropped under it).
+    /// Decided by [`decide_top_layer_with`](super::FlowWM::decide_top_layer_with)
+    /// from the single focus sink, the foreground window's own resize and
+    /// the periodic re-assert pass; see `daemon::top_layer` and
+    /// `docs/src/dev-guide/floating-space.md`, *The floating layer*.
+    pub(super) top_layer_raised: bool,
+
+    /// The last foreground handle the focus sink saw (tracked or not, shell
+    /// or app), so the layer can re-decide against it from paths that have
+    /// no foreground event of their own (`tiling on`, a reload turning the
+    /// option on). `None` until the first foreground event.
+    pub(super) foreground: Option<isize>,
+
+    /// The non-shell foreground that produced the last `dropped` decision:
+    /// the window the members are seated *under* when they leave. `None`
+    /// while raised.
+    pub(super) top_layer_below: Option<isize>,
+
     /// When the pending display-topology change settles and
     /// [`reconcile_monitors`](super::FlowWM::reconcile_monitors) runs.
     ///

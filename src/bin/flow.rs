@@ -766,14 +766,19 @@ fn cmd_ping() -> Result<(), String> {
             hooks_registered,
             ahk_pid,
             tiling_enabled,
+            floating_layer,
         } => {
             let ahk = match ahk_pid {
                 Some(p) => format!(", flow.ahk pid {p}"),
                 None => String::new(),
             };
             let tiling = startup::TilingStatus::from_enabled(tiling_enabled);
+            let layer = match floating_layer {
+                Some(state) => format!(", floating layer {state}"),
+                None => String::new(),
+            };
             println!(
-                "flow: pong from flowd {version} (pid {pid}, {monitors} monitor(s), {hooks_registered} hook(s) registered{ahk}, tiling {tiling})"
+                "flow: pong from flowd {version} (pid {pid}, {monitors} monitor(s), {hooks_registered} hook(s) registered{ahk}, tiling {tiling}{layer})"
             );
             Ok(())
         }

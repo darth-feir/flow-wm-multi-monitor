@@ -494,24 +494,102 @@ the only z-order band above ordinary windows on Windows is the **topmost
 band** (`WS_EX_TOPMOST`), so the layer's members are kept there with
 `SetWindowPos(HWND_TOPMOST, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)`. An
 activated tile goes to the top of the *non*-topmost band, so the floats stay
-above it.
+above it — **while flow owns the foreground**. The moment the foreground
+moves to a fullscreen app or a window flow does not manage, the members are
+dropped under it; this is the upstream stacking invariant, ADR-0003
+(`docs/adr/0003-float-tile-stacking-invariant.md`), which rejects
+"floats always topmost" because it covers fullscreen video and borderless
+games.
 
 **Membership** (`in_top_layer`, pure): a tracked `Floating(Active)` window
 or a tracked `Ignored(ExplicitRule)` window (a dialog or popup the user's
 rules keep out of the strip but still want to see). `layer_wanted` adds the
-daemon conditions: the option on, tiling on, and not a window the daemon put
-fullscreen — the fullscreen code owns that flag, so a float that goes
-fullscreen leaves the layer first and re-enters through `register_float`
-when it comes back; a float and a fullscreen window are both topmost and
-stack by whichever was activated last. Minimized / hidden floats are out
-until restored / shown; `Ignored(Maximized|Fullscreen)` windows and
-untracked windows are never touched.
+daemon conditions: the option on, tiling on, the layer **raised** (below),
+and not a window the daemon put fullscreen — the fullscreen code owns that
+flag, so a float that goes fullscreen leaves the layer first and re-enters
+through `register_float` when it comes back; a float and a fullscreen window
+are both topmost and stack by whichever was activated last. Minimized /
+hidden floats are out until restored / shown; `Ignored(Maximized|Fullscreen)`
+windows and untracked windows are never touched.
+
+**The decision** (`classify_foreground`, pure; `FlowWM::decide_top_layer_with`
+over the daemon's view) looks at one window, the foreground, and yields one
+of three owners:
+
+| Foreground | Owner | Layer |
+|------------|-------|-------|
+| A registry window whose state is `Tiling(Active)`, `Floating(Active)` or `Ignored(ExplicitRule)` — a tile or a layer member — **and** not fullscreen by the live check | `Flow` | raised: members `HWND_TOPMOST` |
+| Fullscreen by live geometry + style (tracked or not); an untracked window; a registry window in any other `Ignored` state (`Maximized`, `Fullscreen`, …) or a minimized / hidden state | `Foreign` | dropped: members seated directly under that window |
+| A shell surface (class in `SHELL_CLASSES`), no foreground, or a handle already gone | `Shell` | kept: the last decision stands |
+
+*Fullscreen is read live, not from the stored state.* F11 in a browser, VS
+Code or a terminal resizes the window — `EVENT_OBJECT_LOCATIONCHANGE`, not a
+`STATECHANGE` — so `Ignored(Fullscreen)` never fires for it. The check is
+`win32::is_fullscreen_on_its_monitor`: the window rect equals the full rect
+(`rcMonitor`) of the monitor it is on, and the style has neither `WS_CAPTION`
+nor `WS_THICKFRAME`. A maximized window keeps its chrome and so does not
+count (an auto-hide taskbar causes no false positive); a borderless game, a
+video player or an F11 browser does. The daemon's own `set-window
+fullscreen` (Mod+F) moves the window without touching its styles, so it stays
+`Flow` and keeps today's handling — the fullscreen code owns that window's
+flag, both stay topmost and stack by activation; only an app that was
+borderless to begin with reads as fullscreen and drops the layer.
+
+*Where it is decided.* Three places, all ending in
+`FlowWM::evaluate_top_layer` (decide, then apply to every window when the
+decision flipped): the single focus sink `on_focus_changed` (every
+foreground change, external or self-induced); the foreground window's own
+`LOCATIONCHANGE` and `STATECHANGE` (the hook callback forwards
+`LOCATIONCHANGE` for `hooks::foreground_hwnd()`, the handle the sink
+recorded, on top of the floats and the dragged tile; the main loop re-decides
+only when the moved window *is* the foreground, which costs one registry
+lookup plus the live check — cheap enough per pixel, no debounce); and the
+periodic `reassert_top_layer` pass (once per `[focus]
+foreground_sync_interval_ms`), which reads `GetForegroundWindow` itself so a
+dropped foreground event or a silent fullscreen switch is corrected both
+ways, then re-raises any member Windows demoted. `sync_all_top_layer`
+(`tiling on`, reload, loadout, display change, startup) re-decides against
+the last foreground the sink saw first, so `tiling on` under a fullscreen app
+stays dropped and `tiling on` after the user went back to a tile raises.
+
+*The drop seats members under the foreground.* `HWND_NOTOPMOST` alone would
+leave a float at the top of the ordinary band — above the fullscreen app that
+dropped it — so a leave caused by a drop uses `SetWindowPos(float,
+hwndInsertAfter = foreground)` (`win32::insert_below`), which clears the
+topmost flag and places the float directly beneath that window in one call;
+the tiles stay under the float. A member that was topmost on its own
+(`was_topmost`) is not touched by a drop at all. Raising again is a plain
+enter (`HWND_TOPMOST`), so `was_topmost` memory survives a drop / raise
+cycle.
+
+*The shell exception — a deliberate deviation from ADR-0003's "any non-flow
+window".* Clicking the taskbar, opening Start or search, Alt+Tab's host and
+the daemon's own surfaces (`FlowBorderOverlay`, `FlowSessionSink`) all take
+the foreground for a moment and give it straight back to a flow window;
+dropping and re-raising on each would flash every float on every taskbar
+click. These classes (`SHELL_CLASSES` in `top_layer.rs`: `Shell_TrayWnd`,
+`Shell_SecondaryTrayWnd`, `Progman`, `WorkerW`, `Windows.UI.Core.CoreWindow`,
+`XamlExplorerHostIslandWindow`, `ForegroundStaging`, and the two above) leave
+the decision as it was, as does a null foreground. The keymap's OSD is shown
+`NoActivate` and never takes the foreground, so it needs no entry; any other
+AutoHotkey window is an ordinary app. A dialog owned by a
+tile (a Save-As box) is *not* on the list: it is a non-flow window and drops
+the layer, but it sits above its owner tile and the float lands right under
+the dialog, so nothing visible changes until its owner is activated again
+and raises.
+
+`flow ping` prints the state (`floating layer raised|dropped`) while the
+option and tiling are on; `flow query all` keeps reporting `on_top`, which is
+`false` for every member while dropped (the daemon does not hold them).
 
 **Bookkeeping** lives on the `Window` record: `on_top` (the daemon holds the
 window in the layer; `on_top` in `flow query all`) and `was_topmost` (the
 flag the window had before it entered — a window that was topmost on its
 own is left topmost when it leaves; one the daemon raised is lowered with
-`HWND_NOTOPMOST`; the daemon never clears a flag it did not set).
+`HWND_NOTOPMOST`, or seated under the foreground on a drop; the daemon never
+clears a flag it did not set) — and on `FlowWM`: `top_layer_raised` (the
+decision), `foreground` (the handle the sink last saw) and `top_layer_below`
+(the window a drop seats members under).
 
 **Transitions** all end in `FlowWM::sync_top_layer(hwnd)`, which compares
 `layer_wanted` with `on_top` and applies the one step `layer_step` decides —
@@ -520,23 +598,29 @@ ex-style only for a window that is wanted or held:
 
 | Transition | Where | Step |
 |------------|-------|------|
-| Window becomes a float (toggle, rule at creation, startup adoption, adopt from ignored, restore of a float registered minimized, back from fullscreen, moved to another monitor) | `register_float` | enter |
+| Window becomes a float (toggle, rule at creation, startup adoption, adopt from ignored, restore of a float registered minimized, back from fullscreen, moved to another monitor) | `register_float` | enter (while raised; a float toggled while dropped enters at the next raise) |
 | Window registered / recovered as `Ignored(ExplicitRule)` | `on_window_created`, `on_window_state_change`, the startup `sync_all_top_layer` | enter |
 | Float restored or shown | `on_window_restored`, `on_window_shown` (after the fullscreen re-assert) | enter |
-| `tiling on`, config reload turning the option on, loadout load, display change | `sync_all_top_layer` | enter |
+| `tiling on`, config reload turning the option on, loadout load, display change | `sync_all_top_layer` (re-decides against the last foreground first) | enter |
+| Foreground moves to a tile / float / explicit-rule ignore that is not fullscreen, or that window's chrome comes back (F11 off) | `on_focus_changed`, the foreground's `LOCATIONCHANGE` / `STATECHANGE`, `reassert_top_layer` → `evaluate_top_layer` | **raise**: enter for every member |
+| Foreground moves to a fullscreen / untracked / OS-ignored window, or the foreground tile goes fullscreen (F11) | the same three paths | **drop**: leave for every member, seated under the foreground |
 | `set-window tile` / `cycle`, adopt an ignored window as a tile | `set_window_to_tile`, `adopt_ignored_as_tile` | leave |
 | Float minimized or hidden | `on_window_minimized`, `on_window_hidden` | leave |
 | Float goes fullscreen | `set_window_to_fullscreen` (before the fullscreen code raises it) | leave |
 | `tiling off`, config reload turning the option off | `sync_all_top_layer` | leave |
 | `flow stop`, fail-back, session end | `release_top_layer` in the shutdown rescue pass | leave, whatever the option says |
 | Destroyed | — | nothing (the record goes) |
-| A member Windows demoted (an app clearing the flag on activation) | `on_focus_changed` for the activated window; `reassert_top_layer` from the main loop once per `[focus] foreground_sync_interval_ms`, over the held windows only | re-assert |
+| A member Windows demoted (an app clearing the flag on activation) | `on_focus_changed` for the activated window (when the decision stands); `reassert_top_layer` from the main loop once per `[focus] foreground_sync_interval_ms`, over the held windows only | re-assert |
 
-The Win32 side (`is_topmost` / `set_topmost`) is behind `TopmostProbe`; the
-tiling on/off probe extends it, so the pause (`released_on_top`) and the
-resume (`raised_on_top`) are covered by the mock desktop. The startup-failure
-rescue (`rescue_stranded_windows_with`, before a `FlowWM` exists) needs no
-release: the layer is first applied after the initial layout, in `FlowWM::new`.
+The Win32 side (`is_topmost` / `set_topmost` / `insert_below` /
+`is_fullscreen_live` / `class_name`) is behind `TopmostProbe`; the tiling
+on/off probe extends it, so the pause (`released_on_top`) and the resume
+(`raised_on_top`) are covered by the mock desktop, and `top_layer.rs`'s own
+mock scripts the foreground (an untracked game window, a taskbar, a tile
+resized to fullscreen) for the decision. The startup-failure rescue
+(`rescue_stranded_windows_with`, before a `FlowWM` exists) needs no release:
+the layer is first applied after the initial layout, in `FlowWM::new`, after
+the first decision against the desktop's real foreground.
 
 ## Future Work
 

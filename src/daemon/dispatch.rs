@@ -126,6 +126,7 @@ impl FlowWM {
                 hooks_registered: self.hook_handle.registered_hooks(),
                 ahk_pid: self.ahk_pid(),
                 tiling_enabled: !self.tiling_paused,
+                floating_layer: self.top_layer_status().map(str::to_owned),
             },
 
             // --- Tiling on/off ---

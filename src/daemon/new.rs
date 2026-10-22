@@ -452,6 +452,9 @@ impl FlowWM {
             manual_drag: None,
             last_foreground_sync: std::time::Instant::now(),
             last_top_layer_reassert: std::time::Instant::now(),
+            top_layer_raised: true,
+            foreground: None,
+            top_layer_below: None,
             topology_deadline: None,
             topology_first_report: None,
             topology_retries: 0,
@@ -473,7 +476,12 @@ impl FlowWM {
         manager.populate_existing_floats();
         // The floating layer (`[floating] always_on_top`): the floats just
         // adopted entered it in `register_float`; this picks up the windows
-        // the scan registered as ignored by an explicit rule.
+        // the scan registered as ignored by an explicit rule — after the
+        // first decision against the desktop's real foreground (a daemon
+        // started under a fullscreen app begins dropped).
+        if let Some(fg) = registry_win32::get_foreground_window() {
+            manager.note_foreground(fg);
+        }
         manager.sync_all_top_layer();
         // Initial border overlay attach for windows found during the scan.
         // Idempotent and O(N) where N = tracked windows. Runs after
@@ -571,6 +579,9 @@ impl FlowWM {
             manual_drag: None,
             last_foreground_sync: std::time::Instant::now(),
             last_top_layer_reassert: std::time::Instant::now(),
+            top_layer_raised: true,
+            foreground: None,
+            top_layer_below: None,
             topology_deadline: None,
             topology_first_report: None,
             topology_retries: 0,

@@ -501,6 +501,12 @@ pub enum SocketResponse {
         /// omits the field.
         #[serde(default = "default_tiling_enabled")]
         tiling_enabled: bool,
+        /// The floating layer's state (`[floating] always_on_top`):
+        /// `"raised"` while flow owns the foreground, `"dropped"` while a
+        /// fullscreen or non-flow window has it; `None` when the option is
+        /// off, tiling is off, or the daemon predates the field.
+        #[serde(default)]
+        floating_layer: Option<String>,
     },
 }
 
@@ -793,12 +799,14 @@ mod tests {
             hooks_registered: 8,
             ahk_pid: Some(4321),
             tiling_enabled: false,
+            floating_layer: Some("dropped".to_owned()),
         };
         let wire = encode_message(&resp).unwrap();
         assert!(wire.contains("\"status\":\"pong\""), "{wire}");
         assert!(wire.contains("\"hooks_registered\":8"), "{wire}");
         assert!(wire.contains("\"ahk_pid\":4321"), "{wire}");
         assert!(wire.contains("\"tiling_enabled\":false"), "{wire}");
+        assert!(wire.contains("\"floating_layer\":\"dropped\""), "{wire}");
         let parsed: SocketResponse = decode_message(&wire).unwrap();
         assert_eq!(parsed, resp);
         // A response never parses as a message.
@@ -818,6 +826,7 @@ mod tests {
             SocketResponse::Pong {
                 tiling_enabled: true,
                 ahk_pid: None,
+                floating_layer: None,
                 ..
             }
         ));

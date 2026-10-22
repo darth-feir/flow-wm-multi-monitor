@@ -714,6 +714,10 @@ impl FlowWM {
     /// natural no-op: the focused column is already visible, so
     /// `ensure_focused_visible` returns `None`.
     pub(super) fn on_focus_changed(&mut self, hwnd: isize) {
+        // The floating layer re-decides against this window below and the
+        // hook callback forwards its resizes from now on.
+        self.note_foreground(hwnd);
+
         // An untracked window taking the foreground is registered first so
         // the bookkeeping below finds it; one that fails a creation gate
         // (taskbar, menu, dialog) falls through and the rest no-ops.
@@ -745,10 +749,15 @@ impl FlowWM {
 
         self.registry.set_focused(hwnd);
 
-        // An activated float that an app demoted from the topmost band is
-        // raised again right away (one ex-style read for a member; nothing
-        // for a tile). The periodic pass is the backstop for the rest.
-        self.sync_top_layer(hwnd);
+        // The floating layer (ADR-0003): members are topmost only while flow
+        // owns the foreground — raised or dropped here, in the single sink,
+        // from the live state of this window (`daemon::top_layer`). When the
+        // decision stands, an activated member that an app demoted from the
+        // topmost band is raised again right away (one ex-style read for a
+        // member; nothing for a tile); the periodic pass backstops the rest.
+        if self.evaluate_top_layer(Some(hwnd)).is_none() {
+            self.sync_top_layer(hwnd);
+        }
 
         let target = WindowId(hwnd);
 
@@ -881,8 +890,12 @@ impl FlowWM {
             self.readd_tile_to_home_monitor(hwnd);
         }
         // A window recovered as a float or as an explicit-rule ignore
-        // enters the floating layer.
+        // enters the floating layer; the foreground window changing state
+        // (maximized, fullscreen, back) re-decides the layer.
         self.sync_top_layer(hwnd);
+        if self.foreground == Some(hwnd) {
+            self.evaluate_top_layer(Some(hwnd));
+        }
         // Border overlay: covers all transitions — Ignored→Tiling (attach),
         // Tiling→Ignored (detach), and no-op cases.
         self.refresh_border_for(hwnd);

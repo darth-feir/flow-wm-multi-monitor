@@ -573,6 +573,25 @@ pub fn clear_dragged_hwnd() {
     DRAGGED_HWND.store(0, Ordering::Release);
 }
 
+/// HWND of the last window the daemon saw take the foreground, or 0.
+///
+/// Written by the daemon's focus sink; the hook callback forwards
+/// `EVENT_OBJECT_LOCATIONCHANGE` for this one window (tile or not) so the
+/// floating layer can re-check whether the foreground just went fullscreen
+/// — F11 in a browser is a resize, not a state change (`daemon::top_layer`).
+static FOREGROUND_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// The foreground HWND the daemon last recorded, or 0.
+#[must_use]
+pub fn foreground_hwnd() -> isize {
+    FOREGROUND_HWND.load(Ordering::Acquire)
+}
+
+/// Record the foreground HWND. Called by the daemon on every foreground change.
+pub fn set_foreground_hwnd(hwnd: isize) {
+    FOREGROUND_HWND.store(hwnd, Ordering::Release);
+}
+
 // ── HookThreadHandle ─────────────────────────────────────────────────
 
 /// Handle to the background hook thread.
@@ -1272,11 +1291,14 @@ fn hook_callback_body(event: u32, hwnd: HWND, id_object: i32) {
     // LOCATIONCHANGE is the ultra-noisy event: filter it hard. Only forward
     // when the window is a tracked active-workspace float AND tracking is
     // currently enabled (disabled while flow animates floats), OR when the
-    // window is the currently-dragged tiled window (DRAGGED_HWND). All other
-    // event types are forwarded unconditionally as before.
+    // window is the currently-dragged tiled window (DRAGGED_HWND), OR when
+    // it is the foreground window (FOREGROUND_HWND: the floating layer
+    // re-checks a foreground that resizes to fullscreen). All other event
+    // types are forwarded unconditionally as before.
     if event == EVENT_OBJECT_LOCATIONCHANGE
         && (!FLOAT_TRACKING_ACTIVE.load(Ordering::Acquire) || !is_float_hwnd(hwnd_val))
         && DRAGGED_HWND.load(Ordering::Acquire) != hwnd_val
+        && FOREGROUND_HWND.load(Ordering::Acquire) != hwnd_val
     {
         return;
     }

@@ -957,6 +957,88 @@ pub fn set_topmost(hwnd_val: isize, topmost: bool) -> bool {
     }
 }
 
+/// Seat `hwnd_val` directly below `after_val` in the z-order, without
+/// moving, resizing or activating it. Placing a window after a non-topmost
+/// window also takes it out of the topmost band, so the floating layer uses
+/// this to drop a float *under* a fullscreen or foreign foreground in one
+/// call (`HWND_NOTOPMOST` alone would leave it at the top of the ordinary
+/// band, above that foreground). `false` when either handle is gone.
+#[must_use]
+pub fn insert_below(hwnd_val: isize, after_val: isize) -> bool {
+    // SAFETY: SetWindowPos with a possibly-stale HWND fails cleanly.
+    let result = unsafe {
+        SetWindowPos(
+            HWND(hwnd_val as *mut _),
+            Some(HWND(after_val as *mut _)),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    };
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            log::debug!("insert_below failed for hwnd {hwnd_val} (after {after_val}): {e}");
+            false
+        }
+    }
+}
+
+/// The window class of `hwnd_val`, or `None` when the handle is gone (or is
+/// null). Used by the floating layer to recognise the shell surfaces it
+/// ignores when the foreground changes (`daemon::top_layer`).
+#[must_use]
+pub fn class_name(hwnd_val: isize) -> Option<String> {
+    if hwnd_val == 0 {
+        return None;
+    }
+    get_class_name(HWND(hwnd_val as *mut _)).ok()
+}
+
+/// Whether `hwnd_val` is fullscreen **on the desktop right now**: its
+/// window rect equals the full rect (`rcMonitor`) of the monitor it is on
+/// and its style has neither `WS_CAPTION` nor `WS_THICKFRAME`. A maximized
+/// window keeps its chrome, so it does not count; a borderless game, a
+/// video player or a browser after F11 does. The monitor-aware twin of
+/// [`is_fullscreen`] (which is primary-screen only and feeds the
+/// classifier); the floating layer asks this on every foreground change
+/// and foreground resize (`daemon::top_layer`). `false` for a handle that
+/// is gone.
+#[must_use]
+pub fn is_fullscreen_on_its_monitor(hwnd_val: isize) -> bool {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    };
+    let hwnd = HWND(hwnd_val as *mut _);
+    let Ok(rect) = get_window_rect(hwnd) else {
+        return false;
+    };
+    // SAFETY: MonitorFromWindow accepts any HWND value; GetMonitorInfoW
+    // fails cleanly (FALSE) for a null monitor handle.
+    let hmonitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let mut mi = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetMonitorInfoW(hmonitor, &mut mi) }.ok().is_err() {
+        return false;
+    }
+    let m = mi.rcMonitor;
+    let covers = rect.x == m.left
+        && rect.y == m.top
+        && rect.width == m.right - m.left
+        && rect.height == m.bottom - m.top;
+    if !covers {
+        return false;
+    }
+    // SAFETY: GetWindowLongW on a stale handle returns 0 (no chrome bits),
+    // but the rect read above already failed for such a handle.
+    let style = WINDOW_STYLE(unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32);
+    style & (WS_CAPTION | WS_THICKFRAME) == WINDOW_STYLE(0)
+}
+
 /// Directly reposition a single window via `SetWindowPos`, bypassing the animator.
 ///
 /// This is the **silent teleport** primitive used during workspace-switch

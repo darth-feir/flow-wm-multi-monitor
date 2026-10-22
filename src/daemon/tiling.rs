@@ -103,6 +103,18 @@ impl TopmostProbe for Win32Tiling {
     fn set_topmost(&self, hwnd: isize, topmost: bool) -> bool {
         registry_win32::set_topmost(hwnd, topmost)
     }
+
+    fn insert_below(&self, hwnd: isize, after: isize) -> bool {
+        registry_win32::insert_below(hwnd, after)
+    }
+
+    fn is_fullscreen_live(&self, hwnd: isize) -> bool {
+        registry_win32::is_fullscreen_on_its_monitor(hwnd)
+    }
+
+    fn class_name(&self, hwnd: isize) -> Option<String> {
+        registry_win32::class_name(hwnd)
+    }
 }
 
 impl TilingProbe for Win32Tiling {
@@ -986,6 +998,18 @@ mod tests {
                 self.topmost.borrow_mut().remove(&hwnd);
             }
             true
+        }
+        fn insert_below(&self, hwnd: isize, _after: isize) -> bool {
+            self.set_topmost(hwnd, false)
+        }
+        // No window on the mock desktop is fullscreen, and none has a class:
+        // the layer's foreground decision is exercised in `top_layer`'s own
+        // tests; here it keeps its last state.
+        fn is_fullscreen_live(&self, _hwnd: isize) -> bool {
+            false
+        }
+        fn class_name(&self, _hwnd: isize) -> Option<String> {
+            None
         }
     }
 

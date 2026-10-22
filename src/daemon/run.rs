@@ -624,6 +624,8 @@ impl FlowWM {
                     // During a tile drag, LOCATIONCHANGE for the dragged window
                     // goes to the drag-move handler; all other LOCATIONCHANGE
                     // events (floats) go to the float sync path as before.
+                    // The foreground window's own resize (F11) is also the
+                    // floating layer's cue to re-decide (`daemon::top_layer`).
                     let is_dragged = self
                         .drag_state
                         .as_ref()
@@ -633,6 +635,9 @@ impl FlowWM {
                         self.on_drag_move(hwnd);
                     } else {
                         self.on_float_location_changed(hwnd);
+                        if self.foreground == Some(hwnd) {
+                            self.evaluate_top_layer(Some(hwnd));
+                        }
                     }
                 }
                 // A keymap session (`drag begin`) owns its window's drag
