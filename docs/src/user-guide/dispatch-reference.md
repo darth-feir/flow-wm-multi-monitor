@@ -513,6 +513,8 @@ A few other top-level commands are worth knowing:
 | `flow query all` | Dump every tracked window (state, `mode` — `tiled` / `floating` / `fullscreen` / `minimized` / `hidden` / `ignored` —, `on_top` — whether FlowWM currently keeps it above the tiles (`[floating] always_on_top`) —, rect, column/row, …) as JSON, plus the monitors (each with its `width_preset`) and whether tiling is on (`tiling_enabled`). |
 | `flow enable-autostart [--ahk]` | Create the login shortcut in `shell:startup` (idempotent). |
 | `flow disable-autostart` | Remove the login shortcut (idempotent). |
+| `flow update` | Ask GitHub whether something newer than this build exists and print how to update — **it never downloads or installs anything**. Compares the commit the binary was built from with the `[update]` branch (by default the build's own branch of the repository its `origin` pointed at), or the crate version with the latest release when `[update] branch = ""`. Exit code `0` = up to date, `10` = something newer, `2` = api.github.com unreachable, `3` = repository / branch / release not found, `4` = other GitHub error, `5` = no commit embedded in the build. `--check` is accepted and changes nothing. |
+| `flow --version` / `flowd --version` | `flow 0.2.0 (feat/multi-monitor @ cf54b88, 2026-10-22)` — the crate version plus the branch, commit and commit date the binary was built from (`-dirty` after the commit if the tree had uncommitted changes). |
 
 Browse them any time with `flow --help`, and the dispatch surface with
 `flow dispatch help`.

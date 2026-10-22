@@ -94,7 +94,7 @@ in the repo root — `flow config init` copies it verbatim.
 | `column_width` | `Option<u32>` | `None` | Optional fixed pixel width per column. When set, ignores `columns_per_screen`. Useful on ultrawide monitors where you want consistent column sizes regardless of monitor count. Both are ignored when a [`[columns]`](#columns--column-width-presets) section is present. |
 | `min_column_width_px` | `u32` | `640` | Floor for column width in pixels. Columns cannot be resized below this. |
 | `min_window_height_px` | `u32` | `100` | Minimum row height in pixels — the floor for any single window's allocated height inside a column. Bounds the maximum number of rows that can stack inside one column. |
-| `check_for_updates` | `bool` | `false` | Whether `flow start` checks GitHub for a newer release and prints a one-line notification prompting `flow update` when one exists. **Off by default in this fork** — nothing is contacted at start unless you opt in with `true`. When on it runs after the daemon is ready, is bounded by a short timeout, and never blocks startup. The explicit `flow update --check` command is unaffected by this flag. |
+| `check_for_updates` | `bool` | `false` | Whether `flow start` runs the update checker (the same one behind `flow update`, configured by [`[update]`](#update--update-checker)) and prints a one-line notice when something newer exists on GitHub. **Off by default in this fork** — nothing is contacted at start unless you opt in with `true`. When on it runs after the daemon is ready, is bounded by a 5 s timeout, stays silent on any failure, never blocks startup and never downloads anything. The explicit `flow update` command is unaffected by this flag. |
 | `adopt_maximized` | `bool` | `false` | Whether a window that is **maximized** when FlowWM meets it — in the startup scan, when it opens, when tiling is turned back on — is un-maximized and classified through your rules (tiled or floated like any other window) instead of being left alone as "ignored: maximized" until you restore it. Fullscreen windows (video, games) are never adopted, nor is a window your rules ignore. An adopted window is maximized again when FlowWM hands the desktop back: `flow dispatch tiling off`, `flow stop`, a fail-back. With `false` (the stock behaviour) a maximized window stays ignored until you restore it or run [`set-window`](./dispatch-reference.md#set-window-mode) on it, which adopts it either way. |
 
 Example:
@@ -104,7 +104,7 @@ columns_per_screen = 4
 # column_width = 1280          # optional fixed width; ignores columns_per_screen
 min_column_width_px = 640
 min_window_height_px = 100
-check_for_updates = false      # the fork's default; true opts in to the start-time GitHub check
+check_for_updates = false      # the fork's default; true opts in to the start-time GitHub check (a notice only)
 adopt_maximized = false        # true: un-maximize and tile/float windows found maximized
 ```
 
@@ -371,6 +371,33 @@ Example:
 ```toml
 [logging]
 keep_days = 14
+```
+
+### `[update]` — update checker
+
+`flow update` is a **checker, never an installer**: it asks GitHub how this
+build relates to a branch (by the commit the binary was built from — see
+`flow --version`) or to the latest release, prints the answer and the recipe
+for updating, and exits `0` when nothing is newer, `10` when something is.
+It never downloads or replaces `flow.exe` / `flowd.exe`. The same checker
+runs at `flow start` when the top-level `check_for_updates` is `true`. See
+[Update Checker](../dev-guide/updater.md) for the mechanics and the full
+exit-code table.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `repo` | `String` | *(absent)* | GitHub repository as `"owner/name"`. When absent it is derived from the `origin` remote of the checkout the binary was built from, if that is a github.com URL (https or ssh form); otherwise the upstream `CCpcalvin/flow-wm`. Anything that is not `owner/name` is refused with exit code 3. |
+| `branch` | `String` | *(absent)* | Branch to compare the build's commit against. When absent, the branch that was checked out at build time (shown by `flow --version`). Set it to the **empty string** `""` to compare the crate version against the repository's latest **release** instead; a build with no branch at all (detached `HEAD`, not a git checkout) also uses release mode. |
+
+Both keys are optional; so is the whole table. A build that is not from a git
+checkout has no commit to compare and must use release mode.
+
+Example:
+
+```toml
+[update]
+repo = "yourname/flow-wm"    # your own fork on GitHub
+branch = "main"              # or "" to compare against releases
 ```
 
 ---

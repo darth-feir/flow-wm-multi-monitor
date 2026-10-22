@@ -1,204 +1,183 @@
-# Self-Update (`flow update`)
+# Update Checker (`flow update`)
 
-`flow update` pulls the latest release from GitHub, verifies it, and replaces the
-running `flow.exe` and `flowd.exe` in place. It is a single command with one
-optional flag:
+`flow update` is a **checker, never an installer**. It asks the GitHub API
+whether something newer than the running build exists, prints the answer and
+the recipe for updating, and exits with a code that scripts can read. It does
+not download archives, verify digests, stage files or swap binaries — this
+fork is built from source, and a source build is updated with `git pull` +
+`cargo build --release`. (The upstream self-updater with its PowerShell swap
+shim was removed in this fork, together with the `zip` and `sha2`
+dependencies it needed.)
 
 | Command | Action |
 |---------|--------|
-| `flow update` | Download, verify, stage, and swap in the latest release |
-| `flow update --check` | Print whether an update is available; exit non-zero if so. Safe while the daemon runs. |
+| `flow update` | Compare this build with the configured branch or the latest release; print the verdict and how to update. Safe while the daemon runs. |
+| `flow update --check` | The same thing. `--check` is accepted for compatibility and changes nothing. |
+| `flow --version` / `flowd --version` | `flow 0.2.0 (feat/multi-monitor @ cf54b88, 2026-10-22)` — the crate version plus the embedded branch, commit and commit date. |
 
-The install path is self-located: `flow` updates whichever copy of itself is
-running, via `std::env::current_exe().parent()`. No registry key, config file,
-or `PATH` entry is consulted. This matches the existing
-[`find_daemon_exe`](../../src/bin/flow.rs) convention — `flowd.exe` is assumed to
-live next to `flow.exe`, and both are replaced together.
+## Build metadata
 
-## The Windows File-Lock Problem
+`build.rs` runs `git` in the checkout being built and hands the result to the
+crate as `FLOW_BUILD_*` environment variables, which
+[`src/build_info.rs`](../../src/build_info.rs) exposes as constants:
 
-The central design constraint is that **Windows refuses to open a running `.exe`
-for write**. While `flow.exe` is executing, its image file is locked by the
-kernel; the same is true for `flowd.exe` while the daemon is running. A naive
-updater that downloads a new binary and overwrites the old one in place fails
-with `ERROR_SHARING_VIOLATION` on the very file it is trying to replace.
+| Constant | Source | Example |
+|----------|--------|---------|
+| `VERSION` | `CARGO_PKG_VERSION` | `0.2.0` |
+| `COMMIT` / `COMMIT_SHORT` | `git rev-parse HEAD` / `--short HEAD` | `cf54b88…` / `cf54b88` |
+| `BRANCH` | `git rev-parse --abbrev-ref HEAD` (empty for a detached `HEAD`) | `feat/multi-monitor` |
+| `DIRTY` | `git status --porcelain --untracked-files=no` non-empty | `false` |
+| `COMMIT_DATE` | `git log -1 --format=%cs` (committer date) | `2026-10-22` |
+| `ORIGIN_URL` | `git config --get remote.origin.url` | `https://github.com/CCpcalvin/flow-wm` |
 
-There is a narrow escape: **Windows does allow a running executable to be
-renamed** (moved within the same volume) but not overwritten or deleted. This is
-the primitive the updater exploits. The flow is:
+Every variable is always set — to the empty string when `git` is not
+installed or the source is not a checkout (a crates.io tarball) — so the crate
+reads them with `env!` and the build never fails for lack of git. The script
+declares `rerun-if-changed` on `.git/HEAD`, `.git/index`, `.git/packed-refs`
+and the current branch's ref file, so a new commit or checkout is picked up
+by the next `cargo build`. A dirty tree shows as `cf54b88-dirty` in
+`--version` and in the checker's output.
 
-1. Download the new archive into memory.
-2. Extract the two binaries to a `.stage/` directory **next to** the install
-   dir.
-3. Spawn a detached helper process (the *shim*) that outlives `flow.exe`.
-4. `flow.exe` exits.
-5. The shim waits for `flow.exe`'s PID to disappear, then for each binary:
-   - renames the running file to `<name>.old` (rename is allowed),
-   - renames the staged file into place,
-   - deletes `<name>.old`.
-6. The shim removes `.stage/` and deletes itself.
+`build_info::github_repo_from_url` turns the origin URL into `owner/name`
+for the https (`https://github.com/owner/name.git`), ssh
+(`git@github.com:owner/name.git`, `ssh://git@github.com/owner/name.git`)
+and `git://` spellings; any other host yields `None`.
 
-By the time the shim renames anything, `flow.exe` has exited and `flowd.exe` is
-guaranteed absent (see [Refuse-if-running](#refuse-if-running) below), so the
-rename window is contention-free.
+## Configuration
 
-### Hardening
-
-- **HTTPS only.** Every request — the release metadata, the sha256 sidecar
-  and the archive — goes through one `ureq` agent built with
-  `https_only(true)` and a global timeout (2 s for the start-time check,
-  5 min for `flow update`). An asset URL that names `http://` (a tampered
-  release listing) is refused, never followed, and a stalled download fails
-  instead of hanging the terminal.
-- **Absolute shim host.** The shim is run by
-  `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`
-  (`shim::powershell_path`), never by a `powershell.exe` found on `PATH` or
-  in the current directory.
-- **No overwrite of the shim file.** `.flow-update-shim.ps1` is created with
-  `create_new`: if a file is already there (a leftover, or something planted
-  in the install dir) the update fails with `AlreadyExists` rather than
-  overwriting it or running it.
-- **`zip` 9 with default features off** (`deflate-flate2` only): the release
-  archive is stored/deflated and the updater reads two named entries into
-  memory — it never calls `extract`, which is where the 8.x advisories
-  (RUSTSEC-2026-0367/0368/0369) lived.
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant flow as flow.exe
-    participant Stage as .stage/
-    participant Shim as powershell shim
-    participant FS as filesystem
-
-    User->>flow: flow update
-    flow->>FS: extract flow.exe + flowd.exe into .stage/
-    flow->>Shim: spawn detached, pass flow PID
-    flow->>User: "updated to vX.Y.Z — run flow start"
-    flow->>flow: process exits
-    Shim->>FS: wait until flow.exe PID gone
-    Shim->>FS: rename flow.exe  -> flow.exe.old
-    Shim->>FS: rename .stage\flow.exe -> flow.exe
-    Shim->>FS: delete flow.exe.old
-    Shim->>FS: (repeat for flowd.exe)
-    Shim->>FS: rmdir .stage, delete self
-```
-
-### Refuse-if-running
-
-The updater refuses to proceed if `transport::is_daemon_running()` reports a live
-daemon, telling the user to run `flow stop` first. This is a deliberate UX
-choice rather than a technical limitation:
-
-- It avoids a surprise window shuffle — `flow stop` runs
-  [graceful-shutdown window rescue](ipc-and-watchdog.md#graceful-shutdown-window-rescue),
-  which the user should see happen explicitly, not as a side effect of an update.
-- It simplifies the shim: with `flowd.exe` guaranteed absent, the shim only
-  needs to wait for **one** PID (`flow.exe` itself) before swapping.
-
-`flow update --check` is exempt from this guard because it only queries the
-GitHub releases API and never touches local files — it is safe to run any time,
-including while the daemon is actively tiling.
-
-## Start-Time Notification
-
-`flow start` can optionally check GitHub for a newer release on each launch and
-print a one-line notification prompting `flow update` when one exists. It is
-**off by default in this fork** (upstream ships it on): a window manager has
-no reason to contact the network at every start, and the fork is built from
-source rather than installed from the upstream releases the check would
-offer. It is controlled by the top-level `check_for_updates` field in
-`flow.toml` (see [Config Reference](../user-guide/config-reference.md)):
+Two pieces of `flow.toml` drive the checker (see the
+[Config Reference](../user-guide/config-reference.md#update--update-checker)):
 
 ```toml
-check_for_updates = true   # opt in to the start-time notification
+check_for_updates = false   # true: `flow start` runs the checker and prints a one-line notice
+
+[update]
+# repo = "owner/name"       # default: parsed from the build's origin URL, else "CCpcalvin/flow-wm"
+# branch = "main"           # default: the build's branch; "" = compare against releases instead
 ```
 
-The notification is deliberately non-intrusive:
+`updater::resolve_target` turns these into a `Target`:
 
-- **Non-blocking** — the check runs *after* the daemon reports ready, so a slow
-  network can never delay tiling. `flow start` prints `flow: daemon started`
-  first, then the notification if one applies.
-- **Bounded** — the network call is capped by a short timeout, so a dead or
-  unresponsive network resolves in seconds rather than hanging the command. The
-  same bound also applies to the metadata fetch in `flow update`; only the
-  multi-MB archive download is left unbounded.
-- **Best-effort** — every error (offline, parse failure, GitHub outage) is
-  silenced. The daemon always starts regardless of the outcome.
-- **Print-only** — it only echoes `flow: update available (<tag>) — run "flow
-  update" to install`; it never downloads or installs anything.
+- **Branch mode** (`Target::Branch`) when a branch is known — from
+  `[update] branch`, else the build's branch. The embedded commit is compared
+  with that branch of the repository.
+- **Release mode** (`Target::Release`) when `branch = ""` is set, or when no
+  branch is known at all (detached `HEAD`, tarball). The crate version is
+  compared with the latest release's tag.
 
-This automatic check reuses [`check_for_update`](../../src/updater/mod.rs) — the
-same call behind `flow update --check`. That explicit command is **unaffected**
-by the `check_for_updates` flag: a user who disables the automatic notification
-can still ask for a version check on demand.
+`repo` is validated to be `owner/name` (letters, digits, `-`, `_`, `.`);
+anything else is reported as a config error (exit code 3) rather than sent to
+GitHub.
 
-## Version Comparison
+## The check
 
-Versions come from two sources:
+All requests go through one `ureq` agent built with `https_only(true)`, a
+5-second global timeout and `User-Agent: flow-wm/<version>`, without a token
+(unauthenticated GitHub allows 60 requests per hour per address; a 403/429 is
+reported with that hint). `ureq` reads `HTTPS_PROXY` / `HTTP_PROXY` /
+`ALL_PROXY` / `NO_PROXY` from the environment by itself.
 
-- The running binary's version: `env!("CARGO_PKG_VERSION")` (e.g. `0.1.0`).
-- The latest release's version: the `tag_name` field of the GitHub releases API
-  response (e.g. `v0.1.1`).
+### Branch mode
 
-Both are parsed into a `(u32, u32, u32)` tuple and compared with tuple ordering.
-The leading `v` on the tag is stripped before parsing. This deliberately avoids
-pulling in a semver crate — FlowWM uses plain `MAJOR.MINOR.PATCH` integers with
-no pre-release suffixes, so a three-tuple is the exact model. `--check` returns
-"up to date" when the tuples are equal; the install path returns early (a
-no-op success) when not strictly newer, so re-running `flow update` after a
-successful update is idempotent.
+1. `GET https://api.github.com/repos/{repo}/compare/{local_full_sha}...{branch}`.
+   GitHub's `status` is from the branch's point of view, so the mapping is:
 
-## Integrity Verification
+   | `status` | Meaning | Verdict | Output |
+   |----------|---------|---------|--------|
+   | `identical` | the build is the branch head | up to date | `up to date: your build cf54b88 is the head of {repo} {branch}` |
+   | `ahead` | the branch has commits the build lacks | **newer** | `update available: your build cf54b88 is N commits behind {repo} {branch}` + `newest remote commit: a1b2c3d (date) first line` |
+   | `behind` | the build has commits the branch lacks | up to date | `up to date: your build cf54b88 is N commits ahead of {repo} {branch} (nothing newer on the remote)` |
+   | `diverged` | both sides have commits the other lacks | **newer** | `update available: {repo} {branch} has N commits your build lacks, and your build has M commits the branch lacks (diverged)` + newest remote commit |
 
-Every release ships a SHA-256 sidecar (`<zipname>.sha256`) alongside the zip,
-produced by `Get-FileHash` in the release workflow (see
-[`.github/workflows/release.yml`](../../../.github/workflows/release.yml)). The
-updater:
+   The newest remote commit is the last entry of the response's `commits`
+   list (short sha, committer date, first line of the message).
 
-1. Downloads the sidecar first and parses the 64-hex-character hash out of its
-   GNU-coreutils-style `<hash>  <filename>\n` format.
-2. Downloads the zip into memory and computes `SHA256` over the bytes via the
-   [`sha2`](../../src/updater/mod.rs) crate.
-3. Compares the computed lowercase-hex digest against the sidecar hash
-   (case-insensitively — `Get-FileHash` emits uppercase, the Rust digest is
-   lowercase).
-4. Aborts with `UpdateError::ShaMismatch` if they disagree.
+2. **404 fallback.** GitHub answers 404 when the local commit is unknown to it
+   — the fork has not been pushed, or the branch was rewritten. The checker
+   then asks `GET /repos/{repo}/commits/{branch}` for the branch head alone
+   and judges by **commit date**: newer when the head was committed on a later
+   day than the build's commit. Output:
+   `update available: {repo} {branch} head is 2a179c3, committed 2026-11-01;
+   your build is cf54b88 from 2026-10-22, not found on the remote (not pushed
+   yet, or rewritten)` (or `nothing newer by date: …`). A second 404 means the
+   branch or the repository does not exist and is reported as such.
 
-The zip is never extracted or written to disk before the hash check passes.
+   Only a 404 falls back (`should_fall_back`); a 403, a 5xx or a network error
+   is reported directly.
 
-## Edge-Case Guards
+3. A build without an embedded commit (not a git checkout) cannot use branch
+   mode: `UpdateError::NoBuildInfo` tells the user to set `branch = ""`.
 
-Two environment checks run before any download:
+### Release mode
 
-- **Running-from-zip**: if `current_exe()` resolves to a path containing
-  `\TempN_` (Windows' temporary folder for opened-in-place zip extraction), the
-  updater aborts with `UpdateError::RunningFromZip`. Updating a binary inside a
-  transient extraction folder would "succeed" but be discarded the moment the
-  user closes the zip viewer.
-- **Read-only install directory**: a writability probe (create and delete a
-  `.flow-write-probe` temp file) catches `Program Files` installs that need
-  elevation. The updater reports `UpdateError::ReadOnlyDir` rather than failing
-  mysteriously halfway through the swap.
+`GET /repos/{repo}/releases/latest`; the tag (`v0.3.0` or `0.3.0`) and
+`CARGO_PKG_VERSION` are parsed as `MAJOR.MINOR.PATCH` triples and compared
+(`compare_versions`). Newer → `update available: release v0.3.0 of {repo} is
+newer than your 0.2.0`; equal → `up to date: release v0.2.0 is the latest of
+{repo} and matches your 0.2.0`; older → `up to date: your 0.2.0 is newer than
+the latest release v0.1.9 of {repo}`. The publish date and release page URL
+follow. A tag that is not a plain triple is reported as malformed (no
+pre-release suffixes are modelled; FlowWM does not use them).
 
-## Code Path
+### Output and exit codes
+
+`flow update` prints, each line prefixed `flow: `:
+
+1. what is being checked and the local build
+   (`checking owner/name branch main; your build: 0.2.0 (cf54b88, 2026-10-22)`),
+2. the verdict line (the `summary` above),
+3. any detail lines,
+4. how to update — for branch mode
+   `to update a source build: git pull (branch main), cargo build --release,
+   flow stop, then copy target\release\flow.exe and flowd.exe over flow.exe and
+   flowd.exe in <dir of the running flow.exe>`; for release mode the
+   `https://github.com/{repo}/releases/latest` page — and the reminder that
+   `flow update` never downloads or replaces anything itself.
+
+Errors go to stderr as `flow: update check failed: <reason>`.
+
+| Exit code | Constant | Meaning |
+|-----------|----------|---------|
+| `0` | `EXIT_UP_TO_DATE` | Nothing newer: identical, ahead, same or newer than the latest release, or not newer by date in the fallback. |
+| `10` | `EXIT_NEWER` | Something newer exists (behind, diverged, the fallback head is newer by date, or a newer release). |
+| `2` | `EXIT_NETWORK` | `could not reach api.github.com: …` — offline, DNS, TLS or the 5 s timeout. |
+| `3` | `EXIT_NOT_FOUND` | The repository, branch or release does not exist (404 twice, or on the release endpoint); `[update] repo` is not `owner/name`; `flow.toml` could not be read. |
+| `4` | `EXIT_GITHUB` | GitHub answered with another status (403 rate limit, 5xx) or something that did not parse. |
+| `5` | `EXIT_NO_BUILD_INFO` | Branch mode on a build with no embedded commit. |
+
+## Start-time notice
+
+With `check_for_updates = true`, `flow start` runs the same `updater::check`
+**after** the daemon has reported ready and prints one line when — and only
+when — the verdict is "newer":
+
+```
+flow: update available: your build cf54b88 is 3 commits behind owner/name main — see "flow update"
+```
+
+Every failure (offline, a bogus `[update] repo`, a GitHub outage) is silent and
+the daemon is already running, so the notice can never block or break a
+start. It is **off by default in this fork**: a window manager has no reason
+to contact the network at every start.
+
+## Code path
 
 | Step | Location |
 |------|----------|
-| Public entry points | `check_for_update`, `perform_update` in [`src/updater/mod.rs`](../../src/updater/mod.rs) |
-| CLI wiring | `cmd_update` in [`src/bin/flow.rs`](../../src/bin/flow.rs) |
-| Daemon-running guard | `transport::is_daemon_running` in [`src/ipc/transport.rs`](../../src/ipc/transport.rs) |
-| Shim script builder + spawner | [`src/updater/shim.rs`](../../src/updater/shim.rs) |
+| Git metadata at build time | [`build.rs`](../../build.rs) |
+| Constants, `version_line`, `github_repo_from_url` | [`src/build_info.rs`](../../src/build_info.rs) |
+| `[update]` table | `UpdateConfig` in [`src/config/types.rs`](../../src/config/types.rs) |
+| Target resolution, requests, JSON → `Report`, exit codes | [`src/updater/mod.rs`](../../src/updater/mod.rs) (`resolve_target`, `check_target`, `compare_report`, `head_report`, `release_report`, `how_to_update`) |
+| CLI wiring | `cmd_update` and `maybe_notify_update` in [`src/bin/flow.rs`](../../src/bin/flow.rs) |
 
-The `updater` module is a sibling of the other top-level modules under `src/`
-(registered in [`src/lib.rs`](../../src/lib.rs)). It depends only on
-`flow_wm::ipc::transport` for the daemon-running guard — it does not touch the
-layout engine, window registry, or config system.
+Everything that interprets GitHub's answers is a pure function over the JSON
+text and a `LocalBuild` value, so the unit tests feed canned responses and
+never touch the network. The only network code is `check_target` and the
+`get` helper beneath it.
 
-## Cross-References
+## Cross-references
 
-- [IPC](ipc-and-watchdog.md) -- the named-pipe transport used for the
-  daemon-running guard and for `flow stop`
-- [Architecture](architecture.md) -- subsystem overview
-- [Roadmap](roadmap.md) -- future work (e.g. delta updates, package-manager
-  integration)
+- [Config & Persistence](config-and-persistence.md) — where `flow.toml` is
+  read from
+- [Building from Source](building-from-source.md) — the `git pull` +
+  `cargo build --release` recipe the checker points at

@@ -176,18 +176,22 @@ pub struct FlowConfig {
     /// the presets — see [`ColumnsConfig`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub columns: Option<ColumnsConfig>,
-    /// Whether `flow start` should query GitHub for a newer release and print a
-    /// one-line notification prompting `flow update` when one exists.
+    /// Whether `flow start` runs the update checker (the same one behind
+    /// `flow update`, see [`UpdateConfig`]) and prints a one-line notice
+    /// when something newer exists on GitHub.
     ///
     /// **Off by default in this fork**: a window manager has no business
-    /// phoning out at every start, and the fork's binaries are built from
-    /// source rather than installed from the upstream releases the check
-    /// would offer. The key is kept so a user can opt in. When on, the check
-    /// runs *after* the daemon is ready, is bounded by a short network
-    /// timeout, and silences all errors — it never blocks or aborts
-    /// startup. The explicit `flow update --check` command is unaffected by
-    /// this flag. See (`docs/src/dev-guide/updater.md`).
+    /// phoning out at every start. The key is kept so a user can opt in.
+    /// When on, the check runs *after* the daemon is ready, is bounded by
+    /// a short network timeout, and silences all errors — it never blocks
+    /// or aborts startup, and it never downloads anything. The explicit
+    /// `flow update` command is unaffected by this flag. See
+    /// (`docs/src/dev-guide/updater.md`).
     pub check_for_updates: bool,
+
+    /// What `flow update` (and the start-time notice) compares this build
+    /// against (`[update]`). See [`UpdateConfig`].
+    pub update: UpdateConfig,
 
     /// Whether a **maximized** window the daemon meets — in the startup
     /// scan, when it opens, on `tiling on` — is un-maximized and classified
@@ -258,6 +262,34 @@ impl Default for LoggingConfig {
     }
 }
 
+/// Where `flow update` looks for something newer (`[update]`).
+///
+/// `flow update` is a **checker**: it asks the GitHub API how this build
+/// relates to a branch or to the latest release and prints the answer; it
+/// never downloads or replaces anything. Both keys are optional and fall
+/// back to what the build script embedded (`crate::build_info`):
+///
+/// - `repo`: `"owner/name"` on github.com. Absent: parsed from the
+///   checkout's `origin` URL at build time when that is a github.com URL
+///   (https or ssh), else the upstream `CCpcalvin/flow-wm`.
+/// - `branch`: the branch to compare the embedded commit against. Absent:
+///   the branch checked out at build time. An **empty string** (or no
+///   build branch to fall back to) switches to *release mode*: the latest
+///   release's tag is compared with the crate version instead.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct UpdateConfig {
+    /// GitHub repository as `"owner/name"`; `None` = derived from the
+    /// build's `origin` URL, else upstream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+
+    /// Branch to compare against; `None` = the build's branch; `Some("")`
+    /// = compare against releases instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
 /// Navigation behaviour at the edges of a strip.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
@@ -301,6 +333,7 @@ impl Default for FlowConfig {
             // The fork opts out of the start-time update check (see the
             // field docs); users opt in with `check_for_updates = true`.
             check_for_updates: false,
+            update: UpdateConfig::default(),
             adopt_maximized: false,
         }
     }
@@ -1276,6 +1309,10 @@ default = \"1/2\"",
                 .expect("columns"),
             ),
             check_for_updates: true,
+            update: UpdateConfig {
+                repo: Some("me/flow-wm".into()),
+                branch: Some(String::new()),
+            },
             adopt_maximized: true,
         };
 
@@ -1319,6 +1356,36 @@ default = \"1/2\"",
         assert_eq!(columns.labels(), vec!["1/3", "1/2"]);
         assert_eq!(columns.default_index(), 1);
         assert!(parsed.check_for_updates);
+        assert_eq!(parsed.update.repo.as_deref(), Some("me/flow-wm"));
+        assert_eq!(parsed.update.branch.as_deref(), Some(""));
+    }
+
+    /// Positive: `[update]` is optional and both of its keys are: an absent
+    /// table, an empty table and a table with one key all parse, the
+    /// missing keys staying `None` (the build-time fallbacks apply).
+    #[test]
+    fn update_config_keys_are_optional() {
+        assert_eq!(
+            UpdateConfig::default(),
+            UpdateConfig {
+                repo: None,
+                branch: None
+            }
+        );
+        let parsed: FlowConfig = toml::from_str(
+            "[update]
+",
+        )
+        .unwrap();
+        assert_eq!(parsed.update, UpdateConfig::default());
+        let parsed: FlowConfig = toml::from_str(
+            "[update]
+branch = \"main\"
+",
+        )
+        .unwrap();
+        assert_eq!(parsed.update.repo, None);
+        assert_eq!(parsed.update.branch.as_deref(), Some("main"));
     }
 
     /// Positive: `check_for_updates` ships **disabled** in this fork — the

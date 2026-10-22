@@ -57,6 +57,27 @@ Verify the install:
 flow --version
 ```
 
+A source build prints the branch, commit and commit date it was built from,
+e.g. `flow 0.2.0 (feat/multi-monitor @ cf54b88, 2026-10-22)`.
+
+### Updating
+
+FlowWM does not update itself. `flow update` only **checks**: it asks GitHub
+whether the branch you built from has moved on (or, with
+`[update] branch = ""` in `flow.toml`, whether a newer release exists) and
+prints the recipe. To actually update a source build:
+
+```powershell
+git pull
+cargo build --release
+flow stop
+# copy target\release\flow.exe and flowd.exe over the installed ones, then
+flow start
+```
+
+See [`[update]`](./config-reference.md#update--update-checker) for the
+repository and branch the check uses.
+
 ## Step 2 — Generate your config and hotkeys
 
 ```powershell

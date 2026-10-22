@@ -76,7 +76,7 @@ use flow_wm::registry::desktop;
 
 /// Daemon CLI arguments.
 #[derive(Parser)]
-#[command(name = "flowd", version, about = "FlowWM daemon")]
+#[command(name = "flowd", version = flow_wm::build_info::version_line_static(), about = "FlowWM daemon")]
 #[command(propagate_version = true)]
 struct Args {
     /// Config directory path. Overrides `FLOW_CONFIG_DIR` env var and default path.

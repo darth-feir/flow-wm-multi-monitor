@@ -24,6 +24,8 @@
 //! - [`common`] — shared bridge types (`WindowId`, `Rect`, `Direction`)
 //! - [`job`] — Win32 Job Objects (ties the hotkey script's life to the daemon's)
 //! - [`rescue`] — daemon-less off-screen window rescue (`flow rescue`)
+//! - [`build_info`] — the commit / branch / origin embedded at build time
+//! - [`updater`] — the GitHub update checker behind `flow update` (never installs)
 //!
 //! Every layout change flows through a pure three-stage pipeline —
 //! **mutate → project → animate** — and all subsystems take `&mut self` (no
@@ -40,6 +42,7 @@
 pub mod animation;
 pub mod autostart;
 pub mod borders;
+pub mod build_info;
 pub mod common;
 pub mod config;
 pub mod daemon;

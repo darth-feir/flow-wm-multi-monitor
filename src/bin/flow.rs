@@ -36,6 +36,7 @@ use clap::{Parser, Subcommand};
 use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 
 use flow_wm::autostart;
+use flow_wm::build_info;
 use flow_wm::common::Direction;
 use flow_wm::config;
 use flow_wm::daemon::startup::{self, StartupState, StartupStatus};
@@ -46,6 +47,7 @@ use flow_wm::ipc::message::WindowMode;
 use flow_wm::ipc::transport;
 use flow_wm::logging;
 use flow_wm::rescue;
+use flow_wm::updater;
 
 /// Maximum time to wait for the daemon to become ready after spawning.
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -54,7 +56,7 @@ const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Parser)]
-#[command(name = "flow", version, about = "FlowWM CLI")]
+#[command(name = "flow", version = build_info::version_line_static(), about = "FlowWM CLI")]
 #[command(propagate_version = true)]
 struct Cli {
     #[command(subcommand)]
@@ -164,16 +166,18 @@ enum Commands {
     },
     /// Remove the login autostart shortcut from `shell:startup`.
     DisableAutostart,
-    /// Check for a newer release, or download and install it.
+    /// Check GitHub for something newer than this build; never installs.
     ///
-    /// Without `--check`: refuses to proceed while the daemon is running (run
-    /// `flow stop` first), downloads the latest GitHub release, verifies the
-    /// SHA256 sidecar, stages the new binaries, then spawns a detached shim
-    /// that swaps them in after this process exits.
+    /// Compares the commit this binary was built from with the `[update]`
+    /// branch (default: the build's branch of the repository its `origin`
+    /// pointed at), or the crate version with the latest release when
+    /// `branch = ""`. Prints the result and how to update. Safe to run
+    /// while the daemon is up. Exit codes: 0 up to date, 10 something
+    /// newer exists, 2 api.github.com unreachable, 3 repository / branch /
+    /// release not found, 4 other GitHub error, 5 no commit embedded.
     Update {
-        /// Only report whether an update is available; do not install. Safe to
-        /// run while the daemon is up. Exits 0 if up to date, non-zero
-        /// otherwise.
+        /// Accepted for compatibility; `flow update` only ever checks, so
+        /// this changes nothing.
         #[arg(long)]
         check: bool,
     },
@@ -523,7 +527,9 @@ fn main() {
         Commands::Dispatch { command } => cmd_dispatch(command),
         Commands::EnableAutostart { ahk } => cmd_enable_autostart(ahk),
         Commands::DisableAutostart => cmd_disable_autostart(),
-        Commands::Update { check } => cmd_update(check),
+        Commands::Update { check: _ } => {
+            std::process::exit(cmd_update());
+        }
     };
 
     if let Err(e) = result {
@@ -764,20 +770,22 @@ fn cmd_ping() -> Result<(), String> {
     }
 }
 
-/// Best-effort start-time update notification, gated by `check_for_updates`.
+/// Best-effort start-time update notice, gated by `check_for_updates`.
 ///
-/// Fires only when the user has not opted out. Runs *after* the daemon is ready
-/// so startup is never delayed by the network; the check is bounded by a short
-/// timeout and silences all errors — a missing or failed check never blocks or
-/// aborts startup. Prints nothing unless a strictly newer release is found, and
-/// never downloads or installs. Explicit `flow update --check` is unaffected by
-/// the flag and remains available regardless.
+/// Fires only when the user opted in. Runs *after* the daemon is ready so
+/// startup is never delayed by the network; the check is bounded by a short
+/// timeout and silences all errors (offline, a bogus `[update] repo`, a
+/// GitHub outage) — a failed check never blocks or aborts startup. Prints one
+/// line, only when the checker's verdict is "newer", and never downloads or
+/// installs. Explicit `flow update` is unaffected by the flag.
 fn maybe_notify_update(config: &config::FlowConfig) {
     if !config.check_for_updates {
         return;
     }
-    if let Ok(Some(tag)) = flow_wm::updater::check_for_update() {
-        println!("flow: update available ({tag}) — run \"flow update\" to install");
+    if let Ok(report) = updater::check(&config.update)
+        && report.verdict == updater::Verdict::Newer
+    {
+        println!("flow: {} — see \"flow update\"", report.summary);
     }
 }
 
@@ -1000,40 +1008,72 @@ fn cmd_disable_autostart() -> Result<(), String> {
     Ok(())
 }
 
-/// Check for an update (`check == true`) or perform an update.
+/// `flow update`: ask GitHub whether something newer than this build exists
+/// and say how to update; never installs anything. Returns the process exit
+/// code (the `EXIT_*` constants in [`updater`]): `0` up to date, `10` newer,
+/// `2`-`5` for the failure kinds, `3` also when `flow.toml` cannot be read.
 ///
-/// `--check` is always safe: it only queries GitHub and compares versions,
-/// printing the result and exiting non-zero when an update is available.
-///
-/// Without `--check`, refuses to proceed while the daemon is running (its
-/// `flowd.exe` would be locked by Windows and the swap would fail). On success
-/// the new binaries have been staged and a detached shim has been spawned to
-/// swap them in once this process exits.
-fn cmd_update(check: bool) -> Result<(), String> {
-    if check {
-        match flow_wm::updater::check_for_update() {
-            Ok(Some(tag)) => {
-                println!("flow: update available ({tag}) — run \"flow update\" to install");
-                std::process::exit(1);
-            }
-            Ok(None) => {
-                println!("flow: up to date");
-                Ok(())
-            }
-            Err(e) => Err(format!("update check failed: {e}")),
+/// The `[update]` table comes from the config directory resolved like every
+/// other local command (`FLOW_CONFIG_DIR`, else the default); the daemon is
+/// not contacted.
+fn cmd_update() -> i32 {
+    let config_dir = config::dirs::resolve_config_dir(None);
+    let app_path = config::dirs::user_app_config_path_in(&config_dir);
+    let config = match config::load_app_config(&app_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("flow: update check failed: {e}");
+            return updater::EXIT_NOT_FOUND;
         }
+    };
+    let target = match updater::target(&config.update) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("flow: update check failed: {e}");
+            return e.exit_code();
+        }
+    };
+    let local = updater::LocalBuild::this();
+    let build = if local.commit_label.is_empty() {
+        format!("your build: {}", local.version)
     } else {
-        if transport::is_daemon_running() {
-            return Err("daemon is running — run \"flow stop\" first".into());
-        }
-        match flow_wm::updater::perform_update() {
-            Ok(tag) => {
-                println!("flow: updated to {tag} — run \"flow start\" to launch the daemon");
-                Ok(())
+        format!(
+            "your build: {} ({}, {})",
+            local.version,
+            local.commit_label,
+            if local.commit_date.is_empty() {
+                "unknown date"
+            } else {
+                &local.commit_date
             }
-            Err(e) => Err(format!("update failed: {e}")),
+        )
+    };
+    match &target {
+        updater::Target::Branch { repo, branch } => {
+            println!("flow: checking {repo} branch {branch}; {build}");
+        }
+        updater::Target::Release { repo } => {
+            println!("flow: checking the latest release of {repo}; {build}");
         }
     }
+    let report = match updater::check_target(&target, &local) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("flow: update check failed: {e}");
+            return e.exit_code();
+        }
+    };
+    println!("flow: {}", report.summary);
+    for line in &report.details {
+        println!("flow: {line}");
+    }
+    let install_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.display().to_string()));
+    for line in updater::how_to_update(&target, install_dir.as_deref()) {
+        println!("flow: {line}");
+    }
+    report.verdict.exit_code()
 }
 
 /// Dispatch a loadout subcommand.
@@ -2288,12 +2328,13 @@ mod tests {
 
     // --- update parsing ---
     //
-    // `flow update` has one optional flag (`--check`). The three cases below
+    // `flow update` has one optional flag (`--check`, a compatibility no-op:
+    // the command only ever checks). The cases below
     // pin both flag states and that no positional or unknown flag is accepted.
 
     #[test]
     fn parse_update_default() {
-        // Positive: `flow update` parses with check = false (the install path).
+        // Positive: `flow update` parses with check = false.
         let cli = Cli::try_parse_from(["flow", "update"]).unwrap();
         match cli.command {
             Commands::Update { check: false } => {}

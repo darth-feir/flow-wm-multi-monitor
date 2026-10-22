@@ -42,5 +42,6 @@ pub use lifecycle::{
 };
 pub use types::BorderConfig;
 pub use types::FlowConfig;
+pub use types::UpdateConfig;
 pub use types::WindowRulesConfig;
 pub use width_preset::{ColumnsConfig, WidthPreset};

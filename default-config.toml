@@ -61,12 +61,14 @@ min_window_height_px = 100
 # row-stack-count cap); the two are independent.
 min_row_height_px = 100
 
-# Whether `flow start` checks GitHub for a newer release and, if one exists,
-# prints a one-line notification prompting `flow update`. This fork opts out
-# of the start-time check (off by default): nothing is contacted unless you
-# set this to true. When on, the check runs after the daemon is ready, is
-# bounded by a short timeout, and never blocks or aborts startup. Explicit
-# `flow update --check` is always available regardless of this flag.
+# Whether `flow start` runs the update checker (the same one behind
+# `flow update`, see the [update] table below) and prints a one-line notice
+# when something newer exists on GitHub. This fork opts out of the start-time
+# check (off by default): nothing is contacted unless you set this to true.
+# When on, the check runs after the daemon is ready, is bounded by a short
+# timeout, stays silent on any failure and never blocks or aborts startup.
+# It only ever reports; nothing is downloaded or installed. The explicit
+# `flow update` command is always available regardless of this flag.
 check_for_updates = false
 
 # Whether a window that is maximized when FlowWM meets it (at startup, when it
@@ -200,3 +202,20 @@ default_path = "loadout.json"
 # only logged at debug level (`flow start --verbose`).
 [logging]
 keep_days = 14
+
+# Update checker (`flow update`, and the start-time notice above). It asks
+# GitHub how this build relates to a branch or to the latest release and
+# prints the answer plus how to update; it NEVER downloads or replaces the
+# binaries. Both keys are optional:
+#
+# - repo:    "owner/name" on github.com. Default: derived from the `origin`
+#            remote of the checkout the binary was built from (https or ssh
+#            github.com URL), else the upstream "CCpcalvin/flow-wm".
+# - branch:  the branch to compare the build's commit against (see
+#            `flow --version` for the commit and branch). Default: the branch
+#            checked out at build time. "" (empty) compares the crate version
+#            against the latest release instead.
+#
+# [update]
+# repo = "yourname/flow-wm"
+# branch = "main"

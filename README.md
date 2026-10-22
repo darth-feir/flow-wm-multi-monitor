@@ -48,6 +48,8 @@ cargo build --release
 
 Both paths produce `flow.exe` (the CLI you drive) and `flowd.exe` (the daemon). `cargo install` puts them on your `PATH` automatically; a source build writes them to `target\release\` — see [Building from Source](https://ccpcalvin.github.io/flow-wm/dev-guide/building-from-source.html) for adding that to `PATH`.
 
+To update, pull and build again. `flow update` only *checks* GitHub for something newer than the commit your binaries were built from (`flow --version` shows it) and tells you how to update; it never downloads or replaces anything.
+
 FlowWM also ships **no keybinder of its own** — on purpose. Every hotkey is just a `flow` CLI call, so anything that can run a command on a keypress will do. The recommended companion is [AutoHotkey v2](https://www.autohotkey.com/), and `flow config init --ahk` writes a ready-to-use `flow.ahk` for it. (See [Design Decisions → Keybindings removed](https://ccpcalvin.github.io/flow-wm/dev-guide/design-decisions.html) for the why.)
 
 ### TL;DR

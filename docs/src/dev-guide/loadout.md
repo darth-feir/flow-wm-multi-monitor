@@ -2,7 +2,7 @@
 
 The loadout feature saves a user's tiling arrangement to a file and restores it
 across a daemon restart — so a `flow stop` / `flow start` (to apply a config
-change), a crash, or a self-update does not destroy their workspace.
+change), a crash, or a reinstall does not destroy their workspace.
 
 This page covers the feature's architecture: how window identity survives a
 restart, the strict no-partial restore guarantee, and the save/load lifecycle.
