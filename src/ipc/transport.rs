@@ -15,25 +15,48 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT, HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
+};
+use windows::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows::Win32::Security::{
+    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    TokenUser,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
     FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+    PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
 };
 use windows::Win32::System::IO::{CancelIo, CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
-    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    WaitNamedPipeW,
 };
-use windows::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent, WaitForSingleObject};
-use windows::core::HRESULT;
+use windows::Win32::System::Threading::{
+    CreateEventW, GetCurrentProcess, OpenProcessToken, ResetEvent, SetEvent, WaitForSingleObject,
+};
+use windows::core::{HRESULT, PWSTR};
 
 use super::message::{self, SocketMessage, SocketResponse};
 
 /// Read buffer size for pipe I/O (8 KiB).
 const BUF_SIZE: u32 = 8192;
+
+/// Longest line either side accepts before giving up on the peer.
+///
+/// A command or reply is a few hundred bytes; `flow query all` on a busy
+/// desktop is tens of KiB. A peer that has sent this much without a newline
+/// is not speaking the protocol (or is trying to make the daemon buffer
+/// without bound), so the read fails with `InvalidData` and the daemon
+/// disconnects that client.
+pub const MAX_LINE_BYTES: usize = 64 * 1024;
+
+/// Longest slice of a bad line the daemon puts in its log.
+const LOG_LINE_PREVIEW: usize = 200;
 
 /// Maximum wall-clock time a single client-side IPC round trip may take.
 ///
@@ -234,22 +257,26 @@ impl PipeServer {
     pub fn create_named(pipe_name: &str) -> io::Result<Self> {
         let name = wide(pipe_name);
 
-        // TODO(security): Create a SECURITY_ATTRIBUTES that restricts pipe
-        // access to the current user session. Currently any local process can
-        // connect and send commands. Acceptable for Phase 1 MVP (single-user
-        // desktop tool), but must be hardened before wider distribution.
-        // Overlapped so the server's reads, writes and accepts can all be
-        // bounded (see `read_message`) and cancelled (see `shutdown`).
+        // The pipe's DACL (see `PipeSecurity`): SYSTEM and Administrators
+        // get full access, the user the daemon runs as gets read + write,
+        // nobody else gets anything — another local account cannot open
+        // the pipe at all. Remote clients are rejected outright. Overlapped
+        // so the server's reads, writes and accepts can all be bounded (see
+        // `read_message`) and cancelled (see `shutdown`).
+        let security = PipeSecurity::for_current_user()?;
+        let attrs = security.attributes();
+        // SAFETY: `name` is NUL-terminated; `attrs` points at a descriptor
+        // that `security` keeps alive for the duration of the call.
         let handle = unsafe {
             CreateNamedPipeW(
                 windows::core::PCWSTR(name.as_ptr()),
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 PIPE_UNLIMITED_INSTANCES,
                 BUF_SIZE,
                 BUF_SIZE,
                 0,
-                None,
+                Some(&attrs),
             )
         };
 
@@ -525,7 +552,10 @@ impl PipeServer {
         message::decode_message(&line).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("failed to parse message: {line:?}"),
+                format!(
+                    "failed to parse message: {:?}",
+                    truncate_for_log(&line, LOG_LINE_PREVIEW)
+                ),
             )
         })
     }
@@ -565,6 +595,138 @@ impl Drop for PipeServer {
             self.shutdown();
         }
     }
+}
+
+// ── Pipe security ───────────────────────────────────────────────────
+
+/// The SDDL string for the server pipe's security descriptor.
+///
+/// `D:P` — a protected DACL (no inherited entries), with three allow ACEs
+/// and nothing else, so Everyone / Authenticated Users / other local
+/// accounts are denied by default:
+///
+/// - `(A;;GA;;;SY)` — SYSTEM: generic all.
+/// - `(A;;GA;;;BA)` — Builtin Administrators: generic all.
+/// - `(A;;GRGW;;;<sid>)` — the daemon's own user: generic read + write,
+///   which is exactly what `CreateFileW(GENERIC_READ | GENERIC_WRITE)` in
+///   the client asks for. No `FILE_CREATE_PIPE_INSTANCE` for anyone, so
+///   nobody can race the daemon for the name (the server is also
+///   `FIRST_PIPE_INSTANCE`).
+///
+/// The user is named by the SID of the process token rather than the
+/// creator-owner placeholder (`CO`), which is only substituted during ACL
+/// *inheritance* and has no meaning in a pipe's own DACL, or `OW` (owner
+/// rights), which would also silently depend on the pipe's owner being
+/// set as expected. Resolving the SID at runtime is explicit and testable.
+#[must_use]
+pub fn pipe_sddl(user_sid: &str) -> String {
+    format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;{user_sid})")
+}
+
+/// The string SID (`S-1-5-21-…`) of the user this process runs as, read
+/// from the process token.
+fn current_user_sid() -> io::Result<String> {
+    let mut token = HANDLE::default();
+    // SAFETY: querying our own process token; `token` receives the handle.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+        .map_err(|e| io::Error::other(format!("OpenProcessToken: {e}")))?;
+    let token = PipeHandle(token);
+
+    let mut needed = 0u32;
+    // SAFETY: size query with a null buffer; failure with
+    // ERROR_INSUFFICIENT_BUFFER is the documented first step.
+    let _ = unsafe { GetTokenInformation(token.raw(), TokenUser, None, 0, &mut needed) };
+    if needed == 0 {
+        return Err(io::Error::other("GetTokenInformation(TokenUser): no size"));
+    }
+    let mut buf = vec![0u8; needed as usize];
+    // SAFETY: `buf` is `needed` bytes, as the first call asked for.
+    unsafe {
+        GetTokenInformation(
+            token.raw(),
+            TokenUser,
+            Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+            needed,
+            &mut needed,
+        )
+    }
+    .map_err(|e| io::Error::other(format!("GetTokenInformation(TokenUser): {e}")))?;
+    // SAFETY: the buffer holds a TOKEN_USER written by the call above; the
+    // SID it points to lives inside `buf`.
+    let user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
+    let mut sid_str = PWSTR::null();
+    // SAFETY: valid SID pointer; `sid_str` receives a LocalAlloc'd string.
+    unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_str) }
+        .map_err(|e| io::Error::other(format!("ConvertSidToStringSidW: {e}")))?;
+    // SAFETY: `sid_str` is a NUL-terminated string from the call above.
+    let s = unsafe { sid_str.to_string() }.map_err(|e| io::Error::other(e.to_string()));
+    // SAFETY: freeing the buffer ConvertSidToStringSidW allocated for us.
+    let _ = unsafe { LocalFree(Some(HLOCAL(sid_str.as_ptr() as *mut core::ffi::c_void))) };
+    s
+}
+
+/// A self-relative security descriptor built from [`pipe_sddl`], owned
+/// (freed with `LocalFree` on drop) and lent to `CreateNamedPipeW` through
+/// [`attributes`](Self::attributes).
+struct PipeSecurity {
+    descriptor: PSECURITY_DESCRIPTOR,
+}
+
+impl PipeSecurity {
+    /// Build the descriptor for the current user's SID.
+    fn for_current_user() -> io::Result<Self> {
+        Self::from_sddl(&pipe_sddl(&current_user_sid()?))
+    }
+
+    fn from_sddl(sddl: &str) -> io::Result<Self> {
+        let sddl_w = wide(sddl);
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: `sddl_w` is NUL-terminated; `descriptor` receives a
+        // LocalAlloc'd self-relative descriptor that `Drop` frees.
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                windows::core::PCWSTR(sddl_w.as_ptr()),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )
+        }
+        .map_err(|e| io::Error::other(format!("security descriptor from {sddl:?}: {e}")))?;
+        Ok(Self { descriptor })
+    }
+
+    /// The `SECURITY_ATTRIBUTES` to pass to `CreateNamedPipeW`; valid while
+    /// `self` lives.
+    fn attributes(&self) -> SECURITY_ATTRIBUTES {
+        SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: self.descriptor.0,
+            bInheritHandle: false.into(),
+        }
+    }
+}
+
+impl Drop for PipeSecurity {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor was allocated with LocalAlloc by
+        // ConvertStringSecurityDescriptorToSecurityDescriptorW.
+        let _ = unsafe { LocalFree(Some(HLOCAL(self.descriptor.0))) };
+    }
+}
+
+/// The first `max` bytes of `s` (cut on a char boundary) with `…` and the
+/// omitted length appended — for logging a line we refused to parse
+/// without copying 64 KiB of it into the log.
+#[must_use]
+pub fn truncate_for_log(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let mut cut = max;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}… ({} more bytes)", &s[..cut], s.len() - cut)
 }
 
 // ── Overlapped (deadline-bounded) I/O ───────────────────────────────
@@ -743,12 +905,24 @@ fn write_all_overlapped(handle: HANDLE, data: &[u8], deadline: Instant) -> io::R
 /// Each chunk is read asynchronously and awaited via [`await_overlapped`]; the
 /// function returns as soon as a `\n` is seen. If `deadline` passes with no
 /// data, the outstanding read is cancelled and a `TimedOut` error is returned.
+/// The deadline is also checked before every chunk, so a peer that keeps
+/// the reads completing synchronously (data trickling in with no newline)
+/// cannot hold the call past it, and a line that reaches [`MAX_LINE_BYTES`]
+/// without a newline fails with `InvalidData`.
 fn read_line_overlapped(handle: HANDLE, deadline: Instant) -> io::Result<String> {
     let event = EventHandle::new()?;
     let mut buf = vec![0u8; BUF_SIZE as usize];
     let mut raw: Vec<u8> = Vec::new();
 
     loop {
+        // Re-checked on every iteration, including after a synchronous
+        // completion: `await_overlapped` only sees the pending ones.
+        if ms_until(deadline).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "IPC read timed out before the line was complete",
+            ));
+        }
         let _ = unsafe { ResetEvent(event.raw()) };
         let mut overlapped = OVERLAPPED {
             hEvent: event.raw(),
@@ -789,6 +963,12 @@ fn read_line_overlapped(handle: HANDLE, deadline: Instant) -> io::Result<String>
         raw.extend_from_slice(&buf[..bytes_read as usize]);
         if raw.contains(&b'\n') {
             break;
+        }
+        if raw.len() > MAX_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("line exceeds {MAX_LINE_BYTES} bytes without a newline; dropping the peer"),
+            ));
         }
     }
 
@@ -925,6 +1105,12 @@ fn pipe_exists(pipe_name: &str) -> bool {
 /// hanging the CLI/test forever: overlapped operations are awaited with
 /// [`WaitForSingleObject`] and cancelled with [`CancelIo`] on timeout.
 ///
+/// It is opened with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`: the
+/// server may learn who the client is but may not impersonate it. Without
+/// an explicit quality of service the default is `SecurityImpersonation`,
+/// which would let whoever managed to own `\\.\pipe\flow` first act under
+/// the CLI user's identity.
+///
 /// A busy pipe (every instance serving another client, or the daemon
 /// between one client's disconnect and the next accept) is waited for with
 /// `WaitNamedPipeW` and retried for up to `BUSY_CONNECT_TIMEOUT`.
@@ -980,7 +1166,10 @@ fn open_named_pipe(pipe_name: &str) -> windows::core::Result<PipeHandle> {
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+            FILE_ATTRIBUTE_NORMAL
+                | FILE_FLAG_OVERLAPPED
+                | SECURITY_SQOS_PRESENT
+                | SECURITY_IDENTIFICATION,
             None,
         )
     }?;
@@ -1163,6 +1352,143 @@ mod tests {
         );
         server.disconnect().expect("disconnect");
         assert!(server.shutdown());
+    }
+
+    #[test]
+    fn server_drops_a_client_that_never_sends_a_newline() {
+        // 200 KB of JSON-ish bytes with no `\n`: the read must stop at
+        // MAX_LINE_BYTES with InvalidData instead of buffering forever, and
+        // the error must not carry the payload into the log.
+        let name = isolated_pipe_name("flood");
+        let mut server = PipeServer::create_named(&name).expect("pipe");
+        server.start_accept();
+        let flooder = std::thread::spawn({
+            let name = name.clone();
+            move || {
+                let client = connect_to_named_pipe(&name).expect("client connects");
+                let payload = vec![b'{'; 200 * 1024];
+                // The daemon stops reading at 64 KiB, so this write may be
+                // cut short (BrokenPipe) — that is the expected outcome.
+                let _ = write_all_overlapped(
+                    client.raw(),
+                    &payload,
+                    Instant::now() + Duration::from_secs(5),
+                );
+            }
+        });
+        assert_eq!(
+            unsafe { WaitForSingleObject(server.connected_event_handle(), 3_000) },
+            WAIT_OBJECT_0
+        );
+        let t0 = Instant::now();
+        let err = server.read_message().expect_err("flood must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().len() < 300, "error must stay short: {err}");
+        assert!(
+            t0.elapsed() < SERVER_READ_TIMEOUT,
+            "refused by size, not by timeout: {:?}",
+            t0.elapsed()
+        );
+        // The daemon loop then disconnects it and serves the next client.
+        server.disconnect().expect("disconnect");
+        let _ = flooder.join();
+        server.start_accept();
+        let client = std::thread::spawn({
+            let name = name.clone();
+            move || send_message_to(&name, &SocketMessage::Ping)
+        });
+        assert_eq!(
+            unsafe { WaitForSingleObject(server.connected_event_handle(), 3_000) },
+            WAIT_OBJECT_0
+        );
+        assert!(matches!(
+            server.read_message().expect("read"),
+            SocketMessage::Ping
+        ));
+        server.write_response(&SocketResponse::Ok).expect("write");
+        assert_eq!(
+            client.join().expect("client").expect("reply"),
+            SocketResponse::Ok
+        );
+        server.disconnect().expect("disconnect");
+        assert!(server.shutdown());
+    }
+
+    #[test]
+    fn unparseable_line_error_is_truncated_for_the_log() {
+        // A 10 KiB garbage line that does arrive with a newline is rejected
+        // with a message holding a ~200-byte preview, not the whole line.
+        let name = isolated_pipe_name("garbage");
+        let mut server = PipeServer::create_named(&name).expect("pipe");
+        server.start_accept();
+        let client = std::thread::spawn({
+            let name = name.clone();
+            move || {
+                let client = connect_to_named_pipe(&name).expect("client connects");
+                let mut payload = vec![b'x'; 10 * 1024];
+                payload.push(b'\n');
+                write_all_overlapped(
+                    client.raw(),
+                    &payload,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .expect("write garbage");
+                // Hold the handle until the server has read it.
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        });
+        assert_eq!(
+            unsafe { WaitForSingleObject(server.connected_event_handle(), 3_000) },
+            WAIT_OBJECT_0
+        );
+        let err = server.read_message().expect_err("garbage must not decode");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let text = err.to_string();
+        assert!(
+            text.len() < 400,
+            "error must be truncated: {} bytes",
+            text.len()
+        );
+        assert!(text.contains("more bytes"), "{text}");
+        assert!(unrecognised_message_response(&err).is_some());
+        server.disconnect().expect("disconnect");
+        let _ = client.join();
+        assert!(server.shutdown());
+    }
+
+    #[test]
+    fn truncate_for_log_keeps_short_lines_and_cuts_long_ones_on_char_boundaries() {
+        assert_eq!(truncate_for_log("short", 200), "short");
+        assert_eq!(truncate_for_log("", 10), "");
+        let long = "a".repeat(250);
+        let cut = truncate_for_log(&long, 200);
+        assert!(cut.starts_with(&"a".repeat(200)));
+        assert!(cut.ends_with("… (50 more bytes)"), "{cut}");
+        // A multi-byte char straddling the cut is dropped, never split.
+        let s = format!("{}é", "b".repeat(199)); // é is 2 bytes at [199, 201)
+        let cut = truncate_for_log(&s, 200);
+        assert!(cut.starts_with(&"b".repeat(199)));
+        assert!(cut.contains("… (2 more bytes)"), "{cut}");
+    }
+
+    #[test]
+    fn pipe_sddl_grants_system_admins_and_the_user_only() {
+        let sddl = pipe_sddl("S-1-5-21-1-2-3-1001");
+        assert_eq!(
+            sddl,
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;S-1-5-21-1-2-3-1001)"
+        );
+        // No Everyone (WD), Authenticated Users (AU), Users (BU) or
+        // Interactive (IU) entries, and the DACL is protected.
+        for sid in ["WD", "AU", "BU", "IU"] {
+            assert!(!sddl.contains(&format!(";;;{sid})")), "{sddl}");
+        }
+        assert!(sddl.starts_with("D:P"));
+        // The descriptor really parses, and the live SID is a real one.
+        let sid = current_user_sid().expect("process token SID");
+        assert!(sid.starts_with("S-1-"), "{sid}");
+        let _descriptor = PipeSecurity::from_sddl(&pipe_sddl(&sid)).expect("SDDL converts");
+        assert!(PipeSecurity::from_sddl("not sddl").is_err());
     }
 
     #[test]

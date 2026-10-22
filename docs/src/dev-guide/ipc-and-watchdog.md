@@ -50,9 +50,42 @@ A named pipe was chosen over TCP or Unix-domain sockets for three reasons:
   exposure, no firewall rules, no port conflicts.
 - **Windows-native** -- `CreateNamedPipeW` / `ConnectNamedPipe` are the standard
   Win32 IPC primitives. No third-party dependency, no compatibility shim.
-- **ACL-capable** -- the pipe can (and will, in a future hardening pass) accept a
-  `SECURITY_ATTRIBUTES` structure to restrict access to the current user session.
-  Currently any local process can connect (acceptable for the single-user MVP).
+- **ACL-capable** -- the pipe carries its own DACL (below), so another local
+  account cannot even open it.
+
+### Pipe security
+
+The server creates the pipe with a `SECURITY_ATTRIBUTES` whose descriptor
+comes from SDDL (`transport::pipe_sddl`):
+
+```text
+D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;<user SID>)
+```
+
+A protected DACL with exactly three allow entries: SYSTEM and Builtin
+Administrators get full access, the user the daemon runs as gets generic
+read + write (what the client's `CreateFileW` asks for), and nobody else —
+no Everyone, no Authenticated Users — gets anything, so a process under
+another local account gets `Access is denied` at open. The user's SID is
+read from the daemon's process token at startup (`OpenProcessToken` →
+`GetTokenInformation(TokenUser)` → `ConvertSidToStringSidW`) rather than
+written as the creator-owner placeholder `CO`, which is only substituted
+during ACL *inheritance* and means nothing in a pipe's own DACL, or `OW`,
+which would silently depend on the owner the kernel assigns. The pipe mode
+also carries `PIPE_REJECT_REMOTE_CLIENTS`.
+
+On the client side `CreateFileW` passes
+`SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`: whoever holds the server
+end may learn the CLI's identity but cannot impersonate it (the default
+quality of service is *impersonation*, which an impostor server squatting
+on the pipe name could abuse).
+
+Both ends cap a line at `MAX_LINE_BYTES` (64 KiB): a peer that sends that
+much with no newline gets `InvalidData` and, on the daemon, is
+disconnected; the read deadline is re-checked before every chunk so a
+trickle of synchronous completions cannot stretch it either. A line that
+arrives but does not decode is logged with a ~200-byte preview, never in
+full.
 
 ### Client-Side Timeout
 

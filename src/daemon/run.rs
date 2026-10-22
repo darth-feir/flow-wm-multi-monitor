@@ -420,6 +420,9 @@ impl FlowWM {
                             // an error reply so the client does not just see
                             // a closed pipe; a disconnect or I/O error has
                             // nobody to answer. Either way the session ends.
+                            // The error carries at most a ~200-byte preview
+                            // of the line (`transport::truncate_for_log`),
+                            // and none of it for an over-long one.
                             if let Some(reply) =
                                 crate::ipc::transport::unrecognised_message_response(&e)
                             {
