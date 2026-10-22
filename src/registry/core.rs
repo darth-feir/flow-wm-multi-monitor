@@ -279,18 +279,12 @@ impl WindowRegistry {
     ///
     /// # Minimized windows
     ///
-    /// A window met iconic (`info.is_iconic`; its `rect` and `is_maximized`
-    /// then describe the restore geometry, see
-    /// [`win32::restored_geometry`]) is classified like a visible one and
-    /// registered in the **minimized** state of its class —
-    /// `Tiling(Minimized)` / `Floating(Minimized)`, `minimized_at` stamped,
-    /// no virtual slot — exactly the record a window minimized *after* it
-    /// was managed has, so the restore hook seats it the same way. An
-    /// ignored one is `Ignored(..)` as usual (a window that restores to
-    /// maximized is `Ignored(Maximized)` and goes through the maximized
-    /// recovery once it is back). Its invisible borders are not measured
-    /// (DWM has no frame for an icon): [`Window::geometry_from_placement`]
-    /// marks the record for a re-measure on restore.
+    /// A window met iconic (`info.is_iconic`, geometry from its placement's
+    /// restore rect) is classified like a visible one and registered in the
+    /// **minimized** state of its class, with no virtual slot and
+    /// [`Window::geometry_from_placement`] set so the restore hook
+    /// re-measures it. See `docs/src/dev-guide/window-registry.md`, *Windows
+    /// met minimized*.
     ///
     /// # Design: Why Separate Classification from Registration?
     ///
@@ -1219,14 +1213,10 @@ impl WindowRegistry {
     }
 
     /// Re-read `hwnd_val`'s window rect and invisible borders from Win32
-    /// into `pre_manage_rect`, `last_natural_size` and `invisible_bounds`.
-    ///
-    /// Called after a window leaves the maximized state (a recovery or an
-    /// adoption): the values measured at registration describe the
-    /// maximized frame — a rect the size of the work area and the thick
-    /// off-screen borders Windows gives a maximized window — and would
-    /// mis-size the column, the float and the border overlay. A window
-    /// that cannot be queried (gone) keeps its old values.
+    /// into `pre_manage_rect`, `last_natural_size` and `invisible_bounds`
+    /// after a window leaves the maximized state: the values measured at
+    /// registration describe the maximized frame. A window that cannot be
+    /// queried (gone) keeps its old values.
     fn refresh_geometry(&mut self, hwnd_val: isize) {
         let hwnd = HWND(hwnd_val as *mut _);
         let Ok(rect) = win32::get_window_rect(hwnd) else {
@@ -1253,19 +1243,12 @@ impl WindowRegistry {
 
     /// Adopt an `Ignored` window on the user's explicit request
     /// (`set-window tile|float|cycle|fullscreen` on it): un-maximize it when
-    /// it is maximized (`ShowWindow(SW_SHOWNOACTIVATE)`, which keeps the
-    /// foreground where it is), re-measure its geometry and set its state
-    /// to a placeholder `Tiling(Active)` (`tile`) or `Floating(Active)`
-    /// (`!tile`) for the daemon to seat — a float's rect is written by
-    /// `register_float`, a tile's slot by the layout sync. A window that
-    /// was maximized is marked [`Window::adopted_from_maximized`].
-    ///
-    /// Any ignore reason qualifies: a window ignored by a rule
-    /// (`Ignored(ExplicitRule)`) is adopted too — Mod+V is explicit intent,
-    /// and the learned rule the daemon records afterwards outranks a
-    /// bundled ignore rule for the app's next window (not a user rule in
-    /// `flow-rules.toml`, which always wins). The rules are **not**
-    /// re-consulted here: the user asked for this mode.
+    /// it is maximized (`ShowWindow(SW_SHOWNOACTIVATE)`), re-measure its
+    /// geometry and set its state to a placeholder `Tiling(Active)` (`tile`)
+    /// or `Floating(Active)` (`!tile`) for the daemon to seat. A window that
+    /// was maximized is marked [`Window::adopted_from_maximized`]. Any ignore
+    /// reason qualifies and the rules are not re-consulted; see
+    /// `docs/src/dev-guide/window-registry.md`, *State Transitions*.
     ///
     /// # Errors
     ///
@@ -1348,20 +1331,16 @@ impl WindowRegistry {
     /// [`Recovered`](super::types::ReclassifyResult::Recovered) variant tells
     /// the daemon to insert it into the live layout. The daemon also calls
     /// it from the foreground, show and move-size-end handlers for a window
-    /// that is still OS-ignored, since the `STATECHANGE` for an un-maximize
-    /// does not always arrive.
+    /// that is still OS-ignored (the `STATECHANGE` does not always arrive).
     ///
     /// # Adoption (`adopt_maximized`)
     ///
     /// With [`set_adopt_maximized`](Self::set_adopt_maximized) on, an
-    /// `Ignored(Maximized)` window that is **still maximized** (and not
-    /// fullscreen) is un-maximized here — provided the rules would take it
-    /// as a tile or a float; a window the rules ignore is left maximized
-    /// and `Unchanged` — then classified like a freshly restored one and
-    /// marked [`Window::adopted_from_maximized`] so it is handed back
-    /// maximized later. A recovered window (adopted or not) also has its
-    /// geometry re-measured, because the registration-time rect and
-    /// invisible borders describe the maximized frame.
+    /// `Ignored(Maximized)` window that is still maximized (and that the
+    /// rules would take) is un-maximized here, classified like a freshly
+    /// restored one and marked [`Window::adopted_from_maximized`]; a
+    /// recovered window also has its geometry re-measured. See
+    /// `docs/src/dev-guide/event-pipelines.md`, *State Change*.
     ///
     /// # Filtering — why this is cheap on a noisy event
     ///

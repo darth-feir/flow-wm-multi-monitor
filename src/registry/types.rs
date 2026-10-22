@@ -210,16 +210,10 @@ pub struct Window {
 
     /// The window rect (full `GetWindowRect` space, like `pre_manage_rect`)
     /// the window had the **first time it entered a tiled layout** this
-    /// run; `None` until then.
-    ///
-    /// Recorded once by
-    /// [`WindowRegistry::update_tiling_slots_from_layout`](super::core::WindowRegistry::update_tiling_slots_from_layout)
-    /// (from `pre_manage_rect`, for a window that was tiled from the start)
-    /// or by [`note_pre_tiling_rect`](super::core::WindowRegistry::note_pre_tiling_rect)
-    /// (from the float rect, for a `set-window tile`), and never refreshed
-    /// afterwards: a float → tile → float → tile cycle keeps the first
-    /// anchor. `flow dispatch tiling off` moves each tile back here, so the
-    /// desktop looks like it did before FlowWM tiled it.
+    /// run; `None` until then. Recorded once (from `pre_manage_rect` or, for
+    /// a `set-window tile`, the float rect) and never refreshed, so a
+    /// float → tile → float → tile cycle keeps the first anchor. `flow
+    /// dispatch tiling off` moves each tile back here.
     #[serde(default)]
     pub pre_tiling_rect: Option<Rect>,
 
@@ -407,15 +401,10 @@ impl std::fmt::Display for CreationSkip {
 ///
 /// Note: tile ↔ float transitions are implemented via `flow dispatch set-window`
 /// (see `docs/src/dev-guide/floating-space.md`). An `Ignored` window leaves
-/// that state three ways: the OS-driven recovery (a restored
-/// `Ignored(Maximized|Fullscreen)` window is re-classified into the layout on
-/// `EVENT_OBJECT_STATECHANGE`, or on a foreground / show / move-size-end
-/// event when that one did not arrive), the `adopt_maximized` config key
-/// (the daemon un-maximizes it and classifies it through the rules), and
-/// `set-window tile|float|cycle|fullscreen`, which adopts any ignored window
-/// (see `Window::adopted_from_maximized`). The one direction that remains
-/// unimplemented is tiling → `Ignored(Maximized)` (maximizing a tiled window
-/// does not evict it from the layout).
+/// that state through the OS-driven recovery, the `adopt_maximized` config
+/// key or `set-window`; the one direction that remains unimplemented is
+/// tiling → `Ignored(Maximized)`. See `docs/src/dev-guide/window-registry.md`,
+/// *State Transitions*.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WindowState {
     /// Window is participating in the tiling layout.

@@ -166,15 +166,9 @@ const EVENT_OBJECT_NAMECHANGE: u32 = 0x800C;
 /// signal that it left the screen.
 const EVENT_OBJECT_CLOAKED: u32 = 0x8017;
 
-/// `EVENT_OBJECT_UNCLOAKED` — DWM uncloaked a window.
-///
-/// A UWP frame (`ApplicationFrameHost.exe`, class `ApplicationFrameWindow`)
-/// is **created cloaked** and uncloaked by DWM once its content is ready —
-/// with no `EVENT_OBJECT_SHOW` or further `CREATE`. The creation gates
-/// reject a cloaked window (it is not Alt+Tab visible), so without this
-/// hook a UWP app opened after the daemon started was never registered
-/// (the Settings app, observed 2026-10-21). The daemon attempts creation
-/// for an untracked window on this event, and re-shows a tracked one.
+/// `EVENT_OBJECT_UNCLOAKED` — DWM uncloaked a window. A UWP frame is created
+/// cloaked and never `SHOW`n, so this is the daemon's chance to register it;
+/// see `docs/src/dev-guide/event-pipelines.md`, *Cloaked / Uncloaked*.
 const EVENT_OBJECT_UNCLOAKED: u32 = 0x8018;
 
 /// `OBJID_WINDOW` — identifies the window object itself (not a child).
@@ -430,7 +424,7 @@ static TOPOLOGY_DIRTY: AtomicBool = AtomicBool::new(false);
 /// Sets the dirty flag and wakes the main loop by signalling the hook event,
 /// exactly like [`request_shutdown`]. Safe to call from any window
 /// procedure or thread; Windows sends several messages per change and
-/// calling this for each of them is expected â€” the main loop debounces.
+/// calling this for each of them is expected — the main loop debounces.
 pub fn request_topology_refresh() {
     if !TOPOLOGY_DIRTY.swap(true, Ordering::AcqRel) {
         log::debug!("display topology change reported");
@@ -1164,12 +1158,9 @@ fn register_hooks() -> Vec<(HWINEVENTHOOK, &'static str)> {
         log::error!("failed to hook NAMECHANGE");
     }
 
-    // Hook: EVENT_OBJECT_CLOAKED + EVENT_OBJECT_UNCLOAKED (range)
-    //
-    // UWP frames are created cloaked and uncloaked by DWM later with no SHOW:
-    // UNCLOAKED is the daemon's chance to register them. CLOAKED is the
-    // "hidden" signal for a UWP app that is suspended or minimized without
-    // becoming iconic. Both are rare events (no filtering needed).
+    // Hook: EVENT_OBJECT_CLOAKED + EVENT_OBJECT_UNCLOAKED (range). UWP frames
+    // are created cloaked and uncloaked later with no SHOW; both events are
+    // rare, so no filtering.
     let h = unsafe {
         SetWinEventHook(
             EVENT_OBJECT_CLOAKED,

@@ -134,15 +134,32 @@ state three ways (none drawn above):
   A window the rules would ignore is left maximized; fullscreen windows are
   never adopted. `WindowRegistry::set_adopt_maximized` is the switch —
   registration itself never un-maximizes, so a maximized window is always
-  `Ignored(Maximized)` first and the daemon decides when it may move.
+  `Ignored(Maximized)` first and the daemon decides when it may move (the
+  daemon turns the switch on at the start of `initial_layout` and off while
+  tiling is paused).
 - **`set-window tile|float|cycle|fullscreen`** — adopts any ignored window,
-  explicit rule included (`WindowRegistry::adopt_ignored_window`).
+  explicit rule included (`WindowRegistry::adopt_ignored_window`). Mod+V on
+  a rule-ignored window is explicit intent, so the rules are *not*
+  re-consulted, and the learned rule the daemon records afterwards outranks
+  a bundled ignore rule for the app's next window (not a user rule in
+  `flow-rules.toml`, which always wins — see
+  [Classification](./classification.md)).
+
+Whichever path un-maximizes a window, the registry re-measures its rect,
+natural size and invisible borders afterwards (`refresh_geometry`): the
+values measured at registration describe the *maximized* frame — a rect the
+size of the work area and the thick off-screen borders Windows gives a
+maximized window — and would mis-size the column, the float and the border
+overlay.
 
 A window the daemon un-maximized carries `Window::adopted_from_maximized`
 and is maximized again (`SW_MAXIMIZE`) wherever the daemon gives windows
 back: `tiling off`, the shutdown rescue (`flow stop`, session end) and the
 fail-back; `tiling on` un-maximizes it again before seating it. The flag is
-never cleared.
+never cleared. `SW_MAXIMIZE` activates the window — `ShowWindow` has no
+non-activating maximize — so every pass that re-maximizes a batch puts the
+previous foreground back afterwards, and a minimized or hidden adopted
+window is left alone (maximizing it would un-minimize it).
 
 The one direction that remains unimplemented is **Tiling →
 `Ignored(Maximized)`** — a tiled window the user then maximizes is not
@@ -423,6 +440,17 @@ while it is still minimized. DWM cannot measure the invisible borders of an
 icon, so the record carries `Window::geometry_from_placement`: the first
 `restore_window` re-measures the rect, natural size and borders from the
 now-visible frame before the daemon seats the window.
+
+One more Win32 quirk guards that re-measure: `IsIconic` flips **before the
+frame has left the icon**. At `EVENT_SYSTEM_MINIMIZEEND`, and briefly after
+a style change on an iconic window, `GetWindowRect` can still report the
+icon rect — at (-32000, -32000) for a window with a taskbar button, at the
+bottom-left of the desktop for one without. Registering or re-measuring
+from that rect would make the icon the window's pre-manage rect, and
+`tiling off` would later hand the window back icon-sized. Every reader
+therefore checks `win32::is_iconic_rect` and waits (the restore handler
+leaves an untracked window to the pending-creation retry or the activation
+that follows a restore) instead of recording it.
 
 ## Recovery Snapshot (Planned)
 

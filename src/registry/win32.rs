@@ -436,16 +436,10 @@ pub fn is_icon_sized(rect: Rect, icon_w: i32, icon_h: i32) -> bool {
 }
 
 /// Whether `rect` (a `GetWindowRect` reading) is the frame of a minimized
-/// window rather than of a window on screen.
-///
-/// `IsIconic` flips before the frame has left the icon: at
-/// `EVENT_SYSTEM_MINIMIZEEND`, and briefly after a style change on an
-/// iconic window, `GetWindowRect` can still report the icon rect — at
-/// (-32000, -32000) for a taskbar window, at the bottom-left of the
-/// desktop for one without a taskbar button. Registering or re-measuring
-/// from that rect would make the icon the window's pre-manage rect (and
-/// `tiling off` would hand the window back icon-sized), so the readers
-/// check here and wait instead.
+/// window rather than of a window on screen: `IsIconic` flips before the
+/// frame has left the icon, so the readers check here and wait instead of
+/// recording the icon rect. See `docs/src/dev-guide/window-registry.md`,
+/// *Windows met minimized*.
 #[must_use]
 pub fn is_icon_rect(rect: Rect) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{SM_CXMINIMIZED, SM_CYMINIMIZED};
@@ -793,17 +787,11 @@ pub fn clear_foreground_window() -> bool {
 }
 
 /// Restore a minimized **or maximized** window to its normal size and
-/// position **without activating it** (`ShowWindow(SW_SHOWNOACTIVATE)`:
-/// like `SW_SHOWNORMAL` — "if the window is minimized, maximized, or
-/// arranged, the system restores it to its original size and position" —
-/// but unlike `SW_RESTORE` it never takes the foreground). Used by the
-/// monitor-hotplug reconcile for windows Windows minimized when their
-/// display vanished — a run of restores must not bounce the foreground (and
-/// with it the daemon's active monitor) through every one of them — and by
-/// the maximized-window adoption (`adopt_maximized`, `set-window` on an
-/// ignored window, `tiling on`) to un-maximize a window before it is tiled.
-/// The reconcile seats the window itself; the resulting
-/// `EVENT_SYSTEM_MINIMIZEEND` finds it seated and only refreshes its border.
+/// position **without activating it** (`ShowWindow(SW_SHOWNOACTIVATE)`, which
+/// restores like `SW_RESTORE` but never takes the foreground). Used by the
+/// hotplug reconcile and by the maximized-window adoption; why not
+/// `SW_RESTORE` is in `docs/src/dev-guide/ipc-and-watchdog.md`, *Monitor
+/// hotplug*.
 ///
 /// # Returns
 ///
@@ -820,14 +808,11 @@ pub fn show_window_restored(hwnd_val: isize) -> bool {
     true
 }
 
-/// Maximize a window (`ShowWindow(SW_MAXIMIZE)`) on the monitor it is on.
-///
-/// The inverse of [`show_window_restored`] for a window the daemon adopted
-/// from maximized (see `Window::adopted_from_maximized`): `tiling off`, the
-/// shutdown rescue and the fail-back hand such a window back maximized, the
-/// way the user had it. `SW_MAXIMIZE` activates the window — there is no
-/// non-activating maximize in `ShowWindow` — so callers that re-maximize a
-/// batch restore the previous foreground afterwards.
+/// Maximize a window (`ShowWindow(SW_MAXIMIZE)`) on the monitor it is on:
+/// the inverse of [`show_window_restored`] for a window adopted from
+/// maximized (`Window::adopted_from_maximized`). `SW_MAXIMIZE` activates the
+/// window — there is no non-activating maximize — so callers that
+/// re-maximize a batch restore the previous foreground afterwards.
 ///
 /// # Returns
 ///
@@ -1697,10 +1682,8 @@ pub fn normal_position_to_screen(normal: Rect, primary_screen: Rect, primary_wor
 /// coordinates (the same space as [`get_window_rect`]), and whether it
 /// restores to **maximized** (`WPF_RESTORETOMAXIMIZED` — `IsZoomed` is
 /// `false` while a window is iconic, so the flag is the only way to know).
-///
-/// This is what the registry classifies a window by when it meets it
-/// minimized: its monitor, its pre-manage rect and its natural size all
-/// come from here, since `GetWindowRect` reports the off-screen icon.
+/// This is what the registry classifies a window met minimized by; see
+/// `docs/src/dev-guide/window-registry.md`, *Windows met minimized*.
 ///
 /// # Errors
 ///
