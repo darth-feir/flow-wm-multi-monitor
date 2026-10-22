@@ -278,19 +278,27 @@ pub fn rescue_offscreen_windows() -> Result<RescueReport, String> {
             // The iconic rect says nothing; the placement's normal position
             // is what would strand it on restore. Invisible borders cannot
             // be measured on a minimized window, so zero is assumed.
+            let hwnd_val = hwnd.0 as isize;
             match rescue_minimized_placement(hwnd, InvisibleBounds::zero(), &monitors, None) {
                 Ok(Some((from, to))) => {
+                    // Titles only at debug level (they are personal and the
+                    // log is kept for days); the report itself, which the
+                    // user asked for, still names the window.
                     log::info!(
-                        "rescue: re-anchored minimized {title:?} from ({},{}) to ({},{})",
+                        "rescue: re-anchored minimized hwnd {hwnd_val:#x} from ({},{}) to ({},{})",
                         from.x,
                         from.y,
                         to.x,
                         to.y
                     );
+                    log::debug!("rescue: hwnd {hwnd_val:#x} is {title:?}");
                     report.minimized.push(RescuedWindow { title, from, to });
                 }
                 Ok(None) => {}
-                Err(e) => log::warn!("rescue: placement of minimized {title:?} not fixed: {e}"),
+                Err(e) => {
+                    log::warn!("rescue: placement of minimized hwnd {hwnd_val:#x} not fixed: {e}");
+                    log::debug!("rescue: hwnd {hwnd_val:#x} is {title:?}");
+                }
             }
             continue;
         }
@@ -312,19 +320,21 @@ pub fn rescue_offscreen_windows() -> Result<RescueReport, String> {
             target_window.height,
         ) {
             log::info!(
-                "rescue: moved {title:?} from ({},{}) to ({},{})",
+                "rescue: moved hwnd {hwnd_val:#x} from ({},{}) to ({},{})",
                 visible.x,
                 visible.y,
                 target.x,
                 target.y
             );
+            log::debug!("rescue: hwnd {hwnd_val:#x} is {title:?}");
             report.moved.push(RescuedWindow {
                 title,
                 from: visible,
                 to: target,
             });
         } else {
-            log::warn!("rescue: SetWindowPos failed for {title:?} (hwnd {hwnd_val})");
+            log::warn!("rescue: SetWindowPos failed for hwnd {hwnd_val:#x}");
+            log::debug!("rescue: hwnd {hwnd_val:#x} is {title:?}");
         }
     }
     Ok(report)

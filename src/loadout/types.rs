@@ -103,10 +103,17 @@ pub struct FloatingEntry {
 /// The matcher keys **only** on [`hwnd`](Self::hwnd): a Win32 window handle
 /// is stable and unique across a daemon restart — the target applications
 /// keep running independently of the daemon — so each saved slot resolves to
-/// at most one live window with no scoring or tie-breaking. `exe` and `title`
-/// are **diagnostic-only**: they are never consulted by the matcher, but make
-/// a failed restore self-describing (a window's identity is only known at save
-/// time, so it must be persisted to name the missing window at load time).
+/// at most one live window with no scoring or tie-breaking. `exe` is
+/// **diagnostic-only**: never consulted by the matcher, but it makes a
+/// failed restore self-describing (a window's identity is only known at
+/// save time, so it must be persisted to name the missing window at load
+/// time).
+///
+/// `title` used to be written for the same reason. It is personal
+/// (document names, chat partners, URLs) and the file sits in the config
+/// directory for as long as the user keeps it, so the daemon **no longer
+/// writes it**; it is still read from files that have it, and shown in the
+/// abort message when present.
 ///
 /// See the design-decision record (`docs/src/dev-guide/design-decisions.md`,
 /// "Loadout Window Identity: HWND-Exact (Not Fuzzy Matching)").
@@ -117,8 +124,10 @@ pub struct WindowRef {
     pub hwnd: isize,
     /// Executable basename (e.g. `"firefox.exe"`) — diagnostic only.
     pub exe: String,
-    /// Window title at the time of snapshot — diagnostic only.
-    pub title: String,
+    /// Window title at the time of snapshot — diagnostic only, read from
+    /// older files, never written any more (see the type docs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// Plain pixel rectangle for floating window placement.
@@ -149,9 +158,28 @@ mod tests {
         assert_eq!(LoadoutFile::CURRENT_VERSION, 3);
     }
 
+    /// A `WindowRef` without a title (what the daemon writes now) omits the
+    /// key; an older file that has one still parses with it.
+    #[test]
+    fn title_is_optional_and_not_written_when_absent() {
+        let bare = WindowRef {
+            hwnd: 0x10,
+            exe: "code.exe".into(),
+            title: None,
+        };
+        let json = serde_json::to_string(&bare).expect("serialize");
+        assert_eq!(json, r#"{"hwnd":16,"exe":"code.exe"}"#);
+        let back: WindowRef = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.title, None);
+        let old: WindowRef =
+            serde_json::from_str(r#"{"hwnd":16,"exe":"code.exe","title":"secret.docx"}"#)
+                .expect("old file with a title still loads");
+        assert_eq!(old.title.as_deref(), Some("secret.docx"));
+    }
+
     /// Round-trip a complete [`LoadoutFile`] through JSON.
     // Positive: full loadout serializes and deserializes correctly with the
-    // HWND-identity `{hwnd, exe, title}` shape (no `class`).
+    // HWND-identity `{hwnd, exe[, title]}` shape (no `class`).
     #[test]
     fn round_trip_full_loadout() {
         let file = LoadoutFile {
@@ -169,7 +197,7 @@ mod tests {
                     focus: Some(WindowRef {
                         hwnd: 0x00_0A_0B_0C,
                         exe: "code.exe".into(),
-                        title: "main.rs — flow-wm".into(),
+                        title: Some("main.rs — flow-wm".into()),
                     }),
                     columns: vec![ColumnSnapshot {
                         width_px: 960,
@@ -177,7 +205,7 @@ mod tests {
                             window: WindowRef {
                                 hwnd: 0x00_0A_0B_0C,
                                 exe: "code.exe".into(),
-                                title: "main.rs — flow-wm".into(),
+                                title: Some("main.rs — flow-wm".into()),
                             },
                             height_px: 600,
                         }],
@@ -187,7 +215,7 @@ mod tests {
                     window: WindowRef {
                         hwnd: 0x00_0D_0E_0F,
                         exe: "slack.exe".into(),
-                        title: "Slack".into(),
+                        title: Some("Slack".into()),
                     },
                     rect: RectJson {
                         x: 100,
@@ -219,7 +247,7 @@ mod tests {
         let row_ref = &ws.scrolling.columns[0].rows[0].window;
         assert_eq!(row_ref.hwnd, 0x00_0A_0B_0C);
         assert_eq!(row_ref.exe, "code.exe");
-        assert_eq!(row_ref.title, "main.rs — flow-wm");
+        assert_eq!(row_ref.title.as_deref(), Some("main.rs — flow-wm"));
         // The serialized shape must carry `hwnd` and never `class`.
         assert!(json.contains("\"hwnd\""));
         assert!(!json.contains("class"));

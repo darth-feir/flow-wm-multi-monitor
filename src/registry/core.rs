@@ -351,7 +351,17 @@ impl WindowRegistry {
         }
 
         self.windows.insert(key, window);
+        // The title is personal (document names, chat partners, URLs) and
+        // the default log is kept for days: hwnd/exe/class at info, the
+        // title only at debug (`flow start --verbose`).
         log::info!(
+            "registered window: {:?} ({}) class={:?}{}",
+            info.hwnd,
+            info.exe,
+            info.class,
+            if info.is_iconic { " (minimized)" } else { "" },
+        );
+        log::debug!(
             "registered window: {:?} ({}) class={:?} title={:?}{}",
             info.hwnd,
             info.exe,

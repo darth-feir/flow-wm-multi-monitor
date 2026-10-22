@@ -14,8 +14,9 @@
 //!
 //! 1. **A date-stamped file** — `<config_dir>/logs/flowd-YYYY-MM-DD.log`,
 //!    opened in append mode. One file per day; multiple daemon restarts on
-//!    the same day accumulate into one file. All historical logs are
-//!    preserved (no automatic rotation or deletion).
+//!    the same day accumulate into one file. Files older than
+//!    `[logging] keep_days` (by the date in their name) are deleted at
+//!    daemon start by [`prune_old_logs`]; `keep_days = 0` keeps them all.
 //! 2. **stderr** — so that running `flowd` directly from a console (rather
 //!    than via `flow start`) still shows logs inline.
 //!
@@ -67,7 +68,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use chrono::Local;
+use chrono::{Local, NaiveDate};
 use env_logger::{Builder, Target};
 
 /// Initialize the global logger.
@@ -186,6 +187,55 @@ pub fn default_level() -> &'static str {
 #[must_use]
 pub fn default_log_path(config_dir: &Path) -> PathBuf {
     crate::config::dirs::log_file_path_in(config_dir, &today_local_date())
+}
+
+/// Delete the daily log files under `<config_dir>/logs` that are older
+/// than `keep_days` days — judged by the date in the file name
+/// (`flowd-YYYY-MM-DD.log`), which is what the daemon wrote, not the
+/// modification time. `keep_days == 0` deletes nothing. Files with any other
+/// name (a `--log-file` target, a user's own notes) are never touched.
+/// Returns how many files were removed; a missing `logs/` directory or an
+/// unreadable entry is not an error.
+pub fn prune_old_logs(config_dir: &Path, keep_days: u32) -> usize {
+    if keep_days == 0 {
+        return 0;
+    }
+    let today = Local::now().date_naive();
+    let dir = crate::config::dirs::logs_dir_in(config_dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_stale_log_name(name, today, keep_days) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => {
+                removed += 1;
+                log::info!("pruned log file {} (older than {keep_days} days)", name);
+            }
+            Err(e) => log::warn!("could not prune log file {}: {e}", entry.path().display()),
+        }
+    }
+    removed
+}
+
+/// `true` when `name` is a daily log file (`flowd-YYYY-MM-DD.log`) whose
+/// date is more than `keep_days` days before `today`. Pure.
+#[must_use]
+pub fn is_stale_log_name(name: &str, today: NaiveDate, keep_days: u32) -> bool {
+    let Some(date) = name
+        .strip_prefix("flowd-")
+        .and_then(|rest| rest.strip_suffix(".log"))
+        .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+    else {
+        return false;
+    };
+    let age_days = (today - date).num_days();
+    age_days > i64::from(keep_days)
 }
 
 /// Return today's local date as a `YYYY-MM-DD` string.
@@ -310,6 +360,60 @@ mod tests {
             (2024..=2100).contains(&year),
             "year should be plausible: {date}"
         );
+    }
+
+    #[test]
+    fn stale_log_name_is_judged_by_the_date_in_the_name() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 22).unwrap();
+        assert!(is_stale_log_name("flowd-2026-09-22.log", today, 14)); // 30 days
+        assert!(is_stale_log_name("flowd-2026-10-07.log", today, 14)); // 15 days
+        assert!(!is_stale_log_name("flowd-2026-10-08.log", today, 14)); // 14 days: kept
+        assert!(!is_stale_log_name("flowd-2026-10-22.log", today, 14)); // today
+        assert!(!is_stale_log_name("flowd-2026-11-01.log", today, 14)); // future
+        // keep_days = 0 would mean "older than 0 days" — the caller short-circuits
+        // it, but even here today's file is never stale.
+        assert!(!is_stale_log_name("flowd-2026-10-22.log", today, 0));
+        // Anything that is not a daily log is left alone.
+        assert!(!is_stale_log_name("flowd-2026-09-22.log.bak", today, 14));
+        assert!(!is_stale_log_name("debug-2026-09-22.log", today, 14));
+        assert!(!is_stale_log_name("flowd-yesterday.log", today, 14));
+        assert!(!is_stale_log_name("stage16.log", today, 14));
+    }
+
+    #[test]
+    fn prune_old_logs_removes_only_stale_daily_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let logs = temp.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let today = Local::now().date_naive();
+        let name = |days_ago: i64| {
+            format!(
+                "flowd-{}.log",
+                (today - chrono::Duration::days(days_ago)).format("%Y-%m-%d")
+            )
+        };
+        for f in [
+            name(30),
+            name(15),
+            name(14),
+            name(0),
+            "notes.log".to_owned(),
+        ] {
+            std::fs::write(logs.join(f), "x").unwrap();
+        }
+        assert_eq!(prune_old_logs(temp.path(), 14), 2);
+        assert!(!logs.join(name(30)).exists());
+        assert!(!logs.join(name(15)).exists());
+        assert!(logs.join(name(14)).exists());
+        assert!(logs.join(name(0)).exists());
+        assert!(logs.join("notes.log").exists());
+        // keep_days = 0: nothing is ever removed.
+        std::fs::write(logs.join(name(400)), "x").unwrap();
+        assert_eq!(prune_old_logs(temp.path(), 0), 0);
+        assert!(logs.join(name(400)).exists());
+        // No logs dir at all is fine.
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(prune_old_logs(empty.path(), 14), 0);
     }
 
     /// Positive: `TeeWriter` writes the full payload to the file.

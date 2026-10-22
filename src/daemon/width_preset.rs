@@ -424,7 +424,7 @@ mod tests {
                             window: WindowRef {
                                 hwnd: C,
                                 exe: "app.exe".into(),
-                                title: "winC".into(),
+                                title: None,
                             },
                             height_px: 1000,
                         }],

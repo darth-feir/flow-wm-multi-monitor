@@ -73,6 +73,8 @@ mod tests {
             "animation",
             "minimize_restore",
             "adopt_maximized",
+            "loadout",
+            "logging",
         ];
         for key in &expected_keys {
             assert!(

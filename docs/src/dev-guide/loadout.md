@@ -18,11 +18,15 @@ running independently of the daemon, so their handles are stable and unique
 across the restart — `HWND` is an exact, unambiguous key for the only window of
 time the matcher must handle (the seconds between `stop` and `start`).
 
-Stored alongside the `HWND` are `exe` and `title`, retained as
-**diagnostic-only** fields: they are never read by the matcher, but make a
-failed restore self-describing (a missing window's identity is only known at
-save time, so it must be persisted to name the window at load time). The
-window `class` is dropped as low diagnostic value.
+Stored alongside the `HWND` is `exe`, retained as a **diagnostic-only**
+field: it is never read by the matcher, but makes a failed restore
+self-describing (a missing window's identity is only known at save time, so
+it must be persisted to name the window at load time). The window `class`
+is dropped as low diagnostic value. The window `title` was written for the
+same diagnostic reason until stage 16 and is **no longer written**: it is
+personal data (document names, chat partners, URLs) in a file that lives in
+the config directory indefinitely, and the matcher never needed it. Files
+that have it still load, and the abort message shows it when present.
 
 This extends the `WindowId`-as-bridge decision: `WindowId` bridges the
 registry and the layout engine *at runtime*; the stored `HWND` bridges the same
@@ -38,8 +42,8 @@ windows are currently open) is left untouched. There is no per-slot skip, no
 gap-collapsing, and no layout-simplification algorithm.
 
 The abort is the single, explicit failure mode. It is logged with the missing
-window's diagnostic `exe`/`title` so a failed restore is diagnosable without a
-debugger, and surfaced as an error to a manual `flow loadout load`.
+window's diagnostic `exe` and `HWND` so a failed restore is diagnosable without
+a debugger, and surfaced as an error to a manual `flow loadout load`.
 
 ## File format
 
@@ -55,10 +59,10 @@ versioned JSON document:
       "active": true,
       "scrolling": {
         "viewport_offset": 0,
-        "focus": { "hwnd": 2885958, "exe": "code.exe", "title": "main.rs" },
+        "focus": { "hwnd": 2885958, "exe": "code.exe" },
         "columns": [
           { "width_px": 960, "rows": [
-            { "window": { "hwnd": 2885958, "exe": "code.exe", "title": "main.rs" },
+            { "window": { "hwnd": 2885958, "exe": "code.exe" },
               "height_px": 600 }
           ] }
         ]
@@ -78,8 +82,8 @@ versioned JSON document:
   a `WindowRef` + height), the viewport scroll offset, the focused window, and
   any floating windows with their screen rectangles.
 
-`exe`/`title` appear in every `WindowRef` purely so the file is human-readable
-when a restore fails.
+`exe` appears in every `WindowRef` purely so the file is human-readable when
+a restore fails; a `title` key is accepted (older files) but not written.
 
 ## Lifecycle
 

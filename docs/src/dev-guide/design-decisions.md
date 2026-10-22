@@ -195,12 +195,14 @@ occurs, because target applications are independent processes that do not close
 during a daemon restart. Aborting the whole load on any missing HWND avoids both
 the silent-misplacement danger and the simplification algorithm entirely.
 
-Stored alongside the HWND are `exe` and `title`, retained as **diagnostic-only**
-fields: they make the loadout file self-describing at the moment a restore fails
-(a missing window's identity is only known at save time, so it must be persisted
-to be useful at load time). They are never consulted by the matcher. The window
+Stored alongside the HWND is `exe`, retained as a **diagnostic-only** field:
+it makes the loadout file self-describing at the moment a restore fails (a
+missing window's identity is only known at save time, so it must be persisted
+to be useful at load time). It is never consulted by the matcher. The window
 `class` is dropped as low-value (opaque Win32 identifiers of no use to a human
-reader).
+reader), and since stage 16 the `title` is no longer written either: it was
+only ever informational, and it is personal data in a file that outlives the
+session (still read from older files, shown in the abort message if present).
 
 This extends the `WindowId`-as-bridge decision above: `WindowId` bridges the
 registry and layout engine *at runtime*; the stored HWND bridges the same

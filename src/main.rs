@@ -311,6 +311,16 @@ fn run(
     let default_rules = load_default_rules();
     reporter.ok(S::Config);
 
+    // Log retention: drop the daily files older than `[logging] keep_days`
+    // (0 = keep forever). Done here, once the config is known.
+    let pruned = logging::prune_old_logs(&config_dir, app_config.logging.keep_days);
+    if pruned > 0 {
+        log::info!(
+            "pruned {pruned} log file(s) older than {} days",
+            app_config.logging.keep_days
+        );
+    }
+
     // Resolve desktop name for hook thread (debug builds pass it through;
     // release builds always use None).
     #[cfg(debug_assertions)]

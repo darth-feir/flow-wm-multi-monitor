@@ -9,16 +9,18 @@
 //! # Window identity: HWND-exact
 //!
 //! The matcher keys each saved slot to its stored `HWND` (see [`WindowRef`]) —
-//! an exact, unambiguous lookup with no scoring or tie-breaking. `exe`/`title`
-//! ride along as diagnostic-only fields so a failed restore can name the
-//! missing window. The rationale for HWND-exact matching (and the rejected
-//! fuzzy alternative) is in the dev guide (`docs/src/dev-guide/loadout.md`).
+//! an exact, unambiguous lookup with no scoring or tie-breaking. `exe` rides
+//! along as a diagnostic-only field so a failed restore can name the
+//! missing window (`title` is read from older files but no longer written:
+//! it is personal and the file is long-lived). The rationale for HWND-exact
+//! matching (and the rejected fuzzy alternative) is in the dev guide
+//! (`docs/src/dev-guide/loadout.md`).
 //!
 //! # Save algorithm
 //!
 //! Walk every monitor → workspace → join the virtual layout (columns, rows,
-//! viewport offset, focus) with per-window registry metadata (HWND, exe,
-//! title). Swap `WindowId` for [`WindowRef`]. Serialize as JSON.
+//! viewport offset, focus) with per-window registry metadata (HWND, exe).
+//! Swap `WindowId` for [`WindowRef`]. Serialize as JSON.
 //!
 //! # Load algorithm (no-partial guarantee)
 //!
@@ -26,7 +28,8 @@
 //! 2. Collect the set of live managed windows' `HWND`s (skipping `Ignored`).
 //! 3. **Phase B (resolve, no mutation):** for each loadout slot, pop its
 //!    stored `HWND` from the live set. If any slot's `HWND` is not live →
-//!    abort with a diagnostic error naming `exe`/`title`, zero state touched.
+//!    abort with a diagnostic error naming `exe` (and the title, if an older
+//!    file recorded one), zero state touched.
 //! 4. **Purge:** every window the file references is removed from every
 //!    workspace on every monitor, so a window can never end up seated in two
 //!    spaces when the file and the live desktop disagree about monitors.
@@ -93,14 +96,25 @@ fn resolve_hwnd(
         Ok(WindowId(window.hwnd))
     } else if claimed.contains(&window.hwnd) {
         Err(format!(
-            "window referenced twice in the loadout: \"{}\" ({}, hwnd {:#x}) — aborting load (no-partial)",
-            window.title, window.exe, window.hwnd as u64
+            "window referenced twice in the loadout: {} — aborting load (no-partial)",
+            describe_ref(window)
         ))
     } else {
         Err(format!(
-            "window not currently open: \"{}\" ({}, hwnd {:#x}) — aborting load (no-partial)",
-            window.title, window.exe, window.hwnd as u64
+            "window not currently open: {} — aborting load (no-partial)",
+            describe_ref(window)
         ))
+    }
+}
+
+/// `exe (hwnd 0x…)`, with the title first when an older file recorded one.
+fn describe_ref(window: &WindowRef) -> String {
+    match &window.title {
+        Some(title) => format!(
+            "\"{title}\" ({}, hwnd {:#x})",
+            window.exe, window.hwnd as u64
+        ),
+        None => format!("{} (hwnd {:#x})", window.exe, window.hwnd as u64),
     }
 }
 
@@ -951,17 +965,18 @@ impl FlowWM {
     }
 
     /// Translate a [`WindowId`] to a [`WindowRef`] keyed by its `HWND`, with
-    /// `exe`/`title` carried as diagnostics.
+    /// `exe` carried as a diagnostic.
     ///
-    /// The matcher reads only `hwnd`; `exe`/`title` are persisted so a failed
-    /// restore can name the missing window. Returns `None` (with a warning) if
-    /// the window is not found in the registry.
+    /// The matcher reads only `hwnd`; `exe` is persisted so a failed restore
+    /// can name the missing window. The title is deliberately not written
+    /// (personal data in a long-lived file; see [`WindowRef`]). Returns
+    /// `None` if the window is not found in the registry.
     fn window_ref_for(&self, wid: WindowId) -> Option<WindowRef> {
         let win = self.registry.get_window(HWND(wid.0 as *mut _))?;
         Some(WindowRef {
             hwnd: wid.0,
             exe: win.exe.clone(),
-            title: win.title.clone(),
+            title: None,
         })
     }
 }
@@ -1563,8 +1578,32 @@ mod tests {
         WindowRef {
             hwnd,
             exe: "app.exe".into(),
-            title: format!("win{hwnd}"),
+            title: None,
         }
+    }
+
+    #[test]
+    fn saved_loadout_carries_no_window_titles() {
+        let flow = two_monitor_flow();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("t.json");
+        flow.build_and_write_loadout(&path).expect("save");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"title\""), "{text}");
+        assert!(!text.contains("winA") && !text.contains("win10"), "{text}");
+        assert!(text.contains("\"exe\""), "{text}");
+        // The abort message names the window by exe and hwnd only, unless an
+        // older file recorded a title.
+        let bare = window_ref(0x77);
+        assert_eq!(describe_ref(&bare), "app.exe (hwnd 0x77)");
+        let old = WindowRef {
+            title: Some("Budget 2026.xlsx".into()),
+            ..bare
+        };
+        assert_eq!(
+            describe_ref(&old),
+            "\"Budget 2026.xlsx\" (app.exe, hwnd 0x77)"
+        );
     }
 
     fn tiled_column(hwnd: isize) -> ColumnSnapshot {

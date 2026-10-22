@@ -353,6 +353,26 @@ Example:
 default_path = "loadout.json"
 ```
 
+### `[logging]` — log retention
+
+The daemon writes one `logs/flowd-YYYY-MM-DD.log` per day under the config
+directory. At the default level the log records every window it manages by
+handle, executable and window class; **window titles are only logged at
+`debug` level** (`flow start --verbose`), since they name your documents and
+conversations. The saved loadout file records executables and handles,
+never titles.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `keep_days` | `u32` | `14` | How many days of daily log files to keep. At every start the daemon deletes `logs/flowd-*.log` files whose date (in the file name) is older than this many days. `0` keeps every file forever. Files with other names are never touched. |
+
+Example:
+
+```toml
+[logging]
+keep_days = 14
+```
+
 ---
 
 ## `flow-rules.toml`

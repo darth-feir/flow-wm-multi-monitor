@@ -295,6 +295,14 @@ and exit code `2`. Never set it in a real session.
 `env_logger` filter such as `trace` or `flow_wm::registry=trace`. Both beat
 `RUST_LOG`. The log directory honours `--config` / `FLOW_CONFIG_DIR`.
 
+**What the log holds.** At `info` a window is identified by handle,
+executable and class (`registered window: HWND(…) (code.exe) class=…`); its
+**title only appears at `debug`** (`registry::core`, and the `rescue:` lines
+the same way), because titles name documents, chat partners and URLs and the
+daily files are kept around. `[logging] keep_days` (default 14, `0` = forever)
+makes the daemon delete `logs/flowd-YYYY-MM-DD.log` files older than that at
+every start (`logging::prune_old_logs`, judged by the date in the name).
+
 #### The hotkey script is tied to the daemon
 
 `flow start --ahk` checks that `flow.ahk` exists and forwards `--ahk` to

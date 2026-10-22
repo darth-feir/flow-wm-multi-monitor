@@ -166,6 +166,9 @@ pub struct FlowConfig {
     /// Navigation behaviour at the edges of a strip (`[navigation]`).
     pub navigation: NavigationConfig,
 
+    /// Daemon log retention (`[logging]`).
+    pub logging: LoggingConfig,
+
     /// Column width presets (`[columns]`). `None` when the section is absent:
     /// columns are then sized from [`columns_per_screen`](Self::columns_per_screen)
     /// / [`column_width`](Self::column_width) as before. When present, every
@@ -234,6 +237,27 @@ impl LoadoutConfig {
     }
 }
 
+/// Daemon log retention (`[logging]`).
+///
+/// The daemon writes one `logs/flowd-YYYY-MM-DD.log` per day under the
+/// config directory and, at every start, deletes the ones older than
+/// `keep_days` days (by the date in the file name). Those files record
+/// every window the daemon met — executable, class and, at `debug` level,
+/// the title — so they should not pile up forever by default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct LoggingConfig {
+    /// How many days of daily log files to keep; older ones are deleted at
+    /// daemon start. `0` keeps every file forever (the upstream behaviour).
+    pub keep_days: u32,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self { keep_days: 14 }
+    }
+}
+
 /// Navigation behaviour at the edges of a strip.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
@@ -272,6 +296,7 @@ impl Default for FlowConfig {
             drag: DragConfig::default(),
             loadout: LoadoutConfig::default(),
             navigation: NavigationConfig::default(),
+            logging: LoggingConfig::default(),
             columns: None,
             // The fork opts out of the start-time update check (see the
             // field docs); users opt in with `check_for_updates = true`.
@@ -1181,6 +1206,16 @@ strategy = "original_slot"
         assert_eq!(default.default_path, "loadout.json");
     }
 
+    /// Positive: `[logging] keep_days` defaults to two weeks, and `0` (keep
+    /// forever) parses.
+    #[test]
+    fn logging_config_default_keeps_two_weeks() {
+        assert_eq!(LoggingConfig::default().keep_days, 14);
+        assert_eq!(FlowConfig::default().logging.keep_days, 14);
+        let parsed: FlowConfig = toml::from_str("[logging]\nkeep_days = 0\n").unwrap();
+        assert_eq!(parsed.logging.keep_days, 0);
+    }
+
     // --- Integration: Full field preservation through round-trip ---
 
     #[test]
@@ -1232,6 +1267,7 @@ strategy = "original_slot"
                 default_path: "my-loadout.json".into(),
             },
             navigation: NavigationConfig { edge_hop: false },
+            logging: LoggingConfig { keep_days: 3 },
             columns: Some(
                 toml::from_str(
                     "presets = [\"1/3\", \"1/2\"]
@@ -1278,6 +1314,7 @@ default = \"1/2\"",
         assert_eq!(parsed.drag.edge_scroll_repeat_interval_ms, 200);
         assert_eq!(parsed.loadout.default_path, "my-loadout.json");
         assert!(!parsed.navigation.edge_hop);
+        assert_eq!(parsed.logging.keep_days, 3);
         let columns = parsed.columns.as_ref().expect("columns round-trips");
         assert_eq!(columns.labels(), vec!["1/3", "1/2"]);
         assert_eq!(columns.default_index(), 1);

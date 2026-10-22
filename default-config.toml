@@ -189,6 +189,14 @@ edge_hop = true
 # Loadout save/restore settings.
 #
 # - default_path:  file name (relative to config dir) used by
-#                   `flow loadout save` and `flow loadout restore`
+#                   `flow loadout save` and `flow loadout restore`.
+#                   A plain file name: no directories, no "..", no drive.
 [loadout]
 default_path = "loadout.json"
+
+# Daemon log retention. The daemon writes one logs/flowd-YYYY-MM-DD.log per
+# day and deletes, at every start, the ones older than keep_days days (by the
+# date in the file name). 0 = keep every log file forever. Window titles are
+# only logged at debug level (`flow start --verbose`).
+[logging]
+keep_days = 14
