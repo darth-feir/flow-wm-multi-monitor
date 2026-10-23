@@ -531,6 +531,8 @@ same table are an error.
 | `close-window` | `close-window` | |
 | `center-column` | `center` | |
 | `toggle-window-floating`, `move-window-to-floating`, `move-window-to-tiling` | `set-window cycle` / `float` / `tile` | |
+| `switch-focus-between-floating-and-tiling` | `switch-focus-between-floating-and-tiling` | focus the other side: the float used last (else the top one), or the strip's last tile; Mod+Shift+V by default |
+| `focus-floating`, `focus-tiling` | the same names | one side explicitly; an empty side is a no-op |
 | `fullscreen-window` | `set-window fullscreen` | |
 | `switch-preset-column-width`, `switch-preset-column-width-back` | `width next` / `width prev` | |
 | `set-column-width "+10%"` / `"-10%"` | `expand-column` / `shrink-column` | one step either way; refused on a width pattern |

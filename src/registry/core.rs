@@ -1142,6 +1142,19 @@ impl WindowRegistry {
         }
     }
 
+    /// Whether `hwnd_val` is a tracked window in
+    /// [`Floating(Active)`](FloatingState::Active): on screen in the
+    /// floating layer, neither minimized nor hidden.
+    #[must_use]
+    pub fn is_floating_active(&self, hwnd_val: isize) -> bool {
+        self.windows.get(&hwnd_val).is_some_and(|window| {
+            matches!(
+                window.state,
+                WindowState::Floating(FloatingState::Active { .. })
+            )
+        })
+    }
+
     /// Returns `true` iff `hwnd` is currently tracked by the registry,
     /// regardless of state (tiling, floating, or ignored).
     ///

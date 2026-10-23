@@ -29,6 +29,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::common::WindowId;
+
 pub mod floating_space;
 pub mod monitor;
 pub mod scrolling_space;
@@ -94,6 +96,11 @@ pub struct Workspace {
     pub scrolling: ScrollingSpace,
     /// The floating (non-tiled) windows on this workspace (literal pixel rects).
     pub floating: FloatingSpace,
+    /// The float the user focused last on this workspace, the first
+    /// candidate of `focus-floating` (ADR-0016). Written by the foreground
+    /// sink; readers check it is still in `floating`, so a window that left
+    /// the layer is skipped rather than cleared on every removal path.
+    pub last_focused_float: Option<WindowId>,
 }
 
 impl Workspace {
@@ -121,6 +128,7 @@ impl Workspace {
             id,
             scrolling,
             floating: FloatingSpace::new(),
+            last_focused_float: None,
         }
     }
 }

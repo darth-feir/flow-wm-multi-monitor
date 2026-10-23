@@ -39,6 +39,19 @@ pub enum WindowMode {
     Fullscreen,
 }
 
+/// The side of the active workspace a [`SocketMessage::FocusLayer`] goes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayerTarget {
+    /// The floating layer: its last-focused float, else the top-most one.
+    Floating,
+    /// The tiling layer: the strip's last-focused tile, else its first.
+    Tiling,
+    /// Whichever side does not hold the focus now (niri's
+    /// `switch-focus-between-floating-and-tiling`).
+    Other,
+}
+
 /// Which column width preset [`SocketMessage::SetWidthPreset`] asks for.
 ///
 /// `Next` / `Cycle` step forward through `[columns] presets` (wrapping),
@@ -156,6 +169,14 @@ pub enum SocketMessage {
     FocusUp,
     /// Move focus down (within column).
     FocusDown,
+    /// Focus the other side of the active workspace — the floating layer,
+    /// the tiling layer, or whichever is not focused now. Answered with
+    /// `Data { "focused": "floating" | "tiling" | null, "hwnd", "message" }`;
+    /// an empty side is a no-op, not an error (ADR-0016).
+    FocusLayer {
+        /// Which side.
+        target: LayerTarget,
+    },
 
     // --- Swap (per-window) ---
     /// Swap the focused window with its left neighbour.
@@ -423,6 +444,7 @@ impl SocketMessage {
                 | Self::FocusRight
                 | Self::FocusUp
                 | Self::FocusDown
+                | Self::FocusLayer { .. }
                 | Self::SwapLeft
                 | Self::SwapRight
                 | Self::SwapUp
@@ -1265,6 +1287,23 @@ mod tests {
         );
     }
 
+    // ── Layer focus (ADR-0016) ────────────────────────────────────────────
+
+    #[test]
+    fn focus_layer_round_trips_with_a_snake_case_target() {
+        for (target, word) in [
+            (LayerTarget::Floating, "floating"),
+            (LayerTarget::Tiling, "tiling"),
+            (LayerTarget::Other, "other"),
+        ] {
+            let msg = SocketMessage::FocusLayer { target };
+            let wire = format!(r#"{{"type":"focus_layer","target":"{word}"}}"#);
+            assert_eq!(serde_json::to_string(&msg).unwrap(), wire);
+            let parsed: SocketMessage = serde_json::from_str(&wire).unwrap();
+            assert_eq!(parsed, msg);
+        }
+    }
+
     // ── Keymap drag sessions ──────────────────────────────────────────────
 
     #[test]
@@ -1337,6 +1376,9 @@ mod tests {
             SocketMessage::FocusRight,
             SocketMessage::FocusUp,
             SocketMessage::FocusDown,
+            SocketMessage::FocusLayer {
+                target: LayerTarget::Other,
+            },
             // Per-window swap
             SocketMessage::SwapLeft,
             SocketMessage::SwapRight,

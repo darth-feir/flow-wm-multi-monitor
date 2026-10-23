@@ -4,12 +4,12 @@
 //! way of starting Windows' own move loop survives, so the keymap moves the
 //! window itself (`WinMove` while the button is held) and tells the daemon
 //! where the gesture begins and ends. `drag begin` puts the focused window
-//! into exactly the state a `MoveSizeStart` would: a tile enters
-//! [`DragMode`](super::drag::DragMode) (border follows, drop zone from the
-//! `LOCATIONCHANGE` stream), a float keeps its float-sync ring but its
-//! bookkeeping writes are held back until `drag end`, which runs the
-//! `MoveSizeEnd` path (commit or snap back; the float's final rect is
-//! recorded once). The decision logic is pure ([`decide_begin`],
+//! into exactly the state a `MoveSizeStart` would — a tile enters
+//! `Classifying` (border follows, drop zone from the `LOCATIONCHANGE`
+//! stream), a float enters [`DragMode::Float`](super::drag::DragMode::Float)
+//! (its rect stored live, the animator off it) — and `drag end` runs the
+//! `MoveSizeEnd` path (commit or snap back; a float's final rect recorded
+//! once more). The decision logic is pure ([`decide_begin`],
 //! [`native_event_is_shadowed`], [`ends_manual_drag`]); the Win32 reads go
 //! through [`DragProbe`] so the whole begin → moves → end sequence runs
 //! against a scripted desktop in the tests below.
@@ -30,7 +30,8 @@ use super::types::FlowWM;
 pub(super) enum ManualDragKind {
     /// A tiled window: the tile-drag state machine is live.
     Tile,
-    /// A floating window: its float-sync writes are held until `drag end`.
+    /// A floating window: `DragMode::Float` is live, its rect is stored on
+    /// every move.
     Float,
 }
 
@@ -153,19 +154,6 @@ pub(super) fn ends_manual_drag(msg: &SocketMessage) -> bool {
 }
 
 impl FlowWM {
-    /// The float a keymap session is moving, if any. The animation and
-    /// float-sync paths leave that window alone while it is set.
-    #[must_use]
-    pub(super) fn manual_float_drag_hwnd(&self) -> Option<isize> {
-        match self.manual_drag {
-            Some(ManualDrag {
-                hwnd,
-                kind: ManualDragKind::Float,
-            }) => Some(hwnd),
-            _ => None,
-        }
-    }
-
     /// Whether a native drag event for `hwnd` is shadowed by an open session
     /// (see [`native_event_is_shadowed`]).
     #[must_use]
@@ -226,8 +214,8 @@ impl FlowWM {
     }
 
     /// Open a session on the focused window (the OS foreground, else the
-    /// registry's focus): a tile enters the drag state machine exactly as on
-    /// `MoveSizeStart`; a float's sync writes are held until the end.
+    /// registry's focus): the window enters the drag state machine exactly
+    /// as on `MoveSizeStart` (`Classifying` for a tile, `Float` for a float).
     pub(super) fn begin_manual_drag_with<P: DragProbe>(
         &mut self,
         probe: &P,
@@ -243,13 +231,14 @@ impl FlowWM {
         let target = focused.map(|h| self.drag_target_of(h));
         let kind = decide_begin(self.tiling_paused, drag_active, target)?;
         let hwnd = focused.expect("decide_begin accepted a focused window");
-        if kind == ManualDragKind::Tile {
-            self.on_drag_start_with(probe, hwnd);
-            if self.drag_state.is_none() {
-                // The registry said tile but the drag machine refused: the
-                // window changed under us. Nothing to drive.
-                return Err(BeginRefusal::NotDraggable(DragTarget::Tile));
-            }
+        self.on_drag_start_with(probe, hwnd);
+        if self.drag_state.is_none() {
+            // The registry said tile or float but the drag machine refused:
+            // the window changed under us. Nothing to drive.
+            return Err(BeginRefusal::NotDraggable(match kind {
+                ManualDragKind::Tile => DragTarget::Tile,
+                ManualDragKind::Float => DragTarget::Float,
+            }));
         }
         let session = ManualDrag { hwnd, kind };
         self.manual_drag = Some(session);
@@ -258,19 +247,11 @@ impl FlowWM {
     }
 
     /// Close the session the `MoveSizeEnd` way: a tile commits its drop
-    /// zone (or snaps back); a float records its final rect and resumes
-    /// float sync. `None` when no session is open.
+    /// zone (or snaps back); a float records its final rect once more.
+    /// `None` when no session is open.
     pub(super) fn end_manual_drag_with<P: DragProbe>(&mut self, probe: &P) -> Option<ManualDrag> {
         let session = self.manual_drag.take()?;
-        match session.kind {
-            ManualDragKind::Tile => self.on_drag_end_with(probe, session.hwnd),
-            ManualDragKind::Float => {
-                // The session is already cleared, so the sync write goes
-                // through and seats the ring at the final rect.
-                self.store_float_rect_with(probe, session.hwnd);
-                self.refresh_border_for(session.hwnd);
-            }
-        }
+        self.on_drag_end_with(probe, session.hwnd);
         log::info!(
             "drag session: end {} {}",
             session.kind.as_str(),
@@ -284,10 +265,10 @@ impl FlowWM {
         self.end_manual_drag_with(&Win32Drag)
     }
 
-    /// Drop the session without committing anything: the tile drag state
-    /// and the `DRAGGED_HWND` bridge are released, a float is simply left
-    /// where it is. Used when the window disappears mid-session, by `tiling
-    /// off` and by the fail-back. No-op without a session.
+    /// Drop the session without committing anything: the drag state and
+    /// the `DRAGGED_HWND` bridge are released, the window is left where it
+    /// is. Used when the window disappears mid-session, by `tiling off` and
+    /// by the fail-back. No-op without a session.
     pub(super) fn abandon_manual_drag(&mut self) {
         let Some(session) = self.manual_drag.take() else {
             return;
@@ -674,7 +655,8 @@ mod tests {
     // ── float: begin → location changes → end keeps the rect ─────────
 
     #[test]
-    fn float_session_holds_sync_writes_and_records_the_final_rect_once() {
+    fn float_session_enters_the_float_drag_state_and_stores_the_rect_live() {
+        let _turn = serialized();
         let desktop = ScriptedDesktop::default();
         let mut flow = fixture(&desktop);
         flow.registry.set_focused(F);
@@ -686,22 +668,27 @@ mod tests {
             .expect("float session");
         assert_eq!(session.kind, ManualDragKind::Float);
         assert!(
-            flow.drag_state.is_none(),
-            "a float never enters the tile machine"
+            matches!(
+                flow.drag_state,
+                Some(super::super::drag::DragMode::Float(_))
+            ),
+            "a float enters the one drag state, as a tile does"
         );
-        assert_eq!(flow.manual_float_drag_hwnd(), Some(F));
+        assert_eq!(crate::registry::hooks::dragged_hwnd(), F);
         assert!(flow.native_drag_event_shadowed(F));
         assert!(!flow.native_drag_event_shadowed(A));
 
-        // The keymap moves the window; the LOCATIONCHANGE path reads it but
-        // the bookkeeping stays at the start rect until the end.
+        // The keymap moves the window; run.rs routes the LOCATIONCHANGE to
+        // the drag path, which stores the rect live (ADR-0016).
         for step in 1..=3 {
-            desktop.place(F, r(100 + 100 * step, 100, 400, 300));
-            flow.store_float_rect_with(&desktop, F);
-            assert_eq!(stored_float_rect(&flow, F), start);
+            let here = r(100 + 100 * step, 100, 400, 300);
+            desktop.place(F, here);
+            flow.on_drag_move_with(&desktop, F);
+            assert_eq!(stored_float_rect(&flow, F), here, "stored on every move");
         }
         // A floating-space animation meanwhile (another float appearing)
-        // leaves the session window alone.
+        // leaves the dragged window alone: the animator excludes whatever
+        // `drag_state` names, tile or float.
         let batch = flow.monitors[0]
             .active_workspace()
             .floating
@@ -713,29 +700,77 @@ mod tests {
         );
         assert!(
             targets.targets.iter().all(|t| t.window_ref.0 != F),
-            "the session float is not re-submitted"
+            "the dragged float is not re-submitted"
         );
 
         let ended = flow.end_manual_drag_with(&desktop).expect("session ended");
         assert_eq!(ended.kind, ManualDragKind::Float);
+        assert!(flow.drag_state.is_none());
+        assert_eq!(crate::registry::hooks::dragged_hwnd(), 0);
         let moved = r(400, 100, 400, 300);
-        assert_eq!(stored_float_rect(&flow, F), moved, "final rect recorded");
+        assert_eq!(stored_float_rect(&flow, F), moved, "final rect kept");
         let mirrored = flow
             .registry
             .get_window(HWND(F as *mut _))
             .map(|w| matches!(w.state, WindowState::Floating(FloatingState::Active { rect }) if rect == moved));
         assert_eq!(mirrored, Some(true), "registry mirror follows");
-        assert_eq!(flow.manual_float_drag_hwnd(), None);
-        // Sync writes flow again.
+        // Sync writes flow as before.
         desktop.place(F, r(500, 100, 400, 300));
         flow.store_float_rect_with(&desktop, F);
         assert_eq!(stored_float_rect(&flow, F), r(500, 100, 400, 300));
+    }
+
+    /// The last `WinMove` of a session can still be in the hook queue when
+    /// `drag end` is read from the pipe: the end stores the rect once more.
+    #[test]
+    fn float_session_end_records_a_move_the_hook_queue_still_holds() {
+        let _turn = serialized();
+        let desktop = ScriptedDesktop::default();
+        let mut flow = fixture(&desktop);
+        flow.registry.set_focused(F);
+        flow.begin_manual_drag_with(&desktop)
+            .expect("float session");
+        desktop.place(F, r(700, 150, 400, 300));
+        // No on_drag_move for this placement: the LOCATIONCHANGE is "late".
+        flow.end_manual_drag_with(&desktop).expect("ended");
+        assert_eq!(stored_float_rect(&flow, F), r(700, 150, 400, 300));
+    }
+
+    /// A native title-bar drag of a float takes the same path as a session:
+    /// `MoveSizeStart` enters `Float`, the moves store live, `MoveSizeEnd`
+    /// clears the state with no commit.
+    #[test]
+    fn native_float_drag_enters_the_float_state_and_stores_live() {
+        let _turn = serialized();
+        let desktop = ScriptedDesktop::default();
+        let mut flow = fixture(&desktop);
+        flow.on_drag_start_with(&desktop, F);
+        assert!(matches!(
+            flow.drag_state,
+            Some(super::super::drag::DragMode::Float(_))
+        ));
+        assert!(flow.manual_drag.is_none(), "a native drag is not a session");
+        assert_eq!(crate::registry::hooks::dragged_hwnd(), F);
+        // `drag begin` is refused meanwhile, like during any native drag.
+        assert_eq!(
+            flow.begin_manual_drag_with(&desktop),
+            Err(BeginRefusal::DragActive)
+        );
+        desktop.place(F, r(250, 260, 400, 300));
+        flow.on_drag_move_with(&desktop, F);
+        assert_eq!(stored_float_rect(&flow, F), r(250, 260, 400, 300));
+        flow.on_drag_end_with(&desktop, F);
+        assert!(flow.drag_state.is_none());
+        assert_eq!(crate::registry::hooks::dragged_hwnd(), 0);
+        assert_eq!(stored_float_rect(&flow, F), r(250, 260, 400, 300));
+        assert_eq!(column_order(&flow), vec![A, B, C], "the strip is untouched");
     }
 
     #[test]
     fn float_session_with_no_movement_keeps_the_size() {
         // Regression for the 4 px shrink: begin + end with the window
         // untouched records the same rect, whatever the invisible frame.
+        let _turn = serialized();
         let desktop = ScriptedDesktop::default();
         let mut flow = fixture(&desktop);
         flow.registry.set_focused(F);

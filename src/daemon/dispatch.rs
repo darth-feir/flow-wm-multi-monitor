@@ -13,7 +13,7 @@ use crate::common::{Direction, Rect, Size, WindowId};
 use crate::config::dirs::{history_rules_path_in, user_app_config_path_in, user_rules_path_in};
 use crate::config::types::WindowAction;
 use crate::config::{load_app_config, load_rules_config};
-use crate::ipc::message::{SocketMessage, SocketResponse, WindowMode};
+use crate::ipc::message::{LayerTarget, SocketMessage, SocketResponse, WindowMode};
 use crate::layout::projection;
 use crate::layout::types::{ActualLayout, AppliedLayout};
 use crate::registry::hooks::{add_float_hwnd, remove_float_hwnd};
@@ -142,6 +142,7 @@ impl FlowWM {
             SocketMessage::FocusRight => self.dispatch_focus(Direction::Right),
             SocketMessage::FocusUp => self.dispatch_focus(Direction::Up),
             SocketMessage::FocusDown => self.dispatch_focus(Direction::Down),
+            SocketMessage::FocusLayer { target } => self.dispatch_focus_layer(*target),
 
             // --- Swap (per-window) ---
             // Swap* operates on the focused window, exchanging it with its
@@ -763,6 +764,132 @@ impl FlowWM {
         self.registry.clear_focused();
         if let Some(prev) = prev_focus {
             self.refresh_border_for(prev);
+        }
+    }
+
+    /// `flow dispatch focus-floating | focus-tiling |
+    /// switch-focus-between-floating-and-tiling` (ADR-0016): push OS focus
+    /// to the other side of the active monitor's workspace. The answer names
+    /// the side and the window; an empty side is `"focused": null` with a
+    /// message, exit 0, because the chord is a toggle the user taps blind.
+    fn dispatch_focus_layer(&mut self, target: LayerTarget) -> SocketResponse {
+        let outcome = self.focus_layer_with(
+            target,
+            registry_win32::is_window,
+            registry_win32::is_visible_uncloaked,
+            registry_win32::push_foreground_window,
+        );
+        match outcome {
+            LayerFocus::Focused { layer, hwnd } => SocketResponse::Data {
+                payload: serde_json::json!({
+                    "focused": layer.word(),
+                    "hwnd": hwnd,
+                    "message": format!("focused the {} windows", layer.word()),
+                }),
+            },
+            LayerFocus::Empty(layer) => SocketResponse::Data {
+                payload: serde_json::json!({
+                    "focused": serde_json::Value::Null,
+                    "message": format!("no {} window to focus", layer.word()),
+                }),
+            },
+        }
+    }
+
+    /// The rule behind [`dispatch_focus_layer`](Self::dispatch_focus_layer),
+    /// with the three Win32 questions injected like
+    /// [`resolve_focus_target_with`](Self::resolve_focus_target_with). The
+    /// floating layer counts as active when the tracked focus is an active
+    /// float of the active monitor's workspace; `Other` goes to the other
+    /// side ([`layer_to_focus`]). Candidates come from
+    /// [`layer_focus_candidates`]; a dead one is purged, a hidden one
+    /// skipped, a refused push skipped — the walk `focus_monitor` does.
+    /// On success the registry focus and the borders are updated here (the
+    /// foreground hook repeats it harmlessly) and a tile is scrolled into
+    /// view.
+    pub(super) fn focus_layer_with(
+        &mut self,
+        target: LayerTarget,
+        is_live: impl Fn(isize) -> bool,
+        is_visible: impl Fn(isize) -> bool,
+        mut push: impl FnMut(isize) -> ForegroundPush,
+    ) -> LayerFocus {
+        let mi = self.active_monitor;
+        // A daemon-fullscreen window sits in the floating space but is the
+        // tiling side's business, as in niri (fullscreen is a scrolling
+        // state there): it neither makes the layer active nor is offered
+        // by `focus-floating`.
+        let floating_is_active = self.registry.focused().is_some_and(|id| {
+            self.registry.is_floating_active(id.0)
+                && !self.is_fullscreen(id.0)
+                && self.monitors[mi].active_workspace().floating.contains(id)
+        });
+        let layer = layer_to_focus(target, floating_is_active);
+        let mut skipped: std::collections::HashSet<isize> = std::collections::HashSet::new();
+        loop {
+            let ws = self.monitors[mi].active_workspace();
+            let candidate =
+                layer_focus_candidates(layer, &ws.scrolling, &ws.floating, ws.last_focused_float)
+                    .into_iter()
+                    .find(|c| {
+                        !skipped.contains(&c.0)
+                            && !(layer == Layer::Floating && self.is_fullscreen(c.0))
+                    });
+            let Some(candidate) = candidate else {
+                log::debug!(
+                    "focus-layer: no {} window to focus on monitor {mi} ({} skipped)",
+                    layer.word(),
+                    skipped.len()
+                );
+                return LayerFocus::Empty(layer);
+            };
+            let hwnd = candidate.0;
+            // Every candidate is tried once, so the walk ends even when a
+            // purge leaves a remembered window in place.
+            skipped.insert(hwnd);
+            if !self.registry.is_tracked(hwnd) || !is_live(hwnd) {
+                log::debug!(
+                    "focus-layer: dropping dead window {hwnd} ({})",
+                    self.describe_window(hwnd)
+                );
+                self.purge_dead_window(mi, candidate);
+                continue;
+            }
+            if !is_visible(hwnd) {
+                continue;
+            }
+            match push(hwnd) {
+                ForegroundPush::Focused => {
+                    let prev = self.registry.focused().map(|w| w.0);
+                    self.registry.set_focused(hwnd);
+                    if layer == Layer::Tiling {
+                        self.active_scrolling_mut().set_focus(candidate);
+                        if let Some(diff) = self.active_scrolling_mut().ensure_focused_visible() {
+                            self.animate_layout(&diff);
+                        }
+                    } else {
+                        self.monitors[mi].active_workspace_mut().last_focused_float =
+                            Some(candidate);
+                    }
+                    self.refresh_border_for(hwnd);
+                    if let Some(p) = prev
+                        && p != hwnd
+                    {
+                        self.refresh_border_for(p);
+                    }
+                    log::info!("focus-layer: {} -> {hwnd}", layer.word());
+                    return LayerFocus::Focused { layer, hwnd };
+                }
+                ForegroundPush::InvalidHandle if !is_live(hwnd) => {
+                    self.purge_dead_window(mi, candidate);
+                }
+                ForegroundPush::InvalidHandle | ForegroundPush::Failed(_) => {
+                    log::debug!(
+                        "focus-layer: SetForegroundWindow refused {hwnd} ({}); trying the next window",
+                        self.describe_window(hwnd)
+                    );
+                }
+            }
         }
     }
 
@@ -2145,6 +2272,100 @@ pub(super) fn focus_candidates(
     out
 }
 
+/// One side of a workspace, for `focus-floating` / `focus-tiling`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Layer {
+    /// The floating space.
+    Floating,
+    /// The scrolling strip.
+    Tiling,
+}
+
+impl Layer {
+    /// The word the reply and the logs use.
+    #[must_use]
+    pub(super) const fn word(self) -> &'static str {
+        match self {
+            Layer::Floating => "floating",
+            Layer::Tiling => "tiling",
+        }
+    }
+}
+
+/// What a layer focus did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LayerFocus {
+    /// `hwnd` on `layer` took the foreground.
+    Focused {
+        /// The side that was focused.
+        layer: Layer,
+        /// The window.
+        hwnd: isize,
+    },
+    /// Nothing live and visible on that side: a no-op.
+    Empty(Layer),
+}
+
+/// Pure rule behind [`FlowWM::focus_layer_with`]: which side to focus.
+/// `Other` goes to the side that does not hold the focus; with nothing
+/// focused the floating layer is not active (niri's `floating_is_active`),
+/// so `Other` means floating.
+#[must_use]
+pub(super) const fn layer_to_focus(target: LayerTarget, floating_is_active: bool) -> Layer {
+    match target {
+        LayerTarget::Floating => Layer::Floating,
+        LayerTarget::Tiling => Layer::Tiling,
+        LayerTarget::Other => {
+            if floating_is_active {
+                Layer::Tiling
+            } else {
+                Layer::Floating
+            }
+        }
+    }
+}
+
+/// Pure candidate rule behind [`FlowWM::focus_layer_with`]: the windows to
+/// try on `layer`, in order. Floating: the workspace's last-focused float
+/// while it is still in the space, then the floats top-most first. Tiling:
+/// the strip's last-focused window, then every tile in column/row order.
+/// No window twice; empty when the side is empty.
+#[must_use]
+pub(super) fn layer_focus_candidates(
+    layer: Layer,
+    scrolling: &crate::workspace::ScrollingSpace,
+    floating: &FloatingSpace,
+    last_float: Option<WindowId>,
+) -> Vec<WindowId> {
+    let mut out: Vec<WindowId> = Vec::new();
+    let push = |id: WindowId, out: &mut Vec<WindowId>| {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    };
+    match layer {
+        Layer::Floating => {
+            if let Some(last) = last_float.filter(|id| floating.contains(*id)) {
+                push(last, &mut out);
+            }
+            for entry in floating.windows().iter().rev() {
+                push(entry.window_id, &mut out);
+            }
+        }
+        Layer::Tiling => {
+            if let Some(last) = scrolling.last_focused_window() {
+                push(last, &mut out);
+            }
+            for column in &scrolling.virtual_layout().columns {
+                for row in &column.rows {
+                    push(row.window_id, &mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The first of [`focus_candidates`]: the strip's last-focused window, else
 /// the first window of the strip, else the top-most float. `None` when the
 /// workspace is empty.
@@ -3113,6 +3334,331 @@ mod tests {
             vec![Workspace::new(WorkspaceId(1), scrolling)],
             0,
         )
+    }
+
+    // ── focus-floating / focus-tiling / switch (ADR-0016) ────────────────
+
+    const TILE_A: isize = 0x40001;
+    const TILE_B: isize = 0x40002;
+    const FLOAT_F: isize = 0x40003;
+    const FLOAT_G: isize = 0x40004;
+
+    fn register_at(registry: &mut WindowRegistry, hwnd: isize, state: WindowState) {
+        let info = registry_win32::WindowInfo {
+            hwnd: HWND(hwnd as *mut _),
+            title: format!("W{hwnd:x}"),
+            class: "TestClass".into(),
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+            exe: "test.exe".into(),
+            process_path: "C:\\test.exe".into(),
+            is_visible: true,
+            is_maximized: false,
+            is_fullscreen: false,
+            is_iconic: false,
+        };
+        registry.register_window_from_info(&info);
+        if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {
+            w.state = state;
+        }
+    }
+
+    /// Tiles A, B (A focused last) and floats F then G (G on top) on one
+    /// monitor; `focused` is the registry focus.
+    fn flow_with_two_layers(focused: isize) -> FlowWM {
+        let rules = WindowRulesConfig::default();
+        let mut registry = WindowRegistry::new(&rules, &rules);
+        let tile = WindowState::Tiling(TilingState::Active { col: 0, row: 0 });
+        register_at(&mut registry, TILE_A, tile.clone());
+        register_at(&mut registry, TILE_B, tile);
+        let f_rect = Rect {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
+        let g_rect = Rect {
+            x: 600,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
+        register_at(
+            &mut registry,
+            FLOAT_F,
+            WindowState::Floating(FloatingState::Active { rect: f_rect }),
+        );
+        register_at(
+            &mut registry,
+            FLOAT_G,
+            WindowState::Floating(FloatingState::Active { rect: g_rect }),
+        );
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let padding = Padding {
+            window_gap: 4,
+            up: 0,
+            down: 0,
+        };
+        let mut scrolling =
+            ScrollingSpace::new(MonitorInfo::single(screen), 960, 320, 100, 100, padding, 4);
+        scrolling.add_window(WindowId(TILE_B));
+        scrolling.add_window(WindowId(TILE_A));
+        scrolling.set_focus(WindowId(TILE_A));
+        let mut ws = Workspace::new(WorkspaceId(1), scrolling);
+        ws.floating.add(WindowId(FLOAT_F), f_rect);
+        ws.floating.add(WindowId(FLOAT_G), g_rect);
+        let monitor = Monitor::new(screen, screen, vec![ws], 0);
+        for hwnd in [TILE_A, TILE_B, FLOAT_F, FLOAT_G] {
+            registry.set_monitor(hwnd, 0);
+        }
+        registry.set_focused(focused);
+        let mut flow = FlowWM::new_for_test(registry, vec![monitor]);
+        flow.config.borders.enabled = false;
+        flow
+    }
+
+    fn focus_layer(flow: &mut FlowWM, target: LayerTarget) -> (LayerFocus, Vec<isize>) {
+        let pushed = std::cell::RefCell::new(Vec::new());
+        let out = flow.focus_layer_with(
+            target,
+            |_| true,
+            |_| true,
+            |h| {
+                pushed.borrow_mut().push(h);
+                ForegroundPush::Focused
+            },
+        );
+        (out, pushed.into_inner())
+    }
+
+    #[test]
+    fn layer_to_focus_other_goes_to_the_side_not_focused() {
+        assert_eq!(layer_to_focus(LayerTarget::Other, false), Layer::Floating);
+        assert_eq!(layer_to_focus(LayerTarget::Other, true), Layer::Tiling);
+        assert_eq!(layer_to_focus(LayerTarget::Floating, true), Layer::Floating);
+        assert_eq!(layer_to_focus(LayerTarget::Tiling, false), Layer::Tiling);
+    }
+
+    #[test]
+    fn layer_candidates_prefer_the_remembered_window_then_the_natural_order() {
+        let flow = flow_with_two_layers(TILE_A);
+        let ws = flow.monitors[0].active_workspace();
+        // Floating: no memory -> top-most first (G was added last).
+        assert_eq!(
+            layer_focus_candidates(Layer::Floating, &ws.scrolling, &ws.floating, None),
+            vec![WindowId(FLOAT_G), WindowId(FLOAT_F)]
+        );
+        // The remembered float comes first, once.
+        assert_eq!(
+            layer_focus_candidates(
+                Layer::Floating,
+                &ws.scrolling,
+                &ws.floating,
+                Some(WindowId(FLOAT_F))
+            ),
+            vec![WindowId(FLOAT_F), WindowId(FLOAT_G)]
+        );
+        // A remembered float that left the space is ignored.
+        assert_eq!(
+            layer_focus_candidates(
+                Layer::Floating,
+                &ws.scrolling,
+                &ws.floating,
+                Some(WindowId(0x999))
+            ),
+            vec![WindowId(FLOAT_G), WindowId(FLOAT_F)]
+        );
+        // Tiling: the strip's last-focused window, then column order.
+        assert_eq!(
+            layer_focus_candidates(Layer::Tiling, &ws.scrolling, &ws.floating, None),
+            vec![WindowId(TILE_A), WindowId(TILE_B)]
+        );
+        let empty = FloatingSpace::new();
+        assert!(layer_focus_candidates(Layer::Floating, &ws.scrolling, &empty, None).is_empty());
+    }
+
+    /// From a tile, the switch lands on the top-most float and remembers
+    /// it; from that float it goes back to the strip's last-focused tile.
+    #[test]
+    fn switch_focus_goes_tile_to_float_and_back() {
+        let mut flow = flow_with_two_layers(TILE_A);
+        let (out, pushed) = focus_layer(&mut flow, LayerTarget::Other);
+        assert_eq!(
+            out,
+            LayerFocus::Focused {
+                layer: Layer::Floating,
+                hwnd: FLOAT_G
+            }
+        );
+        assert_eq!(pushed, vec![FLOAT_G]);
+        assert_eq!(flow.registry.focused(), Some(WindowId(FLOAT_G)));
+        assert_eq!(
+            flow.monitors[0].active_workspace().last_focused_float,
+            Some(WindowId(FLOAT_G))
+        );
+        let (out, pushed) = focus_layer(&mut flow, LayerTarget::Other);
+        assert_eq!(
+            out,
+            LayerFocus::Focused {
+                layer: Layer::Tiling,
+                hwnd: TILE_A
+            }
+        );
+        assert_eq!(pushed, vec![TILE_A]);
+        assert_eq!(flow.registry.focused(), Some(WindowId(TILE_A)));
+        // The user used F in between (the hook recorded it): F comes first now.
+        flow.monitors[0].active_workspace_mut().last_focused_float = Some(WindowId(FLOAT_F));
+        let (out, _) = focus_layer(&mut flow, LayerTarget::Floating);
+        assert_eq!(
+            out,
+            LayerFocus::Focused {
+                layer: Layer::Floating,
+                hwnd: FLOAT_F
+            }
+        );
+    }
+
+    #[test]
+    fn switch_focus_with_an_empty_other_side_is_a_no_op() {
+        let mut flow = flow_with_two_layers(TILE_A);
+        for f in [FLOAT_F, FLOAT_G] {
+            flow.monitors[0]
+                .active_workspace_mut()
+                .floating
+                .remove(WindowId(f));
+        }
+        let (out, pushed) = focus_layer(&mut flow, LayerTarget::Other);
+        assert_eq!(out, LayerFocus::Empty(Layer::Floating));
+        assert!(pushed.is_empty());
+        assert_eq!(
+            flow.registry.focused(),
+            Some(WindowId(TILE_A)),
+            "focus untouched"
+        );
+
+        let mut flow = flow_with_two_layers(FLOAT_G);
+        for t in [TILE_A, TILE_B] {
+            flow.active_scrolling_mut().remove_window(WindowId(t));
+        }
+        let (out, _) = focus_layer(&mut flow, LayerTarget::Other);
+        assert_eq!(out, LayerFocus::Empty(Layer::Tiling));
+    }
+
+    /// A daemon-fullscreen window is a float in the space but counts as the
+    /// tiling side: the switch from it goes to a real float, and it is never
+    /// offered by `focus-floating`.
+    #[test]
+    fn a_fullscreen_window_is_not_the_floating_layer() {
+        let mut flow = flow_with_two_layers(FLOAT_G);
+        flow.fullscreen.insert(
+            FLOAT_G,
+            super::super::fullscreen::FullscreenOrigin::Float {
+                monitor: 0,
+                workspace: WorkspaceId(1),
+                rect: Rect {
+                    x: 600,
+                    y: 100,
+                    width: 400,
+                    height: 300,
+                },
+            },
+        );
+        let (out, _) = focus_layer(&mut flow, LayerTarget::Other);
+        assert_eq!(
+            out,
+            LayerFocus::Focused {
+                layer: Layer::Floating,
+                hwnd: FLOAT_F
+            },
+            "the other side of a fullscreen window is the floating layer, minus itself"
+        );
+    }
+
+    /// Dead, hidden and refused candidates: the dead float is purged from
+    /// the space, the hidden one skipped, the refused one skipped, the next
+    /// one focused.
+    #[test]
+    fn focus_floating_skips_dead_hidden_and_refused_floats() {
+        let mut flow = flow_with_two_layers(TILE_A);
+        let out = flow.focus_layer_with(
+            LayerTarget::Floating,
+            |h| h != FLOAT_G,
+            |_| true,
+            |_| ForegroundPush::Focused,
+        );
+        assert_eq!(
+            out,
+            LayerFocus::Focused {
+                layer: Layer::Floating,
+                hwnd: FLOAT_F
+            }
+        );
+        assert!(
+            !flow.monitors[0]
+                .active_workspace()
+                .floating
+                .contains(WindowId(FLOAT_G)),
+            "the dead float was purged"
+        );
+
+        let mut flow = flow_with_two_layers(TILE_A);
+        let out = flow.focus_layer_with(
+            LayerTarget::Floating,
+            |_| true,
+            |h| h != FLOAT_G,
+            |_| ForegroundPush::Focused,
+        );
+        assert_eq!(
+            out,
+            LayerFocus::Focused {
+                layer: Layer::Floating,
+                hwnd: FLOAT_F
+            }
+        );
+        assert!(
+            flow.monitors[0]
+                .active_workspace()
+                .floating
+                .contains(WindowId(FLOAT_G)),
+            "a hidden float is kept"
+        );
+
+        let mut flow = flow_with_two_layers(TILE_A);
+        let out = flow.focus_layer_with(
+            LayerTarget::Floating,
+            |_| true,
+            |_| true,
+            |h| {
+                if h == FLOAT_G {
+                    ForegroundPush::Failed(5)
+                } else {
+                    ForegroundPush::Focused
+                }
+            },
+        );
+        assert_eq!(
+            out,
+            LayerFocus::Focused {
+                layer: Layer::Floating,
+                hwnd: FLOAT_F
+            }
+        );
+        let out = flow.focus_layer_with(
+            LayerTarget::Tiling,
+            |_| true,
+            |_| true,
+            |_| ForegroundPush::Failed(5),
+        );
+        assert_eq!(out, LayerFocus::Empty(Layer::Tiling), "every push refused");
     }
 
     /// Landing on an empty monitor must forget the tracked focus so the next

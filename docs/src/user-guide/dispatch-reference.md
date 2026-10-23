@@ -345,6 +345,29 @@ last.
 flow dispatch set-window fullscreen    # and again to come back
 ```
 
+### `focus-floating`, `focus-tiling`, `switch-focus-between-floating-and-tiling`
+
+Move the focus to the other side of the active monitor's workspace, as in
+niri. `focus-floating` focuses the floating window you used last there, else
+the top-most one; `focus-tiling` focuses the strip's last-focused window,
+else its first; `switch-focus-between-floating-and-tiling` goes to whichever
+side does not hold the focus now (the win-niri keymap binds it to
+Mod+Shift+V). A side with nothing to focus is a no-op that says so and exits
+0, so the chord can be tapped blind.
+
+This is how a floating window is reached while a fullscreen window has the
+foreground: with `[floating] always_on_top` the floats sit *under* a
+fullscreen or unmanaged window until a flow window has the focus again, and
+focusing a float is exactly that. A window the daemon put fullscreen
+(`set-window fullscreen`) counts as the tiling side and is never offered by
+`focus-floating`.
+
+```powershell
+flow dispatch switch-focus-between-floating-and-tiling
+flow dispatch focus-floating
+flow dispatch focus-tiling
+```
+
 No default hotkey in `flow.ahk` — bind it yourself.
 
 ## Workspaces

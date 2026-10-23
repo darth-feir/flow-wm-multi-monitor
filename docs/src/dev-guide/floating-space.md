@@ -622,6 +622,39 @@ resized to fullscreen) for the decision. The startup-failure rescue
 the layer is first applied after the initial layout, in `FlowWM::new`, after
 the first decision against the desktop's real foreground.
 
+### Reaching the other layer (`focus-floating`, `focus-tiling`, the switch)
+
+With the layer dropped under a fullscreen or foreign foreground there was no
+way to get to a float without leaving fullscreen; niri's answer is a chord
+that makes the floating layer active, and the fork does the same (ADR-0016,
+`docs/adr/0016-layer-focus-switch-and-one-drag-state.md`).
+`SocketMessage::FocusLayer { target }` — `focus-floating`, `focus-tiling`,
+`switch-focus-between-floating-and-tiling` (Mod+Shift+V in the win-niri
+keymap) — acts on the **active monitor's** workspace:
+
+- **Which side is active** (`layer_to_focus`, pure): the floating layer when
+  the registry's focus is an active float of that workspace's
+  `FloatingSpace` that the daemon did not put fullscreen; otherwise the
+  tiling side. `Other` goes to the side that is not active, so with nothing
+  focused it goes to the floats, as in niri.
+- **Candidates** (`layer_focus_candidates`, pure): floating — the
+  workspace's `last_focused_float` while it is still in the space, then the
+  floats top-most first, never a daemon-fullscreen window; tiling — the
+  strip's `last_focused_window`, then every tile in column/row order.
+- **The walk** (`FlowWM::focus_layer_with`) is `focus_monitor`'s: a dead
+  candidate is purged from its space, a hidden one skipped, a refused push
+  skipped, the first one that takes the foreground wins. The registry focus
+  and the borders are updated there (the foreground hook repeats it), a
+  tile is scrolled into view, a float is recorded as `last_focused_float`.
+- **Nothing to focus** answers `Data { "focused": null, "message": "no
+  floating window to focus" }`, exit 0: the chord is a toggle tapped blind.
+
+Focusing a float makes it the OS foreground, so the top-layer rule above
+raises the layer at once — over an F11 browser as much as over a tile. The
+per-workspace memory is written by `on_focus_changed` for any active float
+and validated when read, so no removal path has to clear it; it is not part
+of the loadout.
+
 ## Future Work
 
 Several enhancements are planned but not yet implemented:

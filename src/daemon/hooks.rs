@@ -788,6 +788,11 @@ impl FlowWM {
             if let Some(diff) = self.active_scrolling_mut().ensure_focused_visible() {
                 self.animate_layout(&diff);
             }
+        } else if self.registry.is_floating_active(hwnd) {
+            // The layer's "last used" float, for `focus-floating`.
+            if let Some(ws) = self.active_monitor_mut().workspace_mut(home_ws) {
+                ws.last_focused_float = Some(target);
+            }
         }
 
         // Refresh the new foreground first, then the previous one. `set_focused`

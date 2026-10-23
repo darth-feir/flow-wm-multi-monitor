@@ -506,9 +506,10 @@ impl FlowWM {
         let border_thickness = self.config.borders.thickness as i32;
         let border_overlap = self.config.borders.overlap as i32;
         let monitor_info = *self.monitors[monitor_idx].active_scrolling().monitor();
-        // A float the keymap is moving (`drag begin`) is the user's, not the
-        // animator's: left out like the dragged tile in `submit_animation`.
-        let excluded_float = self.manual_float_drag_hwnd();
+        // The window a drag owns (a native grab or a keymap session, tile or
+        // float) is the user's, not the animator's: left out like the
+        // dragged tile in `submit_animation`.
+        let excluded_float = self.drag_state.as_ref().map(|d| d.dragged_hwnd());
 
         // Build the combined target list. Iterating with explicit loops
         // (rather than `flat_map`) lets us hold one `&self.registry` borrow
@@ -617,7 +618,7 @@ impl FlowWM {
     pub(super) fn teleport_workspaces(&mut self, batches: &[(ActualLayout, i32)]) {
         let border_thickness = self.config.borders.thickness as i32;
         let border_overlap = self.config.borders.overlap as i32;
-        let excluded_float = self.manual_float_drag_hwnd();
+        let excluded_float = self.drag_state.as_ref().map(|d| d.dragged_hwnd());
         let mut submitted: Vec<(isize, Rect)> = Vec::new();
         for (layout, y_offset) in batches {
             for entry in &layout.entries {

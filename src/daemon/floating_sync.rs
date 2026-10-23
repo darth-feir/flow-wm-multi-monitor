@@ -62,7 +62,9 @@ impl FlowWM {
     /// Unlike [`on_float_location_changed`](Self::on_float_location_changed),
     /// this does NOT check `FLOAT_TRACKING_ACTIVE` — the caller gates that.
     /// The resume poll uses this entry point so it can store rects while the
-    /// flag is intentionally off (poll-then-enable ordering).
+    /// flag is intentionally off (poll-then-enable ordering), and so does a
+    /// float drag ([`DragMode::Float`](super::drag::DragMode::Float)), whose
+    /// `LOCATIONCHANGE` events `run.rs` routes to the drag path.
     ///
     /// Skips silently if `hwnd` is untracked, not an active float, or not in
     /// any monitor's active-workspace `FloatingSpace` (see
@@ -123,16 +125,6 @@ impl FlowWM {
             self.config.borders.thickness,
             self.config.borders.overlap,
         );
-
-        // A float the keymap is moving (`drag begin`): the ring follows the
-        // window, the bookkeeping waits for `drag end`, which records the
-        // final rect once (`daemon::drag_session`).
-        if self.manual_float_drag_hwnd() == Some(hwnd) {
-            if let Some(border) = window.border.as_ref() {
-                border.set_geometry(border_rect);
-            }
-            return;
-        }
 
         // FLOAT_HWNS holds the active-workspace floats of every monitor, so
         // the window must be in SOME monitor's active-workspace FloatingSpace.

@@ -550,6 +550,24 @@ const FIXED_ACTIONS: &[(&str, &[&str], &str, &str)] = &[
         "move-window-to-tiling",
     ),
     (
+        "switch-focus-between-floating-and-tiling",
+        &["switch-focus-between-floating-and-tiling"],
+        "switch focus between the floating and the tiled windows",
+        "switch-focus-between-floating-and-tiling",
+    ),
+    (
+        "focus-floating",
+        &["focus-floating"],
+        "focus the floating windows (the one used last)",
+        "focus-floating",
+    ),
+    (
+        "focus-tiling",
+        &["focus-tiling"],
+        "focus the tiled windows (the one used last)",
+        "focus-tiling",
+    ),
+    (
         "switch-preset-column-width",
         &["width", "next"],
         "cycle this screen's column widths (flow.toml [columns] presets)",
@@ -1071,6 +1089,9 @@ const GROUP_ORDER: &[&str] = &[
     "toggle-window-floating",
     "move-window-to-floating",
     "move-window-to-tiling",
+    "switch-focus-between-floating-and-tiling",
+    "focus-floating",
+    "focus-tiling",
     "switch-preset-column-width",
     "switch-preset-column-width-back",
     "expand-column",
@@ -1163,7 +1184,7 @@ pub fn hardwired_rows() -> Vec<HelpRow> {
     vec![
         HelpRow {
             chords: "Mod + left-button drag".into(),
-            help: "move a window grabbed anywhere (a tile drops into the zone under the cursor, a float moves)".into(),
+            help: "move a window grabbed anywhere (a tile drops into the zone under the cursor, a float moves; a click without moving only activates it)".into(),
         },
         HelpRow {
             chords: "Mod+Ctrl+T".into(),
@@ -1575,6 +1596,10 @@ mod tests {
         assert_eq!(find("Mod+Q").action.argv, vec!["close-window"]);
         assert_eq!(find("Mod+C").action.argv, vec!["center"]);
         assert_eq!(find("Mod+V").action.argv, vec!["set-window", "cycle"]);
+        assert_eq!(
+            find("Mod+Shift+V").action.argv,
+            vec!["switch-focus-between-floating-and-tiling"]
+        );
         assert_eq!(find("Mod+R").action.argv, vec!["width", "next"]);
         assert_eq!(find("Mod+F").action.argv, vec!["set-window", "fullscreen"]);
         assert_eq!(
@@ -1596,7 +1621,8 @@ mod tests {
                 .iter()
                 .all(|b| !matches!(b.chord.canonical().as_str(), "Mod+Minus" | "Mod+Equal"))
         );
-        assert_eq!(binds.len(), 8 + 8 + 8 + 20 + 7 + 6 + 2);
+        // focus 8, move 8, monitors 8, workspaces 20, q c v shift+v r f [ ] = 8, programs 6, help + quit.
+        assert_eq!(binds.len(), 8 + 8 + 8 + 20 + 8 + 6 + 2);
     }
 
     #[test]
@@ -1729,8 +1755,8 @@ mod tests {
         assert!(chords.contains(&"Mod+Space, Mod+D"), "{chords:?}");
         assert!(chords.contains(&"Mod+Shift+Slash"));
         assert_eq!(*chords.last().unwrap(), "Mod+Shift+E");
-        // 2 focus + 2 move + monitors 2 + workspaces 2 + q c v r f + consume + launcher + 4 spawn + help + quit
-        assert_eq!(rows.len(), 2 + 2 + 2 + 2 + 5 + 1 + 1 + 4 + 1 + 1);
+        // 2 focus + 2 move + monitors 2 + workspaces 2 + q c v shift+v r f + consume + launcher + 4 spawn + help + quit
+        assert_eq!(rows.len(), 2 + 2 + 2 + 2 + 6 + 1 + 1 + 4 + 1 + 1);
     }
 
     #[test]

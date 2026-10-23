@@ -1,5 +1,5 @@
-//! Tile-window drag lifecycle: a 4-state machine
-//! `DragMode ::= Idle | Classifying | Translate | Resize`.
+//! Window drag lifecycle: a 5-state machine
+//! `DragMode ::= Idle | Classifying | Translate | Resize | Float`.
 //!
 //! When a tiled window is grabbed (`MoveSizeStart`), the drag enters the
 //! provisional [`DragMode::Classifying`] state. Classification happens on the
@@ -26,13 +26,18 @@
 //! grip composes the horizontal and vertical boundary-moves in one gesture
 //! (they touch disjoint fields, so they commute).
 //!
-//! Floating windows never enter [`DragMode`] (they stay on the real-time
-//! float-sync path in `run.rs`, which routes their `LOCATIONCHANGE` events to
-//! `on_float_location_changed` because `drag_state` is never set for them).
+//! A floating window enters [`DragMode::Float`] on its `MoveSizeStart` and
+//! holds `drag_state` until `MoveSizeEnd`. There is nothing to classify or
+//! commit: its `LOCATIONCHANGE` events are routed here (by `dragged_hwnd`,
+//! like a tile's) and each one stores the live rect through the same
+//! `store_float_rect` the passive float-sync path uses. Occupying the one
+//! `drag_state` field is the point — the animator, the busy gate and the
+//! keymap sessions all ask that field, so a float drag needs no flag of its
+//! own (ADR-0016; the same shape as upstream's "floats enter DragMode").
 //!
-//! Because resize lives in the same `drag_state` field, the existing IPC
-//! `Busy` guard (layout-mutating commands rejected while `drag_state` is
-//! `Some`) covers resize automatically.
+//! Because resize and float drags live in the same `drag_state` field, the
+//! existing IPC `Busy` guard (layout-mutating commands rejected while
+//! `drag_state` is `Some`) covers them automatically.
 //!
 //! The three entry points ([`FlowWM::on_drag_start`],
 //! [`FlowWM::on_drag_move`], [`FlowWM::on_drag_end`]) are called from the
@@ -46,7 +51,8 @@
 //! [`DragProbe`] so the `_with` variants run against a scripted desktop in
 //! the unit tests.
 //!
-//! (`docs/src/dev-guide/tile-drag.md`, `docs/adr/0004-tile-resize-contract.md`)
+//! (`docs/src/dev-guide/tile-drag.md`, `docs/adr/0004-tile-resize-contract.md`,
+//! `docs/adr/0016-layer-focus-switch-and-one-drag-state.md`)
 
 use std::time::{Duration, Instant};
 
@@ -63,7 +69,7 @@ use crate::layout::resize::{
 };
 use crate::layout::types::AppliedLayout;
 use crate::registry::hooks::{clear_dragged_hwnd, set_dragged_hwnd};
-use crate::registry::types::{TilingState, WindowState};
+use crate::registry::types::{FloatingState, TilingState, WindowState};
 use crate::registry::win32 as registry_win32;
 
 use super::borders::float_border_rect;
@@ -101,11 +107,12 @@ impl DragProbe for Win32Drag {
     }
 }
 
-/// The 4-state drag state machine, or `None` when idle.
+/// The 5-state drag state machine, or `None` when idle.
 ///
 /// `Idle` is represented as `None` on [`FlowWM::drag_state`], so the existing
 /// `is_some()` / `take()` API (and the IPC `Busy` guard that keys off it) is
-/// unchanged — resize lives in this same field and is covered automatically.
+/// unchanged — resize and float drags live in this same field and are
+/// covered automatically.
 pub(super) enum DragMode {
     /// Provisional state entered on `MoveSizeStart` for a tile. Suppresses
     /// geometry snap-back and classifies on the first `LOCATIONCHANGE` by
@@ -117,6 +124,11 @@ pub(super) enum DragMode {
     Translate(DragState),
     /// Horizontal edge/corner column resize — ticket #9.
     Resize(ResizeDrag),
+    /// A floating window being moved or resized, natively or by a keymap
+    /// session. Entered directly (no classification), held for the whole
+    /// gesture, and ended with no layout commit: every `LOCATIONCHANGE`
+    /// stored the live rect already (ADR-0016).
+    Float(FloatDrag),
 }
 
 impl DragMode {
@@ -127,6 +139,7 @@ impl DragMode {
             DragMode::Classifying(c) => c.dragged_id,
             DragMode::Translate(t) => t.dragged_id,
             DragMode::Resize(r) => r.dragged_id,
+            DragMode::Float(f) => f.dragged_id,
         }
     }
 
@@ -137,6 +150,7 @@ impl DragMode {
             DragMode::Classifying(c) => c.dragged_hwnd,
             DragMode::Translate(t) => t.dragged_hwnd,
             DragMode::Resize(r) => r.dragged_hwnd,
+            DragMode::Float(f) => f.dragged_hwnd,
         }
     }
 
@@ -147,9 +161,19 @@ impl DragMode {
     pub(super) fn edge_scroll_deadline(&self) -> Option<Instant> {
         match self {
             DragMode::Translate(t) => t.edge_scroll_deadline,
-            DragMode::Classifying(_) | DragMode::Resize(_) => None,
+            DragMode::Classifying(_) | DragMode::Resize(_) | DragMode::Float(_) => None,
         }
     }
+}
+
+/// Identity of the float being dragged (the `Float` variant). No start
+/// rect (nothing is classified) and no grip (nothing is committed): the
+/// id and HWND are all the routing and the animator's exclusion need.
+pub(super) struct FloatDrag {
+    /// The layout-engine ID of the dragged float.
+    pub(super) dragged_id: WindowId,
+    /// The raw HWND value (for the `DRAGGED_HWND` global and event routing).
+    pub(super) dragged_hwnd: isize,
 }
 
 /// Provisional `Classifying` payload: identity + the start rect.
@@ -235,15 +259,13 @@ pub(super) struct ResizeDrag {
 // and LocationChange events during a tile drag.
 
 impl FlowWM {
-    /// Begin a tile-window drag (tiles only).
+    /// Begin a window drag: a tile classifies, a float just follows.
     ///
-    /// Called on `MoveSizeStart` for any tracked window. Enters the
-    /// [`DragMode::Classifying`] provisional state only when the window is
-    /// `Tiling(Active)`; otherwise it returns early. Crucially, **floating
-    /// windows never set `drag_state`**, so `run.rs` keeps routing their
-    /// `LOCATIONCHANGE` events to the real-time float-sync path
-    /// (`on_float_location_changed`) — that is the entire float-drag behavior,
-    /// with no wiring change needed here.
+    /// Called on `MoveSizeStart` for any tracked window (and by a keymap
+    /// session's `drag begin`). An active tile enters the
+    /// [`DragMode::Classifying`] provisional state; an active float enters
+    /// [`DragMode::Float`] directly. Anything else (minimized, hidden,
+    /// ignored, untracked) sets no state.
     ///
     /// Entering `Classifying` immediately routes the dragged tile's subsequent
     /// `LOCATIONCHANGE` events into the drag path (not the float-sync path),
@@ -252,7 +274,9 @@ impl FlowWM {
     /// `Resize` via [`classify_drag`] (see [`Self::classify_and_promote`]). A
     /// click with no movement stays `Classifying` and is a no-op on release.
     ///
-    /// No-op if the window is not found or is not an active tile.
+    /// A float's `LOCATIONCHANGE` events are routed here too and stored live
+    /// ([`FlowWM::store_float_rect`]); holding `drag_state` keeps the
+    /// animator off the window and the busy gate up for the gesture.
     pub(super) fn on_drag_start(&mut self, hwnd: isize) {
         self.on_drag_start_with(&Win32Drag, hwnd);
     }
@@ -269,14 +293,18 @@ impl FlowWM {
         let Some(window) = self.registry.get_window(hwnd_handle) else {
             return;
         };
-        // Only tiles enter the drag state machine. Floats stay on the normal
-        // float-sync path (run.rs routes their LOCATIONCHANGE to
-        // on_float_location_changed because drag_state is never set for them).
-        if !matches!(
-            window.state,
-            WindowState::Tiling(TilingState::Active { .. })
-        ) {
-            return;
+        match window.state {
+            WindowState::Tiling(TilingState::Active { .. }) => {}
+            WindowState::Floating(FloatingState::Active { .. }) => {
+                self.drag_state = Some(DragMode::Float(FloatDrag {
+                    dragged_id: WindowId(hwnd),
+                    dragged_hwnd: hwnd,
+                }));
+                set_dragged_hwnd(hwnd);
+                log::debug!("drag start: hwnd={hwnd} (float)");
+                return;
+            }
+            _ => return,
         }
 
         // Capture the start rect for the rect-diff classifier. Falls back to a
@@ -320,6 +348,8 @@ impl FlowWM {
     ///   title-bar reorder preview).
     /// - [`DragMode::Resize`] → [`Self::on_resize_move`] (the boundary-move
     ///   teleport preview).
+    /// - [`DragMode::Float`] → [`Self::store_float_rect`] (the live rect, the
+    ///   ring re-seated; no preview, no commit).
     pub(super) fn on_drag_move(&mut self, hwnd: isize) {
         self.on_drag_move_with(&Win32Drag, hwnd);
     }
@@ -335,6 +365,7 @@ impl FlowWM {
         match self.drag_state.as_ref() {
             Some(DragMode::Translate(_)) => self.on_translate_move(probe, hwnd),
             Some(DragMode::Resize(_)) => self.on_resize_move(probe, hwnd),
+            Some(DragMode::Float(_)) => self.store_float_rect_with(probe, hwnd),
             // Still Classifying (no movement yet), or None — nothing to do.
             _ => {}
         }
@@ -802,7 +833,18 @@ impl FlowWM {
             DragMode::Translate(t) => self.on_translate_end(t),
             DragMode::Resize(r) => self.on_resize_end(probe, r),
             DragMode::Classifying(c) => self.on_classifying_end(c),
+            DragMode::Float(f) => self.on_float_end(probe, f),
         }
+    }
+
+    /// The `Float` variant's release: no layout to commit. The rect is
+    /// stored once more because the last move's `LOCATIONCHANGE` can still be
+    /// in the hook queue when a keymap session's `drag end` is read from the
+    /// pipe; the write is idempotent, and it re-seats the ring.
+    fn on_float_end<P: DragProbe>(&mut self, probe: &P, drag: FloatDrag) {
+        self.store_float_rect_with(probe, drag.dragged_hwnd);
+        self.refresh_border_for(drag.dragged_hwnd);
+        log::debug!("drag end (float): hwnd={}", drag.dragged_hwnd);
     }
 
     /// The `Translate` variant's release commit — the existing title-bar

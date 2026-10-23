@@ -221,25 +221,26 @@ pub struct FlowWM {
     /// and cleared by the resume poll in the main loop.
     pub(super) float_resume_deadline: Option<std::time::Instant>,
 
-    /// State for the in-progress tile-window drag, or `None` when idle.
+    /// State for the in-progress window drag, or `None` when idle.
     ///
-    /// A 4-state machine `Idle | Classifying | Translate | Resize`: `None`
-    /// (idle) is set by [`on_drag_start`](super::drag::FlowWM::on_drag_start)
-    /// (MoveSizeStart on a tiled window) to [`DragMode::Classifying`], promoted
-    /// on the first `LOCATIONCHANGE` to `Translate` or `Resize`, and cleared
-    /// by [`on_drag_end`](super::drag::FlowWM::on_drag_end) (MoveSizeEnd).
+    /// A 5-state machine `Idle | Classifying | Translate | Resize | Float`:
+    /// `None` (idle) is set by [`on_drag_start`](super::drag::FlowWM::on_drag_start)
+    /// (MoveSizeStart) to [`DragMode::Classifying`] for a tile — promoted on
+    /// the first `LOCATIONCHANGE` to `Translate` or `Resize` — or to
+    /// [`DragMode::Float`] for a float, and cleared by
+    /// [`on_drag_end`](super::drag::FlowWM::on_drag_end) (MoveSizeEnd).
     ///
     /// When `Some`, layout-mutating IPC is rejected with
-    /// [`SocketResponse::Busy`](crate::ipc::message::SocketResponse::Busy) —
-    /// this covers resize automatically because it lives in the same field.
+    /// [`SocketResponse::Busy`](crate::ipc::message::SocketResponse::Busy)
+    /// and the animator leaves the dragged window alone — resize and float
+    /// drags get both because they live in the same field.
     pub(super) drag_state: Option<super::drag::DragMode>,
 
     /// The keymap-driven drag session (`flow dispatch drag begin`), or
-    /// `None`. A tile session also holds `drag_state`; a float session
-    /// holds back the float-sync writes and keeps the animator off that
-    /// window. Native move-size events for the session's window are
-    /// ignored, and the busy gate applies as for a native drag. See
-    /// `daemon::drag_session`.
+    /// `None`. A session always holds `drag_state` for its window (tile or
+    /// float); this records that the keymap, not Windows, owns the gesture:
+    /// native move-size events for the window are ignored until `drag end`.
+    /// See `daemon::drag_session`.
     pub(super) manual_drag: Option<super::drag_session::ManualDrag>,
 
     /// Timestamp of the most recent foreground-reconciliation pass.

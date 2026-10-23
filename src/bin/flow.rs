@@ -40,10 +40,10 @@ use flow_wm::build_info;
 use flow_wm::common::Direction;
 use flow_wm::config;
 use flow_wm::daemon::startup::{self, StartupState, StartupStatus};
-use flow_wm::ipc::message::SocketMessage;
 use flow_wm::ipc::message::SocketResponse;
 use flow_wm::ipc::message::WidthPresetRequest;
 use flow_wm::ipc::message::WindowMode;
+use flow_wm::ipc::message::{LayerTarget, SocketMessage};
 use flow_wm::ipc::transport;
 use flow_wm::logging;
 use flow_wm::rescue;
@@ -328,6 +328,18 @@ enum DispatchCommands {
     /// focused column lands at the monitor midpoint using the variable-width
     /// prefix sum — works correctly even with expanded or shrunk columns.
     Center,
+    /// Focus the floating windows of the active workspace: the one used
+    /// last, else the top-most. Sends [`SocketMessage::FocusLayer`]; an
+    /// empty layer is reported and exits 0.
+    FocusFloating,
+    /// Focus the tiled windows of the active workspace: the strip's
+    /// last-focused window, else its first. Sends
+    /// [`SocketMessage::FocusLayer`].
+    FocusTiling,
+    /// Focus whichever of the two is not focused now (niri's
+    /// `switch-focus-between-floating-and-tiling`, Mod+Shift+V in the
+    /// win-niri keymap). Sends [`SocketMessage::FocusLayer`].
+    SwitchFocusBetweenFloatingAndTiling,
     /// Close the currently focused window.
     ///
     /// Sends [`SocketMessage::CloseWindow`]. The daemon asks the focused
@@ -1356,6 +1368,11 @@ fn cmd_dispatch(command: DispatchCommands) -> Result<(), String> {
         }
         DispatchCommands::Width { preset } => cmd_dispatch_width(&preset),
         DispatchCommands::Center => send_command(SocketMessage::Center, "viewport centered"),
+        DispatchCommands::FocusFloating => cmd_dispatch_focus_layer(LayerTarget::Floating),
+        DispatchCommands::FocusTiling => cmd_dispatch_focus_layer(LayerTarget::Tiling),
+        DispatchCommands::SwitchFocusBetweenFloatingAndTiling => {
+            cmd_dispatch_focus_layer(LayerTarget::Other)
+        }
         DispatchCommands::CloseWindow => send_command(SocketMessage::CloseWindow, "window closed"),
         DispatchCommands::SetWindow { mode } => cmd_dispatch_set_window(mode),
         DispatchCommands::SwitchWorkspace { workspace_id } => send_command(
@@ -1421,6 +1438,39 @@ fn cmd_dispatch_drag(action: DragAction) -> Result<(), String> {
         SocketResponse::Busy => Err("daemon is busy (drag in progress), retry shortly".to_string()),
         SocketResponse::Pong { .. } => Err("unexpected pong reply to a command".to_string()),
     }
+}
+
+/// `flow dispatch focus-floating | focus-tiling |
+/// switch-focus-between-floating-and-tiling`: the daemon answers `Data`
+/// with a `message` either way (`focused the floating windows`, `no tiling
+/// window to focus`); an empty side is exit 0, since the chord is a toggle.
+fn cmd_dispatch_focus_layer(target: LayerTarget) -> Result<(), String> {
+    grant_foreground_permission();
+    let msg = SocketMessage::FocusLayer { target };
+    let response =
+        transport::send_message(&msg).map_err(|e| format!("failed to send command: {e}"))?;
+    match response {
+        SocketResponse::Data { payload } => {
+            println!("flow: {}", describe_focus_layer_reply(&payload));
+            Ok(())
+        }
+        SocketResponse::Ok => {
+            println!("flow: focus changed");
+            Ok(())
+        }
+        SocketResponse::Error { message } => Err(format!("daemon error: {message}")),
+        SocketResponse::Busy => Err("daemon is busy (drag in progress), retry shortly".to_string()),
+        SocketResponse::Pong { .. } => Err("unexpected pong reply to a command".to_string()),
+    }
+}
+
+/// The line printed for a `FocusLayer` reply payload: its `message`, else a
+/// generic line.
+fn describe_focus_layer_reply(payload: &serde_json::Value) -> String {
+    payload
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| "focus changed".to_owned(), str::to_owned)
 }
 
 /// The line printed for a `drag begin` / `drag end` reply payload.
@@ -2981,6 +3031,55 @@ mod tests {
             } => {}
             other => panic!("expected Dispatch::Center, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_dispatch_focus_layer_commands() {
+        for (word, expect) in [
+            ("focus-floating", "FocusFloating"),
+            ("focus-tiling", "FocusTiling"),
+            (
+                "switch-focus-between-floating-and-tiling",
+                "SwitchFocusBetweenFloatingAndTiling",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(["flow", "dispatch", word]).unwrap();
+            let got = match cli.command {
+                Commands::Dispatch {
+                    command: DispatchCommands::FocusFloating,
+                } => "FocusFloating",
+                Commands::Dispatch {
+                    command: DispatchCommands::FocusTiling,
+                } => "FocusTiling",
+                Commands::Dispatch {
+                    command: DispatchCommands::SwitchFocusBetweenFloatingAndTiling,
+                } => "SwitchFocusBetweenFloatingAndTiling",
+                other => panic!("expected {expect}, got: {other:?}"),
+            };
+            assert_eq!(got, expect, "{word}");
+            // Takes no argument.
+            assert!(Cli::try_parse_from(["flow", "dispatch", word, "x"]).is_err());
+        }
+    }
+
+    #[test]
+    fn focus_layer_reply_prints_the_daemon_message() {
+        let focused = serde_json::json!({
+            "focused": "floating", "hwnd": 7, "message": "focused the floating windows"
+        });
+        assert_eq!(
+            describe_focus_layer_reply(&focused),
+            "focused the floating windows"
+        );
+        let empty = serde_json::json!({ "focused": null, "message": "no tiling window to focus" });
+        assert_eq!(
+            describe_focus_layer_reply(&empty),
+            "no tiling window to focus"
+        );
+        assert_eq!(
+            describe_focus_layer_reply(&serde_json::json!({})),
+            "focus changed"
+        );
     }
 
     #[test]

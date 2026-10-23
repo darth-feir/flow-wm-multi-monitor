@@ -6,9 +6,11 @@ dragged window will land; on release the layout commits and the dragged
 window snaps into its tile.
 
 The drag works **entirely within the tiling model**. A tile never becomes a
-float mid-drag, and a float never becomes a tile. Dragging a floating window
-is handled by the ordinary float-sync path (`store_float_rect`), not by this
-module. There is no config flag — the feature is always on.
+float mid-drag, and a float never becomes a tile. A floating window being
+dragged holds the same `drag_state` as a tile (`DragMode::Float`, see *Floats
+in the drag state* below) but is only followed — its rect is stored on every
+move through the ordinary `store_float_rect`. There is no config flag — the
+feature is always on.
 
 This is a deliberate departure from the earlier design, which converted the
 dragged window to a float for the duration of the drag and converted it back
@@ -139,14 +141,26 @@ else                               { on_float_location_changed(hwnd) }
 
 `MoveSizeStart` routes to `on_drag_start`; `MoveSizeEnd` to `on_drag_end`.
 
-### Why float drags need no special routing
+### Floats in the drag state
 
-Because `on_drag_start` early-returns for any window that is not
-`Tiling::Active`, a floating window's `drag_state` is never set. Its
-`LOCATIONCHANGE` events therefore continue routing to
-`on_float_location_changed` → `store_float_rect` for the entire drag — the
-float follows the mouse in real time, exactly as it does outside a drag. That
-is the whole float-drag behavior, with zero wiring in this module.
+`on_drag_start` on a `Floating(Active)` window installs `DragMode::Float
+{ id, hwnd }` and sets `DRAGGED_HWND`, exactly as a tile's `MoveSizeStart`
+installs `Classifying`. The router above therefore sends the float's
+`LOCATIONCHANGE` events to `on_drag_move`, whose `Float` arm calls the same
+`store_float_rect` the passive path uses: the rect is stored live, the ring
+re-seated, nothing previewed or committed. `on_drag_end` stores the rect once
+more (a keymap session's last `WinMove` can still be in the hook queue when
+`drag end` is read from the pipe) and refreshes the border.
+
+Why a float occupies `drag_state` at all, when the passive path would move
+it just as well: every consumer that must leave a dragged window alone — the
+animation bridge's exclusion, the busy gate, the keymap sessions — reads that
+one field. Stage 18 kept float sessions out of it and gave the animation
+bridge and the float-sync path a second flag to check; that is the "twin of
+`drag_state`" upstream's "floats enter `DragMode`" record rejects, and
+ADR-0016 (`docs/adr/0016-layer-focus-switch-and-one-drag-state.md`) moved
+the fork to the single field. A native title-bar drag of a float gets the
+same state, so the animator leaves it alone for the gesture too.
 
 For the general hook pipeline architecture — how the hook thread, the mpsc
 channel, and `WaitForMultipleObjects` interact — see *Event Pipelines*
@@ -512,15 +526,18 @@ ends — `src/daemon/drag_session.rs`:
   `on_drag_start` — `Classifying`, `DRAGGED_HWND` set, the border recolored
   — and the keymap's `WinMove`s arrive as the same `LOCATIONCHANGE` stream a
   native drag produces, so classification, border following, drop-zone
-  preview and edge-scroll are untouched. A float gets nothing from
-  `MoveSizeStart` today, so the session only **holds its float-sync
-  writes**: `store_float_rect` keeps moving the ring but leaves the
-  `FloatingSpace` entry and registry mirror alone, and the animation bridge
-  leaves the window out of every batch (a float appearing mid-drag would
-  otherwise re-apply the stale rect under the cursor).
+  preview and edge-scroll are untouched. A float goes through the same
+  `on_drag_start` and enters `DragMode::Float` (*Floats in the drag state*):
+  its rect is stored on every move and the animation bridge leaves the
+  window out of every batch because `drag_state` names it.
 - **`drag end`** runs the `MoveSizeEnd` path: a tile commits its zone or
-  snaps back (`on_drag_end`), a float records its final rect once and the
-  ring is re-seated.
+  snaps back (`on_drag_end`), a float records its final rect once more and
+  the ring is re-seated.
+- **The keymap waits 8 px.** Since ADR-0016 the keymap sends `drag begin`
+  only once the cursor has left an 8 px circle around the press point with
+  the button still held (niri's grab threshold); a release inside it is a
+  plain Mod+click that activated the window, and the daemon never hears of
+  it.
 - **Rules.** `drag begin` while any drag is active (native `drag_state` or
   a session) is an error, as is a focus that is not an active tile or float
   (minimized, hidden, fullscreen, ignored, untracked) or tiling off. `drag
@@ -537,8 +554,10 @@ The decisions are pure (`decide_begin`, `native_event_is_shadowed`,
 through the `DragProbe` trait (`window_rect`, `cursor_pos`, `is_iconic`;
 `Win32Drag` on the live desktop), so the tests in `drag_session.rs` script
 a desktop and run begin → location changes → end on a tile (the strip
-reorders on release, nothing commits before) and on a float (writes held,
-final rect recorded, size kept across repeated empty sessions).
+reorders on release, nothing commits before) and on a float (`Float` state
+entered, rect stored on every move, final rect kept, size kept across
+repeated empty sessions), and a native float `MoveSizeStart` through the same
+state.
 
 The keymap side — window under the cursor, Win-key masking, the move loop —
 is described in `keymaps/win-niri/README.md`.
@@ -555,5 +574,6 @@ is described in `keymaps/win-niri/README.md`.
 - (layout/pipeline.md) — how `AppliedLayout` is produced by the
   mutate-then-project pipeline that `resolve_drop_zone` reads and
   `preview_move` writes.
-- (floating-space.md) — the float-sync path (`store_float_rect`) that handles
-  floating-window drags; the tile drag never enters it.
+- (floating-space.md) — the float-sync path (`store_float_rect`) that the
+  `Float` drag arm shares with passive float moves, and the floating layer
+  the focus switch (`switch-focus-between-floating-and-tiling`) reaches.
