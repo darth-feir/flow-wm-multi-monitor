@@ -663,17 +663,40 @@ fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> ForegroundPush {
         }
     };
     // A direct `SetForegroundWindow` (no foreground lock to defeat), with
-    // its error code classified.
+    // its error code classified. The report is deferred by the caller: with
+    // another thread's input attached, a FALSE here is often followed by
+    // the `BringWindowToTop` below activating the window anyway (seen in the
+    // VM: `SetForegroundWindow failed ... (Win32 error 0x0)` and the
+    // `EVENT_SYSTEM_FOREGROUND` for the target in the same instant), so the
+    // verdict is taken after that call, from `GetForegroundWindow`.
     let direct = |target: HWND| -> ForegroundPush {
         if unsafe { SetForegroundWindow(target) }.as_bool() {
             ForegroundPush::Focused
         } else {
-            let code = unsafe { GetLastError() }.0;
-            report(format!(
-                "set_foreground_window: SetForegroundWindow failed for hwnd {hwnd_val} (Win32 error {code:#x})"
-            ));
-            ForegroundPush::from_error(code)
+            ForegroundPush::from_error(unsafe { GetLastError() }.0)
         }
+    };
+    // The verdict for a FALSE: the target is the foreground within ~50 ms
+    // (focused after all), or the push was refused and is reported.
+    let settle = |target: HWND, outcome: ForegroundPush| -> ForegroundPush {
+        let code = match outcome {
+            ForegroundPush::Focused => return ForegroundPush::Focused,
+            ForegroundPush::InvalidHandle => ERROR_INVALID_HANDLE,
+            ForegroundPush::Failed(code) => code,
+        };
+        for _ in 0..5 {
+            if unsafe { GetForegroundWindow() } == target {
+                log::debug!(
+                    "set_foreground_window: SetForegroundWindow returned FALSE (Win32 error {code:#x}) but hwnd {hwnd_val} became the foreground; treated as focused"
+                );
+                return ForegroundPush::Focused;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        report(format!(
+            "set_foreground_window: SetForegroundWindow failed for hwnd {hwnd_val} (Win32 error {code:#x})"
+        ));
+        outcome
     };
 
     // Get the current foreground window.
@@ -683,7 +706,7 @@ fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> ForegroundPush {
     // direct call. Benign (happens at startup or with no app focused),
     // so no log here.
     if foreground_hwnd.0.is_null() {
-        return direct(target_hwnd);
+        return settle(target_hwnd, direct(target_hwnd));
     }
 
     // GetWindowThreadProcessId's RETURN value is the THREAD ID of the
@@ -701,7 +724,7 @@ fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> ForegroundPush {
             foreground_hwnd,
             unsafe { GetLastError() }.0
         ));
-        return direct(target_hwnd);
+        return settle(target_hwnd, direct(target_hwnd));
     }
 
     let our_thread_id = unsafe { GetCurrentThreadId() };
@@ -742,7 +765,7 @@ fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> ForegroundPush {
         }
     }
 
-    outcome
+    settle(target_hwnd, outcome)
 }
 
 /// Remove the current foreground window by foregrounding the desktop.
