@@ -32,9 +32,11 @@ What the fork adds, each with a page in the Developer Guide (`docs/src/dev-guide
 
 ### Using the fork
 
-Build from this checkout (same toolchain as upstream, below), then:
+Clone the fork and build it (same toolchain as upstream, below):
 
 ```powershell
+git clone -b feat/multi-monitor https://github.com/darth-feir/flow-wm-fork.git
+cd flow-wm-fork
 cargo build --release
 flow config init                 # writes %USERPROFILE%\.config\flow\flow.toml
 ```
