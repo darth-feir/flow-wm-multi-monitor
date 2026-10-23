@@ -17,13 +17,13 @@ adopt_maximized = true
 
 # Column widths as a share of the screen. Mod+R cycles `presets` on the focused screen; a window
 # moved to another screen takes that screen's width. A preset is one fraction for every column
-# ("1/2") or a `+` pattern the columns take by position ("1/3+2/3": the first, third, fifth
-# column a third, the second, fourth, sixth two thirds; widths never change with focus, and a
-# pattern pins them, so shrink/expand are refused while one is active).
-# Two 1920x1080 screens: 1/3 is tight, 1/3+2/3 is a wide editor beside a narrow terminal,
-# 1/2 is the comfortable default, 1/1 is one column.
+# ("1/2") or a `+` pattern of screen slots ("2/3+1/3": two columns on screen, the window you
+# are in takes the first term, so write the main size first; the slots then stay put while the
+# strip scrolls, and a pattern pins them, so shrink/expand are refused while one is active).
+# Two 1920x1080 screens: 1/3 is tight, 2/3+1/3 makes the window you are in wide and its
+# neighbour narrow, 1/2 is the comfortable default, 1/1 is one column.
 [columns]
-presets = ["1/3", "1/3+2/3", "1/2", "1/1"]
+presets = ["1/3", "2/3+1/3", "1/2", "1/1"]
 default = "1/2"
 
 # A screen matched by a rule uses its own list (first match wins; the others use the list

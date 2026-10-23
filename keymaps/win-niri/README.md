@@ -18,7 +18,7 @@ setup.
 | `launcher.ahk` | Application launcher (the `launcher` action, Mod+Space / Mod+D by default): Start-menu shortcuts, open windows, a few built-ins, fuzzy-matched. |
 | `help.ahk` | Key-binding overlay (the `show-hotkey-overlay` action, Mod+Shift+/ by default). Its rows come from the same `flow query binds` listing the hotkeys are registered from, so it cannot disagree with them. |
 | `flow-resident.ahk` | Optional resident starter: runs all the time (shortcut in `shell:startup`) and turns Mod+Ctrl+T into an on/off switch for the whole of FlowWM. |
-| `flow.toml.example` | The daemon side of the map: `[columns]` width presets (fractions and `1/3+2/3`-style patterns, per-screen `[[columns.screen]]` rules), `edge_hop = false`, and commented `[binds]` / `[startup]` examples. |
+| `flow.toml.example` | The daemon side of the map: `[columns]` width presets (fractions and `2/3+1/3`-style slot patterns, per-screen `[[columns.screen]]` rules), `edge_hop = false`, and commented `[binds]` / `[startup]` examples. |
 
 Install: copy `flow.ahk`, `flow-exe.ahk`, `launcher.ahk` and `help.ahk` to
 `%USERPROFILE%\.config\flow\` (the files must sit next to each other — the

@@ -1,6 +1,9 @@
 # Width patterns are assigned by column position and pin the strip
 
-**Status:** Accepted — extends the `[columns]` preset grammar of the fork
+**Status:** Superseded by [ADR-0017](0017-width-patterns-are-screen-slots.md)
+for `+` patterns (the grammar, the per-screen rules, the validation and the
+pin stay; the by-position rule below was replaced by screen slots after one
+day of use). Originally: extends the `[columns]` preset grammar of the fork
 (`presets = ["1/3", "1/2", "1/1"]`, per monitor) with `+` patterns and
 per-screen rules. The resize commands and the ladder are unchanged for a
 plain fraction.

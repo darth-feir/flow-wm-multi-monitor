@@ -218,8 +218,9 @@ Every column on **every workspace** of that monitor takes the new width — the
 active workspace animates, parked workspaces are re-laid out and slide in at
 their new widths on the next switch — and every column created on that monitor
 from then on (a new window, `set-window tile`, a window arriving by
-`move-to-monitor` or an edge hop) starts at it. A pattern (`1/3+2/3`) gives
-each column its position's share and keeps it there. Other monitors keep
+`move-to-monitor` or an edge hop) starts at it. A pattern (`2/3+1/3`) fills
+the screen's slots in place, the focused column taking the first term, and
+keeps them there as the strip scrolls. Other monitors keep
 their own preset. `expand-column` / `shrink-column` keep working on a plain
 fraction: their ladder starts from the monitor's current preset width, so one
 `expand-column` from `1/3` spans two thirds; on a pattern they, `set-column-width`

@@ -352,11 +352,11 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   `docs/adr/0013-floating-layer-follows-adr-0003.md`
 - **ADR-0014 — Width patterns are assigned by column position and pin the
   strip.** A `[columns]` preset may be a `+` pattern (`1/3+2/3`); column `i`
-  takes term `i mod n`, so widths never move with focus, insert and remove
-  re-flow by position, and resize commands are refused while a pattern is
-  on. Per-screen `[[columns.screen]]` rules pick the list by orientation,
-  width or device name, and presets are checked against the real screens
-  instead of being floored silently.
+  took term `i mod n`. The by-position rule is superseded by ADR-0017; the
+  grammar, the pin (resize commands refused while a pattern is on), the
+  per-screen `[[columns.screen]]` rules that pick the list by orientation,
+  width or device name, and the check of presets against the real screens
+  instead of silent flooring all stand.
   `docs/adr/0014-width-patterns-by-column-position.md`
 - **ADR-0015 — Key bindings are configuration the daemon owns, and the
   keymap interprets.** `[binds]` in `flow.toml`, niri's chord and action
@@ -375,3 +375,11 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   `drag_state` as `DragMode::Float`, the shape upstream's unmerged ADR-0008
   chose, so the animator, the busy gate and the routing need no second flag.
   `docs/adr/0016-layer-focus-switch-and-one-drag-state.md`
+- **ADR-0017 — Width patterns are screen slots, filled from the focused
+  column.** A pattern's terms are the slots of the screen, not widths by
+  strip position: applying one resizes the columns on screen in place with
+  the focused column taking the first term, and the slots then stay put —
+  a column scrolled in takes the slot it lands in. The run starts at the
+  column on the viewport's left edge, so the view always begins on a column
+  boundary. Supersedes the position rule of ADR-0014.
+  `docs/adr/0017-width-patterns-are-screen-slots.md`

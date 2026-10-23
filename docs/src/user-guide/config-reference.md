@@ -57,7 +57,7 @@ Not every field can change at runtime. Reload applies **live** fields in place;
 | `padding.window_gap` | Re-projects every workspace's pixel layout — windows animate to the new gaps. |
 | `columns_per_screen` | Updates the cached threshold (no window movement; affects future auto-center). |
 | `column_width`, `min_column_width_px`, `min_window_height_px` | Update cached bounds; existing per-column widths preserved. |
-| `columns.presets`, `columns.default`, `columns.screen` | Each monitor's preset is re-resolved against its list: it stays on the preset it was on when the list still has it, else lands on that list's `default` (so a monitor that had no presets before starts on `default`). Existing per-column widths preserved for a plain fraction; a pattern re-pins them by position. A list with a term under the floor on any attached screen is refused and the old config kept. |
+| `columns.presets`, `columns.default`, `columns.screen` | Each monitor's preset is re-resolved against its list: it stays on the preset it was on when the list still has it, else lands on that list's `default` (so a monitor that had no presets before starts on `default`). Existing per-column widths preserved for a plain fraction; a pattern re-pins them to its slots, keeping the slot order the screen had. A list with a term under the floor on any attached screen is refused and the old config kept. |
 | `columns.visible_rows` | Every column re-shares its height over the new viewport size and the focused row is kept visible (windows animate). |
 | `columns.max_rows` | Applies to the next merge/consume/insert; a column already over the new cap keeps its rows until windows leave it. |
 | `animation.*` | New duration / easing / enabled flag applies to the next animation. |
@@ -132,7 +132,7 @@ focused monitor through the list (see the
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `presets` | `Vec<String>` | `["1/3", "1/2", "1/1"]` | Ordered presets. Each is a fraction `"a/b"` of the work area, a plain number in `(0, 1]` such as `0.5`, or a `+` pattern of those (`"1/3+2/3"`, see below). Must not be empty. |
+| `presets` | `Vec<String>` | `["1/3", "1/2", "1/1"]` | Ordered presets. Each is a fraction `"a/b"` of the work area, a plain number in `(0, 1]` such as `0.5`, or a `+` pattern of those (`"2/3+1/3"`, see below). Must not be empty. |
 | `default` | `Option<String>` | `None` (= the first preset) | The preset every monitor starts on. Must be one of `presets`. |
 | `visible_rows` | `u32` | `0` | How many rows of a column are on screen at once. `0` shows every row sharing the height. With `2`, a column of four windows shows two at a time and `focus up/down` scrolls through the stack. |
 | `max_rows` | `u32` | `0` | The most rows a column may hold; `0` is unlimited. Must be at least `visible_rows` when both are set. Merging into a full column moves the window past it instead. |
@@ -172,25 +172,37 @@ presets = ["1/3", "1/3+2/3", "1/2", "1/1"]
 default = "1/2"
 ```
 
-#### Width patterns: `"1/3+2/3"`
+#### Width patterns: `"2/3+1/3"`
 
-A preset with two or more terms joined by `+` is a **pattern**. The columns
-of the strip take the terms **by position**, repeating: with `"1/3+2/3"` the
-first, third and fifth columns are a third of the work area and the second,
-fourth and sixth two thirds; `"1/4+1/2+1/4"` repeats every three columns.
-The terms of a pattern may add up to at most the whole screen (`1/1`), so a
-whole period plus its gaps fits the work area exactly and scrolling by one
-column shows the same shares in the other order. A single fraction is the
-one-term pattern.
+A preset with two or more terms joined by `+` is a **pattern**. Its terms
+are the screen's **slots**, left to right: with `"2/3+1/3"` the screen shows
+two columns, one two thirds of the work area and one a third; with
+`"1/2+1/4+1/4"` it shows three. The terms may add up to at most the whole
+screen (`1/1`), so the slots plus their gaps fit the work area exactly. A
+single fraction is the one-term pattern.
 
-Widths never change with focus or scrolling. They are decided by position,
-so inserting a column (a new window, a merge, a swap) re-flows the columns
-after it, and so a pattern **pins** the strip: `expand-column`,
-`shrink-column`, `set-column-width` and `toggle-monocle` are refused on that
-screen with a message naming the pattern, and a mouse resize snaps back on
-release. Switch to a single-fraction preset to resize by hand. Why patterns
-are positional rather than anchored on the focused column:
-`docs/adr/0014-width-patterns-by-column-position.md`.
+Applying a pattern (Mod+R, `flow dispatch width`) resizes the columns on
+screen in place, and the **focused column takes the first term** — so write
+the main size first: with `"2/3+1/3"` the window you are in becomes the wide
+one whichever side it is on, the pattern continues to its right and wraps
+round to its left. From then on the slots are fixed on screen. When the
+strip scrolls (focus past an edge, a window arriving from another screen),
+the column that comes in takes the slot it lands in — the window entering on
+the left gets the left slot's width — and the column leaving the view gives
+its slot up; a new window takes the slot it is created in and pushes the
+last one out of view. A pattern therefore **pins** the strip:
+`expand-column`, `shrink-column`, `set-column-width` and `toggle-monocle`
+are refused on that screen with a message naming the pattern, and a mouse
+resize snaps back on release. Switch to a single-fraction preset to resize
+by hand.
+
+Changing the number of slots keeps the column at the left edge where it is:
+from four `1/4` columns to `"1/2+1/4+1/4"` the first three stay and the
+fourth leaves on the right — unless the fourth is the focused one, in which
+case the view moves right just enough to keep it, as the last slot. Back to
+`1/4` the run grows to the right, or, at the end of the strip, the view moves
+left so there is never a gap. Why slots rather than widths by strip
+position: `docs/adr/0017-width-patterns-are-screen-slots.md`.
 
 #### Per-screen rules: `[[columns.screen]]`
 
