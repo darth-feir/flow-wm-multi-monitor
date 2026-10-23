@@ -79,9 +79,12 @@ module's state machine needed a way to be entered and left without
   hidden, destroyed, or `tiling off` / `stop` — the same stuck-state risk
   upstream's "floats enter DragMode" record (on its `feat/floats-above-tiles`
   branch) accepts for native drags.
-  There is no Mod+RMB resize. Upstream's unmerged `DragMode::Float` would
-  make the float half of the session shorter; the fork's version should be
-  rebased on it if that lands.
+  There is no Mod+RMB resize. The float half of a session originally held
+  the float-sync writes through a side field the animation bridge and the
+  float-sync path each checked; ADR-0016 replaced that with
+  `DragMode::Float` in the one `drag_state`, the shape of upstream's
+  unmerged record, and added an 8 px dead zone in the keymap before `drag
+  begin`.
 - **Tests.** `decide_begin`, `native_event_is_shadowed` and
   `ends_manual_drag` are pure; the Win32 reads go through `DragProbe`, so
   begin → location changes → end runs on a tile (strip reorders on release,

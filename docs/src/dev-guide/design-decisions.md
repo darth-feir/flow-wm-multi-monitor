@@ -366,3 +366,12 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   a once-a-second file watch; `flow config check` lists every problem
   through the daemon. Mod+LMB drag, Mod+Ctrl+T and Mod+Ctrl+Shift+T stay
   hardwired. `docs/adr/0015-binds-are-config.md`
+- **ADR-0016 — The layers are reached by a focus switch, and every drag is
+  a `drag_state`.** `focus-floating`, `focus-tiling` and niri's
+  `switch-focus-between-floating-and-tiling` (Mod+Shift+V) push focus to the
+  other side of the active workspace, which is how a float under a
+  fullscreen window is reached; a Mod+click becomes a drag only after 8 px;
+  a float being dragged — natively or by a keymap session — holds the single
+  `drag_state` as `DragMode::Float`, the shape upstream's unmerged ADR-0008
+  chose, so the animator, the busy gate and the routing need no second flag.
+  `docs/adr/0016-layer-focus-switch-and-one-drag-state.md`
