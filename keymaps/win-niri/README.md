@@ -222,10 +222,14 @@ How it works (`ModDrag()` in `flow.ahk`):
    windows (`WS_EX_TRANSPARENT`, e.g. the OSD), DWM-cloaked windows (other
    virtual desktops), the desktop (`Progman`, `WorkerW`) and the taskbar. A
    maximized window is not dragged.
-2. The window is activated and **`flow dispatch drag begin`** is run
-   synchronously (`RunWait`, hidden). The daemon puts the focused window into
-   the state a title-bar grab would give it; a non-zero exit (a drag already
-   in progress, nothing draggable focused, tiling off, daemon gone) means no
+2. The window is activated. The script then waits for the cursor to leave
+   an **8 px circle** around the press point while the button is still
+   held (`DragDeadZonePx`, niri's grab threshold); a release inside it is a
+   plain Mod+click that activated the window, and nothing is sent to the
+   daemon. Only then is **`flow dispatch drag begin`** run synchronously
+   (`RunWait`, hidden). The daemon puts the focused window into the state a
+   title-bar grab would give it; a non-zero exit (a drag already in
+   progress, nothing draggable focused, tiling off, daemon gone) means no
    move loop — the click is simply swallowed.
 3. **The script moves the window itself:** `while GetKeyState("LButton",
    "P")` it `WinMove`s the window by the cursor delta every ~10 ms. Windows'
@@ -258,6 +262,10 @@ Lessons:
 - **Elevated windows** (UIPI) cannot be moved by this script unless it runs
   elevated too; the daemon still answers `drag begin`, the window stays put
   and `drag end` snaps the tile back.
+- **The dead zone belongs in the script.** Before it, every Mod+click opened
+  and closed a `drag` session, and on a tile the daemon re-committed the
+  layout for a gesture that never moved. The threshold is where the cursor
+  is read; a session that never began needs no `drag end`.
 
 ## Launcher
 

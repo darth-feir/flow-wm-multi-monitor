@@ -64,6 +64,7 @@
 "Mod+Q" = "close-window"
 "Mod+C" = "center-column"
 "Mod+V" = "toggle-window-floating"
+"Mod+Shift+V" = "switch-focus-between-floating-and-tiling"
 "Mod+R" = "switch-preset-column-width"
 "Mod+F" = "fullscreen-window"
 "Mod+BracketLeft" = "consume-or-expel-window-left"

@@ -16,7 +16,8 @@
 ; the user guide (Config Reference, `[binds]`).
 ;
 ; Hardwired here, not in the table:
-;   Mod + left-button drag        move a window grabbed anywhere (a tile drops into the zone under the cursor, a float moves)
+;   Mod + left-button drag        move a window grabbed anywhere (a tile drops into the zone under the cursor, a float
+;                                 moves; a click that moves less than 8 px only activates the window)
 ;   Mod+Ctrl+T                    stop FlowWM fully (daemon and this script); flow-resident.ahk,
 ;                                 if it runs, starts FlowWM again with the same chord
 ;   Mod+Ctrl+Shift+T              pause toggle: `flow dispatch tiling toggle` (daemon keeps running)
@@ -451,11 +452,15 @@ ApplyBinds(text)
 ; move loop cannot be started from a hook hotkey, see README.md) and brackets
 ; the gesture with `flow dispatch drag begin` / `drag end`, so the daemon
 ; previews and commits a tile's drop zone and records a float's final rect.
+; A click that moves less than DragDeadZonePx is an activation, not a drag
+; (niri's grab threshold): no session is opened and nothing is told to the
+; daemon.
 #HotIf DaemonUp && TilingOn
 #LButton::ModDrag()
 #HotIf
+DragDeadZonePx := 8     ; the cursor must travel this far before a Mod+click becomes a drag
 ModDrag() {
-    global flowExe
+    global flowExe, DragDeadZonePx
     ; Screen coordinates throughout: WindowAt() and WinMove compare against
     ; WinGetPos (screen) rects, and AutoHotkey v2 defaults mouse coords to the
     ; active window's client area, which would resolve the grab point inside
@@ -471,6 +476,19 @@ ModDrag() {
     AhkLog("mod-drag " hwnd)
     try WinActivate("ahk_id " hwnd)
     WinWaitActive("ahk_id " hwnd, , 0.3)
+    ; Dead zone: wait for the cursor to leave an 8 px circle around the
+    ; press point while the button is still down; a release inside it is a
+    ; plain Mod+click.
+    while GetKeyState("LButton", "P") {
+        MouseGetPos(&mx, &my)
+        if ((mx - mx0) ** 2 + (my - my0) ** 2 >= DragDeadZonePx ** 2)
+            break
+        Sleep 10
+    }
+    if !GetKeyState("LButton", "P") {
+        AhkLog("mod-drag " hwnd " click: activated only")
+        return
+    }
     code := RunWait('"' flowExe '" dispatch drag begin', , "Hide")
     if (code != 0) {
         AhkLog("mod-drag " hwnd " refused: drag begin exit " code)
@@ -588,6 +606,7 @@ bind	#^0	tiling	dispatch	0	Mod+Ctrl+0	move the window to workspace 10	move-to-wo
 bind	#q	tiling	dispatch	0	Mod+Q	close window	close-window
 bind	#c	tiling	dispatch	0	Mod+C	center the focused column	center
 bind	#v	tiling	dispatch	0	Mod+V	toggle floating	set-window<US>cycle
+bind	#+v	tiling	dispatch	0	Mod+Shift+V	switch focus between the floating and the tiled windows	switch-focus-between-floating-and-tiling
 bind	#r	tiling	dispatch	0	Mod+R	cycle this screen's column widths (flow.toml [columns] presets)	width<US>next
 bind	#f	tiling	dispatch	0	Mod+F	fullscreen toggle	set-window<US>fullscreen
 bind	#[	tiling	dispatch	0	Mod+BracketLeft	alone: merge into the column on that side; stacked: pop out to that side	consume-or-expel<US>left
@@ -611,6 +630,7 @@ row	Mod+Ctrl+1..9, Mod+Ctrl+0	move the window to that workspace
 row	Mod+Q	close window
 row	Mod+C	center the focused column
 row	Mod+V	toggle floating
+row	Mod+Shift+V	switch focus between the floating and the tiled windows
 row	Mod+R	cycle this screen's column widths (flow.toml [columns] presets)
 row	Mod+F	fullscreen toggle
 row	Mod+BracketLeft, Mod+BracketRight	alone: merge into the column on that side; stacked: pop out to that side
@@ -621,7 +641,7 @@ row	Mod+Alt+T	run wt
 row	Mod+Alt+Shift+T	run wt as admin
 row	Mod+Shift+Slash	this help (Esc hides it)
 row	Mod+Shift+E	stop FlowWM
-hardwired	Mod + left-button drag	move a window grabbed anywhere (a tile drops into the zone under the cursor, a float moves)
+hardwired	Mod + left-button drag	move a window grabbed anywhere (a tile drops into the zone under the cursor, a float moves; a click without moving only activates it)
 hardwired	Mod+Ctrl+T	FlowWM off (and on again, via flow-resident.ahk)
 hardwired	Mod+Ctrl+Shift+T	pause toggle (off: Windows manages windows, chords fall through)
 source	defaults
