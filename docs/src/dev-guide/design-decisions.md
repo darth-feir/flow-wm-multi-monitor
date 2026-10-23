@@ -350,3 +350,11 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   are topmost only while flow owns the foreground; see the file for the two
   deviations (a config knob, and shell surfaces that leave the state alone).
   `docs/adr/0013-floating-layer-follows-adr-0003.md`
+- **ADR-0014 — Width patterns are assigned by column position and pin the
+  strip.** A `[columns]` preset may be a `+` pattern (`1/3+2/3`); column `i`
+  takes term `i mod n`, so widths never move with focus, insert and remove
+  re-flow by position, and resize commands are refused while a pattern is
+  on. Per-screen `[[columns.screen]]` rules pick the list by orientation,
+  width or device name, and presets are checked against the real screens
+  instead of being floored silently.
+  `docs/adr/0014-width-patterns-by-column-position.md`
