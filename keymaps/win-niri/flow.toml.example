@@ -3,8 +3,9 @@
 # The keys before the first [section] are TOP-LEVEL keys: keep them above `[columns]` — a key
 # written after a section header belongs to that section and is silently ignored.
 
-# 1/3 of 1920 minus gaps is 618 px, below the stock 640 floor, so lower the floor or the 1/3
-# preset is clamped to 640 (three columns then no longer fit on one 1920 screen).
+# 1/3 of 1920 minus gaps is 618 px, below the stock 640 floor, so lower the floor: a preset
+# whose term falls under the floor on a screen is refused at start / reload with a message
+# naming the screen (give that screen its own [[columns.screen]] rule, see below).
 min_column_width_px = 600
 
 # Windows that are already maximized when the daemon starts (or that open maximized, or are
@@ -14,12 +15,32 @@ min_column_width_px = 600
 # regardless of this key.
 adopt_maximized = true
 
-# Column widths as a share of the screen. Mod+R cycles `presets` for every column on the
-# focused screen; a window moved to another screen takes that screen's width.
-# Two 1920x1080 screens: 1/3 is tight, 1/2 is the comfortable default, 1/1 is one column.
+# Column widths as a share of the screen. Mod+R cycles `presets` on the focused screen; a window
+# moved to another screen takes that screen's width. A preset is one fraction for every column
+# ("1/2") or a `+` pattern the columns take by position ("1/3+2/3": the first, third, fifth
+# column a third, the second, fourth, sixth two thirds; widths never change with focus, and a
+# pattern pins them, so shrink/expand are refused while one is active).
+# Two 1920x1080 screens: 1/3 is tight, 1/3+2/3 is a wide editor beside a narrow terminal,
+# 1/2 is the comfortable default, 1/1 is one column.
 [columns]
-presets = ["1/3", "1/2", "1/1"]
+presets = ["1/3", "1/3+2/3", "1/2", "1/1"]
 default = "1/2"
+
+# A screen matched by a rule uses its own list (first match wins; the others use the list
+# above). Match on `orientation` ("portrait" / "landscape"), `min_width_px` / `max_width_px`
+# (work-area width) or `name` ("DISPLAY2"). A rule may set its own `min_column_width_px`,
+# because the top-level floor is screen-blind: 1/2 of a 1080-wide portrait screen is 516 px.
+# [[columns.screen]]
+# match = { orientation = "portrait" }
+# presets = ["1/2", "1/1"]
+# default = "1/1"
+# min_column_width_px = 500
+#
+# A wider screen, when you plug one in: 1/4 of 2560 is 620 px.
+# [[columns.screen]]
+# match = { min_width_px = 2560 }
+# presets = ["1/4", "1/4+1/4+1/2", "1/4+1/2+1/4", "1/3", "1/3+2/3", "1/2", "1/1"]
+# default = "1/3"
 
 # Stacked columns (Mod+[ / Mod+] merge): at most `visible_rows` windows are shown at a time, each
 # an equal share of the height; a column can hold up to `max_rows`, and Mod+Up/Down scrolls the

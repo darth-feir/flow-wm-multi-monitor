@@ -14,7 +14,7 @@ design notes, the Windows lessons behind the scripts and the setup.
 | `launcher.ahk` | Application launcher on Mod+Space / Mod+D: Start-menu shortcuts, open windows, a few built-ins, fuzzy-matched. |
 | `help.ahk` | Key-binding overlay on Mod+Shift+/. Its `Bindings` array is the source of truth for the overlay; keep it in step with the hotkeys. |
 | `flow-resident.ahk` | Optional resident starter: runs all the time (shortcut in `shell:startup`) and turns Mod+Ctrl+T into an on/off switch for the whole of FlowWM. |
-| `flow.toml.example` | The daemon side of the map: `[columns]` width presets and `edge_hop = false`. |
+| `flow.toml.example` | The daemon side of the map: `[columns]` width presets (fractions and `1/3+2/3`-style patterns, per-screen `[[columns.screen]]` rules) and `edge_hop = false`. |
 
 Install: copy `flow.ahk`, `flow-exe.ahk`, `launcher.ahk` and `help.ahk` to
 `%USERPROFILE%\.config\flow\` (the files must sit next to each other — the
@@ -114,7 +114,7 @@ releases them like every other window-management chord.
 Shadowed while the daemon runs: Win+1..9/0 (taskbar launch), Win+C, Win+Q,
 Win+V (clipboard history), Win+R (Run: use the right Win key or the
 launcher), Win+F (Feedback Hub), Win+D (show desktop), Win+T (taskbar
-cycle), Win+Minus/Equal (Magnifier), Win+Arrows (Snap), Win+Ctrl+Left/Right
+cycle), Win+Arrows (Snap), Win+Ctrl+Left/Right
 (virtual desktops), Win+Shift+Left/Right (Windows' own move-to-monitor),
 Win+Space (Windows' input-language switcher; Win+Ctrl+Space, which cycles
 the other way, still works). With tiling off only Win+Space, Win+D,

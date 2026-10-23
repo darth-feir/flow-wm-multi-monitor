@@ -21,9 +21,9 @@
 ;   Mod+Q                         close window
 ;   Mod+C                         center the focused column
 ;   Mod+V                         toggle floating (shadows Windows clipboard history)
-;   Mod+R                         cycle this screen's column width: 1/3 -> 1/2 -> 1/1 (flow.toml [columns])
+;   Mod+R                         cycle this screen's column widths through flow.toml [columns] presets
+;                                 (a fraction like 1/2 for every column, or a pattern like 1/3+2/3 by position)
 ;   Mod+F                         fullscreen toggle
-;   Mod+Minus / Mod+Equal         shrink / expand this column one step
 ;   Mod+[ / Mod+]                 alone in its column: merge into the column on that side;
 ;                                 in a stacked column: pop out into its own column on that side
 ;   Mod+Space, Mod+D              application launcher (launcher.ahk: apps, open windows, settings)
@@ -401,9 +401,7 @@ Loop 9 {
 #q::D("close-window")
 #c::D("center")
 #v::D("set-window cycle")
-#-::D("shrink-column")
-#=::D("expand-column")
-#r::D("width cycle")                  ; 1/3 -> 1/2 -> 1/1 for every column on this screen
+#r::D("width cycle")                  ; next [columns] preset for this screen (shrink-column / expand-column are not bound: widths come from the presets)
 #f::D("set-window fullscreen")        ; toggle
 #[::D("consume-or-expel left")        ; alone: merge into the column to the left; in a stack: pop out to the left
 #]::D("consume-or-expel right")
