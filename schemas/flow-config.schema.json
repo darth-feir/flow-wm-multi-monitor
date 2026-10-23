@@ -222,7 +222,7 @@
       }
     },
     "ColumnsConfig": {
-      "description": "The `[columns]` section: an ordered list of width presets and the one\nevery monitor starts on. Absent from `flow.toml` (`FlowConfig::columns`\nis `None`) the daemon sizes columns from `columns_per_screen` /\n`column_width` exactly as before.",
+      "description": "The `[columns]` section: an ordered list of width presets and the one\nevery monitor starts on, plus optional per-screen rules. Absent from\n`flow.toml` (`FlowConfig::columns` is `None`) the daemon sizes columns\nfrom `columns_per_screen` / `column_width` exactly as before.",
       "type": "object",
       "properties": {
         "default": {
@@ -240,7 +240,7 @@
           "minimum": 0
         },
         "presets": {
-          "description": "Ordered presets; `flow dispatch width next|prev|cycle` walks this\nlist and wraps around.",
+          "description": "Ordered presets; `flow dispatch width next|prev|cycle` walks this\nlist and wraps around. A preset is a fraction (`\"1/2\"`) or a pattern\n(`\"1/3+2/3\"`).",
           "type": "array",
           "default": [
             "1/3",
@@ -249,6 +249,13 @@
           ],
           "items": {
             "type": "string"
+          }
+        },
+        "screen": {
+          "description": "`[[columns.screen]]`: screens matched by a rule use its list instead;\nthe first matching rule wins.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ScreenPresetRule"
           }
         },
         "visible_rows": {
@@ -564,6 +571,21 @@
         }
       }
     },
+    "Orientation": {
+      "description": "Which way a screen is turned, by its work area.",
+      "oneOf": [
+        {
+          "description": "Wider than tall (or square).",
+          "type": "string",
+          "const": "landscape"
+        },
+        {
+          "description": "Taller than wide.",
+          "type": "string",
+          "const": "portrait"
+        }
+      ]
+    },
     "Padding": {
       "description": "Gap and margin configuration in pixels.\n\nGap is applied during the projection step (see [`projection`](crate::layout::projection)),\nnot stored inside window structs. This means [`ActualEntry`](crate::layout::ActualEntry) rects\nare the **final HWND rects** — they can be passed directly to `SetWindowPos`.\n\n# Uniform Gap Model\n\n`window_gap` creates **uniform spacing** everywhere:\n\n```text\nEdge | window_gap | [Window 1] | window_gap | [Window 2] | window_gap | Edge\n```\n\n- `window_gap`: uniform gap between all elements (windows, screen edges)\n- `up`: top screen margin (reserved space above tiling area)\n- `down`: bottom screen margin (reserved space below tiling area, e.g., taskbar)\n\nThe slot-based canvas model ensures that expanding a column consumes the\ninter-column gap so the layout always fills the screen.\n\n```text\n┌─────────────────── monitor work area ────────────────────┐\n│ ↑ padding.up                                             │\n│ ↑ window_gap                                             │\n│ ┌──── window (HWND) ────┐   ┌──── window (HWND) ────┐    │\n│ │                       │   │                       │    │\n│ └───────────────────────┘   └───────────────────────┘    │\n│ ↓ window_gap                                             │\n│ ↓ padding.down                                           │\n└──────────────────────────────────────────────────────────┘\n```",
       "type": "object",
@@ -587,6 +609,87 @@
           "default": 16
         }
       }
+    },
+    "ScreenMatch": {
+      "description": "The `match` table of a `[[columns.screen]]` rule; every field given must\nhold, and at least one must be given.",
+      "type": "object",
+      "properties": {
+        "max_width_px": {
+          "description": "The work area must be at most this wide.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "min_width_px": {
+          "description": "The work area must be at least this wide.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "name": {
+          "description": "The device name (`\"DISPLAY2\"`; the `\\\\.\\` prefix is optional,\ncase-insensitive).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "orientation": {
+          "description": "`\"portrait\"` or `\"landscape\"`, by the work area.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Orientation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ScreenPresetRule": {
+      "description": "One `[[columns.screen]]` rule: the presets a matching screen uses\ninstead of the top-level list.",
+      "type": "object",
+      "properties": {
+        "default": {
+          "description": "The preset such a screen starts on. Must be one of `presets`; when\nomitted the first preset is the default.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "match": {
+          "description": "Which screens the rule is for.",
+          "$ref": "#/$defs/ScreenMatch"
+        },
+        "min_column_width_px": {
+          "description": "A floor for this screen in place of the top-level\n`min_column_width_px`, which is screen-blind.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "presets": {
+          "description": "Ordered presets for those screens; `flow dispatch width` walks this\nlist on them.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "match",
+        "presets"
+      ]
     },
     "UpdateConfig": {
       "description": "Where `flow update` looks for something newer (`[update]`).\n\n`flow update` is a **checker**: it asks the GitHub API how this build\nrelates to a branch or to the latest release and prints the answer; it\nnever downloads or replaces anything. Both keys are optional and fall\nback to what the build script embedded (`crate::build_info`):\n\n- `repo`: `\"owner/name\"` on github.com. Absent: parsed from the\n  checkout's `origin` URL at build time when that is a github.com URL\n  (https or ssh), else the upstream `CCpcalvin/flow-wm`.\n- `branch`: the branch to compare the embedded commit against. Absent:\n  the branch checked out at build time. An **empty string** (or no\n  build branch to fall back to) switches to *release mode*: the latest\n  release's tag is compared with the crate version instead.",

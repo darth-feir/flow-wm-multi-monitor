@@ -201,21 +201,29 @@ command is refused with an error when that section is absent.
   after the last one.
 - `width prev` — the previous preset, wrapping the other way.
 - `width 1/2` — a named preset (any fraction equal to a configured one works:
-  `2/4` selects `1/2`).
+  `2/4` selects `1/2`; a pattern is named as written, `width 1/3+2/3`).
+
+The list is the monitor's own: the first `[[columns.screen]]` rule matching
+that screen, else the top-level `presets`.
 
 Every column on **every workspace** of that monitor takes the new width — the
 active workspace animates, parked workspaces are re-laid out and slide in at
 their new widths on the next switch — and every column created on that monitor
 from then on (a new window, `set-window tile`, a window arriving by
-`move-to-monitor` or an edge hop) starts at it. Other monitors keep their own
-preset. `expand-column` / `shrink-column` keep working: their ladder starts
-from the monitor's current preset width, so one `expand-column` from `1/3`
-spans two thirds. `min_column_width_px` is a floor: a preset narrower than it
-on a small display is widened to the minimum.
+`move-to-monitor` or an edge hop) starts at it. A pattern (`1/3+2/3`) gives
+each column its position's share and keeps it there. Other monitors keep
+their own preset. `expand-column` / `shrink-column` keep working on a plain
+fraction: their ladder starts from the monitor's current preset width, so one
+`expand-column` from `1/3` spans two thirds; on a pattern they, `set-column-width`
+and `toggle-monocle` are refused with an error naming the pattern.
+`min_column_width_px` is checked when the config is loaded (see the Config
+Reference); a display that appears later with a list too narrow for it has
+its terms widened to the floor.
 
 ```powershell
 flow dispatch width cycle     # flow: column width 1/1
 flow dispatch width 1/2       # flow: column width 1/2
+flow dispatch width 1/3+2/3   # flow: column width 1/3+2/3
 ```
 
 The command prints the preset the monitor landed on. `flow query all` reports

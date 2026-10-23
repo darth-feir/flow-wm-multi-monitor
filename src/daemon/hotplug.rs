@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HWND;
 
 use crate::common::{Rect, WindowId};
+use crate::config::width_preset::ScreenFacts;
 use crate::layout::types::MonitorInfo;
 use crate::registry::hooks;
 use crate::registry::types::{FloatingState, TilingState, WindowState};
@@ -32,6 +33,7 @@ use crate::workspace::{Monitor, ScrollingSpace, Workspace, WorkspaceId, Workspac
 use super::animation::{PrevRects, WorkspaceTargets};
 use super::loadout::build_seating_batches;
 use super::types::{FlowWM, LayoutConfig};
+use super::width_preset;
 
 /// How long the display topology must stay quiet before the daemon
 /// reconciles. Windows delivers a burst of `WM_DISPLAYCHANGE` /
@@ -532,26 +534,47 @@ impl FlowWM {
                 MonitorInfo::in_desktop(g.work_area, g.screen_rect, snap.virtual_screen, &others)
             })
             .collect();
-        // Layout parameters per monitor: a survivor keeps its width preset
-        // (re-derived on its new work area), a new monitor starts on the
-        // default preset; without presets the base width follows
-        // `columns_per_screen` / `column_width` on each monitor's own geometry.
-        let default_preset = self
-            .config
-            .columns
-            .as_ref()
-            .map(|c| c.default_index())
-            .unwrap_or(0);
+        // Layout parameters per monitor: a survivor keeps the width preset
+        // it was on when its (possibly new) list still has it, else lands on
+        // that list's default; a new monitor starts on its list's default;
+        // without presets the base width follows `columns_per_screen` /
+        // `column_width` on each monitor's own geometry. A list that does
+        // not fit a screen (a display that appeared with no rule for it) is
+        // only warned about here — the floor keeps the columns usable.
+        let facts: Vec<ScreenFacts> = snap
+            .geometries
+            .iter()
+            .map(|g| width_preset::screen_facts(g.work_area, &g.device_name()))
+            .collect();
+        let presets: Vec<usize> = facts
+            .iter()
+            .enumerate()
+            .map(|(ni, f)| {
+                let Some(columns) = self.columns_config() else {
+                    return 0;
+                };
+                if let Err(e) = columns.check_screen(
+                    f,
+                    self.config.padding.window_gap,
+                    self.config.min_column_width_px,
+                ) {
+                    log::warn!("hotplug: {e}; narrow terms are floored on that screen");
+                }
+                let previous = matching.new_to_old[ni].and_then(|oi| self.monitor_preset(oi));
+                width_preset::resolve_for_screen(
+                    columns,
+                    f,
+                    previous,
+                    self.config.padding.window_gap,
+                    self.config.min_column_width_px,
+                )
+                .0
+            })
+            .collect();
         let configs: Vec<LayoutConfig> = infos
             .iter()
             .enumerate()
-            .map(|(ni, info)| {
-                let preset = matching.new_to_old[ni]
-                    .and_then(|oi| self.monitors.get(oi))
-                    .map(|m| m.width_preset())
-                    .unwrap_or(default_preset);
-                self.layout_config_for(info, preset)
-            })
+            .map(|(ni, info)| self.layout_config_for(info, &facts[ni], presets[ni]))
             .collect();
         let columns_per_screen = self.config.columns_per_screen;
 
@@ -570,6 +593,8 @@ impl FlowWM {
                 Some(mut m) => {
                     m.set_geometry(g.screen_rect, g.work_area);
                     m.set_hmonitor(g.hmonitor);
+                    m.set_device_name(g.device_name());
+                    m.set_width_preset(presets[ni]);
                     for ws in m.workspaces_mut() {
                         // Parameters first (an auto-derived column width follows
                         // the monitor), then the geometry: the row refit inside
@@ -583,6 +608,9 @@ impl FlowWM {
                             columns_per_screen,
                         );
                         let _ = ws.scrolling.set_monitor_info(info);
+                        // The preset's pattern on the new work area (pins
+                        // the columns by position when it has terms).
+                        let _ = ws.scrolling.set_width_pattern(&lc.width_pattern_px);
                         // Floats keep their rect across a geometry change
                         // unless it no longer fits the work area (a display
                         // that shrank, a taskbar that grew): clamp them in
@@ -594,8 +622,7 @@ impl FlowWM {
                     new_monitors.push(m);
                 }
                 None => new_monitors.push(
-                    fresh_monitor(g, info, lc, columns_per_screen)
-                        .with_width_preset(default_preset),
+                    fresh_monitor(g, info, lc, columns_per_screen).with_width_preset(presets[ni]),
                 ),
             }
             log::info!(
@@ -1010,11 +1037,14 @@ fn fresh_monitor(
                     lc.padding,
                     columns_per_screen,
                 )
-                .with_row_limits(lc.visible_rows, lc.max_rows),
+                .with_row_limits(lc.visible_rows, lc.max_rows)
+                .with_width_pattern(&lc.width_pattern_px),
             )
         })
         .collect();
-    Monitor::new(g.screen_rect, g.work_area, workspaces, 0).with_hmonitor(g.hmonitor)
+    Monitor::new(g.screen_rect, g.work_area, workspaces, 0)
+        .with_hmonitor(g.hmonitor)
+        .with_device_name(g.device_name())
 }
 
 #[cfg(test)]
@@ -1045,7 +1075,9 @@ mod tests {
             work_area: screen,
             hmonitor,
             is_primary,
+            device: [0; 32],
         }
+        .with_device_name(&format!(r"\\.\DISPLAY{hmonitor}"))
     }
 
     fn key(hmonitor: isize, screen: Rect) -> MonitorKey {
@@ -1564,6 +1596,114 @@ mod tests {
         // The survivor's own column was not resized by the reconcile.
         let (col, _) = strip.find_window(WindowId(A)).expect("A");
         assert_eq!(strip.columns[col].width_px, 960);
+    }
+
+    /// A display change re-resolves every monitor's preset against its own
+    /// list (`[[columns.screen]]` by device name here): a survivor keeps the
+    /// preset it was on while its list has it, a display that appears starts
+    /// on its list's default, and a pattern pins the migrated columns by
+    /// position.
+    #[test]
+    fn hotplug_carries_presets_over_by_width_and_applies_screen_rules() {
+        let mut flow = side_by_side_flow();
+        flow.config.padding.window_gap = 4;
+        flow.config.min_column_width_px = 320;
+        flow.monitors[0].set_device_name(r"\\.\DISPLAY1");
+        flow.monitors[1].set_device_name(r"\\.\DISPLAY2");
+        flow.config.columns = Some(
+            toml::from_str(
+                r#"
+presets = ["1/3", "1/3+2/3", "1/2", "1/1"]
+default = "1/2"
+[[screen]]
+match = { orientation = "portrait" }
+presets = ["1/2", "1/1"]
+default = "1/1"
+[[screen]]
+match = { name = "DISPLAY2" }
+presets = ["1/2", "1/1"]
+default = "1/1"
+"#,
+            )
+            .expect("columns"),
+        );
+        flow.monitors[0].set_width_preset(1); // the pattern on the primary
+        flow.monitors[1].set_width_preset(0); // "1/2" of DISPLAY2's own list
+        assert_eq!(flow.monitor_preset_label(1).as_deref(), Some("1/2"));
+
+        // LEFT vanishes: the primary survives on its pattern and the
+        // migrated columns are pinned by position (1/3 of 1920 at gap 4 is
+        // 634, 2/3 is 1273).
+        let mut probe = MockTopology::new(vec![geo(1, PRIMARY, true)]);
+        for hwnd in [A, B, C, D, F, M] {
+            probe.nearest.insert(hwnd, 1);
+        }
+        probe.iconic.insert(M);
+        flow.reconcile_monitors_with(&probe)
+            .expect("reconcile succeeds");
+        assert_eq!(flow.monitors.len(), 1);
+        assert_eq!(flow.monitor_preset_label(0).as_deref(), Some("1/3+2/3"));
+        let strip = flow.monitors[0].active_scrolling();
+        assert!(strip.widths_pinned());
+        let widths: Vec<i32> = strip
+            .virtual_layout()
+            .columns
+            .iter()
+            .map(|c| c.width_px)
+            .collect();
+        assert_eq!(widths.len(), 5, "{widths:?}");
+        for (i, w) in widths.iter().enumerate() {
+            assert_eq!(*w, if i % 2 == 0 { 634 } else { 1273 }, "column {i}");
+        }
+
+        // A display named DISPLAY2 appears: its rule's default, "1/1".
+        let probe = MockTopology::new(vec![geo(1, PRIMARY, true), geo(2, LEFT, false)]);
+        flow.reconcile_monitors_with(&probe)
+            .expect("reconcile succeeds");
+        assert_eq!(flow.monitors.len(), 2);
+        assert_eq!(flow.monitors[1].device_name(), r"\\.\DISPLAY2");
+        assert_eq!(flow.monitor_preset_list(1).expect("list").rule, Some(1));
+        assert_eq!(flow.monitor_preset_label(1).as_deref(), Some("1/1"));
+        assert_eq!(
+            flow.monitors[1].active_scrolling().config().column_width,
+            1912
+        );
+        assert_eq!(flow.monitor_preset_label(0).as_deref(), Some("1/3+2/3"));
+
+        // DISPLAY2 goes and a display on the other side, DISPLAY3, comes
+        // (a different rect, so not a survivor): it matches no rule and
+        // starts on the top-level default.
+        let probe = MockTopology::new(vec![geo(1, PRIMARY, true), geo(3, RIGHT, false)]);
+        flow.reconcile_monitors_with(&probe)
+            .expect("reconcile succeeds");
+        assert_eq!(flow.monitor_preset_list(1).expect("list").rule, None);
+        assert_eq!(flow.monitor_preset_label(1).as_deref(), Some("1/2"));
+        assert_eq!(
+            flow.monitors[1].active_scrolling().config().column_width,
+            954
+        );
+
+        // The primary is rotated to portrait: the same HMONITOR survives,
+        // the portrait rule now matches it and has no pattern, so it lands
+        // on that rule's default and its columns are free again.
+        let portrait = r(0, 0, 1080, 1920);
+        let probe = MockTopology::new(vec![geo(1, portrait, true), geo(3, RIGHT, false)]);
+        flow.reconcile_monitors_with(&probe)
+            .expect("reconcile succeeds");
+        assert_eq!(flow.monitor_preset_list(0).expect("list").rule, Some(0));
+        assert_eq!(flow.monitor_preset_label(0).as_deref(), Some("1/1"));
+        assert!(!flow.monitors[0].active_scrolling().widths_pinned());
+        assert_eq!(
+            flow.monitors[0].active_scrolling().config().column_width,
+            1072
+        );
+        // Rotated back: the landscape list has no "1/1"? It does — the
+        // primary stays on it rather than returning to the pattern.
+        let probe = MockTopology::new(vec![geo(1, PRIMARY, true), geo(3, RIGHT, false)]);
+        flow.reconcile_monitors_with(&probe)
+            .expect("reconcile succeeds");
+        assert_eq!(flow.monitor_preset_list(0).expect("list").rule, None);
+        assert_eq!(flow.monitor_preset_label(0).as_deref(), Some("1/1"));
     }
 
     #[test]

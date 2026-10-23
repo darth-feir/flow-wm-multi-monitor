@@ -84,6 +84,7 @@ impl FlowWM {
                         "index": i,
                         "active": i == self.active_monitor,
                         "hmonitor": m.hmonitor(),
+                        "device_name": m.device_name(),
                         "screen_rect": { "x": sr.x, "y": sr.y, "width": sr.width, "height": sr.height },
                         "work_area": { "x": wa.x, "y": wa.y, "width": wa.width, "height": wa.height },
                         "neighbour_left": info.neighbour_left,

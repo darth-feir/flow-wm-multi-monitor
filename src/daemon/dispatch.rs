@@ -930,6 +930,9 @@ impl FlowWM {
             log::debug!("dispatch_expand: no-op (focused window is not an active tile)");
             return SocketResponse::Ok;
         }
+        if let Some(message) = self.pinned_widths_refusal() {
+            return SocketResponse::Error { message };
+        }
         match self.active_scrolling_mut().expand_column(id) {
             Some(diff) => {
                 self.animate_layout(&diff);
@@ -955,6 +958,9 @@ impl FlowWM {
         if !matches!(win.state, WindowState::Tiling(TilingState::Active { .. })) {
             log::debug!("dispatch_shrink: no-op (focused window is not an active tile)");
             return SocketResponse::Ok;
+        }
+        if let Some(message) = self.pinned_widths_refusal() {
+            return SocketResponse::Error { message };
         }
         match self.active_scrolling_mut().shrink_column(id) {
             Some(diff) => {
@@ -986,6 +992,9 @@ impl FlowWM {
         if !matches!(win.state, WindowState::Tiling(TilingState::Active { .. })) {
             log::debug!("dispatch_set_column_width: no-op (focused window is not an active tile)");
             return SocketResponse::Ok;
+        }
+        if let Some(message) = self.pinned_widths_refusal() {
+            return SocketResponse::Error { message };
         }
         let (min, max) = self.active_scrolling().column_width_bounds();
         // `u32 → i32` can fail for absurd inputs (`> i32::MAX`). Reject with a
@@ -1067,6 +1076,9 @@ impl FlowWM {
         if !matches!(win.state, WindowState::Tiling(TilingState::Active { .. })) {
             log::debug!("dispatch_toggle_monocle: no-op (focused window is not an active tile)");
             return SocketResponse::Ok;
+        }
+        if let Some(message) = self.pinned_widths_refusal() {
+            return SocketResponse::Error { message };
         }
         match self.active_scrolling_mut().toggle_monocle(id) {
             Some(diff) => {
@@ -1987,7 +1999,16 @@ impl FlowWM {
             return SocketResponse::Error { message: reason };
         }
 
-        let had_presets = self.config.columns.is_some();
+        // The preset lists must fit the screens they will be used on; a
+        // reload that would put a column under its floor is refused whole,
+        // like any other invalid config.
+        let screens: Vec<crate::config::width_preset::ScreenFacts> = (0..self.monitors.len())
+            .map(|i| self.monitor_facts(i))
+            .collect();
+        if let Err(reason) = super::width_preset::check_screens(&new_config, &screens) {
+            return SocketResponse::Error { message: reason };
+        }
+        let previous_presets = self.current_presets();
 
         // Publish the new config first: animate_layout and the border refresh
         // below read `self.config.borders` live.
@@ -2004,7 +2025,7 @@ impl FlowWM {
         // on their next switch. Each monitor derives its own base column
         // width — from its width preset when `[columns]` is configured, else
         // from `columns_per_screen` / `column_width` and its own work area.
-        self.reapply_base_widths_after_reload(had_presets);
+        self.reapply_presets_after_reload(&previous_presets);
 
         // Animate the active workspace into its new geometry (windows slide to
         // the new gaps) and sync registry slots/rects.

@@ -50,7 +50,7 @@ Not every field can change at runtime. Reload applies **live** fields in place;
 | `padding.window_gap` | Re-projects every workspace's pixel layout — windows animate to the new gaps. |
 | `columns_per_screen` | Updates the cached threshold (no window movement; affects future auto-center). |
 | `column_width`, `min_column_width_px`, `min_window_height_px` | Update cached bounds; existing per-column widths preserved. |
-| `columns.presets`, `columns.default` | Each monitor's base width is re-derived from its preset (a monitor whose preset index no longer exists is clamped; a monitor that had no presets before starts on `default`). Existing per-column widths preserved. |
+| `columns.presets`, `columns.default`, `columns.screen` | Each monitor's preset is re-resolved against its list: it stays on the preset it was on when the list still has it, else lands on that list's `default` (so a monitor that had no presets before starts on `default`). Existing per-column widths preserved for a plain fraction; a pattern re-pins them by position. A list with a term under the floor on any attached screen is refused and the old config kept. |
 | `columns.visible_rows` | Every column re-shares its height over the new viewport size and the focused row is kept visible (windows animate). |
 | `columns.max_rows` | Applies to the next merge/consume/insert; a column already over the new cap keeps its rows until windows leave it. |
 | `animation.*` | New duration / easing / enabled flag applies to the next animation. |
@@ -123,17 +123,27 @@ focused monitor through the list (see the
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `presets` | `Vec<String>` | `["1/3", "1/2", "1/1"]` | Ordered presets. Each is a fraction `"a/b"` of the work area, or a plain number in `(0, 1]` such as `0.5`. Must not be empty. |
+| `presets` | `Vec<String>` | `["1/3", "1/2", "1/1"]` | Ordered presets. Each is a fraction `"a/b"` of the work area, a plain number in `(0, 1]` such as `0.5`, or a `+` pattern of those (`"1/3+2/3"`, see below). Must not be empty. |
 | `default` | `Option<String>` | `None` (= the first preset) | The preset every monitor starts on. Must be one of `presets`. |
 | `visible_rows` | `u32` | `0` | How many rows of a column are on screen at once. `0` shows every row sharing the height. With `2`, a column of four windows shows two at a time and `focus up/down` scrolls through the stack. |
 | `max_rows` | `u32` | `0` | The most rows a column may hold; `0` is unlimited. Must be at least `visible_rows` when both are set. Merging into a full column moves the window past it instead. |
+| `screen` | `Vec<table>` | `[]` | `[[columns.screen]]` rules giving a matched screen its own list (see [Per-screen rules](#per-screen-rules-columnsscreen)). |
 
 A preset `1/n` is sized so that `n` columns **plus their gaps** fill the work
 area exactly: `(work_area_width - window_gap * (n + 1)) / n`. So `"1/1"` is
 `work_area_width - 2 * window_gap` (the whole work area), and on a 1920 px
 monitor with the default 16 px gap `"1/2"` is 936 px and `"1/3"` is 618 px.
-Borders are unaffected. `min_column_width_px` still applies as a floor — with
-the default 640 px minimum, `"1/3"` on a 1920 px display becomes 640 px.
+Borders are unaffected.
+
+`min_column_width_px` is a floor that is **checked, not applied silently**:
+at startup and on reload every preset of every attached screen's list is
+measured on that screen, and a term that comes out narrower than the floor
+is an error naming the preset, the screen and the width — `columns.presets:
+"1/3" is 602 px wide on DISPLAY1 (1872x1080 work area), below
+min_column_width_px 640`. Startup stops at the `monitors` stage; a reload
+keeps the old config. Give that screen its own rule, or lower the floor. (A
+display that appears *later* with no rule for it is only warned about; its
+narrow terms are widened to the floor so the columns stay usable.)
 
 The monitor's current preset is the base width of its strip: new columns are
 created at it, and the `expand-column` / `shrink-column` ladder starts from it.
@@ -142,14 +152,75 @@ Widths follow the monitor: a column that arrives from elsewhere —
 a column migrated by a display change, a loadout column merged from a detached
 monitor — takes the receiving monitor's preset width, never the width it had
 where it came from. `flow query all` shows
-each monitor's `width_preset`; the loadout saves and restores it per monitor.
+each monitor's `width_preset` and `device_name`; the loadout saves and
+restores the preset per monitor.
 
 Example:
 
 ```toml
 [columns]
-presets = ["1/3", "1/2", "1/1"]
+presets = ["1/3", "1/3+2/3", "1/2", "1/1"]
 default = "1/2"
+```
+
+#### Width patterns: `"1/3+2/3"`
+
+A preset with two or more terms joined by `+` is a **pattern**. The columns
+of the strip take the terms **by position**, repeating: with `"1/3+2/3"` the
+first, third and fifth columns are a third of the work area and the second,
+fourth and sixth two thirds; `"1/4+1/2+1/4"` repeats every three columns.
+The terms of a pattern may add up to at most the whole screen (`1/1`), so a
+whole period plus its gaps fits the work area exactly and scrolling by one
+column shows the same shares in the other order. A single fraction is the
+one-term pattern.
+
+Widths never change with focus or scrolling. They are decided by position,
+so inserting a column (a new window, a merge, a swap) re-flows the columns
+after it, and so a pattern **pins** the strip: `expand-column`,
+`shrink-column`, `set-column-width` and `toggle-monocle` are refused on that
+screen with a message naming the pattern, and a mouse resize snaps back on
+release. Switch to a single-fraction preset to resize by hand. Why patterns
+are positional rather than anchored on the focused column:
+`docs/adr/0014-width-patterns-by-column-position.md`.
+
+#### Per-screen rules: `[[columns.screen]]`
+
+Each `[[columns.screen]]` table gives the screens it matches their own
+preset list. A screen takes the **first** rule that matches it, else the
+top-level `presets` / `default`. Matching is re-evaluated on every display
+change (a display plugged in, a resolution change, a rotation): the screen
+stays on the preset it was on when its new list has it, otherwise it lands
+on that list's `default`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `match.orientation` | `"portrait"` / `"landscape"` | By the work area; square counts as landscape. |
+| `match.min_width_px` | `u32` | The work area must be at least this wide. |
+| `match.max_width_px` | `u32` | The work area must be at most this wide. |
+| `match.name` | `String` | Windows' device name, `"DISPLAY2"` (the `\\.\` prefix is optional, case does not matter). `flow query all` prints each monitor's `device_name`. |
+| `presets` | `Vec<String>` | The list for those screens; same grammar as the top-level `presets`. |
+| `default` | `Option<String>` | The preset such a screen starts on; one of the rule's `presets`. |
+| `min_column_width_px` | `Option<u32>` | A floor for those screens instead of the top-level one, which is screen-blind. |
+
+Every field of `match` that is given must hold, and at least one must be
+given. Orientation and width survive display renumbering, so prefer them
+over `name` for everything but a specific display.
+
+```toml
+[columns]
+presets = ["1/3", "1/3+2/3", "1/2", "1/1"]   # every screen unless a rule matches
+default = "1/2"
+
+[[columns.screen]]
+match = { orientation = "portrait" }
+presets = ["1/2", "1/1"]
+default = "1/1"
+min_column_width_px = 500                    # 1/2 of a 1080-wide screen is 516 px
+
+[[columns.screen]]
+match = { min_width_px = 2560 }
+presets = ["1/4", "1/4+1/4+1/2", "1/3", "1/3+2/3", "1/2", "1/1"]
+default = "1/3"
 ```
 
 #### Stacked columns: `visible_rows` and `max_rows`

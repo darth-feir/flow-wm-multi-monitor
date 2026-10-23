@@ -86,6 +86,13 @@ pub struct ScrollingSpace {
     config: MutationConfig,
     /// Saved column width before monocle mode (per column index), in pixels.
     monocle_saved_width: Option<(usize, i32)>,
+    /// The width pattern of the monitor's current preset, one pixel width
+    /// per term. With two or more terms every column is **pinned** to
+    /// `pattern[i % n]` by its position on every mutation; with fewer the
+    /// strip behaves as before (`config.column_width` is the base width and
+    /// columns resize freely). See
+    /// `docs/adr/0014-width-patterns-by-column-position.md`.
+    width_pattern: Vec<u32>,
 }
 
 /// Derive the cached [`MutationConfig`] — including the slot-ladder bounds
@@ -183,6 +190,99 @@ impl ScrollingSpace {
             monitor,
             config,
             monocle_saved_width: None,
+            width_pattern: Vec::new(),
+        }
+    }
+
+    /// The strip with its width pattern set — the construction-time form of
+    /// [`set_width_pattern`](Self::set_width_pattern).
+    #[must_use]
+    pub fn with_width_pattern(mut self, pattern: &[u32]) -> Self {
+        let _ = self.set_width_pattern(pattern);
+        self
+    }
+
+    /// The current width pattern (empty without presets, one entry for a
+    /// plain fraction, the period for a pattern).
+    #[must_use]
+    pub fn width_pattern(&self) -> &[u32] {
+        &self.width_pattern
+    }
+
+    /// Whether a pattern of two or more terms pins every column's width to
+    /// its position (expand / shrink / set-width / monocle / drag-resize are
+    /// then refused or undone on the next mutation).
+    #[must_use]
+    pub fn widths_pinned(&self) -> bool {
+        self.width_pattern.len() > 1
+    }
+
+    /// Install `pattern` (pixel widths per term, already floored by the
+    /// caller) as this strip's width pattern: the first term becomes the
+    /// base column width (the ladder's `n = 0` rung and the width new
+    /// columns are created at) and, for two or more terms, every column is
+    /// re-flowed to `pattern[i % n]` by position. Existing widths are left
+    /// alone for a single term (the reload policy); an empty pattern clears
+    /// pinning and keeps the base width. Returns the re-projected layout.
+    pub fn set_width_pattern(&mut self, pattern: &[u32]) -> ActualLayout {
+        self.width_pattern = pattern.to_vec();
+        if let Some(&first) = pattern.first() {
+            let _ = self.set_base_column_width(first);
+        }
+        if self.widths_pinned() {
+            self.monocle_saved_width = None;
+            let layout = self.virtual_layout.clone();
+            // `apply_mutation` pins the widths and keeps the focus in view.
+            let _ = self.apply_mutation(layout);
+        }
+        self.actual.clone()
+    }
+
+    /// `flow dispatch width <preset>` for a strip: install `pattern` and set
+    /// every column to it — a single term goes through
+    /// [`apply_column_width_to_all`](Self::apply_column_width_to_all), a
+    /// pattern pins every column by position. Returns the applied layout for
+    /// the animator.
+    pub fn apply_width_pattern(&mut self, pattern: &[u32]) -> AppliedLayout {
+        self.width_pattern = pattern.to_vec();
+        match pattern {
+            [] => AppliedLayout {
+                actual_layout: self.actual.clone(),
+                virtual_layout: self.virtual_layout.clone(),
+            },
+            [single] => self.apply_column_width_to_all(*single),
+            [first, ..] => {
+                let _ = self.set_base_column_width(*first);
+                self.monocle_saved_width = None;
+                let mut new_layout = self.virtual_layout.clone();
+                self.pin_widths(&mut new_layout);
+                if !new_layout.columns.is_empty() {
+                    // Narrower columns can leave the camera past the end of
+                    // the canvas; pull it back before revealing the focus.
+                    let canvas =
+                        projection::canvas_width(&new_layout, self.config.padding.window_gap);
+                    let max_offset = (canvas - self.config.monitor_width).max(0);
+                    new_layout.viewport_offset = new_layout.viewport_offset.min(max_offset);
+                    let focus_col = self.focus_col_index().min(new_layout.columns.len() - 1);
+                    new_layout =
+                        mutations::ensure_column_visible(&new_layout, focus_col, &self.config);
+                }
+                self.apply_mutation(new_layout)
+            }
+        }
+    }
+
+    /// Set every column of `layout` to its position's pattern width,
+    /// clamped to the ladder top; a no-op unless the widths are pinned.
+    fn pin_widths(&self, layout: &mut VirtualLayout) {
+        if !self.widths_pinned() {
+            return;
+        }
+        let n = self.width_pattern.len();
+        for (i, col) in layout.columns.iter_mut().enumerate() {
+            col.width_px = (self.width_pattern[i % n] as i32)
+                .min(self.config.abs_max_width)
+                .max(1);
         }
     }
 
@@ -294,6 +394,11 @@ impl ScrollingSpace {
             for col in &mut self.virtual_layout.columns {
                 col.width_px = col.width_px.min(max);
             }
+        }
+        if self.widths_pinned() {
+            let mut layout = self.virtual_layout.clone();
+            self.pin_widths(&mut layout);
+            self.virtual_layout = layout;
         }
         if self.config.available_height() != old.available_height()
             || self.config.padding.window_gap != old.padding.window_gap
@@ -472,9 +577,13 @@ impl ScrollingSpace {
     /// focus cursor.
     fn apply_mutation_for(
         &mut self,
-        new_layout: VirtualLayout,
+        mut new_layout: VirtualLayout,
         window: Option<WindowId>,
     ) -> AppliedLayout {
+        // A pattern decides widths by position, so a structural change
+        // (insert, remove, swap) re-flows the columns after it here and a
+        // resize that slipped through is undone on the spot.
+        self.pin_widths(&mut new_layout);
         let new_layout = mutations::normalize_row_viewports(&new_layout, window, &self.config);
         let new_actual = projection::project(
             &new_layout,

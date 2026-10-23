@@ -127,15 +127,18 @@ impl FlowWM {
             info: MonitorInfo,
             layout_config: super::types::LayoutConfig,
             scrolling: ScrollingSpace,
+            /// The width preset the monitor starts on (its list's default).
+            preset_index: usize,
         }
         // Column width presets (`[columns]`): every monitor starts on the
-        // default preset, and its base column width is that preset's pixel
-        // width on its own work area.
-        let preset_index = app_config
-            .columns
-            .as_ref()
-            .map(|c| c.default_index())
-            .unwrap_or(0);
+        // default preset of its list, and its base column width is that
+        // preset's pixel width on its own work area. The lists are checked
+        // against the real screens here, where they are first known.
+        let facts: Vec<crate::config::width_preset::ScreenFacts> = geometries
+            .iter()
+            .map(|g| super::width_preset::screen_facts(g.work_area, &g.device_name()))
+            .collect();
+        super::width_preset::check_screens(&app_config, &facts).at(S::Monitors)?;
         let mut per_monitor: Vec<PerMonitor> = Vec::with_capacity(geometries.len());
         for (i, g) in geometries.iter().enumerate() {
             let others: Vec<Rect> = screen_rects
@@ -162,20 +165,28 @@ impl FlowWM {
                 info.neighbour_down,
             );
             let mut layout_config = config_derive::derive_layout_config(&app_config, &info);
-            if let Some(columns) = &app_config.columns
-                && let Some(preset) = columns.presets.get(preset_index)
-            {
-                layout_config.column_width = super::width_preset::preset_width_px(
-                    preset,
-                    info.work_area.width,
+            let mut preset_index = 0;
+            if let Some(columns) = &app_config.columns {
+                let (idx, px) = super::width_preset::resolve_for_screen(
+                    columns,
+                    &facts[i],
+                    None,
                     app_config.padding.window_gap,
                     app_config.min_column_width_px,
                 );
+                preset_index = idx;
+                if let Some(&first) = px.first() {
+                    layout_config.column_width = first;
+                }
+                let list = columns.list_for(&facts[i]);
                 log::debug!(
-                    "init: monitor {i}: width preset {} -> column_width {}px",
-                    preset.label(),
-                    layout_config.column_width
+                    "init: monitor {i} ({}): {} preset {} -> column widths {:?}px",
+                    facts[i].describe(),
+                    list.describe(),
+                    list.presets.get(idx).map_or("", |p| p.label()),
+                    px
                 );
+                layout_config.width_pattern_px = px;
             }
             let scrolling = ScrollingSpace::new(
                 info,
@@ -186,11 +197,13 @@ impl FlowWM {
                 layout_config.padding,
                 app_config.columns_per_screen,
             )
-            .with_row_limits(layout_config.visible_rows, layout_config.max_rows);
+            .with_row_limits(layout_config.visible_rows, layout_config.max_rows)
+            .with_width_pattern(&layout_config.width_pattern_px);
             per_monitor.push(PerMonitor {
                 info,
                 layout_config,
                 scrolling,
+                preset_index,
             });
         }
         reporter.ok(S::Monitors);
@@ -408,6 +421,7 @@ impl FlowWM {
                 info,
                 layout_config,
                 scrolling,
+                preset_index,
             } = pm;
             let mut workspaces: Vec<Workspace> = Vec::with_capacity(WORKSPACE_COUNT as usize);
             workspaces.push(Workspace::new(WorkspaceId(1), scrolling));
@@ -421,13 +435,15 @@ impl FlowWM {
                     layout_config.padding,
                     app_config.columns_per_screen,
                 )
-                .with_row_limits(layout_config.visible_rows, layout_config.max_rows);
+                .with_row_limits(layout_config.visible_rows, layout_config.max_rows)
+                .with_width_pattern(&layout_config.width_pattern_px);
                 workspaces.push(Workspace::new(WorkspaceId(id), empty_scrolling));
             }
             monitors.push(
                 Monitor::new(g.screen_rect, g.work_area, workspaces, 0)
                     .with_hmonitor(g.hmonitor)
-                    .with_width_preset(preset_index),
+                    .with_width_preset(preset_index)
+                    .with_device_name(g.device_name()),
             );
         }
 

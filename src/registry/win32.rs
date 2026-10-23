@@ -1517,6 +1517,31 @@ pub struct MonitorGeometry {
     pub hmonitor: isize,
     /// Whether Windows considers this the primary display.
     pub is_primary: bool,
+    /// `MONITORINFOEXW::szDevice` (`\\.\DISPLAY1`), NUL-padded; a fixed
+    /// array so the type stays `Copy`. Read it with
+    /// [`device_name`](Self::device_name).
+    pub device: [u16; 32],
+}
+
+impl MonitorGeometry {
+    /// The device name as a string (`\\.\DISPLAY1`); empty when unknown.
+    #[must_use]
+    pub fn device_name(&self) -> String {
+        let end = self.device.iter().position(|&c| c == 0).unwrap_or(32);
+        String::from_utf16_lossy(&self.device[..end])
+    }
+
+    /// The geometry with its device name set (tests and callers that build
+    /// one by hand).
+    #[must_use]
+    pub fn with_device_name(mut self, name: &str) -> Self {
+        let mut device = [0u16; 32];
+        for (slot, unit) in device.iter_mut().zip(name.encode_utf16().take(31)) {
+            *slot = unit;
+        }
+        self.device = device;
+        self
+    }
 }
 
 /// Get both the physical screen rect and the taskbar-excluded work area of
@@ -1557,28 +1582,27 @@ pub fn get_primary_monitor_info() -> Result<MonitorGeometry, String> {
     let hmonitor = unsafe { MonitorFromWindow(HWND::default(), MONITOR_DEFAULTTOPRIMARY) };
 
     // cbSize must be set before the call; the rects are filled in by Win32.
-    let mut mi = MONITORINFO {
-        cbSize: size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
+    let mut mi = monitorinfoex();
     // `GetMonitorInfoW` returns `BOOL` (not `Result`); `.ok()` promotes a
     // `FALSE` return into `windows::core::Error` so it flows through `?`.
-    unsafe { GetMonitorInfoW(hmonitor, &mut mi) }
+    // SAFETY: a MONITORINFOEXW starts with a MONITORINFO whose cbSize says
+    // which of the two the pointer is.
+    unsafe { GetMonitorInfoW(hmonitor, &mut mi as *mut _ as *mut MONITORINFO) }
         .ok()
         .map_err(|e| format!("GetMonitorInfoW failed: {e}"))?;
 
     Ok(geometry_from_monitorinfo(hmonitor, &mi))
 }
 
-/// Convert a filled-in `MONITORINFO` into a [`MonitorGeometry`].
+/// Convert a filled-in `MONITORINFOEXW` into a [`MonitorGeometry`].
 fn geometry_from_monitorinfo(
     hmonitor: windows::Win32::Graphics::Gdi::HMONITOR,
-    mi: &windows::Win32::Graphics::Gdi::MONITORINFO,
+    mi: &windows::Win32::Graphics::Gdi::MONITORINFOEXW,
 ) -> MonitorGeometry {
     // MONITORINFOF_PRIMARY (winuser.h) is not exported by the windows crate.
     const MONITORINFOF_PRIMARY: u32 = 1;
-    let screen = mi.rcMonitor;
-    let work = mi.rcWork;
+    let screen = mi.monitorInfo.rcMonitor;
+    let work = mi.monitorInfo.rcWork;
     MonitorGeometry {
         screen_rect: Rect {
             x: screen.left,
@@ -1593,8 +1617,18 @@ fn geometry_from_monitorinfo(
             height: work.bottom - work.top,
         },
         hmonitor: hmonitor.0 as isize,
-        is_primary: (mi.dwFlags & MONITORINFOF_PRIMARY) != 0,
+        is_primary: (mi.monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0,
+        device: mi.szDevice,
     }
+}
+
+/// A zeroed `MONITORINFOEXW` with `cbSize` set for `GetMonitorInfoW`, which
+/// then also fills `szDevice` (the `\.\DISPLAYn` name).
+fn monitorinfoex() -> windows::Win32::Graphics::Gdi::MONITORINFOEXW {
+    use windows::Win32::Graphics::Gdi::MONITORINFOEXW;
+    let mut mi = MONITORINFOEXW::default();
+    mi.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+    mi
 }
 
 /// Enumerate every attached display monitor.
@@ -1640,11 +1674,9 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorGeometry>, String> {
 
     let mut out = Vec::with_capacity(handles.len());
     for hmonitor in handles {
-        let mut mi = MONITORINFO {
-            cbSize: size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if unsafe { GetMonitorInfoW(hmonitor, &mut mi) }.as_bool() {
+        let mut mi = monitorinfoex();
+        // SAFETY: see `get_primary_monitor_info`.
+        if unsafe { GetMonitorInfoW(hmonitor, &mut mi as *mut _ as *mut MONITORINFO) }.as_bool() {
             out.push(geometry_from_monitorinfo(hmonitor, &mi));
         } else {
             log::warn!(

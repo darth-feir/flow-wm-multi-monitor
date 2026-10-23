@@ -53,6 +53,12 @@ pub(super) struct LayoutConfig {
     /// `[columns] max_rows` (`0` = unlimited), see
     /// [`ColumnsConfig::max_rows`](crate::config::width_preset::ColumnsConfig::max_rows).
     pub(super) max_rows: u32,
+
+    /// The monitor's width preset as pixel widths per term (`[px]` for a
+    /// plain fraction, the period for a pattern), already floored; empty
+    /// without `[columns]`. See
+    /// [`ScrollingSpace::set_width_pattern`](crate::workspace::ScrollingSpace::set_width_pattern).
+    pub(super) width_pattern_px: Vec<u32>,
 }
 
 /// The single orchestrator for the FlowWM daemon.

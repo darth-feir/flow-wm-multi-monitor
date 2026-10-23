@@ -822,16 +822,14 @@ impl FlowWM {
     /// carry their own widths. A label that is no longer configured is
     /// logged and skipped.
     fn restore_monitor_presets(&mut self, snapshots: &[MonitorSnapshot]) {
-        let Some(columns) = self.columns_config() else {
+        if self.columns_config().is_none() {
             return;
-        };
+        }
         let targets: Vec<(usize, usize)> = snapshots
             .iter()
             .filter_map(|snap| {
                 let mi = snap.index as usize;
-                if mi >= self.monitors.len() {
-                    return None;
-                }
+                let list = self.monitor_preset_list(mi)?;
                 let label = snap.width_preset.as_deref()?;
                 let wanted = match crate::config::width_preset::WidthPreset::parse(label) {
                     Ok(p) => p,
@@ -840,12 +838,13 @@ impl FlowWM {
                         return None;
                     }
                 };
-                match columns.index_of(&wanted) {
+                match list.index_of(&wanted) {
                     Some(pi) => Some((mi, pi)),
                     None => {
                         log::warn!(
-                            "loadout load: monitor {mi} width preset {label:?} is not configured (presets: {}); keeping {}",
-                            columns.labels().join(", "),
+                            "loadout load: monitor {mi} width preset {label:?} is not configured ({}: {}); keeping {}",
+                            list.describe(),
+                            list.labels().join(", "),
                             self.monitor_preset_label(mi).unwrap_or_default()
                         );
                         None
@@ -855,10 +854,9 @@ impl FlowWM {
             .collect();
         for (mi, pi) in targets {
             self.monitors[mi].set_width_preset(pi);
-            let info = *self.monitors[mi].active_scrolling().monitor();
-            if let Some(px) = self.preset_px_for(&info, pi) {
+            if let Some(px) = self.monitor_pattern_px(mi, pi) {
                 for ws in self.monitors[mi].workspaces_mut() {
-                    let _ = ws.scrolling.set_base_column_width(px);
+                    let _ = ws.scrolling.set_width_pattern(&px);
                 }
             }
         }

@@ -205,6 +205,17 @@ Both functions took `(num_columns, focus_col, config)` and computed positions as
 | Negative offset possible | Yes (when focused col is near canvas left) | Yes (when canvas < monitor) | No (clamped to ≥ 0) |
 | Unconditional | Yes (always centers) | No (only used when fit predicate passes) | No (only used when target is off-screen) |
 
+## Width patterns pin columns by position
+
+A `[columns]` preset with two or more terms (`"1/3+2/3"`) is a **pattern**: column `i` of the strip is `terms[i % n]` wide. The mutation functions know nothing about it — they still read and write `width_px` — because the rule lives one layer up, in `ScrollingSpace`:
+
+- `ScrollingSpace::set_width_pattern(&[px])` stores the period as pixel widths (one entry for a plain fraction, which changes nothing below) and makes the first term the base `column_width`.
+- `apply_mutation_for` runs `pin_widths` on **every** new layout before row normalization and projection. With two or more terms it overwrites every column's `width_px` with its position's term (clamped to `abs_max_width`); with fewer it is a no-op. So a structural mutation (insert, remove, swap, merge, promote, a drag commit) re-flows the columns after the change for free, and a sizing mutation that got through (`set_column_width` from a mouse resize commit) is undone on the spot.
+- `refit_to_config` pins too, so a geometry change (`set_monitor_info`, `reconfigure`) keeps the pattern after the daemon has recomputed the pixel widths for the new work area.
+- The daemon refuses `expand-column`, `shrink-column`, `set-column-width` and `toggle-monocle` up front on a pinned strip (`FlowWM::pinned_widths_refusal`), so the user gets a message instead of a no-op.
+
+`apply_width_pattern` is `flow dispatch width` for a strip: a single term goes through `apply_column_width_to_all` (every column resized, free afterwards), a pattern pins and re-flows. Why the pattern is positional rather than anchored on the focused column: `docs/adr/0014-width-patterns-by-column-position.md`.
+
 ## The pure-function convention
 
 Every mutation in the catalog follows the same signature pattern: `fn(&VirtualLayout, ...) -> Option<VirtualLayout>`. They never modify the input — they clone it internally and return a new value. This makes the mutation layer:

@@ -48,10 +48,14 @@ pub struct Monitor {
     /// Win32 `HMONITOR` as an integer; `0` when unknown (tests).
     hmonitor: isize,
     /// Index into the configured column width presets
-    /// (`[columns] presets` in `flow.toml`) this monitor is currently on.
+    /// (`[columns] presets` in `flow.toml`, or the `[[columns.screen]]`
+    /// rule matching this monitor) this monitor is currently on.
     /// Meaningless (kept at `0`) when no presets are configured; the daemon
-    /// clamps it whenever the preset list changes.
+    /// re-resolves it whenever the preset list changes.
     width_preset: usize,
+    /// Windows' device name for the display (`\\.\DISPLAY1`); empty when
+    /// unknown (tests). Matched by `[[columns.screen]] match.name`.
+    device_name: String,
 }
 
 impl Monitor {
@@ -85,7 +89,26 @@ impl Monitor {
             active_workspace,
             hmonitor: 0,
             width_preset: 0,
+            device_name: String::new(),
         }
+    }
+
+    /// Attach Windows' device name for this display (`\\.\DISPLAY1`).
+    #[must_use]
+    pub fn with_device_name(mut self, name: impl Into<String>) -> Self {
+        self.device_name = name.into();
+        self
+    }
+
+    /// Windows' device name for this display; empty when unknown.
+    #[must_use]
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    /// Replace the device name after a display-topology change.
+    pub fn set_device_name(&mut self, name: impl Into<String>) {
+        self.device_name = name.into();
     }
 
     /// Attach the Win32 monitor handle this `Monitor` represents.
