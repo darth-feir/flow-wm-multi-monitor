@@ -1,0 +1,83 @@
+# The win-niri keymap's default key bindings: niri's chord spelling, niri's action names.
+#
+# This file is compiled into the daemon as the built-in `[binds]` table, so the keymap works with
+# no `[binds]` section in flow.toml at all. To change a chord, put a `[binds]` table in flow.toml:
+# its entries are laid over these defaults (same chord = replaced, new chord = added,
+# `"Mod+X" = "none"` = unbound), or start from nothing with `defaults = false`. The grammar and
+# the full action table are in the user guide (Config Reference, `[binds]`).
+#
+# Hardwired in flow.ahk, not in this table: Mod + left-button drag, Mod+Ctrl+T (FlowWM off / on)
+# and Mod+Ctrl+Shift+T (tiling pause).
+
+[binds]
+# Focus and move on this screen (arrows, and upstream's vim-style letters on Alt).
+"Mod+Left" = "focus-column-left"
+"Mod+Down" = "focus-window-down"
+"Mod+Up" = "focus-window-up"
+"Mod+Right" = "focus-column-right"
+"Mod+Shift+Left" = "move-column-left"
+"Mod+Shift+Down" = "move-window-down"
+"Mod+Shift+Up" = "move-window-up"
+"Mod+Shift+Right" = "move-column-right"
+"Alt+H" = "focus-column-left"
+"Alt+J" = "focus-window-down"
+"Alt+K" = "focus-window-up"
+"Alt+L" = "focus-column-right"
+"Alt+Shift+H" = "move-column-left"
+"Alt+Shift+J" = "move-window-down"
+"Alt+Shift+K" = "move-window-up"
+"Alt+Shift+L" = "move-column-right"
+
+# Screens: Mod+Ctrl focuses the other one, Mod+Alt moves the window there.
+"Mod+Ctrl+Left" = "focus-monitor-left"
+"Mod+Ctrl+Down" = "focus-monitor-down"
+"Mod+Ctrl+Up" = "focus-monitor-up"
+"Mod+Ctrl+Right" = "focus-monitor-right"
+"Mod+Alt+Left" = "move-column-to-monitor-left"
+"Mod+Alt+Down" = "move-column-to-monitor-down"
+"Mod+Alt+Up" = "move-column-to-monitor-up"
+"Mod+Alt+Right" = "move-column-to-monitor-right"
+
+# Workspaces 1..10 (Mod+0 is the tenth).
+"Mod+1" = "focus-workspace 1"
+"Mod+2" = "focus-workspace 2"
+"Mod+3" = "focus-workspace 3"
+"Mod+4" = "focus-workspace 4"
+"Mod+5" = "focus-workspace 5"
+"Mod+6" = "focus-workspace 6"
+"Mod+7" = "focus-workspace 7"
+"Mod+8" = "focus-workspace 8"
+"Mod+9" = "focus-workspace 9"
+"Mod+0" = "focus-workspace 10"
+"Mod+Ctrl+1" = "move-column-to-workspace 1"
+"Mod+Ctrl+2" = "move-column-to-workspace 2"
+"Mod+Ctrl+3" = "move-column-to-workspace 3"
+"Mod+Ctrl+4" = "move-column-to-workspace 4"
+"Mod+Ctrl+5" = "move-column-to-workspace 5"
+"Mod+Ctrl+6" = "move-column-to-workspace 6"
+"Mod+Ctrl+7" = "move-column-to-workspace 7"
+"Mod+Ctrl+8" = "move-column-to-workspace 8"
+"Mod+Ctrl+9" = "move-column-to-workspace 9"
+"Mod+Ctrl+0" = "move-column-to-workspace 10"
+
+# Columns and windows.
+"Mod+Q" = "close-window"
+"Mod+C" = "center-column"
+"Mod+V" = "toggle-window-floating"
+"Mod+R" = "switch-preset-column-width"
+"Mod+F" = "fullscreen-window"
+"Mod+BracketLeft" = "consume-or-expel-window-left"
+"Mod+BracketRight" = "consume-or-expel-window-right"
+
+# Programs. A bare name is looked up in Program Files, %LOCALAPPDATA%\Programs, the Store's
+# execution aliases and PATH (never the working directory); `admin = true` runs it elevated.
+"Mod+Space" = "launcher"
+"Mod+D" = "launcher"
+"Mod+T" = { spawn = ["alacritty"] }
+"Mod+Shift+T" = { spawn = ["alacritty"], admin = true }
+"Mod+Alt+T" = { spawn = ["wt"] }
+"Mod+Alt+Shift+T" = { spawn = ["wt"], admin = true }
+
+# Help and session.
+"Mod+Shift+Slash" = "show-hotkey-overlay"
+"Mod+Shift+E" = "quit"

@@ -53,6 +53,22 @@ max_rows = 4
 [navigation]
 edge_hop = false
 
+# Key bindings. Without this section the keymap uses its built-in table (binds.toml next to this
+# file: Mod+Arrows focus, Mod+Shift+Arrows move, Mod+1..9 workspaces, Mod+R widths, Mod+T Alacritty,
+# Mod+Space launcher, Mod+Shift+/ help, ...). Entries here are laid over it in niri's spelling: the
+# same chord replaces the default, a new chord is added, "none" unbinds one. Saved changes apply
+# within a few seconds; `flow query binds` shows the result, `flow config check` names mistakes.
+# The full grammar and action table are in the user guide (Config Reference, [binds]).
+[binds]
+# "Mod+Shift+R" = "switch-preset-column-width-back"
+# "Mod+Q" = "none"
+# "Mod+Return" = { spawn = ["alacritty"] }
+# "Mod+Shift+Return" = { spawn = ["wt", "-p", "PowerShell"], admin = true, help = "admin shell" }
+
+# Programs to run once FlowWM is up, each as ["program", "arg", ...] (looked up like a spawn bind).
+# [startup]
+# spawn = [["alacritty"]]
+
 # The floating layer, as in niri: floating windows (Mod+V) and windows your rules ignore (dialogs,
 # popups) always sit above the tiled windows, even when a tile has the focus, so a dialog is never
 # hidden behind the strip. They go back to the normal z-order when tiled, on `tiling off`

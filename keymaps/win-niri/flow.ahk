@@ -3,40 +3,26 @@
 ; ════════════════════════════════════════════════════════════════════════════
 ; FlowWM keybindings, niri flavour, Windows key as Mod, arrow keys.
 ;
-; Mirrors niri's default binds (https://github.com/YaLTeR/niri/wiki/Configuration:-Key-Bindings)
-; onto `flow dispatch` commands. Install at %USERPROFILE%\.config\flow\flow.ahk
-; (together with flow-exe.ahk, launcher.ahk and help.ahk, which it #Includes)
-; and start with `flow start --ahk`. Design notes, the daemon-liveness gate,
-; the tiling toggle, which Windows keys are shadowed and the AutoHotkey
-; lessons are in README.md next to this file.
+; This script is an interpreter: the chords come from the daemon. At start
+; (and again whenever flow.toml is saved) it runs `flow query binds --plain`,
+; which lists the `[binds]` table of flow.toml laid over the keymap's
+; built-in table (binds.toml next to this file), and registers every chord
+; with Hotkey(). The help overlay (help.ahk) is built from the same listing.
+; Install at %USERPROFILE%\.config\flow\flow.ahk (together with flow-exe.ahk,
+; launcher.ahk and help.ahk, which it #Includes) and start with
+; `flow start --ahk`. Design notes, the daemon-liveness gate, the tiling
+; toggle, which Windows keys are shadowed and the AutoHotkey lessons are in
+; README.md next to this file; the bind grammar and the action table are in
+; the user guide (Config Reference, `[binds]`).
 ;
-;   Mod+Left/Down/Up/Right        focus the next window on this screen
-;   Mod+Shift+Arrows              move the window along the strip (up/down inside a stacked column)
-;   Alt+H/J/K/L, Alt+Shift+H/J/K/L  the same two, vim-style (upstream's default chords)
+; Hardwired here, not in the table:
 ;   Mod + left-button drag        move a window grabbed anywhere (a tile drops into the zone under the cursor, a float moves)
-;   Mod+Ctrl+Arrows               focus the other screen
-;   Mod+Alt+Arrows                move the window to the other screen (it takes that screen's width)
-;   Mod+1..9, Mod+0               switch workspace 1..10
-;   Mod+Ctrl+1..9, Mod+Ctrl+0     move window to workspace 1..10
-;   Mod+Q                         close window
-;   Mod+C                         center the focused column
-;   Mod+V                         toggle floating (shadows Windows clipboard history)
-;   Mod+R                         cycle this screen's column widths through flow.toml [columns] presets
-;                                 (a fraction like 1/2 for every column, or a pattern like 1/3+2/3 by position)
-;   Mod+F                         fullscreen toggle
-;   Mod+[ / Mod+]                 alone in its column: merge into the column on that side;
-;                                 in a stacked column: pop out into its own column on that side
-;   Mod+Space, Mod+D              application launcher (launcher.ahk: apps, open windows, settings)
-;   Mod+T / Mod+Shift+T           Alacritty / Alacritty as admin (UAC)
-;   Mod+Alt+T / Mod+Alt+Shift+T   Windows Terminal / Windows Terminal as admin (UAC)
-;   Mod+Shift+/                   key-binding overlay (help.ahk); Esc or the same chord hides it
 ;   Mod+Ctrl+T                    stop FlowWM fully (daemon and this script); flow-resident.ahk,
 ;                                 if it runs, starts FlowWM again with the same chord
 ;   Mod+Ctrl+Shift+T              pause toggle: `flow dispatch tiling toggle` (daemon keeps running)
-;   Mod+Shift+E                   stop FlowWM (same as Mod+Ctrl+T; niri's quit chord)
 ;
-; All chords are bound only while the daemon's pipe answers (and the
-; window-management ones only while tiling is on); Win+L stays Windows.
+; Every chord is bound only while the daemon's pipe answers; window-management
+; chords only while tiling is on; Win+L stays Windows.
 ; ════════════════════════════════════════════════════════════════════════════
 
 #Include %A_ScriptDir%\flow-exe.ahk
@@ -48,6 +34,14 @@ TilingOn := true        ; refined from `flow ping` after the startup gate
 DownTicks := 0
 BusyPolls := 0          ; consecutive polls that found the pipe busy (121)
 MaxBusyPolls := 5       ; after this many, "busy" means wedged, not alive
+CfgPath := (EnvGet("FLOW_CONFIG_DIR") || A_ScriptDir) "\flow.toml"
+CfgSeen := ""           ; flow.toml's modification time at the last look
+CfgChangedAt := 0       ; A_TickCount when a change was first seen (0: nothing pending)
+BindsText := ""         ; the listing the current hotkeys were registered from
+Registered := []        ; [hotkey, scope] of every chord registered from it
+HelpRows := []          ; [chords, help] rows for help.ahk
+HelpGui := 0            ; the overlay panel, built by help.ahk's BuildHelpGui() from HelpRows (declared here:
+                        ; ApplyBinds() runs before the include's own auto-execute lines)
 
 Flow(cmd) {
     global flowExe
@@ -187,6 +181,7 @@ CheckDaemon() {
         AhkLog("gate: alive=" alive " (was " DaemonUp ") lastError=" A_LastError " busyPolls=" BusyPolls)
     if alive {
         DaemonUp := true, DownTicks := 0
+        CheckConfigFile()
         return
     }
     DaemonUp := false            ; chords fall through to Windows immediately
@@ -229,44 +224,197 @@ ShowCentered(gui) {
     AhkLog("ShowCentered: could not activate " gui.Title)
 }
 
-; Terminals. Admin uses the shell's RunAs verb (UAC prompts as usual), so both
-; are run by fixed absolute paths first and a PATH lookup only as the last resort.
-Alacritty(admin := false) {
-    static exe := ""
-    if (exe = "") {
-        for p in [A_ProgramFiles "\Alacritty\alacritty.exe", EnvGet("LOCALAPPDATA") "\Programs\Alacritty\alacritty.exe"]
-            if FileExist(p) {
-                exe := p
+; --- Programs (the `spawn` binds) -------------------------------------------
+; A bare name is looked up the way the daemon's `[startup]` does it (see the
+; user guide): Program Files, %LOCALAPPDATA%\Programs, the Store's execution
+; aliases, then PATH, never the working directory; a path is taken only when
+; absolute. Admin uses the shell's RunAs verb (UAC prompts as usual).
+IsFile(p) {
+    a := FileExist(p)
+    return a != "" && !InStr(a, "D")
+}
+ResolveProgram(name) {
+    static cache := Map()
+    if cache.Has(name)
+        return cache[name]
+    found := ""
+    if RegExMatch(name, '[\\/:]') {
+        found := RegExMatch(name, '^[A-Za-z]:\\') ? name : ""
+    } else {
+        stem := RegExReplace(name, 'i)\.exe$')
+        for dir in [A_ProgramFiles, EnvGet("ProgramFiles(x86)"), EnvGet("LOCALAPPDATA") "\Programs"]
+            if (dir != "" && IsFile(dir "\" stem "\" stem ".exe")) {
+                found := dir "\" stem "\" stem ".exe"
                 break
             }
-        if (exe = "") {
-            try {
-                out := ComObject("WScript.Shell").Exec(A_ComSpec " /c where.exe alacritty.exe").StdOut.ReadAll()
-                if (Trim(out, " `t`r`n") != "")
-                    exe := Trim(StrSplit(out, "`n")[1], " `t`r")
+        if (found = "" && IsFile(EnvGet("LOCALAPPDATA") "\Microsoft\WindowsApps\" stem ".exe"))
+            found := EnvGet("LOCALAPPDATA") "\Microsoft\WindowsApps\" stem ".exe"
+        if (found = "") {
+            Loop Parse EnvGet("PATH"), ";" {
+                dir := Trim(A_LoopField, ' "')
+                if (dir = "")
+                    continue
+                for p in [dir "\" stem ".exe", dir "\" stem]
+                    if IsFile(p) {
+                        found := p
+                        break
+                    }
+                if (found != "")
+                    break
             }
         }
     }
+    if (found != "")
+        cache[name] := found
+    return found
+}
+Quote(a) {
+    return RegExMatch(a, '[\s"]') ? '"' StrReplace(a, '"', '\"') '"' : a
+}
+Launch(argv, admin := false) {
+    exe := ResolveProgram(argv[1])
     if (exe = "") {
-        AhkLog("alacritty not found")
-        Osd("Alacritty not found (Program Files, %LOCALAPPDATA%\Programs\Alacritty, PATH).")
+        AhkLog("launch: " argv[1] " not found")
+        Osd(argv[1] " not found (Program Files, %LOCALAPPDATA%\Programs, the Store's aliases, PATH).")
         return
     }
-    Launch(exe, admin)
-}
-WindowsTerminal(admin := false) {
-    ; The Store app's execution alias is a fixed per-user path; only if it is
-    ; absent is `wt.exe` left to the shell's own lookup.
-    alias := EnvGet("LOCALAPPDATA") "\Microsoft\WindowsApps\wt.exe"
-    Launch(FileExist(alias) ? alias : "wt.exe", admin)
-}
-Launch(exe, admin) {
-    AhkLog("launch " (admin ? "(admin) " : "") exe)
+    args := ""
+    Loop argv.Length - 1
+        args .= " " Quote(argv[A_Index + 1])
+    AhkLog("launch " (admin ? "(admin) " : "") exe args)
     ; Start in the home folder, not wherever the daemon (and so this script) was started from.
-    try Run((admin ? "*RunAs " : "") '"' exe '"', EnvGet("USERPROFILE"))
+    try Run((admin ? "*RunAs " : "") '"' exe '"' args, EnvGet("USERPROFILE"))
     catch as e
         if !InStr(e.Message, "cancel")       ; a declined UAC prompt is not worth a popup
             Osd("could not start " exe ": " e.Message)
+}
+
+; --- Bindings: the table comes from the daemon -----------------------------
+; `flow query binds --plain` lists one record per line, tab-separated:
+;   bind <hotkey> <scope> <kind> <admin> <chord> <help> <argv items joined by Chr(31)>
+;   row <chords> <help>            an overlay row for the table
+;   hardwired <chords> <help>      an overlay row for the chords below
+;   source defaults|flow.toml
+; The output goes through a file (UTF-8, no console window), never through
+; WScript's Exec, which decodes with the OEM code page.
+QueryBinds() {
+    global flowExe
+    tmp := A_Temp "\flow-binds-" DllCall("GetCurrentProcessId", "UInt") ".txt"
+    try {
+        code := RunWait(A_ComSpec ' /c ""' flowExe '" query binds --plain > "' tmp '" 2>&1"', , "Hide")
+        out := FileRead(tmp, "UTF-8")
+    } catch as e {
+        AhkLog("binds: query failed: " e.Message)
+        return ""
+    }
+    try FileDelete(tmp)
+    if (code != 0 || !InStr(out, "source`t")) {
+        AhkLog("binds: query failed (exit " code "): " SubStr(Trim(out, " `t`r`n"), 1, 200))
+        return ""
+    }
+    return out
+}
+
+; The HotIf criteria. Named functions, so a hotkey registered under one can
+; be found again (turned off, replaced) by the same function object.
+TilingGate(*) {
+    global DaemonUp, TilingOn
+    return DaemonUp && TilingOn
+}
+AlwaysGate(*) {
+    global DaemonUp
+    return DaemonUp
+}
+
+; What a bind runs. 0 for a kind this script does not know (a newer daemon).
+BindCallback(kind, argvText, admin) {
+    argv := argvText = "" ? [] : StrSplit(argvText, Chr(31))
+    switch kind {
+        case "dispatch":
+            cmd := ""
+            for a in argv
+                cmd .= (cmd = "" ? "" : " ") Quote(a)
+            return (*) => D(cmd)
+        case "spawn":
+            return (*) => Launch(argv, admin)
+        case "launcher":
+            return (*) => LauncherToggle()
+        case "help":
+            return (*) => HelpToggle()
+        case "quit":
+            return (*) => StopFlow()
+        case "toggle-tiling":
+            return (*) => D("tiling toggle", TilingToggled)
+    }
+    return 0
+}
+
+; Register the listing: the previous set is turned off first (under the
+; criterion each chord was registered with), then every `bind` record is
+; registered under its scope's gate and the overlay rows are collected.
+ApplyBinds(text) {
+    global Registered, HelpRows, BindsText
+    for r in Registered {
+        HotIf(r[2] = "tiling" ? TilingGate : AlwaysGate)
+        try Hotkey(r[1], "Off")
+    }
+    Registered := [], HelpRows := []
+    n := 0, failed := 0
+    Loop Parse text, "`n", "`r" {
+        f := StrSplit(A_LoopField, "`t")
+        if (f.Length < 3)
+            continue
+        switch f[1] {
+            case "bind":
+                if (f.Length < 8)
+                    continue
+                cb := BindCallback(f[4], f[8], f[5] = "1")
+                if !cb {
+                    AhkLog("binds: " f[6] ": unknown kind " f[4])
+                    failed++
+                    continue
+                }
+                HotIf(f[3] = "tiling" ? TilingGate : AlwaysGate)
+                try {
+                    Hotkey(f[2], cb, "On")
+                    Registered.Push([f[2], f[3]])
+                    n++
+                } catch as e {
+                    AhkLog("binds: " f[6] " (" f[2] ") not registered: " e.Message)
+                    failed++
+                }
+            case "row", "hardwired":
+                HelpRows.Push([f[2], f[3]])
+        }
+    }
+    HotIf()
+    BindsText := text
+    BuildHelpGui()
+    AhkLog("binds: " n " registered" (failed ? ", " failed " failed" : ""))
+    return n
+}
+
+; flow.toml saved: the daemon reloads it by itself (once the file has been
+; stable for a second); this script re-reads the listing ~2.5 s after the
+; change and re-registers only if it differs. A refused reload leaves the
+; daemon's listing as it was, so nothing changes here either.
+CheckConfigFile() {
+    global CfgPath, CfgSeen, CfgChangedAt, BindsText
+    t := ""
+    try t := FileGetTime(CfgPath, "M")
+    if (t != CfgSeen) {
+        CfgSeen := t, CfgChangedAt := A_TickCount
+        AhkLog("config: flow.toml changed; re-reading the bindings shortly")
+        return
+    }
+    if (CfgChangedAt && A_TickCount - CfgChangedAt >= 2500) {
+        CfgChangedAt := 0
+        text := QueryBinds()
+        if (text != "" && text != BindsText) {
+            n := ApplyBinds(text)
+            Osd("FlowWM key bindings reloaded (" n " chords)")
+        }
+    }
 }
 
 AhkLog("flow: " flowExe (EnvGet("FLOW_BIN") != "" ? " (FLOW_BIN=" EnvGet("FLOW_BIN") ")" : " (FLOW_BIN unset)") " cwd=" A_WorkingDir)
@@ -284,39 +432,28 @@ if !DaemonAlive() {
 TilingOn := QueryTiling()
 AhkLog("startup: tiling " (TilingOn ? "on" : "off"))
 DaemonUp := true
+try CfgSeen := FileGetTime(CfgPath, "M")
 SetTimer(CheckDaemon, 2000)
-HotIf((*) => DaemonUp && TilingOn)   ; criterion for the Hotkey() registrations below
-#HotIf DaemonUp && TilingOn          ; criterion for the window-management `::` hotkeys
 
 ; No bare-Win-tap swallow on purpose: the `~LWin::Send "{Blind}{vkE8}"` trick
 ; dropped about one chord in eight in testing (see README.md).
 
-; --- Focus / move on this screen (Mod, Mod+Shift) --------------------------
-#Left::D("focus left")
-#Down::D("focus down")
-#Up::D("focus up")
-#Right::D("focus right")
-#+Left::D("move-window left")
-#+Down::D("move-window down")
-#+Up::D("move-window up")
-#+Right::D("move-window right")
-; Vim-style duplicates of the two rows above, as in upstream's bundled keymap.
-; Alt+<letter> can collide with an app's menu accelerator (Alt+H = Help in some apps) while tiling is on.
-!h::D("focus left")
-!j::D("focus down")
-!k::D("focus up")
-!l::D("focus right")
-!+h::D("move-window left")
-!+j::D("move-window down")
-!+k::D("move-window up")
-!+l::D("move-window right")
+; --- The table ---------------------------------------------------------------
+text := QueryBinds()
+if (text = "") {
+    AhkLog("binds: using the baked defaults")
+    text := StrReplace(DefaultBindsText, "<US>", Chr(31))
+}
+ApplyBinds(text)
 
 ; --- Mod + left-button drag: move a window grabbed anywhere ----------------
 ; The script moves the window itself while the button is held (Windows' own
 ; move loop cannot be started from a hook hotkey, see README.md) and brackets
 ; the gesture with `flow dispatch drag begin` / `drag end`, so the daemon
 ; previews and commits a tile's drop zone and records a float's final rect.
+#HotIf DaemonUp && TilingOn
 #LButton::ModDrag()
+#HotIf
 ModDrag() {
     global flowExe
     ; Screen coordinates throughout: WindowAt() and WinMove compare against
@@ -377,41 +514,6 @@ WindowAt(x, y) {
     return 0
 }
 
-; --- Screens (Mod+Ctrl focus, Mod+Alt move) ---------------------------------
-#^Left::D("focus-monitor left")
-#^Right::D("focus-monitor right")
-#^Down::D("focus-monitor down")
-#^Up::D("focus-monitor up")
-#!Left::D("move-to-monitor left")
-#!Right::D("move-to-monitor right")
-#!Down::D("move-to-monitor down")
-#!Up::D("move-to-monitor up")
-
-; --- Workspaces (Mod+n, Mod+Ctrl+n) ----------------------------------------
-SwitchWs(n, *) => D("switch-workspace " n)
-MoveWs(n, *) => D("move-to-workspace " n)
-Loop 9 {
-    Hotkey("#" A_Index, SwitchWs.Bind(A_Index))
-    Hotkey("#^" A_Index, MoveWs.Bind(A_Index))
-}
-#0::D("switch-workspace 10")
-#^0::D("move-to-workspace 10")
-
-; --- Columns / windows -----------------------------------------------------
-#q::D("close-window")
-#c::D("center")
-#v::D("set-window cycle")
-#r::D("width cycle")                  ; next [columns] preset for this screen (shrink-column / expand-column are not bound: widths come from the presets)
-#f::D("set-window fullscreen")        ; toggle
-#[::D("consume-or-expel left")        ; alone: merge into the column to the left; in a stack: pop out to the left
-#]::D("consume-or-expel right")
-
-; --- Terminals -------------------------------------------------------------
-#t::Alacritty()
-#+t::Alacritty(true)
-#!t::WindowsTerminal()
-#!+t::WindowsTerminal(true)
-
 ; --- Always bound while the daemon runs (tiling on or off) -----------------
 #HotIf DaemonUp
 
@@ -421,13 +523,107 @@ Loop 9 {
 ; --- Daemon ----------------------------------------------------------------
 ; Full stop. flow-resident.ahk binds Mod+Ctrl+T to start while no daemon runs.
 #^t::StopFlow()
-#+e::StopFlow()
+#HotIf
 StopFlow() {
     Flow("stop")
     ExitApp()
 }
-#HotIf
 
-; --- Launcher (Mod+Space, Mod+D) and help overlay (Mod+Shift+/) --------------
+; --- Launcher and help overlay (their chords are in the table) --------------
 #Include %A_ScriptDir%\launcher.ahk
 #Include %A_ScriptDir%\help.ahk
+
+; --- Baked defaults ---------------------------------------------------------
+; For a daemon that does not answer `query binds` (an older build): the
+; built-in table as the daemon lists it, with the argv separator spelled
+; <US>. Generated from binds.toml; a test in src/config/binds.rs keeps it in
+; step (it prints the block to paste when it is out of date).
+; BEGIN DEFAULT BINDS (generated)
+DefaultBindsText := "
+(
+bind	#Left	tiling	dispatch	0	Mod+Left	focus the next window on this screen	focus<US>left
+bind	#Down	tiling	dispatch	0	Mod+Down	focus the next window on this screen	focus<US>down
+bind	#Up	tiling	dispatch	0	Mod+Up	focus the next window on this screen	focus<US>up
+bind	#Right	tiling	dispatch	0	Mod+Right	focus the next window on this screen	focus<US>right
+bind	!h	tiling	dispatch	0	Alt+H	focus the next window on this screen	focus<US>left
+bind	!j	tiling	dispatch	0	Alt+J	focus the next window on this screen	focus<US>down
+bind	!k	tiling	dispatch	0	Alt+K	focus the next window on this screen	focus<US>up
+bind	!l	tiling	dispatch	0	Alt+L	focus the next window on this screen	focus<US>right
+bind	#+Left	tiling	dispatch	0	Mod+Shift+Left	move the window along the strip (up/down inside a stacked column)	move-window<US>left
+bind	#+Down	tiling	dispatch	0	Mod+Shift+Down	move the window along the strip (up/down inside a stacked column)	move-window<US>down
+bind	#+Up	tiling	dispatch	0	Mod+Shift+Up	move the window along the strip (up/down inside a stacked column)	move-window<US>up
+bind	#+Right	tiling	dispatch	0	Mod+Shift+Right	move the window along the strip (up/down inside a stacked column)	move-window<US>right
+bind	!+h	tiling	dispatch	0	Alt+Shift+H	move the window along the strip (up/down inside a stacked column)	move-window<US>left
+bind	!+j	tiling	dispatch	0	Alt+Shift+J	move the window along the strip (up/down inside a stacked column)	move-window<US>down
+bind	!+k	tiling	dispatch	0	Alt+Shift+K	move the window along the strip (up/down inside a stacked column)	move-window<US>up
+bind	!+l	tiling	dispatch	0	Alt+Shift+L	move the window along the strip (up/down inside a stacked column)	move-window<US>right
+bind	#^Left	tiling	dispatch	0	Mod+Ctrl+Left	focus the other screen	focus-monitor<US>left
+bind	#^Down	tiling	dispatch	0	Mod+Ctrl+Down	focus the other screen	focus-monitor<US>down
+bind	#^Up	tiling	dispatch	0	Mod+Ctrl+Up	focus the other screen	focus-monitor<US>up
+bind	#^Right	tiling	dispatch	0	Mod+Ctrl+Right	focus the other screen	focus-monitor<US>right
+bind	#!Left	tiling	dispatch	0	Mod+Alt+Left	move the window to the other screen	move-to-monitor<US>left
+bind	#!Down	tiling	dispatch	0	Mod+Alt+Down	move the window to the other screen	move-to-monitor<US>down
+bind	#!Up	tiling	dispatch	0	Mod+Alt+Up	move the window to the other screen	move-to-monitor<US>up
+bind	#!Right	tiling	dispatch	0	Mod+Alt+Right	move the window to the other screen	move-to-monitor<US>right
+bind	#1	tiling	dispatch	0	Mod+1	switch to workspace 1	switch-workspace<US>1
+bind	#2	tiling	dispatch	0	Mod+2	switch to workspace 2	switch-workspace<US>2
+bind	#3	tiling	dispatch	0	Mod+3	switch to workspace 3	switch-workspace<US>3
+bind	#4	tiling	dispatch	0	Mod+4	switch to workspace 4	switch-workspace<US>4
+bind	#5	tiling	dispatch	0	Mod+5	switch to workspace 5	switch-workspace<US>5
+bind	#6	tiling	dispatch	0	Mod+6	switch to workspace 6	switch-workspace<US>6
+bind	#7	tiling	dispatch	0	Mod+7	switch to workspace 7	switch-workspace<US>7
+bind	#8	tiling	dispatch	0	Mod+8	switch to workspace 8	switch-workspace<US>8
+bind	#9	tiling	dispatch	0	Mod+9	switch to workspace 9	switch-workspace<US>9
+bind	#0	tiling	dispatch	0	Mod+0	switch to workspace 10	switch-workspace<US>10
+bind	#^1	tiling	dispatch	0	Mod+Ctrl+1	move the window to workspace 1	move-to-workspace<US>1
+bind	#^2	tiling	dispatch	0	Mod+Ctrl+2	move the window to workspace 2	move-to-workspace<US>2
+bind	#^3	tiling	dispatch	0	Mod+Ctrl+3	move the window to workspace 3	move-to-workspace<US>3
+bind	#^4	tiling	dispatch	0	Mod+Ctrl+4	move the window to workspace 4	move-to-workspace<US>4
+bind	#^5	tiling	dispatch	0	Mod+Ctrl+5	move the window to workspace 5	move-to-workspace<US>5
+bind	#^6	tiling	dispatch	0	Mod+Ctrl+6	move the window to workspace 6	move-to-workspace<US>6
+bind	#^7	tiling	dispatch	0	Mod+Ctrl+7	move the window to workspace 7	move-to-workspace<US>7
+bind	#^8	tiling	dispatch	0	Mod+Ctrl+8	move the window to workspace 8	move-to-workspace<US>8
+bind	#^9	tiling	dispatch	0	Mod+Ctrl+9	move the window to workspace 9	move-to-workspace<US>9
+bind	#^0	tiling	dispatch	0	Mod+Ctrl+0	move the window to workspace 10	move-to-workspace<US>10
+bind	#q	tiling	dispatch	0	Mod+Q	close window	close-window
+bind	#c	tiling	dispatch	0	Mod+C	center the focused column	center
+bind	#v	tiling	dispatch	0	Mod+V	toggle floating	set-window<US>cycle
+bind	#r	tiling	dispatch	0	Mod+R	cycle this screen's column widths (flow.toml [columns] presets)	width<US>next
+bind	#f	tiling	dispatch	0	Mod+F	fullscreen toggle	set-window<US>fullscreen
+bind	#[	tiling	dispatch	0	Mod+BracketLeft	alone: merge into the column on that side; stacked: pop out to that side	consume-or-expel<US>left
+bind	#]	tiling	dispatch	0	Mod+BracketRight	alone: merge into the column on that side; stacked: pop out to that side	consume-or-expel<US>right
+bind	#Space	always	launcher	0	Mod+Space	application launcher (apps, open windows, settings)	
+bind	#d	always	launcher	0	Mod+D	application launcher (apps, open windows, settings)	
+bind	#t	always	spawn	0	Mod+T	run alacritty	alacritty
+bind	#+t	always	spawn	1	Mod+Shift+T	run alacritty as admin	alacritty
+bind	#!t	always	spawn	0	Mod+Alt+T	run wt	wt
+bind	#!+t	always	spawn	1	Mod+Alt+Shift+T	run wt as admin	wt
+bind	#+vkBF	always	help	0	Mod+Shift+Slash	this help (Esc hides it)	
+bind	#+e	always	quit	0	Mod+Shift+E	stop FlowWM	
+row	Mod+Left/Down/Up/Right	focus the next window on this screen
+row	Alt+H/J/K/L	focus the next window on this screen
+row	Mod+Shift+Left/Down/Up/Right	move the window along the strip (up/down inside a stacked column)
+row	Alt+Shift+H/J/K/L	move the window along the strip (up/down inside a stacked column)
+row	Mod+Ctrl+Left/Down/Up/Right	focus the other screen
+row	Mod+Alt+Left/Down/Up/Right	move the window to the other screen
+row	Mod+1..9, Mod+0	switch to that workspace
+row	Mod+Ctrl+1..9, Mod+Ctrl+0	move the window to that workspace
+row	Mod+Q	close window
+row	Mod+C	center the focused column
+row	Mod+V	toggle floating
+row	Mod+R	cycle this screen's column widths (flow.toml [columns] presets)
+row	Mod+F	fullscreen toggle
+row	Mod+BracketLeft, Mod+BracketRight	alone: merge into the column on that side; stacked: pop out to that side
+row	Mod+Space, Mod+D	application launcher (apps, open windows, settings)
+row	Mod+T	run alacritty
+row	Mod+Shift+T	run alacritty as admin
+row	Mod+Alt+T	run wt
+row	Mod+Alt+Shift+T	run wt as admin
+row	Mod+Shift+Slash	this help (Esc hides it)
+row	Mod+Shift+E	stop FlowWM
+hardwired	Mod + left-button drag	move a window grabbed anywhere (a tile drops into the zone under the cursor, a float moves)
+hardwired	Mod+Ctrl+T	FlowWM off (and on again, via flow-resident.ahk)
+hardwired	Mod+Ctrl+Shift+T	pause toggle (off: Windows manages windows, chords fall through)
+source	defaults
+)"
+; END DEFAULT BINDS

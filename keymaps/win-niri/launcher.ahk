@@ -1,5 +1,6 @@
 ; ════════════════════════════════════════════════════════════════════════════
-; FlowWM application launcher (Mod+Space, Mod+D). Included from flow.ahk.
+; FlowWM application launcher (the `launcher` action: Mod+Space, Mod+D by
+; default). Included from flow.ahk.
 ;
 ; Fuzzy-finds Start-menu shortcuts, a few built-ins (Settings, Lock, Task
 ; Manager) and the open top-level windows. Enter runs / activates the
@@ -340,11 +341,9 @@ LauncherActivate(e) {
 }
 
 ; --- Hotkeys ---------------------------------------------------------------
-#HotIf DaemonUp
-#Space::LauncherToggle()
-#d::LauncherToggle()
-#HotIf
-
+; The chords that open the launcher (Mod+Space and Mod+D by default) are the
+; `launcher` action in the binds table; flow.ahk registers them. Only the
+; keys inside the panel are bound here.
 #HotIf IsSet(LauncherGui) && WinActive("ahk_id " LauncherGui.Hwnd)
 Up::LauncherMove(-1)
 Down::LauncherMove(1)

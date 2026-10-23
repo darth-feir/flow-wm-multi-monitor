@@ -2,19 +2,23 @@
 
 FlowWM keybindings in niri's flavour: the Windows key is Mod, arrows instead
 of hjkl, and every chord maps onto a `flow dispatch` command. The bindings
-themselves are listed in the header of `flow.ahk`; this file holds the
-design notes, the Windows lessons behind the scripts and the setup.
+are configuration: the `[binds]` table of `flow.toml`, in niri's spelling,
+laid over the default table in `binds.toml` here (see *The keymap is an
+interpreter* below and the user guide's Config Reference, `[binds]`). This
+file holds the design notes, the Windows lessons behind the scripts and the
+setup.
 
 ## Files
 
 | File | Role |
 |------|------|
-| `flow.ahk` | The keymap. `#Include`s the three files below. Started by the daemon (`flow start --ahk`) inside its kill-on-close job object. |
+| `flow.ahk` | The keymap: an interpreter that registers the chords `flow query binds --plain` lists (the daemon's view of `[binds]`), re-reads them when `flow.toml` is saved, and hardwires the Mod + left-button drag, Mod+Ctrl+T and Mod+Ctrl+Shift+T. `#Include`s the three files below. Started by the daemon (`flow start --ahk`) inside its kill-on-close job object. |
+| `binds.toml` | The default `[binds]` table, compiled into the daemon (`include_str!`). Paste a line into `flow.toml` to change it. Not read at runtime. |
 | `flow-exe.ahk` | `ResolveFlowExe()` — where `flow.exe` is. Shared by `flow.ahk` and `flow-resident.ahk`. |
-| `launcher.ahk` | Application launcher on Mod+Space / Mod+D: Start-menu shortcuts, open windows, a few built-ins, fuzzy-matched. |
-| `help.ahk` | Key-binding overlay on Mod+Shift+/. Its `Bindings` array is the source of truth for the overlay; keep it in step with the hotkeys. |
+| `launcher.ahk` | Application launcher (the `launcher` action, Mod+Space / Mod+D by default): Start-menu shortcuts, open windows, a few built-ins, fuzzy-matched. |
+| `help.ahk` | Key-binding overlay (the `show-hotkey-overlay` action, Mod+Shift+/ by default). Its rows come from the same `flow query binds` listing the hotkeys are registered from, so it cannot disagree with them. |
 | `flow-resident.ahk` | Optional resident starter: runs all the time (shortcut in `shell:startup`) and turns Mod+Ctrl+T into an on/off switch for the whole of FlowWM. |
-| `flow.toml.example` | The daemon side of the map: `[columns]` width presets (fractions and `1/3+2/3`-style patterns, per-screen `[[columns.screen]]` rules) and `edge_hop = false`. |
+| `flow.toml.example` | The daemon side of the map: `[columns]` width presets (fractions and `1/3+2/3`-style patterns, per-screen `[[columns.screen]]` rules), `edge_hop = false`, and commented `[binds]` / `[startup]` examples. |
 
 Install: copy `flow.ahk`, `flow-exe.ahk`, `launcher.ahk` and `help.ahk` to
 `%USERPROFILE%\.config\flow\` (the files must sit next to each other — the
@@ -47,6 +51,52 @@ Terminals and launched applications start in the home folder
 started from; `flow-resident.ahk` starts the daemon from the home folder
 for the same reason.
 
+## The keymap is an interpreter
+
+`flow.ahk` has no chord table of its own. After its startup gate it runs
+`flow query binds --plain` (the output goes through a temp file, read as
+UTF-8, so nothing is decoded with the console code page and no console
+window flashes) and registers every `bind` record with `Hotkey()`:
+
+```text
+bind  #Left  tiling  dispatch  0  Mod+Left  focus the next window on this screen  focus<US>left
+row   Mod+Left/Down/Up/Right  focus the next window on this screen
+hardwired  Mod+Ctrl+T  FlowWM off (and on again, via flow-resident.ahk)
+source  defaults
+```
+
+- The **hotkey** is the daemon's translation of the chord (`Mod+Shift+Slash`
+  → `#+vkBF`, see the lesson below); the **scope** picks the `HotIf`
+  criterion: `tiling` = `TilingGate` (daemon up and tiling on), `always` =
+  `AlwaysGate` (daemon up). The gates are named functions so a reload can
+  turn a chord off under the criterion it was registered with.
+- The **kind** picks the callback: `dispatch` runs `flow dispatch <argv>`
+  through `D()`, `spawn` resolves and starts a program (`Launch()`),
+  `launcher` / `help` / `quit` / `toggle-tiling` call the script's own
+  functions. A kind this script does not know (a newer daemon) is logged
+  and skipped.
+- `row` and `hardwired` records are the overlay; `help.ahk` rebuilds its
+  panel from them after every (re)load.
+
+The listing is re-read when `flow.toml` changes: `CheckDaemon`'s 2 s timer
+also compares the file's modification time, and ~2.5 s after a change
+(after the daemon's own one-second debounce has applied or refused it) the
+script queries again and re-registers only if the listing differs, with a
+one-line OSD. A refused reload leaves the daemon's listing, and so the
+chords, unchanged.
+
+Hardwired here and refused by the table: the Mod + left-button drag, and
+Mod+Ctrl+T / Mod+Ctrl+Shift+T, which `flow-resident.ahk` shares and which
+must keep working with a broken table. `DefaultBindsText` at the end of the
+script is the built-in listing for a daemon too old to answer `query
+binds`; a test (`the_keymaps_baked_fallback_matches_the_defaults`) keeps it
+in step and prints the block to paste when `binds.toml` changes.
+
+To change a chord: add it to `[binds]` in `flow.toml` and save. `flow query
+binds` shows the result; `flow config check` names mistakes
+(`binds."Mod+Bogus": unknown key ...`); set `FLOW_AHK_LOG` to see each
+registration (`binds: 59 registered`).
+
 ## Daemon liveness and fail-back
 
 Every window-management chord is registered under `#HotIf DaemonUp` (or
@@ -77,18 +127,20 @@ polling has not noticed yet.
 
 `flow dispatch tiling toggle` pauses tiling inside the daemon without
 stopping it. While tiling is off every window-management chord (focus,
-move, monitors, workspaces, close, center, float, width, consume/expel,
-terminals) is released to Windows, so Win+Arrows snap, Win+1..9 launch from
-the taskbar, and so on. Only the toggle itself, the launcher, the help
-overlay and the stop chords stay bound. The state is read from `flow ping`
+move, monitors, workspaces, close, center, float, width, consume/expel —
+the `tiling`-scoped binds) is released to Windows, so Win+Arrows snap,
+Win+1..9 launch from the taskbar, and so on. The toggle itself, the
+launcher, the help overlay, the program (`spawn`) chords and the stop
+chords stay bound (`always` scope). The state is read from `flow ping`
 at startup (`"tiling off"` in its output; `true` is assumed if ping cannot
 be run or does not answer in 3 s) and flipped locally whenever the toggle
 dispatch exits 0; an on-screen message reports each flip.
 
 ## Stop and start (Mod+Ctrl+T, Mod+Shift+E)
 
-`flow.ahk` binds Mod+Ctrl+T and Mod+Shift+E (niri's quit chord) to
-`flow stop` followed by its own exit. `flow-resident.ahk` binds the same
+`flow.ahk` hardwires Mod+Ctrl+T, and the default table binds Mod+Shift+E
+(niri's quit chord, the `quit` action), to `flow stop` followed by the
+script's own exit. `flow-resident.ahk` binds the same
 Mod+Ctrl+T to `flow start --ahk` under `#HotIf DaemonDown()`, so with the
 resident script running the chord is a plain on/off switch. Both scripts
 hook the key; the one whose `#HotIf` condition is false lets it pass
@@ -117,8 +169,10 @@ launcher), Win+F (Feedback Hub), Win+D (show desktop), Win+T (taskbar
 cycle), Win+Arrows (Snap), Win+Ctrl+Left/Right
 (virtual desktops), Win+Shift+Left/Right (Windows' own move-to-monitor),
 Win+Space (Windows' input-language switcher; Win+Ctrl+Space, which cycles
-the other way, still works). With tiling off only Win+Space, Win+D,
-Win+Shift+/, Win+Ctrl+T, Win+Ctrl+Shift+T and Win+Shift+E remain shadowed.
+the other way, still works). With tiling off only the `always`-scoped
+chords remain shadowed: Win+Space, Win+D, Win+T and its Shift/Alt variants,
+Win+Shift+/, Win+Ctrl+T, Win+Ctrl+Shift+T and Win+Shift+E. All of these
+follow the `[binds]` table; the list above is the default one.
 
 ## AutoHotkey and Windows lessons
 
@@ -139,13 +193,14 @@ Win+Shift+/, Win+Ctrl+T, Win+Ctrl+Shift+T and Win+Shift+E remain shadowed.
   the monitor that holds the active window, then retries `WinActivate` for
   ~0.5 s. It measures the window with a hidden `Show` first so auto-sized
   controls are already laid out.
-- **Admin launches** use the shell's `RunAs` verb, so UAC prompts as usual;
-  a declined prompt is not reported. Alacritty is run by fixed absolute
-  paths first (the machine-wide `%ProgramFiles%` install before the
-  per-user one) and a `where.exe` lookup only as the last resort; Windows
-  Terminal's Store execution alias is a fixed per-user path
-  (`%LOCALAPPDATA%\Microsoft\WindowsApps\wt.exe`), with `wt.exe` left to the
-  shell's lookup only if the alias is absent.
+- **Programs** (`spawn` binds) are resolved by `ResolveProgram()` the way
+  the daemon resolves `[startup]` entries: a bare name is tried as
+  `%ProgramFiles%\<name>\<name>.exe` (and the x86 folder),
+  `%LOCALAPPDATA%\Programs\<name>\<name>.exe`, the Store's execution alias
+  `%LOCALAPPDATA%\Microsoft\WindowsApps\<name>.exe`, then each `PATH`
+  entry — never the working directory; a path is taken only when absolute.
+  Admin launches use the shell's `RunAs` verb, so UAC prompts as usual; a
+  declined prompt is not reported. Programs start in the home folder.
 - **Exit codes without blocking a hotkey:** `DispatchDone` opens the
   process with `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE` (enough to
   read the exit code) and polls `WaitForSingleObject` with a zero timeout.
