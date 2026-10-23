@@ -87,12 +87,17 @@ pub struct ScrollingSpace {
     /// Saved column width before monocle mode (per column index), in pixels.
     monocle_saved_width: Option<(usize, i32)>,
     /// The width pattern of the monitor's current preset, one pixel width
-    /// per term. With two or more terms every column is **pinned** to
-    /// `pattern[i % n]` by its position on every mutation; with fewer the
-    /// strip behaves as before (`config.column_width` is the base width and
-    /// columns resize freely). See
-    /// `docs/adr/0014-width-patterns-by-column-position.md`.
+    /// per term. With two or more terms the terms are the screen's **slots**
+    /// and every column is **pinned** to its slot on every mutation
+    /// ([`pin_to_slots`](Self::pin_to_slots)); with fewer the strip behaves
+    /// as before (`config.column_width` is the base width and columns
+    /// resize freely). See `docs/adr/0017-width-patterns-are-screen-slots.md`.
     width_pattern: Vec<u32>,
+    /// Which term the first slot shows: slot `k` (0 at the anchor column)
+    /// has term `(k + slot_shift) mod n`. Chosen on every pattern apply so
+    /// the focused column gets the first term, kept while the pattern stays,
+    /// 0 without one.
+    slot_shift: usize,
 }
 
 /// Derive the cached [`MutationConfig`] — including the slot-ladder bounds
@@ -191,6 +196,7 @@ impl ScrollingSpace {
             config,
             monocle_saved_width: None,
             width_pattern: Vec::new(),
+            slot_shift: 0,
         }
     }
 
@@ -210,29 +216,53 @@ impl ScrollingSpace {
     }
 
     /// Whether a pattern of two or more terms pins every column's width to
-    /// its position (expand / shrink / set-width / monocle / drag-resize are
-    /// then refused or undone on the next mutation).
+    /// its screen slot (expand / shrink / set-width / monocle / drag-resize
+    /// are then refused or undone on the next mutation).
     #[must_use]
     pub fn widths_pinned(&self) -> bool {
         self.width_pattern.len() > 1
+    }
+
+    /// The slot order of the current pattern: slot `k` shows term
+    /// `(k + slot_shift) mod n`. 0 without a pattern.
+    #[must_use]
+    pub fn slot_shift(&self) -> usize {
+        self.slot_shift
+    }
+
+    /// The anchor column of the current layout — the column at the
+    /// viewport's left edge, where the run of slots starts — while a pattern
+    /// pins the strip. `None` without a pattern or without columns.
+    #[must_use]
+    pub fn slot_anchor(&self) -> Option<usize> {
+        if !self.widths_pinned() {
+            return None;
+        }
+        self.anchor_of(&self.virtual_layout)
     }
 
     /// Install `pattern` (pixel widths per term, already floored by the
     /// caller) as this strip's width pattern: the first term becomes the
     /// base column width (the ladder's `n = 0` rung and the width new
     /// columns are created at) and, for two or more terms, every column is
-    /// re-flowed to `pattern[i % n]` by position. Existing widths are left
-    /// alone for a single term (the reload policy); an empty pattern clears
-    /// pinning and keeps the base width. Returns the re-projected layout.
+    /// pinned to its slot with the slot order the strip already had (a
+    /// reload or hotplug carry-over does not re-choose it). Existing widths
+    /// are left alone for a single term (the reload policy); an empty
+    /// pattern clears pinning and keeps the base width. Returns the
+    /// re-projected layout.
     pub fn set_width_pattern(&mut self, pattern: &[u32]) -> ActualLayout {
         self.width_pattern = pattern.to_vec();
+        self.slot_shift = match pattern.len() {
+            0 | 1 => 0,
+            n => self.slot_shift % n,
+        };
         if let Some(&first) = pattern.first() {
             let _ = self.set_base_column_width(first);
         }
         if self.widths_pinned() {
             self.monocle_saved_width = None;
             let layout = self.virtual_layout.clone();
-            // `apply_mutation` pins the widths and keeps the focus in view.
+            // `apply_mutation` pins the slots and keeps the focus in view.
             let _ = self.apply_mutation(layout);
         }
         self.actual.clone()
@@ -240,11 +270,13 @@ impl ScrollingSpace {
 
     /// `flow dispatch width <preset>` for a strip: install `pattern` and set
     /// every column to it — a single term goes through
-    /// [`apply_column_width_to_all`](Self::apply_column_width_to_all), a
-    /// pattern pins every column by position. Returns the applied layout for
-    /// the animator.
+    /// [`apply_column_width_to_all`](Self::apply_column_width_to_all); a
+    /// pattern fills the screen's slots in place from the column at the left
+    /// edge, with the slot order chosen so the **focused column takes the
+    /// first term**. Returns the applied layout for the animator.
     pub fn apply_width_pattern(&mut self, pattern: &[u32]) -> AppliedLayout {
         self.width_pattern = pattern.to_vec();
+        self.slot_shift = 0;
         match pattern {
             [] => AppliedLayout {
                 actual_layout: self.actual.clone(),
@@ -252,12 +284,20 @@ impl ScrollingSpace {
             },
             [single] => self.apply_column_width_to_all(*single),
             [first, ..] => {
-                let old = self.virtual_layout.clone();
+                // `refit_to_config` pins with shift 0 and seats the camera on
+                // the anchor; the shift is then read off the focus's distance
+                // from that anchor and the strip pinned once more.
                 let _ = self.set_base_column_width(*first);
                 self.monocle_saved_width = None;
                 let mut new_layout = self.virtual_layout.clone();
-                self.pin_widths(&mut new_layout);
-                self.reanchor_after_reflow(&old, &mut new_layout);
+                let anchor = self.pin_to_slots(&mut new_layout, None);
+                let focus = self
+                    .last_focused_window
+                    .and_then(|w| new_layout.find_window(w).map(|(c, _)| c));
+                if let (Some(anchor), Some(focus)) = (anchor, focus) {
+                    let n = pattern.len() as i64;
+                    self.slot_shift = (anchor as i64 - focus as i64).rem_euclid(n) as usize;
+                }
                 self.apply_mutation(new_layout)
             }
         }
@@ -289,18 +329,61 @@ impl ScrollingSpace {
         *new_layout = mutations::ensure_column_visible(new_layout, focus_col, &self.config);
     }
 
-    /// Set every column of `layout` to its position's pattern width,
-    /// clamped to the ladder top; a no-op unless the widths are pinned.
-    fn pin_widths(&self, layout: &mut VirtualLayout) {
-        if !self.widths_pinned() {
-            return;
+    /// The anchor of `layout`: the first column whose left edge is at or
+    /// past the viewport's left edge under the widths it carries, capped so
+    /// a whole run of `n` slots still fits before the strip's end. `None`
+    /// without columns.
+    fn anchor_of(&self, layout: &VirtualLayout) -> Option<usize> {
+        let len = layout.columns.len();
+        if len == 0 {
+            return None;
         }
-        let n = self.width_pattern.len();
+        let gap = self.config.padding.window_gap;
+        let first_full = (0..len)
+            .find(|&i| column_left(layout, i, gap) >= layout.viewport_offset)
+            .unwrap_or(len - 1);
+        Some(first_full.min(len.saturating_sub(self.width_pattern.len())))
+    }
+
+    /// Pin `layout` to the screen slots (ADR-0017): the anchor column
+    /// ([`anchor_of`](Self::anchor_of)) starts the run, column `i` takes term
+    /// `(i − anchor + slot_shift) mod n`, and the camera starts on the
+    /// anchor, so the view always begins on a column boundary and the run
+    /// fills the screen. If that leaves `keep` (else the strip's focus) past
+    /// the right edge — terms adding up to less than the screen let more
+    /// than `n` columns fit before the re-flow — the run is moved so that
+    /// column ends it. A no-op without a pattern; returns the anchor used.
+    fn pin_to_slots(&self, layout: &mut VirtualLayout, keep: Option<WindowId>) -> Option<usize> {
+        if !self.widths_pinned() {
+            return None;
+        }
+        let mut anchor = self.anchor_of(layout)?;
+        self.pin_run(layout, anchor);
+        let gap = self.config.padding.window_gap;
+        let keep = keep
+            .or(self.last_focused_window)
+            .and_then(|w| layout.find_window(w).map(|(c, _)| c));
+        if let Some(col) = keep {
+            let right = column_left(layout, col, gap) + layout.columns[col].width_px;
+            if right > layout.viewport_offset + self.config.monitor_width {
+                anchor = (col + 1).saturating_sub(self.width_pattern.len());
+                self.pin_run(layout, anchor);
+            }
+        }
+        Some(anchor)
+    }
+
+    /// Widths and camera for the run of slots starting at `anchor`.
+    fn pin_run(&self, layout: &mut VirtualLayout, anchor: usize) {
+        let gap = self.config.padding.window_gap;
+        let n = self.width_pattern.len() as i64;
         for (i, col) in layout.columns.iter_mut().enumerate() {
-            col.width_px = (self.width_pattern[i % n] as i32)
+            let term = (i as i64 - anchor as i64 + self.slot_shift as i64).rem_euclid(n) as usize;
+            col.width_px = (self.width_pattern[term] as i32)
                 .min(self.config.abs_max_width)
                 .max(1);
         }
+        layout.viewport_offset = (column_left(layout, anchor, gap) - gap).max(0);
     }
 
     /// Re-derive this space's cached geometry from new layout params without
@@ -414,7 +497,7 @@ impl ScrollingSpace {
         }
         if self.widths_pinned() {
             let mut layout = self.virtual_layout.clone();
-            self.pin_widths(&mut layout);
+            let _ = self.pin_to_slots(&mut layout, None);
             self.virtual_layout = layout;
         }
         if self.config.available_height() != old.available_height()
@@ -590,10 +673,11 @@ impl ScrollingSpace {
         mut new_layout: VirtualLayout,
         window: Option<WindowId>,
     ) -> AppliedLayout {
-        // A pattern decides widths by position, so a structural change
-        // (insert, remove, swap) re-flows the columns after it here and a
-        // resize that slipped through is undone on the spot.
-        self.pin_widths(&mut new_layout);
+        // A pattern decides widths by screen slot, so a camera move or a
+        // structural change (insert, remove, swap) re-pins the run from the
+        // column now at the left edge here, and a resize that slipped
+        // through is undone on the spot.
+        let _ = self.pin_to_slots(&mut new_layout, window);
         let new_layout = mutations::normalize_row_viewports(&new_layout, window, &self.config);
         let new_actual = projection::project(
             &new_layout,
@@ -1394,11 +1478,10 @@ mod tests {
         let col_left = |layout: &VirtualLayout, i: usize| column_left(layout, i, gap);
 
         // 1/3 + 2/3 of a 1920 screen: 636 + 1272 + 3 gaps = 1920. The focus
-        // (column 2, 636 wide) is revealed on the right, so the view starts
-        // at column 1.
-        let applied = engine.apply_width_pattern(&[636, 1272]);
-        let vl = &applied.virtual_layout;
-        assert_eq!(vl.viewport_offset, col_left(vl, 1) - gap);
+        // (column 2) must stay in view, so the run starts at column 1 and
+        // the focus, last in the run, takes the first term.
+        engine.apply_width_pattern(&[636, 1272]);
+        assert_run(&engine, 1, &[1272, 636]);
 
         // Uniform 1/2 (954 + 954 + 3 gaps = 1920), through the preset entry
         // point so the pattern pin is released first: column 1 stays at the
@@ -1407,12 +1490,240 @@ mod tests {
         let vl = &applied.virtual_layout;
         assert_eq!(vl.viewport_offset, col_left(vl, 1) - gap);
         assert_eq!(col_left(vl, 2) + 954 + gap, vl.viewport_offset + 1920);
+        assert_eq!(engine.slot_shift(), 0);
+        assert_eq!(engine.slot_anchor(), None);
 
         // Back to the pattern: the same column is anchored again.
-        let applied = engine.apply_width_pattern(&[636, 1272]);
-        let vl = &applied.virtual_layout;
-        assert_eq!(vl.viewport_offset, col_left(vl, 1) - gap);
-        assert_eq!(col_left(vl, 2) + 636 + gap, vl.viewport_offset + 1920);
+        engine.apply_width_pattern(&[636, 1272]);
+        assert_run(&engine, 1, &[1272, 636]);
+    }
+
+    /// Every column's width, left to right.
+    fn widths(engine: &ScrollingSpace) -> Vec<i32> {
+        engine
+            .virtual_layout()
+            .columns
+            .iter()
+            .map(|c| c.width_px)
+            .collect()
+    }
+
+    /// The run of slots starts at `anchor`: the camera sits one gap before
+    /// it, the columns from it have the slot widths, and the last slot ends
+    /// at or before the right edge of the 1920 px test monitor.
+    fn assert_run(engine: &ScrollingSpace, anchor: usize, slots: &[i32]) {
+        let gap = test_padding().window_gap;
+        let vl = engine.virtual_layout();
+        assert_eq!(
+            engine.slot_anchor(),
+            Some(anchor),
+            "anchor {:?}",
+            widths(engine)
+        );
+        assert_eq!(
+            vl.viewport_offset,
+            (column_left(vl, anchor, gap) - gap).max(0),
+            "camera on the anchor"
+        );
+        for (k, w) in slots.iter().enumerate() {
+            assert_eq!(
+                vl.columns[anchor + k].width_px,
+                *w,
+                "slot {k} of {:?}",
+                widths(engine)
+            );
+        }
+        let last = anchor + slots.len() - 1;
+        assert!(
+            column_left(vl, last, gap) + vl.columns[last].width_px <= vl.viewport_offset + 1920,
+            "the run fits the screen"
+        );
+    }
+
+    /// Whether column `idx` is wholly on screen.
+    fn visible(engine: &ScrollingSpace, idx: usize) -> bool {
+        let gap = test_padding().window_gap;
+        let vl = engine.virtual_layout();
+        let left = column_left(vl, idx, gap);
+        left >= vl.viewport_offset && left + vl.columns[idx].width_px <= vl.viewport_offset + 1920
+    }
+
+    #[test]
+    fn mod_r_gives_the_focused_column_the_first_term() {
+        // Three columns of 634 (3 × 634 + 4 gaps = 1918) all on screen.
+        let mut engine = ScrollingSpace::new(test_monitor(), 634, 320, 100, 100, test_padding(), 4);
+        engine.add_window(WindowId(1));
+        engine.add_window(WindowId(2));
+        engine.add_window(WindowId(3));
+        // "1/2+1/4+1/4": 954 + 475 + 475 + 4 gaps = 1920.
+        engine.set_focus(WindowId(2));
+        engine.apply_width_pattern(&[954, 475, 475]);
+        assert_run(&engine, 0, &[475, 954, 475]);
+        assert_eq!(engine.slot_shift(), 2);
+        engine.set_focus(WindowId(3));
+        engine.apply_width_pattern(&[954, 475, 475]);
+        assert_run(&engine, 0, &[475, 475, 954]);
+        assert_eq!(engine.slot_shift(), 1);
+        engine.set_focus(WindowId(1));
+        engine.apply_width_pattern(&[954, 475, 475]);
+        assert_run(&engine, 0, &[954, 475, 475]);
+        assert_eq!(engine.slot_shift(), 0);
+
+        // "2/3+1/3" with the right window focused: it is the big one.
+        let mut two = ScrollingSpace::new(test_monitor(), 954, 320, 100, 100, test_padding(), 4);
+        two.add_window(WindowId(1));
+        two.add_window(WindowId(2));
+        two.apply_width_pattern(&[1272, 636]);
+        assert_run(&two, 0, &[636, 1272]);
+    }
+
+    #[test]
+    fn focus_past_the_edge_re_pins_the_run_and_keeps_the_slots() {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        engine.add_window(WindowId(1));
+        engine.add_window(WindowId(2));
+        engine.add_window(WindowId(3)); // focus
+        engine.apply_width_pattern(&[1272, 636]);
+        // The run is columns 1 and 2, the focus (column 2) big.
+        assert_run(&engine, 1, &[636, 1272]);
+        assert!(!visible(&engine, 0));
+
+        // Focus within the run: nothing moves.
+        let (focused, diff) = engine
+            .focus(WindowId(3), Direction::Left)
+            .expect("neighbour");
+        assert_eq!(focused, WindowId(2));
+        assert!(diff.is_none());
+        assert_run(&engine, 1, &[636, 1272]);
+
+        // Past the left edge: column 0 comes in and takes the left slot,
+        // column 1 moves to the right slot, column 2 leaves on the right.
+        let (focused, diff) = engine
+            .focus(WindowId(2), Direction::Left)
+            .expect("neighbour");
+        assert_eq!(focused, WindowId(1));
+        assert!(diff.is_some());
+        assert_run(&engine, 0, &[636, 1272]);
+        assert!(!visible(&engine, 2));
+
+        // And back past the right edge: column 2 takes the right slot again.
+        let _ = engine.focus(WindowId(1), Direction::Right);
+        let (_, diff) = engine
+            .focus(WindowId(2), Direction::Right)
+            .expect("neighbour");
+        assert!(diff.is_some());
+        assert_run(&engine, 1, &[636, 1272]);
+        assert!(!visible(&engine, 0));
+    }
+
+    #[test]
+    fn a_column_added_next_to_the_focus_takes_its_slot_and_removal_keeps_a_full_run() {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        engine.add_window(WindowId(1));
+        engine.add_window(WindowId(2)); // focus
+        engine.apply_width_pattern(&[1272, 636]);
+        assert_run(&engine, 0, &[636, 1272]);
+
+        // A new column after the focus: the run moves one column right so
+        // the new, focused column is in it; column 0 leaves on the left and
+        // the slots stay where they were on screen.
+        engine.add_window(WindowId(3));
+        assert_run(&engine, 1, &[636, 1272]);
+        assert!(!visible(&engine, 0));
+
+        // Removing the anchor: the run re-forms from what is left.
+        engine.remove_window(WindowId(2));
+        assert_eq!(widths(&engine), vec![636, 1272]);
+        assert_run(&engine, 0, &[636, 1272]);
+    }
+
+    #[test]
+    fn swapping_visible_columns_moves_the_windows_not_the_slots() {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        engine.add_window(WindowId(1));
+        engine.add_window(WindowId(2)); // focus
+        engine.apply_width_pattern(&[1272, 636]);
+        assert_run(&engine, 0, &[636, 1272]);
+        engine
+            .swap_column(WindowId(2), Direction::Left)
+            .expect("swapped");
+        let vl = engine.virtual_layout();
+        assert_eq!(vl.columns[0].rows[0].window_id, WindowId(2));
+        assert_eq!(vl.columns[1].rows[0].window_id, WindowId(1));
+        assert_run(&engine, 0, &[636, 1272]);
+    }
+
+    #[test]
+    fn fewer_slots_keep_the_anchor_and_the_focus_in_view_and_more_slots_grow_right() {
+        // Four columns of 475 (4 × 475 + 5 gaps = 1920), all on screen.
+        let mut engine = ScrollingSpace::new(test_monitor(), 475, 320, 100, 100, test_padding(), 4);
+        for id in 1..=4 {
+            engine.add_window(WindowId(id));
+        }
+        engine.apply_width_pattern(&[475]);
+        assert!(visible(&engine, 0) && visible(&engine, 3));
+
+        // Three slots with the first column focused: columns 0..2 take them,
+        // column 3 leaves on the right.
+        engine.set_focus(WindowId(1));
+        engine.apply_width_pattern(&[954, 475, 475]);
+        assert_run(&engine, 0, &[954, 475, 475]);
+        assert!(!visible(&engine, 3));
+
+        // The same with the last column focused: the run moves right by the
+        // minimum that keeps it in view, so columns 1..3 take the slots, the
+        // focus (last in the run) is the big one, column 0 leaves on the left.
+        engine.apply_width_pattern(&[475]);
+        engine.set_focus(WindowId(4));
+        engine.apply_width_pattern(&[954, 475, 475]);
+        assert_run(&engine, 1, &[475, 475, 954]);
+        assert!(!visible(&engine, 0));
+
+        // Back to four slots: the run grows to the right from the anchor,
+        // and with no column beyond 3 the camera comes back so all four fit.
+        engine.apply_width_pattern(&[475]);
+        assert_eq!(engine.virtual_layout().viewport_offset, 0);
+        assert!(visible(&engine, 0) && visible(&engine, 3));
+
+        // With a fifth column the grown run is columns 1..4.
+        engine.add_window(WindowId(5));
+        engine.set_focus(WindowId(4));
+        engine.apply_width_pattern(&[954, 475, 475]);
+        assert_run(&engine, 1, &[475, 475, 954]);
+        engine.apply_width_pattern(&[475]);
+        assert!(!visible(&engine, 0));
+        assert!(visible(&engine, 1) && visible(&engine, 4));
+    }
+
+    #[test]
+    fn terms_under_one_screen_keep_the_focus_in_view() {
+        // Five columns of 300 all on screen; "1/2+1/10"-sized slots (954 +
+        // 188) leave room, so more than two old columns fit before the pin.
+        let mut engine = ScrollingSpace::new(test_monitor(), 300, 320, 100, 100, test_padding(), 4);
+        for id in 1..=5 {
+            engine.add_window(WindowId(id));
+        }
+        engine.apply_width_pattern(&[954, 188]);
+        // The focus (column 4) ends the run and takes the first term.
+        assert_run(&engine, 3, &[188, 954]);
+        assert!(visible(&engine, 4));
+    }
+
+    #[test]
+    fn a_carried_over_pattern_keeps_its_slot_order() {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        engine.add_window(WindowId(1));
+        engine.add_window(WindowId(2)); // focus
+        engine.apply_width_pattern(&[1272, 636]);
+        assert_eq!(engine.slot_shift(), 1);
+        // A reload or hotplug re-installs the (re-floored) pattern: same order.
+        engine.set_width_pattern(&[1272, 636]);
+        assert_eq!(engine.slot_shift(), 1);
+        assert_run(&engine, 0, &[636, 1272]);
+        // A fraction has no slot order.
+        engine.set_width_pattern(&[954]);
+        assert_eq!(engine.slot_shift(), 0);
+        assert!(!engine.widths_pinned());
     }
 
     #[test]

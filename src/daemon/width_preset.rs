@@ -10,11 +10,13 @@
 //! column on that monitor is created at — a window that arrives by
 //! creation, `set-window tile`, `move-to-monitor`, an edge hop, a hotplug
 //! migration or a loadout leftover — and the `n = 0` rung of the
-//! expand/shrink ladder. A preset with two or more terms (`"1/3+2/3"`) is a
-//! **pattern**: the strip pins every column to `terms[i % n]` by position
-//! ([`ScrollingSpace::set_width_pattern`]), so resizing is refused on that
-//! monitor. `flow dispatch width` additionally sets every existing column on
-//! every workspace of the focused monitor to the new preset.
+//! expand/shrink ladder. A preset with two or more terms (`"2/3+1/3"`) is a
+//! **pattern**: its terms are the screen's slots, filled from the column at
+//! the left edge with the focused column taking the first term
+//! ([`ScrollingSpace::apply_width_pattern`]), and the strip stays pinned to
+//! them, so resizing is refused on that monitor. `flow dispatch width`
+//! additionally sets every existing column on every workspace of the
+//! focused monitor to the new preset.
 //!
 //! Without a `[columns]` section nothing here applies: the base width comes
 //! from `columns_per_screen` / `column_width` as before
@@ -22,9 +24,10 @@
 //! Whether a preset fits a screen is checked against the live screens
 //! ([`check_screens`]) at startup and on reload; the pixel floor is only a
 //! fallback for a display that appears later. Rationale:
-//! `docs/adr/0014-width-patterns-by-column-position.md`.
+//! `docs/adr/0014-width-patterns-by-column-position.md` (grammar, rules)
+//! and `docs/adr/0017-width-patterns-are-screen-slots.md` (slots).
 //!
-//! [`ScrollingSpace::set_width_pattern`]: crate::workspace::ScrollingSpace::set_width_pattern
+//! [`ScrollingSpace::apply_width_pattern`]: crate::workspace::ScrollingSpace::apply_width_pattern
 
 use crate::common::Rect;
 use crate::config::types::FlowConfig;
@@ -240,8 +243,8 @@ impl FlowWM {
     }
 
     /// Why a resize command is refused on the active monitor: its preset is
-    /// a pattern, which pins every column's width to its position. `None`
-    /// when columns may be resized.
+    /// a pattern, which pins every column's width to its screen slot.
+    /// `None` when columns may be resized.
     #[must_use]
     pub(super) fn pinned_widths_refusal(&self) -> Option<String> {
         if !self.active_scrolling().widths_pinned() {
@@ -251,7 +254,7 @@ impl FlowWM {
             .monitor_preset_label(self.active_monitor)
             .unwrap_or_default();
         Some(format!(
-            "column widths follow the pattern \"{label}\" on this screen (every column takes its position's share); switch to a single-fraction preset with `flow dispatch width` to resize columns"
+            "column widths follow the pattern \"{label}\" on this screen (the columns on screen take its shares left to right); switch to a single-fraction preset with `flow dispatch width` to resize columns"
         ))
     }
 
@@ -865,13 +868,16 @@ mod tests {
     }
 
     #[test]
-    fn a_pattern_pins_widths_by_position_and_reflows_on_insert_and_remove() {
+    fn a_pattern_fills_the_screen_slots_from_the_focused_column() {
         let mut flow = pattern_fixture();
         assert_eq!(flow.monitor_preset_label(1).as_deref(), Some("1/3+2/3"));
-        // C at position 0 takes 1/3 (618), D at position 1 takes 2/3 (1253).
-        assert_eq!(widths(&flow, 1, 1), vec![618, 1253]);
+        // D (the strip's focus, on the right) takes the first term, 1/3
+        // (618); C, in the slot before it, 2/3 (1253).
+        assert_eq!(widths(&flow, 1, 1), vec![1253, 618]);
         assert_eq!(base_width(&flow, 1, 1), 618);
-        assert!(flow.monitors[1].active_scrolling().widths_pinned());
+        let strip = flow.monitors[1].active_scrolling();
+        assert!(strip.widths_pinned());
+        assert_eq!((strip.slot_anchor(), strip.slot_shift()), (Some(0), 1));
         // The empty workspace 2 learned the pattern too.
         assert!(
             flow.monitors[1]
@@ -880,22 +886,32 @@ mod tests {
                 .scrolling
                 .widths_pinned()
         );
-        // A third column repeats the period: 1/3 again.
+        // Applied again with C focused: C takes the first term instead.
+        flow.monitors[1]
+            .active_scrolling_mut()
+            .set_focus(WindowId(C));
+        flow.apply_width_preset(1, 1);
+        assert_eq!(widths(&flow, 1, 1), vec![618, 1253]);
+        assert_eq!(flow.monitors[1].active_scrolling().slot_shift(), 0);
+        // A third column, focused, appended on the right: the run moves one
+        // column right so it is in view; the slots stay where they are.
         flow.monitors[1]
             .active_scrolling_mut()
             .add_window(WindowId(0x99));
-        assert_eq!(widths(&flow, 1, 1), vec![618, 1253, 618]);
-        // Inserting at the front re-flows everything after it.
+        assert_eq!(widths(&flow, 1, 1), vec![1253, 618, 1253]);
+        assert_eq!(flow.monitors[1].active_scrolling().slot_anchor(), Some(1));
+        // Inserting at the front brings the camera back to the strip's start.
         flow.monitors[1]
             .active_scrolling_mut()
             .prepend_window(WindowId(0x98));
         assert_eq!(widths(&flow, 1, 1), vec![618, 1253, 618, 1253]);
-        // Removing the first column re-flows the rest.
+        assert_eq!(flow.monitors[1].active_scrolling().slot_anchor(), Some(0));
+        // Removing the anchor: the next column starts the run.
         flow.monitors[1]
             .active_scrolling_mut()
             .remove_window(WindowId(0x98));
         assert_eq!(widths(&flow, 1, 1), vec![618, 1253, 618]);
-        // Swapping two columns moves the windows, not the widths.
+        // Swapping two columns moves the windows, not the slots.
         let strip = flow.monitors[1].active_scrolling().virtual_layout();
         let first = strip.columns[0].rows[0].window_id;
         let second = strip.columns[1].rows[0].window_id;
@@ -910,6 +926,7 @@ mod tests {
         flow.apply_width_preset(1, 2);
         assert_eq!(widths(&flow, 1, 1), vec![936, 936, 936]);
         assert!(!flow.monitors[1].active_scrolling().widths_pinned());
+        assert_eq!(flow.monitors[1].active_scrolling().slot_anchor(), None);
     }
 
     #[test]
@@ -928,14 +945,14 @@ mod tests {
                 panic!("{name}: expected Error, got {resp:?}");
             };
             assert!(message.contains("1/3+2/3"), "{name}: {message}");
-            assert_eq!(widths(&flow, 1, 1), vec![618, 1253], "{name}");
+            assert_eq!(widths(&flow, 1, 1), vec![1253, 618], "{name}");
         }
         // A width written straight into the layout (a mouse resize commit)
         // is undone on the next mutation.
         let mut vl = flow.monitors[1].active_scrolling().virtual_layout().clone();
         vl.columns[0].width_px = 900;
         let applied = flow.monitors[1].active_scrolling_mut().commit_layout(vl);
-        assert_eq!(applied.virtual_layout.columns[0].width_px, 618);
+        assert_eq!(applied.virtual_layout.columns[0].width_px, 1253);
         // Monitor 0 (on "1/3+2/3" as well by index, but re-applied? no: it
         // kept its old single-width strip) is not pinned.
         assert!(!flow.monitors[0].active_scrolling().widths_pinned());
