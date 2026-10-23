@@ -185,13 +185,14 @@ impl FlowWM {
 
             // --- Queries ---
             SocketMessage::QueryWindowsAll => self.query_windows_all(),
+            SocketMessage::QueryBinds => self.query_binds(),
             SocketMessage::QueryLayoutVirtual => self.query_layout_virtual(),
             SocketMessage::QueryLayoutActual => self.query_layout_actual(),
             SocketMessage::QueryState => unimplemented_command("query_state"),
 
             // --- Config mutation ---
             SocketMessage::ReloadConfig => self.dispatch_reload_config(),
-            SocketMessage::CheckConfig => unimplemented_command("check_config"),
+            SocketMessage::CheckConfig => self.dispatch_check_config(),
             SocketMessage::SetConfigValue { .. } => unimplemented_command("set_config_value"),
             SocketMessage::ForgetApp { .. } => unimplemented_command("forget_app"),
             SocketMessage::ForgetAllApps => unimplemented_command("forget_all_apps"),
@@ -1979,7 +1980,7 @@ impl FlowWM {
     ///
     /// Returns [`SocketResponse::Error`] only when `flow.toml` cannot be loaded
     /// or fails validation. The window-rule file never fails the command.
-    fn dispatch_reload_config(&mut self) -> SocketResponse {
+    pub(super) fn dispatch_reload_config(&mut self) -> SocketResponse {
         // Load + validate BEFORE touching any state (validate-before-apply:
         // nothing to roll back if this fails).
         let new_config = match load_app_config(&user_app_config_path_in(&self.config_dir)) {
@@ -2056,7 +2057,60 @@ impl FlowWM {
             Err(error) => log::warn!("flowd: {error}; keeping current window rules"),
         }
 
+        // The files on disk are the running config now, so the watcher does
+        // not reload them a second time.
+        self.config_watch.mark_applied(&super::config_watch::mtime);
+
         SocketResponse::Ok
+    }
+
+    /// `flow config check` against the running daemon: every problem in
+    /// `flow.toml` (parse, validation, `[binds]` entry by entry, preset
+    /// lists against the attached screens) and `flow-rules.toml`, without
+    /// applying anything. Answers `Data { "ok", "problems": [...] }`.
+    fn dispatch_check_config(&self) -> SocketResponse {
+        let problems = self.config_problems();
+        SocketResponse::Data {
+            payload: serde_json::json!({
+                "ok": problems.is_empty(),
+                "problems": problems,
+                "screens": self.monitors.len(),
+            }),
+        }
+    }
+
+    /// The problems `dispatch_check_config` reports, one line each.
+    pub(super) fn config_problems(&self) -> Vec<String> {
+        let mut problems: Vec<String> = Vec::new();
+        match load_app_config(&user_app_config_path_in(&self.config_dir)) {
+            Err(error) => problems.push(format!("{error}")),
+            Ok(cfg) => {
+                // Binds are reported entry by entry; the rest of the config
+                // is validated with an always-valid table so each problem
+                // is listed once.
+                if let Err(p) = cfg.binds.resolve() {
+                    problems.extend(p);
+                }
+                let rest = crate::config::FlowConfig {
+                    binds: crate::config::binds::BindsConfig::default(),
+                    ..cfg.clone()
+                };
+                if let Err(reason) = rest.validate() {
+                    problems.push(reason);
+                }
+                let screens: Vec<crate::config::width_preset::ScreenFacts> =
+                    (0..self.monitors.len())
+                        .map(|i| self.monitor_facts(i))
+                        .collect();
+                if let Err(reason) = super::width_preset::check_screens(&cfg, &screens) {
+                    problems.push(reason);
+                }
+            }
+        }
+        if let Err(error) = load_rules_config(&user_rules_path_in(&self.config_dir)) {
+            problems.push(format!("{error}"));
+        }
+        problems
     }
 }
 /// Pure candidate rule behind [`FlowWM::resolve_focus_target_with`]: the

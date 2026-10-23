@@ -1049,6 +1049,114 @@ default = "1/2"
         assert!(check_screens(&config, &[screen_facts(r(0, 0, 100, 100), "")]).is_ok());
     }
 
+    /// `flow config check` through the daemon: every problem in both files,
+    /// the `[binds]` entries one by one, the preset lists against the real
+    /// screens; nothing applied.
+    #[test]
+    fn check_config_lists_every_problem_without_applying() {
+        let mut flow = fixture();
+        let dir = std::env::temp_dir().join(format!(
+            "flowwm-check-config-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("config dir");
+        flow.config_dir = dir.clone();
+        // A clean pair of files: ok, and the screen count is reported.
+        std::fs::write(
+            dir.join("flow.toml"),
+            "min_column_width_px = 600\n[columns]\npresets = [\"1/2\"]\n",
+        )
+        .expect("write");
+        let resp = flow.dispatch(&SocketMessage::CheckConfig);
+        let SocketResponse::Data { payload } = resp else {
+            panic!("expected Data, got {resp:?}");
+        };
+        assert_eq!(payload["ok"], true, "{payload}");
+        assert_eq!(payload["screens"], 2);
+        assert_eq!(payload["problems"].as_array().map(Vec::len), Some(0));
+
+        // Two bad binds, a preset under the floor and a broken rules file:
+        // four lines, each naming its culprit.
+        std::fs::write(
+            dir.join("flow.toml"),
+            "min_column_width_px = 600\n[columns]\npresets = [\"1/4\", \"1/2\"]\n[binds]\n\"Mod+Bogus\" = \"close-window\"\n\"Mod+Q\" = \"fly\"\n",
+        )
+        .expect("write");
+        std::fs::write(dir.join("flow-rules.toml"), "this is = not [toml\n").expect("write");
+        let resp = flow.dispatch(&SocketMessage::CheckConfig);
+        let SocketResponse::Data { payload } = resp else {
+            panic!("expected Data, got {resp:?}");
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(payload["ok"], false);
+        let problems: Vec<String> = serde_json::from_value(payload["problems"].clone()).unwrap();
+        assert_eq!(problems.len(), 4, "{problems:?}");
+        assert!(
+            problems[0].starts_with("binds.\"Mod+Bogus\": unknown key"),
+            "{}",
+            problems[0]
+        );
+        assert!(
+            problems[1].starts_with("binds.\"Mod+Q\": unknown action"),
+            "{}",
+            problems[1]
+        );
+        assert!(
+            problems[2].contains("\"1/4\" is 460 px wide on DISPLAY1"),
+            "{}",
+            problems[2]
+        );
+        assert!(problems[3].contains("flow-rules.toml"), "{}", problems[3]);
+        // Nothing was applied.
+        assert_eq!(flow.config.min_column_width_px, 320);
+        assert!(flow.config.binds.entries.is_empty());
+    }
+
+    /// `flow query binds`: the resolved table, its source, and a user table
+    /// laid over the defaults.
+    #[test]
+    fn query_binds_reports_the_table_and_its_source() {
+        let mut flow = fixture();
+        let resp = flow.dispatch(&SocketMessage::QueryBinds);
+        let SocketResponse::Data { payload } = resp else {
+            panic!("expected Data, got {resp:?}");
+        };
+        let report: crate::config::BindsReport = serde_json::from_value(payload).unwrap();
+        assert_eq!(report.source, "defaults");
+        assert_eq!(
+            report.binds.len(),
+            crate::config::binds::default_binds().len()
+        );
+        assert_eq!(report.hardwired.len(), 3);
+        assert!(
+            report
+                .binds
+                .iter()
+                .any(|b| b.chord == "Mod+R" && b.argv == ["width", "next"])
+        );
+
+        flow.config.binds = toml::from_str::<crate::config::FlowConfig>(
+            "[binds]\n\"Mod+Shift+R\" = \"switch-preset-column-width-back\"\n\"Mod+Q\" = \"none\"\n",
+        )
+        .unwrap()
+        .binds;
+        let resp = flow.dispatch(&SocketMessage::QueryBinds);
+        let SocketResponse::Data { payload } = resp else {
+            panic!("expected Data, got {resp:?}");
+        };
+        let report: crate::config::BindsReport = serde_json::from_value(payload).unwrap();
+        assert_eq!(report.source, "flow.toml");
+        assert!(
+            report.binds.iter().any(|b| b.chord == "Mod+Shift+R"
+                && b.hotkey == "#+r"
+                && b.argv == ["width", "prev"])
+        );
+        assert!(report.binds.iter().all(|b| b.chord != "Mod+Q"));
+        assert!(report.rows.iter().any(|r| r.chords == "Mod+R"));
+        assert!(report.rows.iter().any(|r| r.chords == "Mod+Shift+R"));
+    }
+
     #[test]
     fn reload_refuses_a_list_that_does_not_fit_a_screen_and_keeps_the_old_config() {
         let mut flow = fixture();

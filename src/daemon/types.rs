@@ -150,6 +150,10 @@ pub struct FlowWM {
     /// `flow-rules.toml` on hot-reload.
     pub(super) config_dir: PathBuf,
 
+    /// The once-a-second look at `flow.toml` / `flow-rules.toml` that turns
+    /// a saved edit into a reload (`daemon::config_watch`).
+    pub(super) config_watch: super::config_watch::ConfigWatch,
+
     /// Receiver for hook events from the background WinEvent hook thread.
     pub(super) hook_receiver: Receiver<crate::registry::HookEvent>,
 

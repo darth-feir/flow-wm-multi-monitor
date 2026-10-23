@@ -219,3 +219,22 @@ keep_days = 14
 # [update]
 # repo = "yourname/flow-wm"
 # branch = "main"
+
+# Key bindings, for a keymap that reads them (the fork's win-niri keymap
+# does; the bundled flow.ahk template has its chords in the script). niri's
+# spelling: "Mod+Shift+Left" = "move-column-left", "Mod+T" = { spawn =
+# ["alacritty"] }, "Mod+Q" = "none" unbinds a default. Entries are laid over
+# the keymap's built-in table (keymaps/win-niri/binds.toml); `defaults =
+# false` starts from nothing. `flow query binds` prints the result, `flow
+# config check` names every bad entry. The grammar and the action table are
+# in the user guide (Config Reference, [binds]).
+#
+# [binds]
+# "Mod+Shift+R" = "switch-preset-column-width-back"
+
+# Programs to run once the daemon is ready, each as ["program", "arg", ...].
+# A bare name is looked up in Program Files, %LOCALAPPDATA%\Programs, the
+# Store's execution aliases and PATH (never the working directory).
+#
+# [startup]
+# spawn = [["alacritty"]]

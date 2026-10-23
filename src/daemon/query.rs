@@ -45,6 +45,29 @@ impl FlowWM {
         })
     }
 
+    /// `flow query binds`: the resolved `[binds]` table for the hotkey script
+    /// and the overlay — every bind with its AutoHotkey hotkey string, kind,
+    /// argv and scope, the collapsed help rows and the hardwired chords
+    /// (`config::binds::report`). The running config validated at load, so
+    /// a resolve failure here is answered as an error rather than reached.
+    pub(super) fn query_binds(&self) -> SocketResponse {
+        let binds = &self.config.binds;
+        match binds.resolve() {
+            Ok(resolved) => {
+                let from_config = !binds.defaults || !binds.entries.is_empty();
+                SocketResponse::Data {
+                    payload: serde_json::json!(crate::config::binds::report(
+                        &resolved,
+                        from_config
+                    )),
+                }
+            }
+            Err(problems) => SocketResponse::Error {
+                message: problems.join("; "),
+            },
+        }
+    }
+
     /// Return all tracked windows as JSON.
     ///
     /// The viewport offset from the virtual layout is included so clients

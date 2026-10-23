@@ -174,7 +174,7 @@ format with a `"type"` field and snake_case variant names.
 
 | Group | Variants | Description |
 |-------|----------|-------------|
-| Control | `Stop`, `ReloadConfig`, `CheckConfig` | Daemon lifecycle and config |
+| Control | `Stop`, `ReloadConfig`, `CheckConfig` | Daemon lifecycle and config; `CheckConfig` loads both files from disk without applying them and answers `Data { "ok", "problems": [...], "screens" }` (every problem, the `[binds]` entries one by one, the preset lists against the attached screens) |
 | Liveness | `Ping` | Answered with `Pong` (version, pid, monitor count, registered hooks, tiling on/off); not layout-mutating, so it works mid-drag. Used by `flow start` and `flow ping` |
 | Tiling on/off | `SetTiling { enabled }`, `ToggleTiling` | Pause / resume tiling without stopping the daemon (see [Tiling on/off](#tiling-onoff-pause-and-resume)); layout-mutating (rejected mid-drag) but the only mutating commands accepted while tiling is off. Answered with `Data { "tiling_enabled": bool }` — the resulting state |
 | Keymap drag session | `DragBegin`, `DragEnd` | Bracket a drag the hotkey script performs itself (Mod + left-button drag, see [Tile Drag](./tile-drag.md), *Keymap-driven sessions*). `DragBegin` puts the focused window into the `MoveSizeStart` state and answers `Data { "drag": "tile" or "float", "hwnd" }` (error: a drag already active, nothing draggable focused, tiling off); `DragEnd` runs the `MoveSizeEnd` path and answers `Data { "ended": true, "drag" }`, or `Data { "ended": false }` with no session. Neither is layout-mutating |
@@ -186,7 +186,7 @@ format with a `"type"` field and snake_case variant names.
 | Column resize | `ExpandColumn`, `ShrinkColumn`, `SetColumnWidth { width_px }`, `SetWidthPreset { preset }` | Adjust column widths; `SetWidthPreset` (`next`/`prev`/`cycle`/`{"preset": "1/2"}`) moves the focused monitor to a `[columns]` preset and answers `Data { "width_preset", "monitor" }` |
 | Window state | `SetWindow { mode }`, `ToggleFloat`, `ToggleMonocle`, `PlaceAbove`, `Promote`, `MergeColumn`, `ConsumeOrExpel`, `CloseWindow` | Per-window operations; `SetWindow` takes `float`, `tile`, `cycle` or `fullscreen` (a toggle — see `daemon::fullscreen`); `ConsumeOrExpel { direction }` is `Promote` for a window that shares its column, `MergeColumn` for one alone in it |
 | Workspace | `SwitchWorkspace { workspace_id }`, `SwapWorkspace { workspace_id }`, `MoveWindowToWorkspace { workspace_id }` | niri-style virtual desktops (`Switch`/`Move` implemented; `Swap` stub) |
-| Query | `QueryWindowsAll`, `QueryLayoutVirtual`, `QueryLayoutActual`, `QueryState` | Read-only introspection |
+| Query | `QueryWindowsAll`, `QueryLayoutVirtual`, `QueryLayoutActual`, `QueryState`, `QueryBinds` | Read-only introspection; `QueryBinds` answers the resolved `[binds]` table for the hotkey script (see [Key Bindings](./keybinds.md)) |
 | Config mutation | `SetConfigValue { key, value }` | Runtime config change |
 | App preferences | `ForgetApp { exe }`, `ForgetAllApps` | Clear per-app learned state |
 
@@ -463,10 +463,10 @@ because there is only ever one shortcut.
 | `flow config reload` | Send `ReloadConfig` to daemon |
 | `flow config edit` | Open config dir in `$EDITOR` / `VISUAL` / `notepad.exe` |
 | `flow config path` | Print resolved config directory path |
-| `flow config check` | Validate config files locally |
+| `flow config check` | Send `CheckConfig`; list every problem the daemon finds (local, screen-blind check when no daemon runs) |
 
-All config commands except `reload` operate on local files without contacting the
-daemon. The config directory resolution chain is documented in
+All config commands except `reload` and `check` operate on local files without
+contacting the daemon. The config directory resolution chain is documented in
 [config and persistence](config-and-persistence.md).
 
 ### Query
@@ -474,6 +474,7 @@ daemon. The config directory resolution chain is documented in
 | Command | Action |
 |---------|--------|
 | `flow query all` | Send `QueryWindowsAll`, pretty-print JSON response |
+| `flow query binds [--plain]` | Send `QueryBinds`; JSON, or with `--plain` the tab-separated listing `flow.ahk` registers its hotkeys from |
 
 The `QueryWindowsAll` payload lists every tracked window plus a `monitors`
 array (index, `hmonitor`, screen rect, work area, neighbours, active

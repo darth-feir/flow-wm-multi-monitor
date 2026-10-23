@@ -20,7 +20,7 @@ features.
 | Graceful-shutdown rescue | ✅ Done | `rescue_stranded_windows` restores off-screen windows on clean exit |
 | Mouse-drag follow on tiled windows | ✅ Done | title-bar drag reorders live (`src/daemon/drag.rs`, [Tile Drag](./tile-drag.md)); the fork adds Mod + left-button drag anywhere in the window via keymap-driven sessions (`drag begin` / `drag end`, ADR-0011) |
 | `SwapWorkspace` animation | 🜂 Near-term | only workspace command still stubbed |
-| Remaining IPC stubs | 🜂 Near-term | `PlaceAbove`, `QueryState`, `CheckConfig`, `SetConfigValue`, `ForgetApp`/`ForgetAllApps` |
+| Remaining IPC stubs | 🜂 Near-term | `PlaceAbove`, `QueryState`, `SetConfigValue`, `ForgetApp`/`ForgetAllApps` (`CheckConfig` done in the fork: ADR-0015) |
 | Floating enhancements | 🜂 Near-term | smart placement, size memory, z-order, gap mgmt |
 | Real cross-column `MoveWindow` | 🜂 Near-term | Left/Right aliased to swap-column; row-preserving move + floating nudge pending |
 | Multi-monitor support | ✅ Done | one `Monitor` + scrolling space per display; windows tile on the monitor they appear on; parked columns and parked workspaces stay off every monitor (neighbours modelled on all four sides); cross-monitor focus/move commands (`focus-monitor`, `move-to-monitor`, edge hops) — see [Command Reference › Monitors](../user-guide/dispatch-reference.md#monitors) |
@@ -94,7 +94,7 @@ stable so external tooling and keybindings can target them now:
 |---|---|
 | `PlaceAbove` | Raise the focused floating window's z-order (`SetWindowPos` with `HWND_TOPMOST`/restore) |
 | `QueryState` | Read-only introspection of daemon/registry state beyond `QueryWindowsAll` |
-| `CheckConfig` / `SetConfigValue` | Runtime config validation / mutation without a daemon restart (`ReloadConfig` is already implemented) |
+| `SetConfigValue` | Runtime config mutation without a daemon restart (`ReloadConfig` is implemented; `CheckConfig` is too — the fork's `flow config check` asks the daemon to list every problem in `flow.toml`, `[binds]` and `flow-rules.toml` against the attached screens, see [Key Bindings](./keybinds.md)) |
 | `ForgetApp` / `ForgetAllApps` | Programmatic clearing of learned rules (today this requires hand-editing `history-flow-rules.toml`) |
 
 See [Classification & Learned Rules](./classification.md) for the learned-rules

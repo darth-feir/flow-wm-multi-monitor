@@ -362,6 +362,10 @@ pub enum SocketMessage {
     // --- Queries ---
     /// Query all managed windows.
     QueryWindowsAll,
+    /// The resolved `[binds]` table (`flow query binds`): every chord with
+    /// its AutoHotkey hotkey, action, argv and scope, plus the overlay rows.
+    /// Read-only; the hotkey script asks at start and after a reload.
+    QueryBinds,
     /// Query the virtual layout.
     QueryLayoutVirtual,
     /// Query the actual (projected) layout.

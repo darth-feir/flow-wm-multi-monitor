@@ -216,6 +216,15 @@ enum ConfigCommands {
 enum QueryCommands {
     /// Dump all tracked windows with full debug info (state, rect, col/row, etc.).
     All,
+    /// The key bindings the daemon resolved from `[binds]` (or the keymap's
+    /// built-in table): chord, AutoHotkey hotkey, action, what it runs, and
+    /// the help-overlay rows. JSON by default; `--plain` prints the
+    /// tab-separated listing the hotkey script reads.
+    Binds {
+        /// One record per line, tab-separated (what `flow.ahk` parses).
+        #[arg(long)]
+        plain: bool,
+    },
 }
 
 /// Dispatch subcommands — one per action category.
@@ -515,7 +524,14 @@ enum LoadoutCommands {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    // `flow dispatch <niri action>` (focus-column-left, focus-workspace 3)
+    // is spelled into our own subcommand before clap sees it, so a bind
+    // line and a shell command read the same.
+    let args: Vec<String> = std::env::args().collect();
+    let cli = match config::binds::niri_alias(&args) {
+        Some(aliased) => Cli::parse_from(aliased),
+        None => Cli::parse(),
+    };
 
     let result = match cli.command {
         Commands::Start {
@@ -1219,27 +1235,77 @@ fn cmd_config_path() -> Result<(), String> {
     Ok(())
 }
 
-/// Validate configuration files without loading them into the daemon.
+/// Validate the configuration files without applying them.
 ///
-/// Calls [`config::check_config`] which reads and validates both `flow.toml` and
-/// `flow-rules.toml` if they exist. Missing files are not errors — they simply
-/// mean defaults will be used.
+/// Asks the running daemon (`CheckConfig`), which lists every problem —
+/// parse errors, validation, each bad `[binds]` entry, preset lists that do
+/// not fit the attached screens — and the rules file. Without a daemon the
+/// files are checked locally ([`config::check_config`]), which cannot see
+/// the screens. Missing files are not errors: defaults apply.
 ///
 /// # Errors
 ///
-/// Returns an error string if any config file fails validation (parse error or
-/// invalid field values).
+/// One line per problem on stderr and an error naming their count.
 fn cmd_config_check() -> Result<(), String> {
-    let dir = config::dirs::config_dir();
-    config::check_config(&dir)?;
-    println!("flow: configuration is valid");
-    Ok(())
+    match transport::send_message(&SocketMessage::CheckConfig) {
+        Ok(SocketResponse::Data { payload }) => {
+            let problems: Vec<String> = payload
+                .get("problems")
+                .and_then(|p| serde_json::from_value(p.clone()).ok())
+                .unwrap_or_default();
+            let screens = payload.get("screens").and_then(serde_json::Value::as_u64);
+            if problems.is_empty() {
+                println!(
+                    "flow: configuration is valid (checked by the running daemon{})",
+                    screens.map_or_else(String::new, |n| format!(" against {n} screen(s)"))
+                );
+                return Ok(());
+            }
+            for p in &problems {
+                eprintln!("flow: {p}");
+            }
+            Err(format!("configuration has {} problem(s)", problems.len()))
+        }
+        Ok(SocketResponse::Error { message }) => Err(format!("daemon error: {message}")),
+        Ok(other) => Err(format!("unexpected reply to check: {other:?}")),
+        Err(_) => {
+            let dir = config::dirs::config_dir();
+            config::check_config(&dir)?;
+            println!("flow: configuration is valid (no daemon running; checked locally)");
+            Ok(())
+        }
+    }
 }
 
 /// Dispatch a query subcommand.
 fn cmd_query(command: QueryCommands) -> Result<(), String> {
     match command {
         QueryCommands::All => cmd_query_all(),
+        QueryCommands::Binds { plain } => cmd_query_binds(plain),
+    }
+}
+
+/// Print the daemon's resolved key bindings: pretty JSON, or with `plain`
+/// the tab-separated listing (`config::binds::plain_text`) the hotkey
+/// script parses.
+fn cmd_query_binds(plain: bool) -> Result<(), String> {
+    let response = transport::send_message(&SocketMessage::QueryBinds)
+        .map_err(|e| format!("failed to send command: {e}"))?;
+    match response {
+        SocketResponse::Data { payload } => {
+            if plain {
+                let report: config::BindsReport = serde_json::from_value(payload)
+                    .map_err(|e| format!("daemon sent an unexpected binds payload: {e}"))?;
+                print!("{}", config::binds::plain_text(&report));
+            } else {
+                let formatted =
+                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+                println!("{formatted}");
+            }
+            Ok(())
+        }
+        SocketResponse::Error { message } => Err(format!("daemon error: {message}")),
+        other => Err(format!("unexpected reply to query binds: {other:?}")),
     }
 }
 
@@ -2493,6 +2559,55 @@ mod tests {
             } => {}
             other => panic!("expected Config::Check, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_query_binds() {
+        let cli = Cli::try_parse_from(["flow", "query", "binds"]).unwrap();
+        match cli.command {
+            Commands::Query {
+                command: QueryCommands::Binds { plain },
+            } => assert!(!plain, "--plain defaults to false"),
+            other => panic!("expected Query::Binds, got: {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["flow", "query", "binds", "--plain"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Query {
+                command: QueryCommands::Binds { plain: true }
+            }
+        ));
+    }
+
+    /// `main` rewrites niri action names before clap sees them; the rewritten
+    /// line must parse as the ordinary subcommand.
+    #[test]
+    fn niri_alias_lines_parse_as_our_subcommands() {
+        let args: Vec<String> = ["flow", "dispatch", "focus-column-left"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let aliased = config::binds::niri_alias(&args).expect("aliased");
+        let cli = Cli::try_parse_from(aliased).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Dispatch {
+                command: DispatchCommands::Focus {
+                    direction: FocusDirection::Left
+                }
+            }
+        ));
+        let args: Vec<String> = ["flow", "dispatch", "focus-workspace", "3"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let cli = Cli::try_parse_from(config::binds::niri_alias(&args).expect("aliased")).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Dispatch {
+                command: DispatchCommands::SwitchWorkspace { workspace_id: 3 }
+            }
+        ));
     }
 
     #[test]

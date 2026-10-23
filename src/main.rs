@@ -355,6 +355,10 @@ fn run(
         }
     }
 
+    // 6b. `[startup] spawn`: the user's programs, once the daemon is ready
+    //     and the keymap is up. Failures are logged, never fatal.
+    flow.run_startup_spawns();
+
     // 7. Event loop, under catch_unwind so a main-thread panic still reaches
     //    the fail-back below. `FLOW_FAIL_AT=runtime` panics here on purpose.
     let inject_runtime_panic = reporter.fail_at() == Some(S::Runtime);

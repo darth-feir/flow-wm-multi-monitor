@@ -5,7 +5,7 @@ FlowWM splits configuration across two TOML files in your config directory
 
 | File | Controls |
 |------|----------|
-| `flow.toml` | Geometry, padding, animation, borders, floating defaults, focus reconciliation. |
+| `flow.toml` | Geometry, padding, animation, borders, floating defaults, focus reconciliation, [key bindings](#binds--key-bindings), [startup programs](#startup--programs-to-run). |
 | `flow-rules.toml` | Window classification — which apps tile, which float, which are ignored entirely. |
 
 Both files are optional — `flow config init` writes commented defaults, but you
@@ -21,23 +21,30 @@ filled in from `FlowConfig::default()`.
 
 ## Editing and reloading
 
-Edit either file in any text editor. To pick up changes without restarting the
-daemon:
+Edit either file in any text editor and save it: the daemon notices the
+change within a second or two and reloads it (the log says `config:
+reloaded`, or `config: reload refused: ...` with the reason). To reload at
+once, or from a script:
 
 ```powershell
 flow config reload
 ```
 
-The daemon reloads `flow.toml` and `flow-rules.toml` from disk, validates them
-**before** touching any state, and applies the live-reloadable fields. A
-broken file produces an error on your terminal and leaves the running daemon
-untouched — there is nothing to roll back.
+Either way the daemon reloads `flow.toml` and `flow-rules.toml` from disk,
+validates them **before** touching any state, and applies the live-reloadable
+fields. A broken file leaves the running daemon untouched — there is nothing
+to roll back — and a save made while tiling is off is applied when tiling
+resumes.
 
-To validate without loading:
+To list every problem without applying anything:
 
 ```powershell
 flow config check
 ```
+
+With a daemon running the check is done by the daemon, so it also knows the
+attached screens (preset lists are checked per screen) and reports each bad
+`[binds]` entry on its own line; without one, the files are checked locally.
 
 ### Live-reloadable vs. structural fields
 
@@ -57,6 +64,8 @@ Not every field can change at runtime. Reload applies **live** fields in place;
 | `navigation.edge_hop` | Applies to the next `focus` / `move-window` at a strip edge. |
 | `adopt_maximized` | Applies to the next maximized window the daemon meets (a window already parked as ignored is adopted when it is next focused, shown or moved). |
 | `floating.always_on_top` | Immediate: turned on, every floating window and every rule-ignored window is raised above the tiles; turned off, they go back to the normal z-order (a window that was "always on top" by itself keeps that). |
+| `binds.*` | The daemon re-resolves the table; the hotkey script re-reads it a few seconds after the save and re-registers the chords (one-line message). A table with an error keeps the old chords. |
+| `startup.*` | Applies to the next daemon start only. |
 | **Workspace count (10), monitor geometry** | **Structural** — not reloadable. Restart the daemon. |
 
 What is preserved across reload: the user's arranged layout (columns, rows,
@@ -472,6 +481,109 @@ branch = "main"              # or "" to compare against releases
 ```
 
 ---
+
+### `[binds]` — key bindings
+
+The chords, in niri's spelling, laid over the keymap's built-in table
+(`keymaps/win-niri/binds.toml` in the repository, compiled into the daemon).
+Without a `[binds]` section you get that table; with one, each entry
+replaces the default on the same chord or adds a new one, and `"none"`
+unbinds a default. The daemon validates the table like the rest of the
+file and hands it to the hotkey script, which registers the chords at
+runtime and builds the Mod+Shift+/ overlay from it — so the overlay always
+shows what is bound. See `flow query binds` for the resolved list.
+
+```toml
+[binds]
+# defaults = false                         # start from an empty table instead of the built-in one
+"Mod+Shift+R" = "switch-preset-column-width-back"   # add a chord
+"Mod+Q" = "none"                           # unbind a default
+"Mod+Shift+Q" = "close-window"             # ... and put it elsewhere
+"Mod+Return" = { spawn = ["alacritty"] }   # run a program
+"Mod+Shift+Return" = { spawn = ["wt", "-p", "PowerShell"], admin = true, help = "admin shell" }
+"Mod+Shift+WheelScrollDown" = "focus-column-right"
+"Mod+X" = "dispatch width 1/2"             # anything `flow dispatch` accepts
+```
+
+**Chords.** `Modifier+...+Key`, any order, any case; the last word is the
+key. Modifiers: `Mod` (also `Super`, `Win` — the Windows key), `Ctrl`
+(`Control`), `Alt`, `Shift`. Keys: a letter, a digit, `F1`..`F24`, one of
+`Left Right Up Down Home End Page_Up Page_Down Insert Delete BackSpace
+Return Tab Escape Space Print Pause Minus Equal BracketLeft BracketRight
+Semicolon Apostrophe Grave Backslash Comma Period Slash WheelScrollUp
+WheelScrollDown WheelScrollLeft WheelScrollRight`, or a raw AutoHotkey
+`vkXX` / `scXXX` code. A bare key needs a modifier (`Print` and `Pause`
+excepted); mouse buttons are not configurable. `Mod+Ctrl+T` and
+`Mod+Ctrl+Shift+T` are reserved by the keymap (FlowWM off/on, tiling
+pause), as is Mod + left-button drag. Two spellings of one chord in the
+same table are an error.
+
+**Actions.** A string is an action line; a table is a program to run.
+
+| Action | What it runs | |
+|---|---|---|
+| `focus-column-left` / `-right`, `focus-window-up` / `-down` | `flow dispatch focus <dir>` | |
+| `move-column-left` / `-right`, `move-window-up` / `-down` | `move-window <dir>` | |
+| `focus-monitor-left` / `-right` / `-up` / `-down` | `focus-monitor <dir>` | |
+| `move-column-to-monitor-<dir>` (also `move-window-to-monitor-<dir>`) | `move-to-monitor <dir>` | |
+| `focus-workspace N` | `switch-workspace N` | N from 1 |
+| `move-column-to-workspace N` (also `move-window-to-workspace N`) | `move-to-workspace N` | |
+| `close-window` | `close-window` | |
+| `center-column` | `center` | |
+| `toggle-window-floating`, `move-window-to-floating`, `move-window-to-tiling` | `set-window cycle` / `float` / `tile` | |
+| `fullscreen-window` | `set-window fullscreen` | |
+| `switch-preset-column-width`, `switch-preset-column-width-back` | `width next` / `width prev` | |
+| `set-column-width "+10%"` / `"-10%"` | `expand-column` / `shrink-column` | one step either way; refused on a width pattern |
+| `consume-or-expel-window-left` / `-right` | `consume-or-expel <dir>` | |
+| `consume-window-into-column` | `merge-column right` | nearest equivalent: the focused window joins the column to its right |
+| `expel-window-from-column` | `promote right` | |
+| `dispatch <args>` | `flow dispatch <args>` | anything the CLI accepts |
+| `launcher` | the keymap's application launcher | |
+| `show-hotkey-overlay` | the key-binding overlay | |
+| `toggle-tiling` | `tiling toggle` with the keymap's message | Mod+Ctrl+Shift+T does this and is reserved |
+| `quit` | `flow stop` and the keymap exits | |
+| `none` | unbinds the chord | |
+| `{ spawn = ["prog", "arg", ...], admin = false, help = "..." }` | runs the program | see below |
+
+Window-management actions are live while the daemon runs *and tiling is
+on*; `launcher`, `show-hotkey-overlay`, `toggle-tiling`, `quit` and `spawn`
+whenever the daemon runs. The same names work on the command line:
+`flow dispatch focus-column-left` is accepted as an alias of `flow dispatch
+focus left`.
+
+**Programs.** `spawn` takes the program and its arguments. A bare name
+(`"alacritty"`, `"wt"`, `"notepad"`) is looked up in `%ProgramFiles%\<name>\<name>.exe`
+(and the x86 folder), `%LOCALAPPDATA%\Programs\<name>\<name>.exe`, the
+Store's execution aliases (`%LOCALAPPDATA%\Microsoft\WindowsApps\<name>.exe`)
+and then each `PATH` entry — never the folder FlowWM was started from. A
+path must be absolute. `admin = true` runs it elevated (UAC prompts as
+usual); `help` replaces the overlay's `run <program>` text. Programs start
+in your home folder.
+
+**Where to look.** `flow query binds` prints the resolved table as JSON
+(`flow query binds --plain` is the listing the keymap reads); the overlay
+(`show-hotkey-overlay`, Mod+Shift+/ by default) shows it on screen;
+`flow config check` names every bad entry (`binds."Mod+Bogus": unknown key
+"Bogus" (...)`). Help texts and chord names are ASCII so the overlay renders
+the same everywhere.
+
+### `[startup]` — programs to run
+
+Programs the daemon starts once it is ready, in order, each as the program
+and its arguments. A bare name is looked up like a `spawn` bind (above); a
+program that cannot be started is logged and the rest still run. They start
+in your home folder and are not tied to the daemon's lifetime.
+
+```toml
+[startup]
+spawn = [["alacritty"], ["wt", "-p", "PowerShell"]]
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `spawn` | `Vec<Vec<String>>` | `[]` | One entry per program: `["program", "arg", ...]`. An entry without a program name is a config error. |
+
+Applies to the next daemon start; it is not re-run on reload.
 
 ## `flow-rules.toml`
 

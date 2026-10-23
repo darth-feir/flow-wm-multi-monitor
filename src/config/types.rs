@@ -169,6 +169,16 @@ pub struct FlowConfig {
     /// Daemon log retention (`[logging]`).
     pub logging: LoggingConfig,
 
+    /// Key bindings (`[binds]`): niri's chord and action names, laid over
+    /// the keymap's built-in table. The daemon validates them and the hotkey
+    /// script registers them at runtime (`flow query binds`). See
+    /// [`BindsConfig`](crate::config::binds::BindsConfig).
+    pub binds: crate::config::binds::BindsConfig,
+
+    /// Programs run once the daemon is ready (`[startup]`). See
+    /// [`StartupConfig`](crate::config::startup::StartupConfig).
+    pub startup: crate::config::startup::StartupConfig,
+
     /// Column width presets (`[columns]`). `None` when the section is absent:
     /// columns are then sized from [`columns_per_screen`](Self::columns_per_screen)
     /// / [`column_width`](Self::column_width) as before. When present, every
@@ -329,6 +339,8 @@ impl Default for FlowConfig {
             loadout: LoadoutConfig::default(),
             navigation: NavigationConfig::default(),
             logging: LoggingConfig::default(),
+            binds: crate::config::binds::BindsConfig::default(),
+            startup: crate::config::startup::StartupConfig::default(),
             columns: None,
             // The fork opts out of the start-time update check (see the
             // field docs); users opt in with `check_for_updates = true`.
@@ -434,6 +446,8 @@ impl FlowConfig {
         self.padding.validate()?;
         self.borders.validate()?;
         self.loadout.validate()?;
+        self.binds.validate()?;
+        self.startup.validate()?;
         if self.columns_per_screen == 0 {
             return Err("columns_per_screen must be at least 1, got 0".into());
         }
@@ -1301,6 +1315,16 @@ strategy = "original_slot"
             },
             navigation: NavigationConfig { edge_hop: false },
             logging: LoggingConfig { keep_days: 3 },
+            binds: crate::config::binds::BindsConfig {
+                defaults: false,
+                entries: vec![(
+                    "Mod+Q".to_owned(),
+                    crate::config::binds::BindValue::Action("close-window".to_owned()),
+                )],
+            },
+            startup: crate::config::startup::StartupConfig {
+                spawn: vec![vec!["alacritty".to_owned()]],
+            },
             columns: Some(
                 toml::from_str(
                     "presets = [\"1/3\", \"1/2\"]
@@ -1320,6 +1344,8 @@ default = \"1/2\"",
         let parsed: FlowConfig = toml::from_str(&toml_str).expect("deserialize all fields");
 
         assert_eq!(parsed.columns_per_screen, 3);
+        assert_eq!(parsed.binds, config.binds);
+        assert_eq!(parsed.startup, config.startup);
         assert_eq!(parsed.column_width, Some(1200));
         assert_eq!(parsed.min_column_width_px, 400);
         assert_eq!(parsed.min_window_height_px, 120);

@@ -18,6 +18,11 @@
         "enabled": true
       }
     },
+    "binds": {
+      "description": "Key bindings (`[binds]`): niri's chord and action names, laid over\nthe keymap's built-in table. The daemon validates them and the hotkey\nscript registers them at runtime (`flow query binds`). See\n[`BindsConfig`](crate::config::binds::BindsConfig).",
+      "$ref": "#/$defs/BindsConfig",
+      "default": {}
+    },
     "borders": {
       "description": "Window border overlay configuration.",
       "$ref": "#/$defs/BorderConfig",
@@ -145,6 +150,13 @@
         "window_gap": 16
       }
     },
+    "startup": {
+      "description": "Programs run once the daemon is ready (`[startup]`). See\n[`StartupConfig`](crate::config::startup::StartupConfig).",
+      "$ref": "#/$defs/StartupConfig",
+      "default": {
+        "spawn": []
+      }
+    },
     "update": {
       "description": "What `flow update` (and the start-time notice) compares this build\nagainst (`[update]`). See [`UpdateConfig`].",
       "$ref": "#/$defs/UpdateConfig",
@@ -173,6 +185,51 @@
           "type": "boolean",
           "default": true
         }
+      }
+    },
+    "BindsConfig": {
+      "description": "Key bindings in niri's spelling: \"Mod+Shift+Left\" = \"move-column-left\". Entries are laid over the keymap's built-in defaults; \"none\" unbinds a chord.",
+      "type": "object",
+      "properties": {
+        "defaults": {
+          "description": "Start from the keymap's built-in table (true) or from an empty one (false).",
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "description": "An action, e.g. \"focus-column-left\", \"focus-workspace 3\", \"none\".",
+            "type": "string"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "admin": {
+                "description": "Run elevated.",
+                "type": "boolean",
+                "default": false
+              },
+              "help": {
+                "description": "Overlay text instead of \"run <program>\".",
+                "type": "string"
+              },
+              "spawn": {
+                "description": "The program and its arguments.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "spawn"
+            ]
+          }
+        ]
       }
     },
     "BorderConfig": {
@@ -690,6 +747,24 @@
         "match",
         "presets"
       ]
+    },
+    "StartupConfig": {
+      "description": "`[startup]`: what to run after the daemon reaches `ready`.",
+      "type": "object",
+      "properties": {
+        "spawn": {
+          "description": "Programs to run once, each as `[\"program\", \"arg\", ...]`, in order.\nA bare name is looked up like a `[binds]` spawn; a failure to start\none is logged and the rest still run.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "UpdateConfig": {
       "description": "Where `flow update` looks for something newer (`[update]`).\n\n`flow update` is a **checker**: it asks the GitHub API how this build\nrelates to a branch or to the latest release and prints the answer; it\nnever downloads or replaces anything. Both keys are optional and fall\nback to what the build script embedded (`crate::build_info`):\n\n- `repo`: `\"owner/name\"` on github.com. Absent: parsed from the\n  checkout's `origin` URL at build time when that is a github.com URL\n  (https or ssh), else the upstream `CCpcalvin/flow-wm`.\n- `branch`: the branch to compare the embedded commit against. Absent:\n  the branch checked out at build time. An **empty string** (or no\n  build branch to fall back to) switches to *release mode*: the latest\n  release's tag is compared with the crate version instead.",

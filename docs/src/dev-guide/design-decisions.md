@@ -358,3 +358,11 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   width or device name, and presets are checked against the real screens
   instead of being floored silently.
   `docs/adr/0014-width-patterns-by-column-position.md`
+- **ADR-0015 — Key bindings are configuration the daemon owns, and the
+  keymap interprets.** `[binds]` in `flow.toml`, niri's chord and action
+  spelling, laid over the keymap's built-in table; the daemon validates and
+  lists it (`flow query binds`), the hotkey script registers the list at
+  runtime and draws its overlay from it; a saved `flow.toml` is reloaded by
+  a once-a-second file watch; `flow config check` lists every problem
+  through the daemon. Mod+LMB drag, Mod+Ctrl+T and Mod+Ctrl+Shift+T stay
+  hardwired. `docs/adr/0015-binds-are-config.md`

@@ -63,6 +63,7 @@
 mod animation;
 mod borders;
 mod config_derive;
+mod config_watch;
 mod dispatch;
 mod drag;
 mod drag_session;
@@ -77,6 +78,7 @@ mod query;
 mod run;
 pub mod session;
 pub(crate) mod shutdown;
+mod spawn;
 pub mod startup;
 mod tiling;
 mod top_layer;

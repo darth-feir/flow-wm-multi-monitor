@@ -21,6 +21,14 @@ flowchart LR
   D --> L[mutate → project → animate]
 ```
 
+> **niri names work too.** The fork's win-niri keymap takes its chords from
+> a `[binds]` table in `flow.toml` written in niri's spelling (see the
+> [Config Reference](./config-reference.md#binds--key-bindings)), and the
+> CLI accepts those action names as aliases: `flow dispatch
+> focus-column-left` is `flow dispatch focus left`, `flow dispatch
+> focus-workspace 3` is `flow dispatch switch-workspace 3`. The names below
+> stay the primary ones.
+
 > **The modifier is configurable.** The default `flow.ahk` holds every chord with
 > `Alt`. That's a single `ModKey` line at the top of the file — change it
 > and every chord below follows. The hotkey column below assumes the default
@@ -555,8 +563,9 @@ A few other top-level commands are worth knowing:
 | `flow config reload` | Tell the running daemon to re-read config from disk. |
 | `flow config edit` | Open the config directory in your editor. |
 | `flow config path` | Print the resolved config directory path. |
-| `flow config check` | Validate `flow.toml` / `flow-rules.toml` without loading them. |
+| `flow config check` | List every problem in `flow.toml` (each `[binds]` entry on its own line, preset lists against the attached screens) and `flow-rules.toml` without applying anything — through the running daemon, or locally when none runs. |
 | `flow loadout save [path]` / `flow loadout load [path]` | Save / restore the window arrangement. Without a path the config's `[loadout] default_path` (a plain file name in the config dir) is used. A given path must be a `.json` file with no `..` in it; relative paths are resolved against the config directory, absolute ones used as given. Anything else is refused — by the CLI before sending, and by the daemon for whatever arrives over the pipe. |
+| `flow query binds [--plain]` | The key bindings the daemon resolved from `[binds]` (or the keymap's built-in table) as JSON: chord, AutoHotkey hotkey, action, what it runs, scope, help text, plus the overlay rows. `--plain` prints the tab-separated listing `flow.ahk` registers its hotkeys from. |
 | `flow query all` | Dump every tracked window (state, `mode` — `tiled` / `floating` / `fullscreen` / `minimized` / `hidden` / `ignored` —, `on_top` — whether FlowWM currently keeps it above the tiles (`[floating] always_on_top`) —, rect, column/row, …) as JSON, plus the monitors (each with its `width_preset`) and whether tiling is on (`tiling_enabled`). |
 | `flow enable-autostart [--ahk]` | Create the login shortcut in `shell:startup` (idempotent). |
 | `flow disable-autostart` | Remove the login shortcut (idempotent). |

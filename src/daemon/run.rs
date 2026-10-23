@@ -276,6 +276,10 @@ impl FlowWM {
             // settle timer, and reconcile the monitor list once it is due.
             self.poll_topology_change();
 
+            // A saved flow.toml / flow-rules.toml: once a second, reload when
+            // the change has settled (`daemon::config_watch`).
+            self.poll_config_files();
+
             // Reconcile internal focus against GetForegroundWindow(). This runs
             // on every wake, but no-ops in ~1 µs when tracked focus already
             // matches reality. The `foreground_sync_interval_ms` timeout folded

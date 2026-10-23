@@ -127,7 +127,7 @@ After loading `flow.toml`, the daemon calls `FlowConfig::validate()` to catch se
 
 ### 3. Validate -- `check_config`
 
-Used by `flow config check` to validate config files without loading them into the daemon. Missing files are not errors -- they simply mean defaults will be used. Logs nothing (designed for pure CLI output).
+The local validation pass: parse both files and run `FlowConfig::validate` (which covers `[binds]` and `[startup]` too). Missing files are not errors -- they simply mean defaults will be used. Logs nothing (designed for pure CLI output). `flow config check` uses it only when no daemon answers; with one running it sends `CheckConfig` and the daemon lists every problem, screens included (see [Live reload](#live-reload-the-file-watcher) below).
 
 ### 4. Use -- daemon subsystems
 
@@ -186,6 +186,34 @@ sequenceDiagram
         C-->>U: "configuration reloaded"
     end
 ```
+
+## Live reload: the file watcher
+
+The daemon also reloads on its own when `flow.toml` or `flow-rules.toml`
+changes on disk ([`daemon::config_watch`](../../src/daemon/config_watch.rs)).
+Once a second — the event loop wakes at least that often for its liveness
+check — it reads both files' modification times. A change counts only when
+it is seen unchanged on the next look, which rides out editors that
+truncate-then-write or write-then-rename; it then runs the same
+`dispatch_reload_config` as `flow config reload`, with the same
+validate-before-apply rule, and logs the outcome (`config: reloaded` /
+`config: reload refused: ...; keeping the running config`). A change that
+arrives while tiling is off (reload is refused then) is held and applied
+when tiling resumes. A manual reload marks the files applied so the watcher
+does not reload them a second time.
+
+Polling was chosen over `ReadDirectoryChangesW` or the `notify` crate: two
+`GetFileAttributesEx` calls per second cost nothing, there is no thread to
+supervise and no new dependency, and the two-look debounce is the whole
+coalescing logic. The latency is one to two seconds. The decision is
+[ADR-0015](design-decisions.md#decisions-made-in-the-multi-monitor-fork);
+the keymap's side of it — re-reading `flow query binds` after a save — is
+in [Key Bindings](keybinds.md#live-reload).
+
+`flow config check` asks the daemon (`CheckConfig`) rather than reading the
+files itself, so the check sees the attached screens (preset lists are
+validated per screen) and lists every problem rather than the first; with
+no daemon running the CLI falls back to the local `check_config`.
 
 ## Application Config Fields
 

@@ -27,19 +27,23 @@
 //!
 //! See [`lifecycle`] module docs for detailed documentation of each function.
 
+pub mod binds;
 pub mod color;
 pub mod dirs;
 pub mod history;
 pub mod lifecycle;
 pub mod schema;
+pub mod startup;
 pub mod types;
 pub mod width_preset;
 
+pub use binds::{Bind, BindsConfig, BindsReport};
 pub use color::Color;
 pub use lifecycle::{
     check_config, init_config_dir, load_app_config, load_default_rules, load_rules_config,
     write_ahk_template,
 };
+pub use startup::StartupConfig;
 pub use types::BorderConfig;
 pub use types::FlowConfig;
 pub use types::UpdateConfig;
