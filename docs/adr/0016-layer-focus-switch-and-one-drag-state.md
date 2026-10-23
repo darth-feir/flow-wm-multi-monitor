@@ -98,6 +98,13 @@ into the one field, where the busy gate, the animator exclusion and the
   that the keymap owns the gesture (native move-size events for the window
   are ignored) and the word for the reply. The stage-18 float geometry rule
   (no inset for floats) is unchanged.
+- **The foreground push verdict moved.** The first VM run showed
+  `SetForegroundWindow` returning FALSE with no error code while the
+  `BringWindowToTop` that follows activated the float anyway, so the switch
+  reported "no floating window to focus" as the float took the foreground.
+  `set_foreground_window_impl` now takes its verdict after that call, from
+  `GetForegroundWindow` (re-read for up to ~50 ms); `focus_monitor` and the
+  workspace switch share the fix.
 - **Behaviour that changed.** A native float drag now holds the busy gate
   and the animator exclusion for its duration (before, only tiles did); the
   top-layer re-decision on the foreground's own `LOCATIONCHANGE` is skipped

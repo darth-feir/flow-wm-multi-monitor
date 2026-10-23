@@ -272,7 +272,16 @@ pushes the first one that takes the foreground (`resolve_focus_target_with`):
   Windows snapped it), and such a window keeps its seat and simply does not
   get the foreground this time;
 - any other refused push (the foreground lock) keeps the candidate: the
-  window exists and is what the user should be on.
+  window exists and is what the user should be on;
+- a push is judged **after** the `BringWindowToTop` that follows it, not
+  from `SetForegroundWindow`'s return value alone: with another thread's
+  input attached the call often returns FALSE with no error code while the
+  window is activated anyway (the VM showed `SetForegroundWindow failed
+  ... 0x0` and the target's `EVENT_SYSTEM_FOREGROUND` in the same instant),
+  so `set_foreground_window_impl` re-reads `GetForegroundWindow` for up to
+  ~50 ms and counts the target being there as focused. Without that,
+  `focus-floating` skipped the only float as refused while it took the
+  foreground.
 
 With nothing live and visible left, the monitor still becomes active, the
 tracked focus is cleared (so a later command cannot act on the window the
