@@ -252,24 +252,41 @@ impl ScrollingSpace {
             },
             [single] => self.apply_column_width_to_all(*single),
             [first, ..] => {
+                let old = self.virtual_layout.clone();
                 let _ = self.set_base_column_width(*first);
                 self.monocle_saved_width = None;
                 let mut new_layout = self.virtual_layout.clone();
                 self.pin_widths(&mut new_layout);
-                if !new_layout.columns.is_empty() {
-                    // Narrower columns can leave the camera past the end of
-                    // the canvas; pull it back before revealing the focus.
-                    let canvas =
-                        projection::canvas_width(&new_layout, self.config.padding.window_gap);
-                    let max_offset = (canvas - self.config.monitor_width).max(0);
-                    new_layout.viewport_offset = new_layout.viewport_offset.min(max_offset);
-                    let focus_col = self.focus_col_index().min(new_layout.columns.len() - 1);
-                    new_layout =
-                        mutations::ensure_column_visible(&new_layout, focus_col, &self.config);
-                }
+                self.reanchor_after_reflow(&old, &mut new_layout);
                 self.apply_mutation(new_layout)
             }
         }
+    }
+
+    /// Place the camera after every column's width changed. The column that
+    /// stood at the viewport's left edge in `old` stays there, so the view
+    /// still begins on a column boundary: a raw offset kept across a re-flow
+    /// starts mid-column, and a column cut by the left edge is parked when a
+    /// neighbour monitor lies beyond it, which leaves a bare gap (the dev
+    /// guide's *Projection*, the overhang rule). Then the end-of-canvas clamp
+    /// and the focus reveal as before.
+    fn reanchor_after_reflow(&self, old: &VirtualLayout, new_layout: &mut VirtualLayout) {
+        if new_layout.columns.is_empty() {
+            return;
+        }
+        let gap = self.config.padding.window_gap;
+        let last = new_layout.columns.len() - 1;
+        let anchor = (0..old.columns.len())
+            .find(|&i| column_left(old, i, gap) >= old.viewport_offset)
+            .unwrap_or(last)
+            .min(last);
+        let canvas = projection::canvas_width(new_layout, gap);
+        let max_offset = (canvas - self.config.monitor_width).max(0);
+        new_layout.viewport_offset = (column_left(new_layout, anchor, gap) - gap)
+            .max(0)
+            .min(max_offset);
+        let focus_col = self.focus_col_index().min(last);
+        *new_layout = mutations::ensure_column_visible(new_layout, focus_col, &self.config);
     }
 
     /// Set every column of `layout` to its position's pattern width,
@@ -431,6 +448,7 @@ impl ScrollingSpace {
     /// ladder) and the focused column is kept in view. Returns the
     /// re-projected layout for the animator.
     pub fn apply_column_width_to_all(&mut self, column_width: u32) -> AppliedLayout {
+        let old = self.virtual_layout.clone();
         let _ = self.set_base_column_width(column_width);
         let width = (column_width as i32).min(self.config.abs_max_width).max(1);
         let mut new_layout = self.virtual_layout.clone();
@@ -438,15 +456,7 @@ impl ScrollingSpace {
             col.width_px = width;
         }
         self.monocle_saved_width = None;
-        if !new_layout.columns.is_empty() {
-            // Narrower columns can leave the camera past the end of the
-            // canvas; pull it back before revealing the focused column.
-            let canvas = projection::canvas_width(&new_layout, self.config.padding.window_gap);
-            let max_offset = (canvas - self.config.monitor_width).max(0);
-            new_layout.viewport_offset = new_layout.viewport_offset.min(max_offset);
-            let focus_col = self.focus_col_index().min(new_layout.columns.len() - 1);
-            new_layout = mutations::ensure_column_visible(&new_layout, focus_col, &self.config);
-        }
+        self.reanchor_after_reflow(&old, &mut new_layout);
         self.apply_mutation(new_layout)
     }
 
@@ -1257,6 +1267,15 @@ impl ScrollingSpace {
     }
 }
 
+/// Canvas x of column `idx`'s left edge: the leading gap plus every earlier
+/// column's slot (`width_px + gap`), the prefix sum the projection walks.
+fn column_left(layout: &VirtualLayout, idx: usize, gap: i32) -> i32 {
+    gap + layout.columns[..idx]
+        .iter()
+        .map(|c| c.width_px + gap)
+        .sum::<i32>()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,6 +1377,42 @@ mod tests {
         let before = engine.virtual_layout().clone();
         let applied = engine.restore_window_at(0, 0, true, WindowId(7), None);
         assert_eq!(applied.virtual_layout, before);
+    }
+
+    /// Three columns, the view starting on the second one. Switching the
+    /// widths must keep that column at the left edge (the view begins on a
+    /// column boundary) instead of keeping the old pixel offset, which put
+    /// the camera mid-column: a gap where the cut column was parked and the
+    /// last column spilling off the right edge.
+    #[test]
+    fn width_changes_keep_the_left_edge_column_anchored() {
+        let gap = test_padding().window_gap; // 4
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        engine.add_window(WindowId(1));
+        engine.add_window(WindowId(2));
+        engine.add_window(WindowId(3)); // focus
+        let col_left = |layout: &VirtualLayout, i: usize| column_left(layout, i, gap);
+
+        // 1/3 + 2/3 of a 1920 screen: 636 + 1272 + 3 gaps = 1920. The focus
+        // (column 2, 636 wide) is revealed on the right, so the view starts
+        // at column 1.
+        let applied = engine.apply_width_pattern(&[636, 1272]);
+        let vl = &applied.virtual_layout;
+        assert_eq!(vl.viewport_offset, col_left(vl, 1) - gap);
+
+        // Uniform 1/2 (954 + 954 + 3 gaps = 1920), through the preset entry
+        // point so the pattern pin is released first: column 1 stays at the
+        // left edge and column 2 ends exactly at the right edge.
+        let applied = engine.apply_width_pattern(&[954]);
+        let vl = &applied.virtual_layout;
+        assert_eq!(vl.viewport_offset, col_left(vl, 1) - gap);
+        assert_eq!(col_left(vl, 2) + 954 + gap, vl.viewport_offset + 1920);
+
+        // Back to the pattern: the same column is anchored again.
+        let applied = engine.apply_width_pattern(&[636, 1272]);
+        let vl = &applied.virtual_layout;
+        assert_eq!(vl.viewport_offset, col_left(vl, 1) - gap);
+        assert_eq!(col_left(vl, 2) + 636 + gap, vl.viewport_offset + 1920);
     }
 
     #[test]
