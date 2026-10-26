@@ -728,7 +728,7 @@ pub fn resolve_action(line: &str) -> Result<Action, String> {
         "show-hotkey-overlay" => Ok(builtin(ActionKind::Help, "this help (Esc hides it)")),
         "launcher" => Ok(builtin(
             ActionKind::Launcher,
-            "application launcher (apps, open windows, settings)",
+            "application launcher (apps; window - x and file - x search those instead)",
         )),
         "toggle-tiling" => Ok(builtin(
             ActionKind::ToggleTiling,
@@ -1785,7 +1785,7 @@ mod tests {
         assert!(lines.contains(
             &"bind\t#+t\talways\tspawn\t1\tMod+Shift+T\trun alacritty as admin\talacritty"
         ));
-        assert!(lines.contains(&"bind\t#Space\talways\tlauncher\t0\tMod+Space\tapplication launcher (apps, open windows, settings)\t"));
+        assert!(lines.contains(&"bind\t#Space\talways\tlauncher\t0\tMod+Space\tapplication launcher (apps; window - x and file - x search those instead)\t"));
         assert!(
             lines
                 .iter()

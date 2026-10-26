@@ -2,19 +2,30 @@
 ; FlowWM application launcher (the `launcher` action: Mod+Space, Mod+D by
 ; default). Included from flow.ahk.
 ;
-; Fuzzy-finds Start-menu shortcuts, a few built-ins (Settings, Lock, Task
-; Manager) and the open top-level windows. Enter runs / activates the
-; selection or, with nothing matched, passes the typed text to Run; Esc
-; hides. Needs nothing from the daemon (only ShowCentered() and AhkLog()
-; from flow.ahk). Keys, index rules and the scoring are in README.md.
+; Fuzzy-finds one kind of thing at a time, chosen by a prefix on the query:
+; "app - x" (Start-menu shortcuts and a few built-ins: Settings, Lock, Task
+; Manager), "window - x" (open top-level windows) or "file - x" (files
+; under the user's folders and the shell's Recent items). No prefix means
+; app. Enter runs / activates the selection or, with nothing matched,
+; passes the typed text to Run; Esc hides. Needs nothing from the daemon
+; (only ShowCentered() and AhkLog() from flow.ahk). Keys, index rules and
+; the scoring are in README.md.
 ; ════════════════════════════════════════════════════════════════════════════
 
 ; --- State -----------------------------------------------------------------
 LauncherApps := []          ; .lnk + built-in entries, rebuilt lazily (60 s)
 LauncherAppsBuilt := 0      ; A_TickCount of the last app scan
-LauncherEntries := []       ; windows + apps, rebuilt on every show
+LauncherWins := []          ; open windows, rebuilt on every show
+LauncherFiles := []         ; file entries, built on the first "file - " query, kept 60 s
+LauncherFilesBuilt := 0     ; A_TickCount of the last file scan
 LauncherResults := []       ; entries behind the ListBox rows, in row order
 LauncherLastQuery := ""     ; raw Edit text the list currently reflects
+
+; Where "file - x" looks: these folders, LauncherFileDepth levels deep, at
+; most LauncherFileCap files in all, plus the shell's Recent items.
+LauncherFileRoots := [A_Desktop, A_MyDocuments, EnvGet("USERPROFILE") "\Downloads", EnvGet("USERPROFILE") "\Pictures", EnvGet("USERPROFILE") "\Videos", EnvGet("USERPROFILE") "\Music"]
+LauncherFileDepth := 3
+LauncherFileCap := 5000
 
 ; --- GUI -------------------------------------------------------------------
 LauncherGui := Gui("+AlwaysOnTop -Caption +ToolWindow +Owner", "FlowWM Launcher")
@@ -127,18 +138,42 @@ FuzzySelfCheck() {
 }
 FuzzySelfCheck()
 
+; --- Query -----------------------------------------------------------------
+; "app - x" / "window - x" / "file - x" (any case, spaces around the dash
+; optional) selects the kind searched; anything else is an app query.
+LauncherParse(q) {
+    if RegExMatch(q, "i)^(app|window|file)\s*-\s*(.*)$", &m)
+        return {kind: StrLower(m[1]), text: Trim(m[2])}
+    return {kind: "app", text: q}
+}
+
 ; --- Index -----------------------------------------------------------------
+; Called on every show: windows are re-enumerated, apps every 60 s. Files
+; are scanned by LauncherFilter the first time a "file - " query asks.
 LauncherBuildIndex() {
-    global LauncherApps, LauncherAppsBuilt, LauncherEntries
+    global LauncherApps, LauncherAppsBuilt, LauncherWins
     if (LauncherApps.Length = 0 || A_TickCount - LauncherAppsBuilt > 60000) {
         LauncherApps := LauncherScanApps()
         LauncherAppsBuilt := A_TickCount
     }
-    LauncherEntries := []
-    for e in LauncherWindows()
-        LauncherEntries.Push(e)
-    for e in LauncherApps
-        LauncherEntries.Push(e)
+    LauncherWins := LauncherWindows()
+}
+
+; The entries a query of the given kind is matched against.
+LauncherEntriesFor(kind) {
+    global LauncherFiles, LauncherFilesBuilt
+    if (kind = "window")
+        return LauncherWins
+    if (kind = "file") {
+        if (LauncherFilesBuilt = 0 || A_TickCount - LauncherFilesBuilt > 60000) {
+            t0 := A_TickCount
+            LauncherFiles := LauncherScanFiles()
+            LauncherFilesBuilt := A_TickCount
+            AhkLog("launcher file scan: " LauncherFiles.Length " file(s) in " (A_TickCount - t0) " ms")
+        }
+        return LauncherFiles
+    }
+    return LauncherApps
 }
 
 ; Every .lnk under the Start menus, deduplicated by display name
@@ -209,8 +244,60 @@ LauncherCloaked(hwnd) {
     return cloaked != 0
 }
 
-; Row text: "name  —  kind"; window titles longer than 70 chars are cut with
-; an ellipsis (the full title is still what gets matched).
+; Files under LauncherFileRoots (LauncherFileDepth levels, hidden and
+; system entries and dot-folders skipped, LauncherFileCap in all) plus the
+; targets of the shell's Recent shortcuts that still exist and are not
+; folders. Deduplicated by full path, case-insensitively.
+LauncherScanFiles() {
+    files := []
+    seen := Map()
+    for root in LauncherFileRoots {
+        if (files.Length >= LauncherFileCap)
+            break
+        if (root = "" || !DirExist(root))
+            continue
+        LauncherScanDir(root, LauncherFileDepth, files, seen)
+    }
+    recent := EnvGet("APPDATA") "\Microsoft\Windows\Recent"
+    if DirExist(recent) {
+        Loop Files, recent "\*.lnk" {
+            target := ""
+            try FileGetShortcut(A_LoopFileFullPath, &target)
+            catch
+                continue
+            attr := (target = "") ? "" : FileExist(target)
+            if (attr = "" || InStr(attr, "D") || seen.Has(StrLower(target)))
+                continue
+            seen[StrLower(target)] := true
+            SplitPath(target, &fname, &fdir)
+            files.Push({name: fname, kind: "File", sub: fdir, run: target})
+        }
+    }
+    return files
+}
+
+LauncherScanDir(dir, depth, files, seen) {
+    Loop Files, dir "\*", "FD" {
+        if (files.Length >= LauncherFileCap)
+            return
+        if (InStr(A_LoopFileAttrib, "H") || InStr(A_LoopFileAttrib, "S") || SubStr(A_LoopFileName, 1, 1) = ".")
+            continue
+        if InStr(A_LoopFileAttrib, "D") {
+            if (depth > 1)
+                LauncherScanDir(A_LoopFileFullPath, depth - 1, files, seen)
+            continue
+        }
+        key := StrLower(A_LoopFileFullPath)
+        if seen.Has(key)
+            continue
+        seen[key] := true
+        files.Push({name: A_LoopFileName, kind: "File", sub: A_LoopFileDir, run: A_LoopFileFullPath})
+    }
+}
+
+; Row text: "name  —  kind"; names longer than 70 chars are cut with an
+; ellipsis (the full name is still what gets matched). Windows show their
+; process, files the tail of their folder.
 LauncherDisplay(e) {
     sep := "  " Chr(0x2014) "  "
     name := e.name
@@ -218,6 +305,12 @@ LauncherDisplay(e) {
         name := RTrim(SubStr(name, 1, 69)) Chr(0x2026)
     if (e.kind = "Window")
         return name "  (" e.sub ")" sep "Window"
+    if (e.kind = "File") {
+        dir := e.sub
+        if (StrLen(dir) > 40)
+            dir := Chr(0x2026) SubStr(dir, -39)
+        return name "  (" dir ")" sep "File"
+    }
     return name sep e.kind
 }
 
@@ -238,6 +331,7 @@ LauncherToggle(*) {
 LauncherHide(*) {
     SetTimer(LauncherWatch, 0)
     LauncherGui.Hide()
+    AhkLog("launcher hidden")
 }
 
 ; Backstop while the launcher is visible: if the Edit text no longer matches
@@ -257,20 +351,24 @@ LauncherWatch() {
     }
 }
 
-; Re-score every entry against the query and refill the list. Sorting is
-; done by Sort() on "paddedScore<TAB>name<TAB>index" lines: fixed-width
-; zero-padded (999999 - score), so plain lexicographic order gives score
-; descending, then name (Sort is case-insensitive). The entry index is read
-; back from the end of each sorted line. Entries scoring 0 are dropped.
+; Re-score every entry of the query's kind against its text and refill the
+; list. Sorting is done by Sort() on "paddedScore<TAB>name<TAB>index"
+; lines: fixed-width zero-padded (999999 - score), so plain lexicographic
+; order gives score descending, then name (Sort is case-insensitive). The
+; entry index is read back from the end of each sorted line. Entries
+; scoring 0 are dropped; an empty text lists the whole kind by name.
 LauncherFilter(*) {
     global LauncherResults, LauncherLastQuery
+    Critical "On"             ; a later Change event must not interleave with this one (README.md)
     raw := LauncherEdit.Value
     LauncherLastQuery := raw
-    q := Trim(raw)
+    p := LauncherParse(Trim(raw))
+    q := p.text
+    entries := LauncherEntriesFor(p.kind)
     lines := ""
-    for i, e in LauncherEntries {
+    for i, e in entries {
         if (q = "")
-            s := (e.kind = "Window") ? 2 : 1       ; empty query: windows first
+            s := 1
         else {
             s := FuzzyScore(q, e.name)
             if (e.kind = "Window") {
@@ -289,7 +387,7 @@ LauncherFilter(*) {
             if (items.Length >= 60)
                 break
             idx := Integer(SubStr(A_LoopField, InStr(A_LoopField, "`t", , -1) + 1))
-            e := LauncherEntries[idx]
+            e := entries[idx]
             LauncherResults.Push(e)
             items.Push(LauncherDisplay(e))
         }
@@ -299,7 +397,8 @@ LauncherFilter(*) {
         LauncherList.Add(items)
         LauncherList.Choose(1)
     }
-    AhkLog("launcher filter '" q "' -> " items.Length " row(s)" (items.Length ? ", top: " LauncherResults[1].name : ""))
+    AhkLog("launcher filter " p.kind " '" q "' -> " items.Length " row(s)" (items.Length ? ", top: " LauncherResults[1].name : ""))
+    Critical "Off"
 }
 
 LauncherMove(delta) {
@@ -315,16 +414,18 @@ LauncherRun(*) {
     if (LauncherEdit.Value !== LauncherLastQuery)   ; never act on a stale list
         LauncherFilter()
     i := LauncherList.Value
-    text := Trim(LauncherEdit.Value)
+    text := LauncherParse(Trim(LauncherEdit.Value)).text
     if (i < 1 && LauncherResults.Length > 0)
         i := 1
     LauncherHide()
     if (i >= 1 && i <= LauncherResults.Length) {
+        AhkLog("launcher run row " i ": " LauncherResults[i].kind " " LauncherResults[i].name)
         LauncherActivate(LauncherResults[i])
         return
     }
     if (text = "")
         return
+    AhkLog("launcher run text: " text)
     try Run(text, EnvGet("USERPROFILE"))
     catch as err
         Osd("could not run " text ": " err.Message)

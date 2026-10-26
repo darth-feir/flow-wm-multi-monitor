@@ -15,7 +15,7 @@ setup.
 | `flow.ahk` | The keymap: an interpreter that registers the chords `flow query binds --plain` lists (the daemon's view of `[binds]`), re-reads them when `flow.toml` is saved, and hardwires the Mod + left-button drag, Mod+Ctrl+T and Mod+Ctrl+Shift+T. `#Include`s the three files below. Started by the daemon (`flow start --ahk`) inside its kill-on-close job object. |
 | `binds.toml` | The default `[binds]` table, compiled into the daemon (`include_str!`). Paste a line into `flow.toml` to change it. Not read at runtime. |
 | `flow-exe.ahk` | `ResolveFlowExe()` — where `flow.exe` is. Shared by `flow.ahk` and `flow-resident.ahk`. |
-| `launcher.ahk` | Application launcher (the `launcher` action, Mod+Space / Mod+D by default): Start-menu shortcuts, open windows, a few built-ins, fuzzy-matched. |
+| `launcher.ahk` | Application launcher (the `launcher` action, Mod+Space / Mod+D by default): fuzzy-matches Start-menu shortcuts and a few built-ins; `window - x` and `file - x` search open windows or files instead. |
 | `help.ahk` | Key-binding overlay (the `show-hotkey-overlay` action, Mod+Shift+/ by default). Its rows come from the same `flow query binds` listing the hotkeys are registered from, so it cannot disagree with them. |
 | `flow-resident.ahk` | Optional resident starter: runs all the time (shortcut in `shell:startup`) and turns Mod+Ctrl+T into an on/off switch for the whole of FlowWM. |
 | `flow.toml.example` | The daemon side of the map: `[columns]` width presets (fractions and `2/3+1/3`-style slot patterns, per-screen `[[columns.screen]]` rules), `edge_hop = false`, and commented `[binds]` / `[startup]` examples. |
@@ -277,14 +277,29 @@ runs, Esc hides, double-click runs. Enter runs or activates the selection;
 with nothing matched, the typed text is passed to `Run` as a command or
 path.
 
-**Index.** Every `.lnk` under the user and common Start menus
+**Query syntax.** The query searches one kind of entry, chosen by a
+prefix: `app - x`, `window - x` or `file - x` (any case; the spaces
+around the dash are optional). Without a prefix it is an app query, so
+`jellyfin-tui` and `app - jellyfin-tui` are the same search. An empty
+text after the prefix lists the whole kind by name. Enter with nothing
+matched passes the text after the prefix to `Run`.
+
+**Index.** *Apps:* every `.lnk` under the user and common Start menus
 (`A_StartMenu`, `A_StartMenuCommon`, `A_Programs`, `A_ProgramsCommon`,
 nested roots skipped), deduplicated by display name case-insensitively,
 `Uninstall*` skipped, rebuilt lazily every 60 s; plus Settings, Lock and
-Task Manager as built-ins; plus the open top-level windows (empty titles,
-tool windows, cloaked windows — other virtual desktops, suspended UWP —
-the shell's own frames and the script's own windows are skipped),
-rebuilt on every show. With an empty query windows are listed first.
+Task Manager as built-ins. *Windows:* the open top-level windows (empty
+titles, tool windows, cloaked windows — other virtual desktops, suspended
+UWP — the shell's own frames and the script's own windows are skipped),
+rebuilt on every show. *Files:* scanned the first time a `file - ` query
+asks and kept for 60 s: every file under `LauncherFileRoots` (Desktop,
+Documents, Downloads, Pictures, Videos, Music) down to `LauncherFileDepth`
+(3) folder levels, hidden and system entries and dot-folders skipped, at
+most `LauncherFileCap` (5000) files in all; plus the targets of the
+shell's Recent shortcuts that still exist and are not folders. The three
+constants sit at the top of `launcher.ahk`. A file is matched on its name
+only and the row shows the tail of its folder; Enter opens it with its
+default program.
 
 **Fuzzy matching** (`FuzzyScore`) is a case-insensitive subsequence match.
 0 means no match (the query is not a subsequence of the text); otherwise:
@@ -318,6 +333,10 @@ the Edit text no longer matches what the list was built from (a missed
 `Change` event) and keeps the keyboard focus on the Edit so typed letters
 never go to the ListBox, whose own type-ahead would eat them; `Enter`
 refilters first if the list is stale, so it never acts on a stale row.
+`LauncherFilter` runs `Critical`: AutoHotkey lets a later `Change` event
+interrupt a running one, and without it the first-character refilter of
+a pasted or fast-typed query could finish *after* the full-text one and
+overwrite the list with its stale rows (seen in the VM, 2026-10-26).
 
 ## Tracing
 

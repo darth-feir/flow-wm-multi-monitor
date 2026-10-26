@@ -64,24 +64,26 @@ AhkLog(msg) {
 ; Short on-screen message in the bottom-right corner of the primary screen,
 ; gone after `ms`. Never TrayTip: on Windows 11 the toast holds the
 ; foreground lock until dismissed (see README.md).
+; The static must not be called `gui`: a local of that name shadows the Gui
+; class (names are case-insensitive) and `Gui(...)` then calls an Integer.
 Osd(msg, ms := 2500) {
-    static gui := 0
+    static box := 0
     AhkLog("osd: " msg)
-    if gui
-        try gui.Destroy()
-    gui := Gui("+AlwaysOnTop -Caption +ToolWindow +Owner +E0x20", "FlowWM")   ; E0x20: click-through
-    gui.BackColor := 0x1E1E1E
-    gui.MarginX := 16, gui.MarginY := 10
-    gui.SetFont("s11 cE8E8E8", "Segoe UI")
-    gui.AddText("w520", msg)
+    if box
+        try box.Destroy()
+    box := Gui("+AlwaysOnTop -Caption +ToolWindow +Owner +E0x20", "FlowWM")   ; E0x20: click-through
+    box.BackColor := 0x1E1E1E
+    box.MarginX := 16, box.MarginY := 10
+    box.SetFont("s11 cE8E8E8", "Segoe UI")
+    box.AddText("w520", msg)
     MonitorGetWorkArea(MonitorGetPrimary(), &l, &t, &r, &b)
-    gui.Show("NoActivate Hide")
-    gui.GetPos(, , &w, &h)
-    gui.Show("NoActivate x" (r - w - 24) " y" (b - h - 24))
-    SetTimer(OsdHide.Bind(gui), -ms)
+    box.Show("NoActivate Hide")
+    box.GetPos(, , &w, &h)
+    box.Show("NoActivate x" (r - w - 24) " y" (b - h - 24))
+    SetTimer(OsdHide.Bind(box), -ms)
 }
-OsdHide(gui) {
-    try gui.Hide()
+OsdHide(box) {
+    try box.Hide()
 }
 
 ; onExit (optional): a function object called as onExit(exitCode) once the
@@ -611,8 +613,8 @@ bind	#r	tiling	dispatch	0	Mod+R	cycle this screen's column widths (flow.toml [co
 bind	#f	tiling	dispatch	0	Mod+F	fullscreen toggle	set-window<US>fullscreen
 bind	#[	tiling	dispatch	0	Mod+BracketLeft	alone: merge into the column on that side; stacked: pop out to that side	consume-or-expel<US>left
 bind	#]	tiling	dispatch	0	Mod+BracketRight	alone: merge into the column on that side; stacked: pop out to that side	consume-or-expel<US>right
-bind	#Space	always	launcher	0	Mod+Space	application launcher (apps, open windows, settings)	
-bind	#d	always	launcher	0	Mod+D	application launcher (apps, open windows, settings)	
+bind	#Space	always	launcher	0	Mod+Space	application launcher (apps; window - x and file - x search those instead)	
+bind	#d	always	launcher	0	Mod+D	application launcher (apps; window - x and file - x search those instead)	
 bind	#t	always	spawn	0	Mod+T	run alacritty	alacritty
 bind	#+t	always	spawn	1	Mod+Shift+T	run alacritty as admin	alacritty
 bind	#!t	always	spawn	0	Mod+Alt+T	run wt	wt
@@ -634,7 +636,7 @@ row	Mod+Shift+V	switch focus between the floating and the tiled windows
 row	Mod+R	cycle this screen's column widths (flow.toml [columns] presets)
 row	Mod+F	fullscreen toggle
 row	Mod+BracketLeft, Mod+BracketRight	alone: merge into the column on that side; stacked: pop out to that side
-row	Mod+Space, Mod+D	application launcher (apps, open windows, settings)
+row	Mod+Space, Mod+D	application launcher (apps; window - x and file - x search those instead)
 row	Mod+T	run alacritty
 row	Mod+Shift+T	run alacritty as admin
 row	Mod+Alt+T	run wt
