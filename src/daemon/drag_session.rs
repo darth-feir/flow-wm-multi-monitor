@@ -551,12 +551,13 @@ mod tests {
         assert!(flow.drag_state.is_some(), "the tile drag machine is live");
         assert_eq!(crate::registry::hooks::dragged_hwnd(), A);
 
-        // The keymap moves A over B's column: the cursor lands in B's
-        // right column-edge band (inside the column, outside the 30 px
-        // monitor-edge scroll band), the window rect follows the cursor.
+        // The keymap moves A over B's column: the cursor lands in the
+        // outer third of B's right side (inside the column, outside the
+        // twelfth-of-the-screen monitor-edge scroll band), the window rect
+        // follows the cursor.
         let b = tile_rect(&flow, B);
         let a0 = tile_rect(&flow, A);
-        let cursor = (b.right() - 60, b.y + b.height / 2);
+        let cursor = (b.right() - 200, b.y + b.height / 2);
         desktop.cursor.set(cursor);
         for step in 1..=5 {
             let dx = (cursor.0 - (a0.x + a0.width / 2)) * step / 5;
@@ -792,5 +793,129 @@ mod tests {
             flow.end_manual_drag_with(&desktop).expect("ended");
             assert_eq!(stored_float_rect(&flow, F), visible);
         }
+    }
+
+    // ── cross-screen tile drops (ADR-0018) ────────────────────────────
+
+    const D: isize = 0x1004;
+
+    /// The single-monitor fixture plus a second 1920x1080 monitor to its
+    /// right (x 1920..3840) holding tile D, or nothing when `empty`.
+    fn two_monitor_fixture(desktop: &ScriptedDesktop, empty: bool) -> FlowWM {
+        let mut flow = fixture(desktop);
+        let screen = r(1920, 0, 1920, 1080);
+        let padding = Padding {
+            window_gap: 4,
+            up: 0,
+            down: 0,
+        };
+        let mut scrolling =
+            ScrollingSpace::new(MonitorInfo::single(screen), 960, 320, 100, 100, padding, 4);
+        if !empty {
+            register(&mut flow.registry, D, r(0, 0, 800, 600), tile());
+            scrolling.add_window(WindowId(D));
+            flow.registry
+                .update_tiling_slots_from_layout(scrolling.virtual_layout());
+            flow.registry.update_tiled_rects(scrolling.actual_layout());
+            for entry in &scrolling.actual_layout().entries {
+                desktop.place(entry.window_id.0, entry.rect);
+            }
+            flow.registry.set_monitor(D, 1);
+        }
+        let ws = Workspace::new(WorkspaceId(1), scrolling);
+        flow.monitors
+            .push(Monitor::new(screen, screen, vec![ws], 0));
+        flow
+    }
+
+    fn order_on(flow: &FlowWM, mi: usize) -> Vec<isize> {
+        flow.monitors[mi]
+            .active_scrolling()
+            .virtual_layout()
+            .columns
+            .iter()
+            .flat_map(|c| c.rows.iter().map(|row| row.window_id.0))
+            .collect()
+    }
+
+    /// Drive a tile session for A through `path` (cursor points; the
+    /// window follows each one), then end it.
+    fn drag_a_through(flow: &mut FlowWM, desktop: &ScriptedDesktop, path: &[(i32, i32)]) {
+        flow.begin_manual_drag_with(desktop).expect("tile session");
+        let a0 = tile_rect(flow, A);
+        for &(x, y) in path {
+            desktop.cursor.set((x, y));
+            desktop.place(A, r(x - a0.width / 2, y - 20, a0.width, a0.height));
+            flow.on_drag_move_with(desktop, A);
+        }
+        flow.end_manual_drag_with(desktop).expect("session ended");
+    }
+
+    #[test]
+    fn a_tile_dropped_on_another_monitor_joins_that_strip_at_the_zone() {
+        let _turn = serialized();
+        let desktop = ScriptedDesktop::default();
+        let mut flow = two_monitor_fixture(&desktop, false);
+        // D spans x 1924..2884; its right outer third starts at 2884 - 316.
+        drag_a_through(&mut flow, &desktop, &[(900, 500), (1500, 500), (2800, 500)]);
+        assert_eq!(order_on(&flow, 0), vec![B, C], "A left its own strip");
+        assert_eq!(order_on(&flow, 1), vec![D, A], "A landed right of D");
+        assert_eq!(flow.monitor_index_for_window(WindowId(A)), 1);
+        assert_eq!(flow.remembered_monitor(WindowId(A)), Some(1));
+        assert_eq!(flow.active_monitor, 1, "the target monitor is active");
+        assert_eq!(
+            flow.monitors[1].active_scrolling().last_focused_window(),
+            Some(WindowId(A))
+        );
+    }
+
+    #[test]
+    fn a_cross_screen_drop_into_the_middle_third_stacks_by_window_half() {
+        let _turn = serialized();
+        let desktop = ScriptedDesktop::default();
+        let mut flow = two_monitor_fixture(&desktop, false);
+        // D's middle third, top half: A goes above D.
+        drag_a_through(&mut flow, &desktop, &[(1500, 500), (2400, 200)]);
+        let cols = &flow.monitors[1].active_scrolling().virtual_layout().columns;
+        assert_eq!(cols.len(), 1);
+        let ids: Vec<isize> = cols[0].rows.iter().map(|r| r.window_id.0).collect();
+        assert_eq!(ids, vec![A, D]);
+    }
+
+    #[test]
+    fn a_drag_that_returns_to_its_own_screen_does_not_cross() {
+        let _turn = serialized();
+        let desktop = ScriptedDesktop::default();
+        let mut flow = two_monitor_fixture(&desktop, false);
+        let a = tile_rect(&flow, A);
+        // Over D, then back to A's own tile (its middle third, top half).
+        drag_a_through(
+            &mut flow,
+            &desktop,
+            &[(2400, 500), (2800, 500), (a.x + a.width / 2, a.y + 100)],
+        );
+        assert_eq!(order_on(&flow, 0), vec![A, B, C]);
+        assert_eq!(order_on(&flow, 1), vec![D]);
+        assert_eq!(flow.monitor_index_for_window(WindowId(A)), 0);
+    }
+
+    #[test]
+    fn a_release_off_every_monitor_snaps_back() {
+        let _turn = serialized();
+        let desktop = ScriptedDesktop::default();
+        let mut flow = two_monitor_fixture(&desktop, false);
+        drag_a_through(&mut flow, &desktop, &[(2400, 500), (2400, 1500)]);
+        assert_eq!(order_on(&flow, 0), vec![A, B, C]);
+        assert_eq!(order_on(&flow, 1), vec![D]);
+    }
+
+    #[test]
+    fn a_tile_dropped_on_an_empty_monitor_becomes_its_first_column() {
+        let _turn = serialized();
+        let desktop = ScriptedDesktop::default();
+        let mut flow = two_monitor_fixture(&desktop, true);
+        drag_a_through(&mut flow, &desktop, &[(1500, 500), (2800, 500)]);
+        assert_eq!(order_on(&flow, 0), vec![B, C]);
+        assert_eq!(order_on(&flow, 1), vec![A]);
     }
 }

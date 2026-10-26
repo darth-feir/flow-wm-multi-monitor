@@ -959,21 +959,40 @@ impl FlowWM {
         {
             dst = diff;
         }
+        self.finish_tiled_monitor_move(id, (from, &src), (target, &dst), &[]);
+        SocketResponse::Ok
+    }
+
+    /// The shared tail of every move of a tile between two strips (the
+    /// `move-to-monitor` command and a cross-screen tile drop): `id` has
+    /// already been removed from `from`'s strip (`src` is that layout) and
+    /// seated in `target`'s (`dst`). Records the new owner, makes `target`
+    /// active, animates both strips plus any `extra` ones (a drag's other
+    /// touched strips) in one batch, and gives `id` the focus.
+    pub(super) fn finish_tiled_monitor_move(
+        &mut self,
+        id: WindowId,
+        (from, src): (usize, &AppliedLayout),
+        (target, dst): (usize, &AppliedLayout),
+        extra: &[(usize, AppliedLayout)],
+    ) {
+        self.set_active_monitor(target);
         self.remember_monitor(id, target);
         // Both monitors change in one command: submit them as one batch so
         // the source strip's columns resettle instead of being cut off by
         // the destination's submission.
-        self.animate_layouts_on(&[(from, &src), (target, &dst)]);
+        let mut batch: Vec<(usize, &AppliedLayout)> = vec![(from, src), (target, dst)];
+        batch.extend(extra.iter().map(|(m, l)| (*m, l)));
+        self.animate_layouts_on(&batch);
 
         if !registry_win32::set_foreground_window(id.0) {
             log::warn!(
-                "move_tiled_to_monitor: SetForegroundWindow failed for hwnd {}",
+                "finish_tiled_monitor_move: SetForegroundWindow failed for hwnd {}",
                 id.0
             );
         }
         self.registry.set_focused(id.0);
         self.refresh_border_for(id.0);
-        SocketResponse::Ok
     }
 
     /// Move a float to `target`, keeping its offset relative to the work

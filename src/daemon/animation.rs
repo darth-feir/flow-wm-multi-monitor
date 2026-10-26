@@ -189,10 +189,12 @@ impl FlowWM {
     /// calls [`animate_layout`], `drag_state` has already been `take()`n so the
     /// filter does not trigger — the dragged window animates to its final
     /// position as intended.
-    fn submit_animation(&mut self, layout: &AppliedLayout, monitor_idx: usize) {
+    fn submit_animation(&mut self, layouts: &[(usize, &AppliedLayout)]) {
         let mut targets: Vec<WindowTarget> = Vec::new();
         let mut submitted: Vec<(isize, Rect)> = Vec::new();
-        self.collect_targets(layout, monitor_idx, &mut targets, &mut submitted);
+        for (monitor_idx, layout) in layouts {
+            self.collect_targets(layout, *monitor_idx, &mut targets, &mut submitted);
+        }
         self.record_submitted(&submitted);
         if targets.is_empty() {
             return;
@@ -388,8 +390,18 @@ impl FlowWM {
     /// direct `border.set_geometry` calls in `on_drag_move`.
     /// (`docs/src/dev-guide/tile-drag.md`) `monitor_idx` is the monitor
     /// whose strip the preview was projected for.
+    #[cfg(test)]
     pub(super) fn animate_preview_on(&mut self, monitor_idx: usize, preview: &AppliedLayout) {
-        self.submit_animation(preview, monitor_idx);
+        self.submit_animation(&[(monitor_idx, preview)]);
+    }
+
+    /// [`animate_preview_on`](Self::animate_preview_on) for several strips
+    /// in **one** animator batch, so a cross-screen drag that previews on
+    /// one monitor and settles another does not cut either short (the
+    /// animator supersedes an in-flight batch). Non-committing like the
+    /// single-strip form: no registry sync.
+    pub(super) fn animate_previews_on(&mut self, layouts: &[(usize, &AppliedLayout)]) {
+        self.submit_animation(layouts);
     }
 
     /// Submit a single combined animation batch spanning multiple workspaces.

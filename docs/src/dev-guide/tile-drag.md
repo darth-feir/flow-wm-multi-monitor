@@ -51,6 +51,10 @@ The `Dragging` state is `Option<DragState>` on the `FlowWM` struct.
 - `current_zone: Option<DropZone>` — the drop zone currently under the
   cursor. `None` until the first `on_drag_move`; this is the value committed
   on release.
+- `zone_monitor: Option<usize>` — the monitor whose strip `current_zone`
+  belongs to (another monitor than the window's own makes the drop a
+  cross-screen move), and `touched`, the other monitors the drag previewed
+  on (see *Cross-screen drop*).
 
 There is no `DragSource`, no dwell timer, no animation lock, no center-preview
 flag — those belonged to the float-conversion and dwell models and are gone.
@@ -175,77 +179,99 @@ only its arguments and touches no live state or Win32 API.
 
 ```mermaid
 flowchart TB
-    Start["resolve_drop_zone(applied, monitor, cursor)"]
-    Start --> Edge{"cursor in edge band AND<br/>content off-screen that way?"}
+    Start["resolve_drop_zone(applied, monitor, cursor, params)"]
+    Start --> WA{"cursor inside this<br/>strip's work area?"}
+    WA -- no --> None[None]
+    WA -- yes --> Edge{"screen-edge band AND<br/>content off-screen that way?"}
     Edge -- left --> SL[ScrollLeft]
     Edge -- right --> SR[ScrollRight]
-    Edge -- no --> Col["find column under cursor<br/>(seam falls to right neighbor)"]
-    Col --> Band{"cursor in col-edge band?"}
-    Band -- "left edge" --> CL["Column k (insert before)"]
-    Band -- "right edge" --> CR["Column k+1 (insert after)"]
-    Band -- body --> Body["split column into n+1 regions"]
-    Body --> Row["Row at (k, j)"]
+    Edge -- no --> Gap{"gap beside or<br/>between columns?"}
+    Gap -- yes --> CG["Column (insert there)"]
+    Gap -- no --> Band{"outer third<br/>of the column?"}
+    Band -- left --> CL["Column k (insert before)"]
+    Band -- right --> CR["Column k+1 (insert after)"]
+    Band -- middle --> RB{"row band AND rows<br/>parked that way?"}
+    RB -- top --> SU["ScrollUp { k }"]
+    RB -- bottom --> SD["ScrollDown { k }"]
+    RB -- no --> Half["half of the visible<br/>row under the cursor"]
+    Half -- top half of row j --> RA["Row (k, j)"]
+    Half -- bottom half of row j --> RBl["Row (k, j+1)"]
 ```
 
-The function returns a `DropZone` (`src/layout/preview.rs`) — one of four
-variants:
+The function returns a `DropZone` (`src/layout/preview.rs`):
 
 - `Row { col, row }` — insert as row `row` of column `col`.
 - `Column { col }` — insert a new single-row column at index `col`.
-- `ScrollLeft` / `ScrollRight` — scroll the viewport.
+- `ScrollLeft` / `ScrollRight` — scroll the strip's viewport one column.
+- `ScrollUp { col }` / `ScrollDown { col }` — scroll column `col`'s row
+  viewport one row.
 
-The map is layered, highest priority first.
-
-**1. Edge scroll.** A band `edge_scroll_width` pixels wide on each monitor
-edge. The cursor in the left band maps to `ScrollLeft`, but only if there is
-content scrolled off-screen to the left (`viewport_offset > 0`);
-`ScrollRight` only if the column content extends past the right viewport
-edge. The right-edge check uses `content_right = canvas_width − gap` rather
-than the raw canvas width, because `canvas_width` includes a trailing
-right-edge gap that is not scrollable content — once the last column is flush
-with the viewport, scrolling right would reveal nothing, so the band falls
-through to column targeting instead.
-
-**2. Column-edge band → column insert.** For the column under the cursor,
-`band = max(1, min(col_edge_ratio · column_width, col_edge_max_px))`. The
-cursor in the left band maps to `Column { col: k }` (insert a new column
-*before* column k); the right band maps to `Column { col: k + 1 }` (insert
-*after*). The `min` clamp means narrow columns still expose a usable band
-(capped by the pixel limit), while wide columns don't grow an oversized one;
-the `max(1)` floor guarantees even a sub-pixel band still registers.
-
-**3. Column body → (n+1) row regions.** If the cursor is in the body of
-column k (which currently has n rows), the column's height is split into
-**n+1 equal regions**. The cursor's region index is
+Its knobs come in one `ZoneParams` (the `[drag]` table plus the strip's
+`visible_rows`). The map is layered, highest priority first
+(ADR-0018, `docs/adr/0018-drop-zones-by-window-halves.md`):
 
 ```text
-j = clamp(floor((my − col.y) / (col.height / (n+1))), 0, n)
+ screen                                                         screen
+ edge                                                           edge
+ |<band>|  col k-1  |gap|        column k (middle third)  |gap|  |<band>|
+ |      |           |   | third | row band (rows parked) | third|  |      |
+ |      |           |   |       | top half of row j  ->j  |      |  |      |
+ |      |           |   |Column | bottom half of j ->j+1  |Column|  |      |
+ |      |           |   | {k}   | top half of row j+1->j+1| {k+1}|  |      |
+ |      |           |   |       |  ... visible rows ...   |      |  |      |
+ |      |           |   |       | row band (rows parked) |      |  |      |
 ```
 
-mapping to `Row { col: k, row: j }`.
+**0. Work area.** A cursor outside the strip's work area — on a monitor
+beside, above or below it, in a gap between monitors, over the taskbar —
+is no zone of this strip (`None`). The drag asks the strip of the monitor
+under the cursor instead (*Cross-screen drop* below).
 
-**The (n+1) split is the key geometric insight.** A column of n rows has
-exactly n+1 insertion slots — above row 0, between rows, or below row n−1.
-Splitting the column height into n+1 regions makes the map a clean bijection:
-every cursor y in the column maps to exactly one structural outcome, and
-every outcome has a contiguous region that produces it. There are no ties and
-no gaps.
+**1. Screen-edge scroll.** A band on each side of the work area,
+`max(edge_scroll_width, edge_scroll_ratio · work-area width)` wide — a
+twelfth of the screen by default. On an edge shared with a neighbouring
+monitor the band is only `edge_scroll_width` pixels, so a drag crossing to
+the neighbour does not sweep through a wide band (entering a band scrolls
+at once). The cursor in the left band maps to `ScrollLeft` only if content
+is scrolled off to the left (`viewport_offset > 0`); `ScrollRight` only if
+the column content extends past the right edge. The right-edge check uses
+`content_right = canvas_width − gap`, because `canvas_width` includes a
+trailing gap that is not scrollable content.
 
-**Seams and gaps.** If the cursor lands in the inter-column gap (a seam),
-`resolve_drop_zone` treats it as a column insert at the right neighbor
-(`Column { col: right_neighbor }`). Left of the first column maps to
-`Column { col: 0 }`; right of the last column maps to append.
+**2. Gaps.** Left of the first visible column maps to a new column before
+it; right of the last, to append; the gap between two columns, to a new
+column at the right neighbour.
 
-**Totality.** Every cursor position in the work area maps to a zone. The
-function returns `None` for the empty-workspace degenerate (no columns), which
-cannot arise during a tile drag — the dragged window is itself a column member
-— and for a cursor **above or below the work area**: on a stacked pair the
-display above or below shares this strip's x range, so a cursor over there must
-hit neither a scroll band nor a column zone (the horizontal bound on the scroll
-bands covers the side-by-side case). `None` mid-drag previews nothing and, on
-release, snaps the window back into its own strip.
+**3. Outer thirds → column insert.** For the column under the cursor,
+`band = col_edge_ratio · column_width` (`0.33`: a third), capped by
+`col_edge_max_px` when that is positive (`0`, the default, is no cap), at
+least one pixel. The left band maps to `Column { col: k }` (insert
+*before*), the right band to `Column { col: k + 1 }` (insert *after*).
 
-**Own-column allowed.** The dragged window's own column is *not* excluded
+**4. Row-scroll bands.** In the middle third of a column that holds more
+rows than `visible_rows`, a band at the top of its visible rows maps to
+`ScrollUp { col: k }` while rows are parked above, one at the bottom to
+`ScrollDown { col: k }` while rows are parked below. The band height is
+`max(edge_scroll_width, edge_scroll_ratio · work-area height)`. At the end
+of the content the band is not offered and the area is an ordinary row
+half again, so the user can drop above all or below all.
+
+**5. Per-window halves.** The rest of the middle third is split by the
+**visible rows** of the column (the ones in its row viewport, not the
+parked ones): the top half of row `j` maps to `Row { col: k, row: j }`
+(above it), the bottom half to `Row { col: k, row: j + 1 }` (below it). So
+in a stack the bottom half of one window and the top half of the next give
+the same slot, the top half of the top window is "above all" and the bottom
+half of the bottom window "below all". A cursor in the gap between two rows
+belongs to the lower row's top half.
+
+**Totality.** Every cursor position in the work area maps to a zone,
+including an empty strip (`Column { col: 0 }`, the target of a cross-screen
+drop onto an empty monitor) and a strip whose columns are all off screen
+(append).
+
+**A lone window over its own column** (either half of its middle third)
+is a no-op in `preview_move`: its column is its slot. **Own-column allowed.** The dragged window's own column is *not* excluded
 from the map. This enables within-column reordering (drag a window down past
 its sibling to swap their rows) and makes totality trivial to guarantee.
 No-op drops — where the resolved zone is the window's current position — are
@@ -270,34 +296,36 @@ corrupting the layout:
   `drag_state` has been `take()`n). The dragged window visibly snaps from its
   mouse-following position into its tile.
 
-### `on_drag_move`: always submit, never commit
+### `on_drag_move`: preview on zone change, never commit
 
-On each `LOCATIONCHANGE`, `on_drag_move` (`src/daemon/drag.rs`):
+On each `LOCATIONCHANGE`, `on_translate_move` (`src/daemon/drag.rs`):
 
 1. Reads the window's rect and sets its border geometry directly (see *Border
    Following* below).
-2. Reads the cursor position.
-3. Snapshots the committed layout and resolves the drop zone via
+2. Reads the cursor position and finds the monitor under it.
+3. Snapshots that monitor's committed strip and resolves the drop zone via
    `resolve_drop_zone`.
-4. Updates `DragState::current_zone` (so `on_drag_end` knows where to commit).
-5. **Always submits a candidate layout to the animator** — no zone-change
-   gate:
-   - `ScrollLeft` / `ScrollRight` → `scroll_left` / `scroll_right` +
-     `animate_layout`. Viewport scroll commits live — see *Edge Scroll During
-     Drag* below.
-   - `Row` / `Column` → `preview_move` + `animate_preview` (non-committing).
-     If `preview_move` returns `None` (the window is already at the target),
-     the *committed* layout is submitted instead, resetting any stale reflow
-     from a prior zone.
-   - `None` (empty workspace) → nothing.
+4. Updates `DragState::current_zone` and `zone_monitor` (so `on_drag_end`
+   knows where to commit).
+5. Acts only when `(monitor, zone)` changed since the previous move:
+   - entering a scroll band (`ScrollLeft` / `ScrollRight` / `ScrollUp` /
+     `ScrollDown`) scrolls once at once and arms the repeat timer; leaving
+     it cancels the timer. The scroll commits live — see *Edge Scroll
+     During Drag* below.
+   - `Row` / `Column` → `preview_move` (own strip) or `preview_insert`
+     (another strip) + `animate_previews_on` (non-committing), with the
+     other strips the drag touched at their committed layout in the same
+     batch. If the preview is a no-op, the *committed* layout is submitted
+     instead, resetting any stale reflow from a prior zone.
+   - `None` → the strips the drag touched settle at their committed layout.
 
-There is deliberately **no zone-change gate**. Re-submitting the same zone
-every move is harmless: `preview_move` is idempotent per zone, and the
-animator drops windows whose position hasn't changed (see *The Animator's Two
-Properties* below). A gate would optimize an already-free operation — and,
-worse, it would break edge-scrolling: a scroll zone is *cumulative* (each move
-in the band should scroll another column), but a zone-equality gate would
-suppress every scroll after the first.
+The gate is on the zone, not on the move: the animator's
+`RetargetFromCurrent` policy restarts a batch from the windows' current
+positions on every submit, so resubmitting an unchanged target on every
+pixel of movement would keep resetting the reflow and it would never
+finish. A scroll band is a distinct zone value, so passing through one
+always re-arms the next preview; the cumulative scroll inside a band runs
+off the timer, not off repeated moves.
 
 ### Why dwell is gone
 
@@ -390,10 +418,59 @@ puts the border where the mouse actually is.)
 | Teleport | Bystander during a workspace switch | `set_geometry(visible_rect)` directly |
 | **Tile drag** | **Tiled window being dragged** | **`set_geometry(float_border_rect)` directly** |
 
+## Cross-screen drop
+
+A tile can be dropped onto another monitor's strip (ADR-0018). On every
+move `on_translate_move` finds the monitor under the cursor
+(`monitor_index_for_rect_opt` with a 1×1 rect at the cursor, against the
+screen rects) and resolves the zone against **that** strip; `DragState`
+stores it as `zone_monitor` beside `current_zone`, and every monitor other
+than the source that got a zone is added to `touched`.
+
+- **Preview.** On the source strip the preview is `preview_move` as
+  before; on another strip it is `preview_insert`, which inserts the window
+  that is not in that layout at the zone. The other strips the drag
+  touched — the source included — are shown at their committed layout
+  **in the same animator batch** (`animate_previews_on`): the animator
+  supersedes an in-flight batch, so a source strip settling back and a
+  target strip opening a gap must travel together. The preview gate keys
+  on `(monitor, zone)`, because column 0 of one strip is not column 0 of
+  another.
+- **Scroll.** A screen-edge or row band on the other strip scrolls *that*
+  strip (`perform_edge_scroll` acts on the zone monitor) with the same
+  scheduler; the other touched strips are re-settled in the scroll's batch.
+- **Release.** The drop is decided by the last move's
+  `(zone_monitor, current_zone)`, never by the cursor at release (a
+  keymap session's final `WinMove` can still be queued when `drag end`
+  arrives). A placement zone on another monitor runs `drop_on_other_monitor`:
+  `preview_insert` against the target (a full column refuses, and the
+  window snaps back), `remove_window` from the source, the target's focus
+  set to the window, `ensure_column_visible`, `commit_layout`, then the
+  shared tail `finish_tiled_monitor_move` that `move-to-monitor` also uses
+  (remember the owner, make the target active, animate both strips and the
+  other touched ones in one batch, foreground, border). Anything else —
+  the cursor back on the source, a scroll band, no zone, a gap between
+  monitors, the taskbar — commits on the source strip or snaps back.
+- **Stacked monitors.** A cursor above or below the source work area that
+  lies on the other display is a cross-screen drag like a side-by-side one;
+  a cursor on no display is no zone.
+- **Native title-bar drags** take the same path (the classifier promotes
+  them to `Translate` like a keymap session).
+
 ## Edge Scroll During Drag
 
 Dragging the window against the left or right monitor edge scrolls the
-viewport so the user can reach columns that are currently off-screen. This is
+viewport so the user can reach columns that are currently off-screen; in a
+column holding more rows than `visible_rows`, the top and bottom bands of
+its middle third scroll its row viewport (`ScrollUp` / `ScrollDown`,
+`ScrollingSpace::scroll_column_rows`) so the user can reach a row that is
+parked off the screen and drop next to it. Both kinds commit live and run
+on the same scheduler (immediate scroll on entering the band, then the
+timed repeat while the cursor stays in it), one column or one row per
+step; the row scroll does not pull the strip's focused window back into
+view, and the drop then focuses the dropped window, whose row
+`insert_row_at` revealed, so the window that was on top moves off screen
+and Mod+Up reaches it. This is
 a **live commit**: `scroll_left` / `scroll_right` mutate `viewport_offset`
 immediately, then `animate_layout` animates the *other* windows to their
 scrolled slots. The dragged window's border keeps following the mouse (the
@@ -406,17 +483,17 @@ the user expects the canvas to scroll when they drag to the edge, and they
 expect it to stay scrolled. Treating viewport scroll as committed-live
 matches that expectation, and matches Niri's behavior.
 
-The scroll is **bounded by content**. `layout::mutations::scroll_left` /
+A column scroll that would overshoot the end of the strip stops at the end
+(`scroll_right` clamps to the last offset), so the band always reaches the
+last column. The scroll is **bounded by content**. `layout::mutations::scroll_left` /
 `scroll_right` (`src/layout/mutations.rs`) return `None` once there is nothing
 left to reveal (their own `viewport_offset <= 0` / `new_offset > max_offset`
 checks), so holding the window at the edge scrolls until the content runs out
 and then stops — no runaway.
 
-> **Known limitation — stationary edge-scroll.** Edge-scroll fires on
-> `LOCATIONCHANGE`, i.e. while the dragged window is *moving*. If the user
-> holds the cursor perfectly still at the edge, no `LOCATIONCHANGE` is
-> generated and scrolling stops. Continuous *stationary* edge-scroll would
-> need a repeating timer (Niri uses one); it is not implemented here.
+A cursor held still in a band keeps scrolling: the repeat runs off the
+`EdgeScrollScheduler` timer (`src/daemon/edge_scroll.rs`), not
+off `LOCATIONCHANGE`.
 
 ## The Busy Gate
 
@@ -449,14 +526,17 @@ end` are not layout-mutating themselves: they *are* the drag.
 
 ## Config
 
-The `[drag]` section (`DragConfig` in (`src/config/types.rs`)) has three
+The `[drag]` section (`DragConfig` in (`src/config/types.rs`)) has these
 knobs:
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `edge_scroll_width` | `30` | Pixel width of the left/right monitor-edge scroll bands |
-| `col_edge_ratio` | `0.18` | Fraction of column width used as the column-insert band floor |
-| `col_edge_max_px` | `120` | Pixel cap on the column-insert band (`band = max(1, min(ratio · width, max_px))`) |
+| `edge_scroll_width` | `30` | Minimum pixel width of the screen-edge scroll bands; the whole band on an edge shared with another monitor |
+| `edge_scroll_ratio` | `0.0833` | Screen-edge band as a fraction of the work-area width (a twelfth: 160 px on 1920); also the height of the row-scroll bands as a fraction of the work-area height (90 px on 1080). `0` = pixels only |
+| `col_edge_ratio` | `0.33` | Fraction of a column's width, each side, that inserts a new column (clamped to `0.5`) |
+| `col_edge_max_px` | `0` | Pixel cap on that band; `0` = no cap |
+| `edge_scroll_initial_delay_ms` | `500` | Gap from the immediate scroll on entering a band to the first repeat |
+| `edge_scroll_repeat_interval_ms` | `240` | Gap between repeats (column or row) while the cursor stays in a band |
 
 Per the project's config-defaults rule, **code is the single source of
 truth**: the `Default` impl on `DragConfig` holds the authoritative defaults,
@@ -484,12 +564,14 @@ side to return to — for no structural capability the map cannot already
 express. Floats already have their own real-time sync path; reusing it for
 float drags is cheaper than special-casing them.
 
-**The (n+1) row split.** A column of `n` rows has exactly `n+1` insertion
-slots (above the first, between each pair, below the last). Splitting the
-column height into `n+1` equal regions makes the map a clean bijection: every
-cursor `y` in the column maps to exactly one structural outcome, and every
-outcome has a region that produces it. There are no ties to break and no gaps
-that fall through to a default.
+**Per-window halves, not (n+1) regions.** A column of `n` rows has `n+1`
+insertion slots. The first map split the column height into `n+1` equal
+regions — a bijection, but one whose boundaries do not line up with the
+windows (in a two-row stack the top third of the column, not the top half
+of the top window, meant "above all"), and it measured the whole column
+including rows parked off screen. Halves of the visible windows keep the
+bijection (each slot is the union of the two halves that border it) and put
+every boundary where the user sees one: the middle of a window. ADR-0018.
 
 **Always-submit + animator no-op, instead of a controller-side gate.** The
 alternative — gating `on_drag_move` on "did the zone change?" — would save one

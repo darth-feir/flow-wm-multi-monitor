@@ -1,12 +1,15 @@
 //! Drop-zone preview: pure computation of a layout after a drag-and-drop move.
 //!
 //! Provides [`preview_move`] (move a window already in the layout to a new
-//! drop zone) and [`resolve_drop_zone`] (map the cursor position to a
-//! [`DropZone`]). Both are pure — they clone the virtual layout, apply their
+//! drop zone), [`preview_insert`] (drop a window that comes from another
+//! monitor's strip) and [`resolve_drop_zone`] (map the cursor position to a
+//! [`DropZone`]). All are pure — they clone the virtual layout, apply their
 //! operation, and project to actual coordinates without touching any live
 //! state or Win32 APIs.
 //!
-//! (`docs/src/dev-guide/tile-drag.md`)
+//! (`docs/src/dev-guide/tile-drag.md`, `docs/adr/0018-drop-zones-by-window-halves.md`)
+
+use std::collections::HashMap;
 
 use crate::common::{Rect, WindowId};
 #[cfg(test)]
@@ -18,7 +21,7 @@ use crate::layout::types::{AppliedLayout, Column, MonitorInfo, Row, VirtualLayou
 /// Where a dragged window would land when dropped.
 ///
 /// Produced by zone detection during a tile drag and consumed by
-/// [`preview_move`] to compute the resulting layout.
+/// [`preview_move`] / [`preview_insert`] to compute the resulting layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropZone {
     /// Insert the dragged window as a new row in column `col` at row index `row`.
@@ -37,6 +40,45 @@ pub enum DropZone {
     ScrollLeft,
     /// Scroll the viewport right by one column. NOT a layout mutation.
     ScrollRight,
+    /// Scroll column `col`'s row viewport up by one row. NOT a layout
+    /// mutation; only offered while rows are parked above the viewport.
+    ScrollUp {
+        /// The column whose row viewport scrolls.
+        col: usize,
+    },
+    /// Scroll column `col`'s row viewport down by one row. NOT a layout
+    /// mutation; only offered while rows are parked below the viewport.
+    ScrollDown {
+        /// The column whose row viewport scrolls.
+        col: usize,
+    },
+}
+
+impl DropZone {
+    /// Whether this zone places the window (`Row` / `Column`) rather than
+    /// scrolling a viewport.
+    #[must_use]
+    pub fn is_placement(self) -> bool {
+        matches!(self, DropZone::Row { .. } | DropZone::Column { .. })
+    }
+}
+
+/// The knobs of the zone map: the `[drag]` table plus the strip's
+/// `visible_rows`. See (`docs/src/dev-guide/tile-drag.md`, *Configuration*).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ZoneParams {
+    /// Minimum width of a screen-edge scroll band in pixels, and the whole
+    /// width of a band on an edge shared with a neighbouring monitor.
+    pub edge_scroll_px: i32,
+    /// Screen-edge band as a fraction of the work-area width (outer edges)
+    /// and of its height (the row-scroll bands of a stacked column).
+    pub edge_scroll_ratio: f32,
+    /// Fraction of a column's width on each side that inserts a new column.
+    pub col_edge_ratio: f32,
+    /// Pixel cap on that band; `0` = no cap.
+    pub col_edge_max_px: i32,
+    /// `[columns] visible_rows` of the strip (`0` = every row is shown).
+    pub visible_rows: u32,
 }
 
 /// Computes the layout that would result from moving `dragged_id` to `zone`.
@@ -45,7 +87,7 @@ pub enum DropZone {
 /// the target zone, projects to actual coordinates, and returns the result.
 ///
 /// Returns `None` if:
-/// - the zone is `ScrollLeft` or `ScrollRight` (handled by daemon scroll logic),
+/// - the zone is a scroll zone (handled by daemon scroll logic),
 /// - the dragged window is not found in the layout,
 /// - the target column/row is out of bounds after source removal,
 /// - the move is a no-op (the layout would be identical after the move).
@@ -54,7 +96,7 @@ pub enum DropZone {
 ///
 /// - `Column { col }` → new single-row column at index `col`
 /// - `Row { col, row }` → new row at position `row` in column `col`
-/// - `ScrollLeft` / `ScrollRight` → `None` (not a layout mutation)
+/// - scroll zones → `None` (not a layout mutation)
 #[must_use]
 pub fn preview_move(
     virtual_layout: &VirtualLayout,
@@ -64,13 +106,18 @@ pub fn preview_move(
     monitor: &MonitorInfo,
 ) -> Option<AppliedLayout> {
     // Scroll zones are not layout mutations.
-    if matches!(zone, DropZone::ScrollLeft | DropZone::ScrollRight) {
+    if !zone.is_placement() {
         return None;
     }
 
     // The dragged window must exist in the layout.
     let (src_col, _src_row) = virtual_layout.find_window(dragged_id)?;
     let src_had_single_row = virtual_layout.columns[src_col].rows.len() == 1;
+    // A window alone in its column dropped onto that same column (either
+    // half) stays where it is: its column is the slot, not the next one.
+    if src_had_single_row && matches!(zone, DropZone::Row { col, .. } if col == src_col) {
+        return None;
+    }
 
     // Preserve the original viewport offset.
     let original_offset = virtual_layout.viewport_offset;
@@ -79,27 +126,17 @@ pub fn preview_move(
     let mut layout = remove_window(virtual_layout, dragged_id, config);
 
     // Step 2: Re-insert at the target zone.
-    match zone {
-        DropZone::Column { col } => {
-            let pos = adjust_index(col, src_col, src_had_single_row);
-            let pos = pos.min(layout.columns.len());
-            let new_col = make_single_row_column(dragged_id, config.column_width as i32, config);
-            layout.columns.insert(pos, new_col);
-        }
-        DropZone::Row { col, row } => {
-            let col_idx = adjust_index(col, src_col, src_had_single_row);
-            if col_idx >= layout.columns.len() {
-                return None;
-            }
-            // A full column (`max_rows`) refuses the drop: a drag has no
-            // "past the column" to walk to, the user picks another zone.
-            if config.column_full(layout.columns[col_idx].rows.len()) {
-                return None;
-            }
-            insert_row_at(&mut layout, col_idx, row, dragged_id, config);
-        }
-        DropZone::ScrollLeft | DropZone::ScrollRight => return None,
-    }
+    let zone = match zone {
+        DropZone::Column { col } => DropZone::Column {
+            col: adjust_index(col, src_col, src_had_single_row),
+        },
+        DropZone::Row { col, row } => DropZone::Row {
+            col: adjust_index(col, src_col, src_had_single_row),
+            row,
+        },
+        other => other,
+    };
+    insert_at_zone(&mut layout, zone, dragged_id, config)?;
 
     // Restore the viewport offset.
     layout.viewport_offset = original_offset;
@@ -116,6 +153,69 @@ pub fn preview_move(
         virtual_layout: layout,
         actual_layout: actual,
     })
+}
+
+/// Computes the layout that would result from dropping `window`, which is
+/// **not** in `virtual_layout` (it comes from another monitor's strip), at
+/// `zone`: the cross-screen counterpart of [`preview_move`].
+///
+/// Returns `None` for a scroll zone, a window that already has a seat in
+/// this layout, a `Row` zone whose column does not exist, and a `Row` zone
+/// into a full column (`max_rows`), which refuses the drop like
+/// [`preview_move`] does. The viewport offset is kept; the caller brings
+/// the new column into view when it commits.
+#[must_use]
+pub fn preview_insert(
+    virtual_layout: &VirtualLayout,
+    window: WindowId,
+    zone: DropZone,
+    config: &MutationConfig,
+    monitor: &MonitorInfo,
+) -> Option<AppliedLayout> {
+    if virtual_layout.find_window(window).is_some() {
+        return None;
+    }
+    let mut layout = virtual_layout.clone();
+    insert_at_zone(&mut layout, zone, window, config)?;
+    let actual = projection::project(&layout, monitor, &config.padding, config.visible_rows);
+    Some(AppliedLayout {
+        virtual_layout: layout,
+        actual_layout: actual,
+    })
+}
+
+/// Insert `window` at `zone` (indices already relative to `layout`).
+/// `None` for a scroll zone, a missing column or a full column.
+fn insert_at_zone(
+    layout: &mut VirtualLayout,
+    zone: DropZone,
+    window: WindowId,
+    config: &MutationConfig,
+) -> Option<()> {
+    match zone {
+        DropZone::Column { col } => {
+            let pos = col.min(layout.columns.len());
+            let new_col = make_single_row_column(window, config.column_width as i32, config);
+            layout.columns.insert(pos, new_col);
+            Some(())
+        }
+        DropZone::Row { col, row } => {
+            if col >= layout.columns.len() {
+                return None;
+            }
+            // A full column (`max_rows`) refuses the drop: a drag has no
+            // "past the column" to walk to, the user picks another zone.
+            if config.column_full(layout.columns[col].rows.len()) {
+                return None;
+            }
+            insert_row_at(layout, col, row, window, config);
+            Some(())
+        }
+        DropZone::ScrollLeft
+        | DropZone::ScrollRight
+        | DropZone::ScrollUp { .. }
+        | DropZone::ScrollDown { .. } => None,
+    }
 }
 
 /// Build a single-row column with height distributed for one row.
@@ -166,10 +266,25 @@ fn adjust_index(idx: usize, src_col: usize, src_col_removed: bool) -> usize {
 // resolve_drop_zone: cursor position to DropZone (pure function)
 // ---------------------------------------------------------------------------
 
-/// Compute the column-edge band width, capped by both the ratio and the
-/// absolute maximum.
+/// Compute the column-edge band width: `col_edge_ratio` of the column,
+/// capped by `max_px` when that is positive, at least one pixel.
 fn compute_col_edge_band(col_width: i32, ratio: f32, max_px: i32) -> i32 {
-    ((col_width as f32 * ratio) as i32).min(max_px).max(1)
+    let band = (col_width as f32 * ratio.clamp(0.0, 0.5)) as i32;
+    let band = if max_px > 0 { band.min(max_px) } else { band };
+    band.max(1)
+}
+
+/// Width of a scroll band along an extent of `extent` pixels: the larger of
+/// `px` and `ratio · extent`, or just `px` on an edge shared with another
+/// monitor (`neighbour`), so that crossing to the neighbour does not sweep
+/// through a wide band.
+fn scroll_band(params: &ZoneParams, extent: i32, neighbour: bool) -> i32 {
+    let px = params.edge_scroll_px.max(0);
+    if neighbour {
+        px
+    } else {
+        px.max((extent as f32 * params.edge_scroll_ratio.clamp(0.0, 0.5)).round() as i32)
+    }
 }
 
 /// Check whether content exists offscreen to the left of the viewport.
@@ -182,195 +297,213 @@ fn can_scroll_left(vl: &VirtualLayout) -> bool {
 /// Derives the inter-column gap from the first two visible columns when
 /// available; otherwise uses a structural check (single visible column that
 /// is not the last virtual column).
-fn can_scroll_right(vl: &VirtualLayout, wa_width: i32, vis_cols: &[(usize, Rect)]) -> bool {
+fn can_scroll_right(vl: &VirtualLayout, wa_width: i32, vis_cols: &[VisibleColumn]) -> bool {
     if vis_cols.len() >= 2 {
         // Visible columns form a contiguous virtual-index range, so the
         // first two are always adjacent on the canvas. Derive the gap from
         // their screen positions: gap = screen_x_1 - (screen_x_0 + col0_width).
-        let col0_w = vl.columns[vis_cols[0].0].width_px;
-        let gap = (vis_cols[1].1.x - (vis_cols[0].1.x + col0_w)).max(0);
+        let col0_w = vl.columns[vis_cols[0].idx].width_px;
+        let gap = (vis_cols[1].rect.x - (vis_cols[0].rect.x + col0_w)).max(0);
         let total_span = projection::canvas_width(vl, gap);
         // canvas_width includes the trailing right-edge gap, which is not
         // scrollable content; compare the last column's content right edge.
         let content_right = total_span - gap;
         content_right > vl.viewport_offset + wa_width
-    } else if let Some(&(idx, _)) = vis_cols.first() {
+    } else if let Some(first) = vis_cols.first() {
         // Single visible column: right scroll is possible iff more columns
         // exist to the right on the canvas.
-        idx < vl.columns.len() - 1
+        first.idx < vl.columns.len() - 1
     } else {
         false
     }
 }
 
-/// Build bounding rectangles for visible columns from the applied layout.
+/// A column on screen: its virtual index, the bounding box of its visible
+/// rows, and those rows (row index + rect), top to bottom.
+struct VisibleColumn {
+    idx: usize,
+    rect: Rect,
+    rows: Vec<(usize, Rect)>,
+    /// Rows are parked above the row viewport.
+    parked_above: bool,
+    /// Rows are parked below the row viewport.
+    parked_below: bool,
+}
+
+/// Build the visible columns from the applied layout.
 ///
-/// Groups actual-layout entries by virtual column index and computes each
-/// column's bounding box. Columns entirely outside `wa` are excluded. Does
-/// NOT exclude the dragged window's own column.
-fn build_visible_column_rects(applied: &AppliedLayout, wa: &Rect) -> Vec<(usize, Rect)> {
+/// Only the rows inside each column's row viewport (`row_offset ..
+/// row_offset + slots`) count: a row parked above or below the monitor is
+/// not a drop target. Columns entirely outside `wa` are excluded. Does NOT
+/// exclude the dragged window's own column.
+fn build_visible_columns(
+    applied: &AppliedLayout,
+    wa: &Rect,
+    visible_rows: u32,
+) -> Vec<VisibleColumn> {
     let vl = &applied.virtual_layout;
-    if vl.columns.is_empty() {
-        return Vec::new();
-    }
-
-    // Per-column bounding box: (x, y_min, y_max, width).
-    // All entries in a column share the same x and width (projection
-    // invariant), so only y bounds need updating.
-    let mut boxes: Vec<Option<(i32, i32, i32, i32)>> = vec![None; vl.columns.len()];
-
-    for entry in &applied.actual_layout.entries {
-        if let Some((ci, _)) = vl.find_window(entry.window_id) {
-            let r = entry.rect;
-            match &mut boxes[ci] {
-                Some(b) => {
-                    b.1 = b.1.min(r.y);
-                    b.2 = b.2.max(r.y + r.height);
-                }
-                None => {
-                    boxes[ci] = Some((r.x, r.y, r.y + r.height, r.width));
-                }
-            }
-        }
-    }
+    let rects: HashMap<WindowId, Rect> = applied
+        .actual_layout
+        .entries
+        .iter()
+        .map(|e| (e.window_id, e.rect))
+        .collect();
 
     let mon_left = wa.x;
     let mon_right = wa.x + wa.width;
 
     let mut result = Vec::new();
-    for (ci, b) in boxes.into_iter().enumerate() {
-        if let Some((x, y_min, y_max, w)) = b {
-            if x + w <= mon_left || x >= mon_right {
-                continue;
-            }
-            result.push((
-                ci,
-                Rect {
-                    x,
-                    y: y_min,
-                    width: w,
-                    height: y_max - y_min,
-                },
-            ));
+    for (ci, col) in vl.columns.iter().enumerate() {
+        let slots = col.slots(visible_rows);
+        let first = col.row_offset.min(col.max_row_offset(visible_rows));
+        let rows: Vec<(usize, Rect)> = (first..first + slots)
+            .filter_map(|ri| {
+                let id = col.rows.get(ri)?.window_id;
+                rects.get(&id).map(|r| (ri, *r))
+            })
+            .collect();
+        let Some(&(_, top)) = rows.first() else {
+            continue;
+        };
+        let (_, bottom) = rows[rows.len() - 1];
+        if top.x + top.width <= mon_left || top.x >= mon_right {
+            continue;
         }
+        result.push(VisibleColumn {
+            idx: ci,
+            rect: Rect {
+                x: top.x,
+                y: top.y,
+                width: top.width,
+                height: bottom.y + bottom.height - top.y,
+            },
+            rows,
+            parked_above: first > 0,
+            parked_below: first + slots < col.rows.len(),
+        });
     }
     result
 }
 
 /// Resolve the drop target for a tile drag from the cursor position.
 ///
-/// Pure: reads only `applied`, `monitor`, and the three config knobs; touches
-/// no live state or Win32 APIs. Total over the work area, every cursor
-/// position inside it maps to a zone. Returns `None` for the empty-workspace
-/// degenerate (no columns), which cannot arise for a tile drag, and for a
-/// cursor **above or below the work area** (`my` outside
-/// `[wa.y, wa.bottom())`): on a stacked pair the display above or below
-/// shares this strip's x range, and a cursor over there must hit neither a
+/// Pure: reads only `applied`, `monitor`, and `params`; touches no live
+/// state or Win32 APIs. Total over the work area: every cursor position
+/// inside it maps to a zone, an empty strip included (`Column { col: 0 }`,
+/// the drop target of a cross-screen drag onto an empty monitor). Returns
+/// `None` for a cursor **outside the work area**: on a stacked pair the
+/// display above or below shares this strip's x range, and beside it the
+/// neighbour shares its y range; a cursor over there must hit neither a
 /// scroll band nor a column zone of this strip.
 ///
-/// Map: edge scroll, column-edge band, column body
-/// ((n+1) equal row regions). See (`docs/src/dev-guide/tile-drag.md`).
-///
-/// The scroll bands are bounded on both sides: the cursor must be inside the
-/// work area horizontally (`wa.x <= mx < wa.right()`) for either band to
-/// match. A cursor that has crossed onto a neighbouring monitor is therefore
-/// never "in the edge band" of this strip, so the strip does not auto-scroll
-/// while the user hovers the other display.
-#[allow(clippy::too_many_arguments)]
+/// Map, first match wins (`docs/src/dev-guide/tile-drag.md`, ADR-0018):
+/// 1. screen-edge scroll bands (left/right, only when there is content
+///    that way);
+/// 2. gaps beside and between columns → new column there;
+/// 3. the outer `col_edge_ratio` of a column on either side → new column
+///    beside it;
+/// 4. the top/bottom row-scroll bands of a column with rows parked that
+///    way;
+/// 5. the rest of the column: the half of the visible row under the
+///    cursor → above it (top half) or below it (bottom half).
 #[must_use]
 pub fn resolve_drop_zone(
     applied: &AppliedLayout,
     monitor: &MonitorInfo,
-    dragged_id: WindowId,
     mx: i32,
     my: i32,
-    edge_band: i32,
-    col_edge_ratio: f32,
-    col_edge_max_px: i32,
+    params: &ZoneParams,
 ) -> Option<DropZone> {
-    let _ = dragged_id; // Own column is allowed, no exclusion logic needed.
     let wa = &monitor.work_area;
     let vl = &applied.virtual_layout;
-
-    let vis_cols = build_visible_column_rects(applied, wa);
-    if vis_cols.is_empty() {
-        return None;
-    }
-    // Above or below this strip's work area the cursor is on a stacked
-    // neighbour (or off-screen): no zone of this strip.
-    if my < wa.y || my >= wa.y + wa.height {
-        return None;
-    }
-
-    // Step 1: Edge scroll (checked first). Both bands require the cursor to
-    // be inside this monitor's work area horizontally: beyond either edge
-    // the cursor is on another monitor (or off-screen), not in the band.
     let wa_right = wa.x + wa.width;
-    let inside_h = mx >= wa.x && mx < wa_right;
-    if inside_h && mx <= wa.x + edge_band && can_scroll_left(vl) {
+
+    // Outside this strip's work area the cursor is on a neighbour (or
+    // off-screen): no zone of this strip.
+    if my < wa.y || my >= wa.y + wa.height || mx < wa.x || mx >= wa_right {
+        return None;
+    }
+
+    let vis_cols = build_visible_columns(applied, wa, params.visible_rows);
+    if vis_cols.is_empty() {
+        // An empty strip takes the window as its first column; a strip
+        // whose columns are all off screen appends it.
+        return Some(DropZone::Column {
+            col: vl.columns.len(),
+        });
+    }
+
+    // 1. Screen-edge scroll bands.
+    let left_band = scroll_band(params, wa.width, monitor.neighbour_left);
+    let right_band = scroll_band(params, wa.width, monitor.neighbour_right);
+    if mx <= wa.x + left_band && can_scroll_left(vl) {
         return Some(DropZone::ScrollLeft);
     }
-    if inside_h && mx >= wa_right - edge_band && can_scroll_right(vl, wa.width, &vis_cols) {
+    if mx >= wa_right - right_band && can_scroll_right(vl, wa.width, &vis_cols) {
         return Some(DropZone::ScrollRight);
     }
 
-    // Step 4: Locate cursor relative to columns.
+    // 2. Gaps: left of the first column, right of the last, between two.
     let first = &vis_cols[0];
     let last = &vis_cols[vis_cols.len() - 1];
-
-    // Left of first column -> prepend.
-    if mx < first.1.x {
-        return Some(DropZone::Column { col: first.0 });
+    if mx < first.rect.x {
+        return Some(DropZone::Column { col: first.idx });
     }
-
-    // Right of last column -> append.
-    let last_right = last.1.x + last.1.width;
+    let last_right = last.rect.x + last.rect.width;
     if mx >= last_right {
-        return Some(DropZone::Column { col: last.0 + 1 });
+        return Some(DropZone::Column { col: last.idx + 1 });
     }
-
-    // Check seams between adjacent visible columns.
-    for i in 0..vis_cols.len().saturating_sub(1) {
-        let seam_left = vis_cols[i].1.x + vis_cols[i].1.width;
-        let seam_right = vis_cols[i + 1].1.x;
-        if mx >= seam_left && mx < seam_right {
-            return Some(DropZone::Column {
-                col: vis_cols[i + 1].0,
-            });
+    for pair in vis_cols.windows(2) {
+        let seam_left = pair[0].rect.x + pair[0].rect.width;
+        if mx >= seam_left && mx < pair[1].rect.x {
+            return Some(DropZone::Column { col: pair[1].idx });
         }
     }
 
-    // Find the column body containing mx (Steps 5 to 6).
-    for (col_idx, col_rect) in &vis_cols {
-        let col_right = col_rect.x + col_rect.width;
-        if mx >= col_rect.x && mx < col_right {
-            // Step 5: Column-edge band -> column insert.
-            let band = compute_col_edge_band(col_rect.width, col_edge_ratio, col_edge_max_px);
-            if mx < col_rect.x + band {
-                return Some(DropZone::Column { col: *col_idx });
-            }
-            if mx > col_right - band {
-                return Some(DropZone::Column { col: col_idx + 1 });
-            }
+    // The column body containing mx.
+    let Some(vc) = vis_cols
+        .iter()
+        .find(|c| mx >= c.rect.x && mx < c.rect.x + c.rect.width)
+    else {
+        // Unreachable for valid inputs: every mx between the first column's
+        // left and the last column's right is in a column or a seam.
+        return Some(DropZone::Column { col: last.idx + 1 });
+    };
+    let col_right = vc.rect.x + vc.rect.width;
 
-            // Step 6: Column body -> (n+1) row split.
-            let n = vl.columns[*col_idx].rows.len();
-            // n >= 1 (column invariant), so n+1 >= 2. col_rect.height >= 1
-            // in practice, but .max(1) guards the theoretical degenerate.
-            let rh = (col_rect.height / (n + 1) as i32).max(1);
-            let rel_y = (my - col_rect.y).max(0);
-            let j = (rel_y / rh) as usize;
-            let j = j.min(n);
+    // 3. Outer bands of the column → new column beside it.
+    let band = compute_col_edge_band(vc.rect.width, params.col_edge_ratio, params.col_edge_max_px);
+    if mx < vc.rect.x + band {
+        return Some(DropZone::Column { col: vc.idx });
+    }
+    if mx >= col_right - band {
+        return Some(DropZone::Column { col: vc.idx + 1 });
+    }
+
+    // 4. Row-scroll bands of a column with parked rows.
+    let row_band = scroll_band(params, wa.height, false);
+    if vc.parked_above && my < vc.rect.y + row_band {
+        return Some(DropZone::ScrollUp { col: vc.idx });
+    }
+    if vc.parked_below && my >= vc.rect.y + vc.rect.height - row_band {
+        return Some(DropZone::ScrollDown { col: vc.idx });
+    }
+
+    // 5. Per-window halves: the top half of a row inserts above it, the
+    //    bottom half below it (= above the next row).
+    for &(ri, r) in &vc.rows {
+        if my < r.y + r.height / 2 {
             return Some(DropZone::Row {
-                col: *col_idx,
-                row: j,
+                col: vc.idx,
+                row: ri,
             });
         }
     }
-
-    // Defensive fallback, unreachable for valid inputs where vis_cols is
-    // non-empty and mx falls within the column range.
-    Some(DropZone::Column { col: last.0 + 1 })
+    let below_last = vc.rows.last().map_or(0, |&(ri, _)| ri + 1);
+    Some(DropZone::Row {
+        col: vc.idx,
+        row: below_last,
+    })
 }
 
 #[cfg(test)]
@@ -379,6 +512,34 @@ mod tests {
     use crate::common::Rect;
     use crate::layout::ActualLayout;
     use crate::layout::types::Padding;
+
+    /// The pre-ADR-0018 positional call shape the older resolver tests use:
+    /// a pixel-only screen-edge band and no row viewport.
+    #[allow(clippy::too_many_arguments)]
+    fn rdz_legacy(
+        applied: &AppliedLayout,
+        monitor: &MonitorInfo,
+        _dragged: WindowId,
+        mx: i32,
+        my: i32,
+        edge_band: i32,
+        col_edge_ratio: f32,
+        col_edge_max_px: i32,
+    ) -> Option<DropZone> {
+        resolve_drop_zone(
+            applied,
+            monitor,
+            mx,
+            my,
+            &ZoneParams {
+                edge_scroll_px: edge_band,
+                edge_scroll_ratio: 0.0,
+                col_edge_ratio,
+                col_edge_max_px,
+                visible_rows: 0,
+            },
+        )
+    }
 
     fn test_config() -> MutationConfig {
         MutationConfig {
@@ -756,6 +917,26 @@ mod tests {
     }
 
     #[test]
+    fn a_lone_window_dropped_on_its_own_column_stays() {
+        // [A], [B, C]: A over its own column's middle, either half, is a
+        // no-op, not a row in the column that slides into index 0.
+        let layout = two_col_layout();
+        for row in [0, 1] {
+            assert!(
+                preview_move(
+                    &layout,
+                    WindowId(1),
+                    DropZone::Row { col: 0, row },
+                    &test_config(),
+                    &test_monitor()
+                )
+                .is_none(),
+                "row {row}"
+            );
+        }
+    }
+
+    #[test]
     fn row_zone_out_of_bounds_column_returns_none() {
         // [A], [B, C] → drag A to Row{col:5, row:0}
         // Remove A → [B, C] (1 col). adjust_index(5, 0, true) = 4.
@@ -940,7 +1121,7 @@ mod tests {
             0,
         );
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -963,7 +1144,7 @@ mod tests {
         );
         // my=800 in bottom half -> row 1.
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -987,7 +1168,7 @@ mod tests {
         // n=1, rh=500. Boundary at col.y + 500 = 500.
         // my=499: rel_y=499, 499/500=0 -> row 0.
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1001,7 +1182,7 @@ mod tests {
         );
         // my=500: rel_y=500, 500/500=1 -> row 1.
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1031,7 +1212,7 @@ mod tests {
         );
         // Top region (0..333): my=100 -> row 0.
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1045,7 +1226,7 @@ mod tests {
         );
         // Middle region (333..666): my=400 -> row 1.
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1059,7 +1240,7 @@ mod tests {
         );
         // Bottom region (666..1000): my=800 -> row 2.
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1083,46 +1264,15 @@ mod tests {
             0,
             0,
         );
-        // n=2, rh=333. Boundaries at 333 and 666.
-        assert_eq!(
-            resolve_drop_zone(
-                &layout,
-                &rdz_monitor(),
-                WindowId(99),
-                250,
-                332,
-                30,
-                0.18,
-                72
-            ),
-            Some(DropZone::Row { col: 0, row: 0 }),
-        );
-        assert_eq!(
-            resolve_drop_zone(
-                &layout,
-                &rdz_monitor(),
-                WindowId(99),
-                250,
-                333,
-                30,
-                0.18,
-                72
-            ),
-            Some(DropZone::Row { col: 0, row: 1 }),
-        );
-        assert_eq!(
-            resolve_drop_zone(
-                &layout,
-                &rdz_monitor(),
-                WindowId(99),
-                250,
-                666,
-                30,
-                0.18,
-                72
-            ),
-            Some(DropZone::Row { col: 0, row: 2 }),
-        );
+        // Per-window halves (ADR-0018): row 0 spans 0..500 (mid 250), row 1
+        // spans 500..1000 (mid 750). Boundaries at 250 and 750.
+        for (my, row) in [(249, 0), (250, 1), (749, 1), (750, 2)] {
+            assert_eq!(
+                rdz_legacy(&layout, &rdz_monitor(), WindowId(99), 250, my, 30, 0.18, 72),
+                Some(DropZone::Row { col: 0, row }),
+                "my={my}"
+            );
+        }
     }
 
     // -- Column-edge band --
@@ -1136,7 +1286,7 @@ mod tests {
         );
         // band=min(90,72)=72. mx=50 (< 0+72=72) -> Column{col:0}.
         assert_eq!(
-            resolve_drop_zone(&layout, &rdz_monitor(), WindowId(99), 50, 500, 30, 0.18, 72),
+            rdz_legacy(&layout, &rdz_monitor(), WindowId(99), 50, 500, 30, 0.18, 72),
             Some(DropZone::Column { col: 0 }),
         );
     }
@@ -1150,7 +1300,7 @@ mod tests {
         );
         // band=72. col_right=500. mx=480 (> 500-72=428) -> Column{col:1}.
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1174,12 +1324,12 @@ mod tests {
         );
         // mx=71 -> inside left band (0..72).
         assert_eq!(
-            resolve_drop_zone(&layout, &rdz_monitor(), WindowId(99), 71, 500, 30, 0.18, 72),
+            rdz_legacy(&layout, &rdz_monitor(), WindowId(99), 71, 500, 30, 0.18, 72),
             Some(DropZone::Column { col: 0 }),
         );
         // mx=73 -> outside band, in body. n=1, rh=500, my=500 -> j=1.
         assert_eq!(
-            resolve_drop_zone(&layout, &rdz_monitor(), WindowId(99), 73, 500, 30, 0.18, 72),
+            rdz_legacy(&layout, &rdz_monitor(), WindowId(99), 73, 500, 30, 0.18, 72),
             Some(DropZone::Row { col: 0, row: 1 }),
         );
     }
@@ -1194,13 +1344,13 @@ mod tests {
         );
         // mx=35 -> inside left band (0..36).
         assert_eq!(
-            resolve_drop_zone(&layout, &rdz_monitor(), WindowId(99), 35, 500, 30, 0.18, 72),
+            rdz_legacy(&layout, &rdz_monitor(), WindowId(99), 35, 500, 30, 0.18, 72),
             Some(DropZone::Column { col: 0 }),
         );
         // mx=37 -> body. col_right=200. 37 < 200-36=164 -> body.
         // n=1, rh=500, my=500 -> j=1.
         assert_eq!(
-            resolve_drop_zone(&layout, &rdz_monitor(), WindowId(99), 37, 500, 30, 0.18, 72),
+            rdz_legacy(&layout, &rdz_monitor(), WindowId(99), 37, 500, 30, 0.18, 72),
             Some(DropZone::Row { col: 0, row: 1 }),
         );
     }
@@ -1222,7 +1372,7 @@ mod tests {
         );
         // mx=505 -> in seam -> Column{col:1} (right neighbor).
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1250,28 +1400,42 @@ mod tests {
             10,
         );
         assert_eq!(
-            resolve_drop_zone(&layout, &rdz_monitor(), WindowId(99), 5, 500, 30, 0.18, 72),
+            rdz_legacy(&layout, &rdz_monitor(), WindowId(99), 5, 500, 30, 0.18, 72),
             Some(DropZone::Column { col: 0 }),
         );
     }
 
     #[test]
     fn rdz_right_of_last_column() {
-        // 2 cols, gap=10. Col1 right edge = 510+490=1000. mx=1001 -> append.
+        // 2 cols 480 wide, gap=10. Col1 spans [500, 980); the gap right of
+        // it (mx=985) appends. (Past the work area, mx >= 1000, is no zone.)
         let layout = make_rdz_applied(
             vec![
-                Column::with_row(490, Row::new(WindowId(1), 1000)),
-                Column::with_row(490, Row::new(WindowId(2), 1000)),
+                Column::with_row(480, Row::new(WindowId(1), 1000)),
+                Column::with_row(480, Row::new(WindowId(2), 1000)),
             ],
             0,
             10,
         );
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
-                1001,
+                1000,
+                500,
+                30,
+                0.18,
+                72
+            ),
+            None,
+        );
+        assert_eq!(
+            rdz_legacy(
+                &layout,
+                &rdz_monitor(),
+                WindowId(99),
+                985,
                 500,
                 30,
                 0.18,
@@ -1294,7 +1458,7 @@ mod tests {
             0,
             0,
         );
-        let zone = resolve_drop_zone(&layout, &rdz_monitor(), WindowId(1), 250, 500, 30, 0.18, 72);
+        let zone = rdz_legacy(&layout, &rdz_monitor(), WindowId(1), 250, 500, 30, 0.18, 72);
         assert!(zone.is_some(), "own column should not be excluded");
         match zone {
             Some(DropZone::Row { col: 0, .. }) | Some(DropZone::Column { col: 0 }) => {}
@@ -1320,7 +1484,7 @@ mod tests {
             0,
         );
         assert_eq!(
-            resolve_drop_zone(&layout, &rdz_monitor(), WindowId(99), 10, 500, 30, 0.18, 72),
+            rdz_legacy(&layout, &rdz_monitor(), WindowId(99), 10, 500, 30, 0.18, 72),
             Some(DropZone::ScrollLeft),
         );
     }
@@ -1337,7 +1501,7 @@ mod tests {
             0,
             0,
         );
-        let zone = resolve_drop_zone(&layout, &rdz_monitor(), WindowId(99), 10, 500, 30, 0.18, 72);
+        let zone = rdz_legacy(&layout, &rdz_monitor(), WindowId(99), 10, 500, 30, 0.18, 72);
         assert_ne!(zone, Some(DropZone::ScrollLeft));
     }
 
@@ -1356,7 +1520,7 @@ mod tests {
             0,
         );
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1382,7 +1546,7 @@ mod tests {
             0,
             0,
         );
-        let zone = resolve_drop_zone(
+        let zone = rdz_legacy(
             &layout,
             &rdz_monitor(),
             WindowId(99),
@@ -1409,8 +1573,7 @@ mod tests {
         );
         for &mx in &[0, 200, 499, 500, 750, 999] {
             for &my in &[0, 333, 666, 999] {
-                let zone =
-                    resolve_drop_zone(&layout, &rdz_monitor(), WindowId(99), mx, my, 30, 0.18, 72);
+                let zone = rdz_legacy(&layout, &rdz_monitor(), WindowId(99), mx, my, 30, 0.18, 72);
                 assert!(zone.is_some(), "no zone at ({mx}, {my})");
             }
         }
@@ -1419,14 +1582,30 @@ mod tests {
     // -- Empty layout --
 
     #[test]
-    fn rdz_empty_layout_returns_none() {
+    fn rdz_empty_layout_takes_column_zero() {
+        // An empty strip (a cross-screen drop onto an empty monitor) takes
+        // the window as its first column anywhere in the work area.
         let empty = AppliedLayout {
             virtual_layout: VirtualLayout::new(),
             actual_layout: ActualLayout::new(),
         };
         assert_eq!(
-            resolve_drop_zone(&empty, &rdz_monitor(), WindowId(99), 500, 500, 30, 0.18, 72),
+            rdz_legacy(&empty, &rdz_monitor(), WindowId(99), 500, 500, 30, 0.18, 72),
+            Some(DropZone::Column { col: 0 }),
+        );
+        assert_eq!(
+            rdz_legacy(
+                &empty,
+                &rdz_monitor(),
+                WindowId(99),
+                500,
+                1000,
+                30,
+                0.18,
+                72
+            ),
             None,
+            "below the work area is still no zone"
         );
     }
 
@@ -1447,7 +1626,7 @@ mod tests {
             0,
         );
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1487,7 +1666,7 @@ mod tests {
             0,
         );
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1511,7 +1690,7 @@ mod tests {
             0,
             0,
         );
-        let zone = resolve_drop_zone(
+        let zone = rdz_legacy(
             &layout,
             &rdz_monitor(),
             WindowId(99),
@@ -1545,7 +1724,7 @@ mod tests {
             0,
             10,
         );
-        let zone = resolve_drop_zone(
+        let zone = rdz_legacy(
             &layout,
             &rdz_monitor(),
             WindowId(99),
@@ -1578,7 +1757,7 @@ mod tests {
             10,
         );
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1608,7 +1787,7 @@ mod tests {
             0,
         );
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1635,7 +1814,7 @@ mod tests {
             10,
         );
         assert_eq!(
-            resolve_drop_zone(&layout, &rdz_monitor(), WindowId(99), 100, 5, 30, 0.18, 72),
+            rdz_legacy(&layout, &rdz_monitor(), WindowId(99), 100, 5, 30, 0.18, 72),
             Some(DropZone::Row { col: 0, row: 0 }),
         );
     }
@@ -1663,16 +1842,16 @@ mod tests {
         let layout = rdz_scrollable_both_ways();
         // Inside the band: scrolls.
         assert_eq!(
-            resolve_drop_zone(&layout, &rdz_monitor(), WindowId(99), 0, 500, 30, 0.18, 72),
+            rdz_legacy(&layout, &rdz_monitor(), WindowId(99), 0, 500, 30, 0.18, 72),
             Some(DropZone::ScrollLeft),
         );
         // One pixel onto the monitor to the left: not this strip's band.
         assert_ne!(
-            resolve_drop_zone(&layout, &rdz_monitor(), WindowId(99), -1, 500, 30, 0.18, 72),
+            rdz_legacy(&layout, &rdz_monitor(), WindowId(99), -1, 500, 30, 0.18, 72),
             Some(DropZone::ScrollLeft),
         );
         assert_ne!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1690,7 +1869,7 @@ mod tests {
     fn rdz_cursor_right_of_the_work_area_is_not_a_scroll_band() {
         let layout = rdz_scrollable_both_ways();
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1704,7 +1883,7 @@ mod tests {
         );
         // wa.right() itself is the first pixel of the neighbour.
         assert_ne!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1717,7 +1896,7 @@ mod tests {
             Some(DropZone::ScrollRight),
         );
         assert_ne!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1756,15 +1935,15 @@ mod tests {
             actual_layout: actual,
         };
         assert_eq!(
-            resolve_drop_zone(&layout, &monitor, WindowId(99), -995, 500, 30, 0.18, 72),
+            rdz_legacy(&layout, &monitor, WindowId(99), -995, 500, 30, 0.18, 72),
             Some(DropZone::ScrollLeft),
         );
         assert_eq!(
-            resolve_drop_zone(&layout, &monitor, WindowId(99), -5, 500, 30, 0.18, 72),
+            rdz_legacy(&layout, &monitor, WindowId(99), -5, 500, 30, 0.18, 72),
             Some(DropZone::ScrollRight),
         );
         // On the primary monitor (x >= 0): neither band.
-        let on_primary = resolve_drop_zone(&layout, &monitor, WindowId(99), 5, 500, 30, 0.18, 72);
+        let on_primary = rdz_legacy(&layout, &monitor, WindowId(99), 5, 500, 30, 0.18, 72);
         assert!(
             !matches!(
                 on_primary,
@@ -1824,28 +2003,28 @@ mod tests {
         // on the upper display: no zone at all.
         for mx in [5, 100, 500, 995] {
             assert_eq!(
-                resolve_drop_zone(&layout, &monitor, WindowId(99), mx, 700, 30, 0.18, 72),
+                rdz_legacy(&layout, &monitor, WindowId(99), mx, 700, 30, 0.18, 72),
                 None,
                 "mx={mx} on the upper display"
             );
             // The last pixel above the work area, too.
             assert_eq!(
-                resolve_drop_zone(&layout, &monitor, WindowId(99), mx, 1439, 30, 0.18, 72),
+                rdz_legacy(&layout, &monitor, WindowId(99), mx, 1439, 30, 0.18, 72),
                 None,
                 "mx={mx} just above the work area"
             );
         }
         // Inside the strip the same x values resolve as usual.
         assert_eq!(
-            resolve_drop_zone(&layout, &monitor, WindowId(99), 5, 1440, 30, 0.18, 72),
+            rdz_legacy(&layout, &monitor, WindowId(99), 5, 1440, 30, 0.18, 72),
             Some(DropZone::ScrollLeft),
         );
         assert_eq!(
-            resolve_drop_zone(&layout, &monitor, WindowId(99), 995, 2000, 30, 0.18, 72),
+            rdz_legacy(&layout, &monitor, WindowId(99), 995, 2000, 30, 0.18, 72),
             Some(DropZone::ScrollRight),
         );
         assert!(matches!(
-            resolve_drop_zone(&layout, &monitor, WindowId(99), 300, 2000, 30, 0.18, 72),
+            rdz_legacy(&layout, &monitor, WindowId(99), 300, 2000, 30, 0.18, 72),
             Some(DropZone::Row { .. } | DropZone::Column { .. })
         ));
     }
@@ -1857,11 +2036,11 @@ mod tests {
         // or off-screen): nothing.
         for mx in [5, 300, 995] {
             assert_eq!(
-                resolve_drop_zone(&layout, &monitor, WindowId(99), mx, 2440, 30, 0.18, 72),
+                rdz_legacy(&layout, &monitor, WindowId(99), mx, 2440, 30, 0.18, 72),
                 None
             );
             assert_eq!(
-                resolve_drop_zone(&layout, &monitor, WindowId(99), mx, 3000, 30, 0.18, 72),
+                rdz_legacy(&layout, &monitor, WindowId(99), mx, 3000, 30, 0.18, 72),
                 None
             );
         }
@@ -1877,12 +2056,12 @@ mod tests {
         // the band would be 0px and the left-edge insert zone unreachable.
         let layout = make_rdz_applied(vec![Column::with_row(3, Row::new(WindowId(1), 1000))], 0, 0);
         assert_eq!(
-            resolve_drop_zone(&layout, &rdz_monitor(), WindowId(99), 0, 500, 30, 0.18, 72),
+            rdz_legacy(&layout, &rdz_monitor(), WindowId(99), 0, 500, 30, 0.18, 72),
             Some(DropZone::Column { col: 0 }),
         );
         // mx=1 is past the 1px band, into the body -> Row split.
         assert_eq!(
-            resolve_drop_zone(&layout, &rdz_monitor(), WindowId(99), 1, 500, 30, 0.18, 72),
+            rdz_legacy(&layout, &rdz_monitor(), WindowId(99), 1, 500, 30, 0.18, 72),
             Some(DropZone::Row { col: 0, row: 1 }),
         );
     }
@@ -1904,7 +2083,7 @@ mod tests {
         );
         // Seam left boundary is inclusive: mx=500 -> Column{1}.
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1918,7 +2097,7 @@ mod tests {
         );
         // Last seam pixel (seam_right=510 is exclusive): mx=509 -> Column{1}.
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1934,7 +2113,7 @@ mod tests {
         // -> col1 body row split (NOT a Column insert). col_rect.y=10 (gap
         // shifts the column down), so my=500 -> rel_y=490 -> row 0.
         assert_eq!(
-            resolve_drop_zone(
+            rdz_legacy(
                 &layout,
                 &rdz_monitor(),
                 WindowId(99),
@@ -1979,6 +2158,445 @@ mod tests {
                 &test_monitor()
             )
             .is_some()
+        );
+    }
+
+    // =================================================================
+    // ADR-0018 zone map: outer thirds, per-window halves, row bands,
+    // edge bands as a twelfth, cross-screen
+    // =================================================================
+
+    /// The shipped defaults on a strip with `visible_rows` slots.
+    fn defaults(visible_rows: u32) -> ZoneParams {
+        ZoneParams {
+            edge_scroll_px: 30,
+            edge_scroll_ratio: 0.0833,
+            col_edge_ratio: 0.33,
+            col_edge_max_px: 0,
+            visible_rows,
+        }
+    }
+
+    fn applied_on(
+        vl: VirtualLayout,
+        monitor: &MonitorInfo,
+        gap: i32,
+        visible_rows: u32,
+    ) -> AppliedLayout {
+        let actual = projection::project(&vl, monitor, &rdz_padding(gap), visible_rows);
+        AppliedLayout {
+            virtual_layout: vl,
+            actual_layout: actual,
+        }
+    }
+
+    /// Three 300-px single-row columns at x 0, 300, 600 (gap 0); nothing
+    /// to scroll to.
+    fn three_narrow_columns() -> AppliedLayout {
+        let vl = VirtualLayout::with_columns(
+            (1..=3)
+                .map(|i| Column::with_row(300, Row::new(WindowId(i), 1000)))
+                .collect(),
+            0,
+        );
+        applied_on(vl, &rdz_monitor(), 0, 0)
+    }
+
+    /// One 300-px column (x 300..600) of `heights.len()` rows, after a
+    /// single-row column at x 0..300.
+    fn stack(heights: &[i32], row_offset: usize, visible_rows: u32) -> AppliedLayout {
+        let rows = heights
+            .iter()
+            .enumerate()
+            .map(|(i, &h)| Row::new(WindowId(10 + i as isize), h))
+            .collect();
+        let vl = VirtualLayout::with_columns(
+            vec![
+                Column::with_row(300, Row::new(WindowId(1), 1000)),
+                Column::with_rows(300, rows).with_row_offset(row_offset),
+            ],
+            0,
+        );
+        applied_on(vl, &rdz_monitor(), 0, visible_rows)
+    }
+
+    fn zone(applied: &AppliedLayout, mx: i32, my: i32, params: &ZoneParams) -> Option<DropZone> {
+        resolve_drop_zone(applied, &rdz_monitor(), mx, my, params)
+    }
+
+    #[test]
+    fn outer_third_of_a_column_inserts_a_column_on_that_side() {
+        // Middle column x 300..600, band = 0.33 * 300 = 99.
+        let l = three_narrow_columns();
+        let p = defaults(0);
+        assert_eq!(zone(&l, 300, 500, &p), Some(DropZone::Column { col: 1 }));
+        assert_eq!(zone(&l, 398, 500, &p), Some(DropZone::Column { col: 1 }));
+        assert_eq!(
+            zone(&l, 399, 500, &p),
+            Some(DropZone::Row { col: 1, row: 1 })
+        );
+        assert_eq!(
+            zone(&l, 450, 499, &p),
+            Some(DropZone::Row { col: 1, row: 0 })
+        );
+        assert_eq!(
+            zone(&l, 500, 500, &p),
+            Some(DropZone::Row { col: 1, row: 1 })
+        );
+        assert_eq!(zone(&l, 501, 500, &p), Some(DropZone::Column { col: 2 }));
+        assert_eq!(zone(&l, 599, 500, &p), Some(DropZone::Column { col: 2 }));
+    }
+
+    #[test]
+    fn a_third_of_a_640_px_column_is_not_capped_by_default() {
+        assert_eq!(compute_col_edge_band(640, 0.33, 0), 211);
+        assert_eq!(
+            compute_col_edge_band(640, 0.33, 120),
+            120,
+            "an explicit cap still caps"
+        );
+        assert_eq!(
+            compute_col_edge_band(640, 0.9, 0),
+            320,
+            "the ratio clamps to a half"
+        );
+    }
+
+    #[test]
+    fn one_row_column_splits_at_the_windows_half() {
+        let l = stack(&[1000], 0, 0);
+        let p = defaults(0);
+        assert_eq!(
+            zone(&l, 450, 499, &p),
+            Some(DropZone::Row { col: 1, row: 0 })
+        );
+        assert_eq!(
+            zone(&l, 450, 500, &p),
+            Some(DropZone::Row { col: 1, row: 1 })
+        );
+    }
+
+    #[test]
+    fn three_row_column_splits_each_window_into_halves() {
+        // Rows at y 0..333, 333..666, 666..1000 (mids 166, 499, 833).
+        let l = stack(&[333, 333, 334], 0, 0);
+        let p = defaults(0);
+        // top half of the top window: above all; bottom half of the top
+        // window and top half of the middle one: between them; ...; bottom
+        // half of the bottom window: below all.
+        for (my, row) in [
+            (0, 0),
+            (165, 0),
+            (166, 1),
+            (400, 1),
+            (499, 2),
+            (700, 2),
+            (833, 3),
+            (999, 3),
+        ] {
+            assert_eq!(
+                zone(&l, 450, my, &p),
+                Some(DropZone::Row { col: 1, row }),
+                "my={my}"
+            );
+        }
+    }
+
+    /// Four rows of 500, two visible: rows `off` and `off + 1` fill the
+    /// column (y 0..500 and 500..1000); the others are parked.
+    fn four_rows_two_visible(off: usize) -> AppliedLayout {
+        stack(&[500, 500, 500, 500], off, 2)
+    }
+
+    #[test]
+    fn halves_use_the_visible_rows_not_the_parked_ones() {
+        let l = four_rows_two_visible(1);
+        let p = defaults(2);
+        assert_eq!(
+            zone(&l, 450, 200, &p),
+            Some(DropZone::Row { col: 1, row: 1 })
+        );
+        assert_eq!(
+            zone(&l, 450, 300, &p),
+            Some(DropZone::Row { col: 1, row: 2 })
+        );
+        assert_eq!(
+            zone(&l, 450, 600, &p),
+            Some(DropZone::Row { col: 1, row: 2 })
+        );
+        assert_eq!(
+            zone(&l, 450, 800, &p),
+            Some(DropZone::Row { col: 1, row: 3 })
+        );
+    }
+
+    #[test]
+    fn row_bands_appear_only_toward_parked_rows() {
+        // Row band = max(30, round(0.0833 * 1000)) = 83 px.
+        let p = defaults(2);
+        let mid = four_rows_two_visible(1);
+        assert_eq!(zone(&mid, 450, 0, &p), Some(DropZone::ScrollUp { col: 1 }));
+        assert_eq!(zone(&mid, 450, 82, &p), Some(DropZone::ScrollUp { col: 1 }));
+        assert_eq!(
+            zone(&mid, 450, 83, &p),
+            Some(DropZone::Row { col: 1, row: 1 })
+        );
+        assert_eq!(
+            zone(&mid, 450, 917, &p),
+            Some(DropZone::ScrollDown { col: 1 })
+        );
+        assert_eq!(
+            zone(&mid, 450, 916, &p),
+            Some(DropZone::Row { col: 1, row: 3 })
+        );
+        // At the top of the content: no up band, the top half is "above all".
+        let top = four_rows_two_visible(0);
+        assert_eq!(
+            zone(&top, 450, 10, &p),
+            Some(DropZone::Row { col: 1, row: 0 })
+        );
+        assert_eq!(
+            zone(&top, 450, 990, &p),
+            Some(DropZone::ScrollDown { col: 1 })
+        );
+        // At the bottom: no down band, the bottom half is "below all".
+        let bottom = four_rows_two_visible(2);
+        assert_eq!(
+            zone(&bottom, 450, 10, &p),
+            Some(DropZone::ScrollUp { col: 1 })
+        );
+        assert_eq!(
+            zone(&bottom, 450, 990, &p),
+            Some(DropZone::Row { col: 1, row: 4 })
+        );
+        // The outer thirds stay column inserts even inside the band height.
+        assert_eq!(zone(&mid, 310, 10, &p), Some(DropZone::Column { col: 1 }));
+    }
+
+    #[test]
+    fn no_row_bands_when_every_row_is_visible() {
+        let l = stack(&[500, 500], 0, 2);
+        let p = defaults(2);
+        assert_eq!(zone(&l, 450, 5, &p), Some(DropZone::Row { col: 1, row: 0 }));
+        assert_eq!(
+            zone(&l, 450, 995, &p),
+            Some(DropZone::Row { col: 1, row: 2 })
+        );
+    }
+
+    #[test]
+    fn scroll_column_rows_is_bounded_by_content() {
+        use crate::layout::mutations::scroll_column_rows;
+        let mut config = test_config();
+        config.visible_rows = 2;
+        let vl = four_rows_two_visible(1).virtual_layout;
+        let down = scroll_column_rows(&vl, 1, true, &config).expect("one down");
+        assert_eq!(down.columns[1].row_offset, 2);
+        assert!(
+            scroll_column_rows(&down, 1, true, &config).is_none(),
+            "content edge"
+        );
+        let up = scroll_column_rows(&vl, 1, false, &config).expect("one up");
+        assert_eq!(up.columns[1].row_offset, 0);
+        assert!(scroll_column_rows(&up, 1, false, &config).is_none());
+        assert!(
+            scroll_column_rows(&vl, 0, true, &config).is_none(),
+            "nothing parked"
+        );
+        assert!(
+            scroll_column_rows(&vl, 9, true, &config).is_none(),
+            "no such column"
+        );
+    }
+
+    /// Three 490-px columns, gap 10: the third is off screen right.
+    fn scrollable_right(monitor: &MonitorInfo) -> AppliedLayout {
+        let vl = VirtualLayout::with_columns(
+            (1..=3)
+                .map(|i| Column::with_row(490, Row::new(WindowId(i), 1000)))
+                .collect(),
+            0,
+        );
+        applied_on(vl, monitor, 10, 0)
+    }
+
+    #[test]
+    fn edge_bands_are_a_twelfth_of_the_work_area() {
+        // 1000 px wide: band = max(30, 83) = 83, so mx >= 917 scrolls.
+        let m = rdz_monitor();
+        let l = scrollable_right(&m);
+        let p = defaults(0);
+        assert_eq!(
+            resolve_drop_zone(&l, &m, 917, 500, &p),
+            Some(DropZone::ScrollRight)
+        );
+        assert_ne!(
+            resolve_drop_zone(&l, &m, 916, 500, &p),
+            Some(DropZone::ScrollRight)
+        );
+        // `edge_scroll_width` is the floor.
+        let wide = ZoneParams {
+            edge_scroll_px: 200,
+            ..p
+        };
+        assert_eq!(
+            resolve_drop_zone(&l, &m, 800, 500, &wide),
+            Some(DropZone::ScrollRight)
+        );
+    }
+
+    #[test]
+    fn an_edge_shared_with_a_neighbour_keeps_the_pixel_band() {
+        let mut m = rdz_monitor();
+        m.neighbour_right = true;
+        let l = scrollable_right(&m);
+        let p = defaults(0);
+        assert_ne!(
+            resolve_drop_zone(&l, &m, 917, 500, &p),
+            Some(DropZone::ScrollRight)
+        );
+        assert_eq!(
+            resolve_drop_zone(&l, &m, 970, 500, &p),
+            Some(DropZone::ScrollRight)
+        );
+    }
+
+    /// Monitor 1 of a side-by-side pair: work area x 1000..2000.
+    fn right_monitor() -> MonitorInfo {
+        let mut m = MonitorInfo::single(Rect {
+            x: 1000,
+            y: 0,
+            width: 1000,
+            height: 1000,
+        });
+        m.neighbour_left = true;
+        m
+    }
+
+    #[test]
+    fn cross_screen_resolves_against_the_target_strip() {
+        let target = right_monitor();
+        let vl = VirtualLayout::with_columns(
+            vec![
+                Column::with_row(300, Row::new(WindowId(5), 1000)),
+                Column::with_rows(
+                    300,
+                    vec![Row::new(WindowId(6), 500), Row::new(WindowId(7), 500)],
+                ),
+            ],
+            0,
+        );
+        let l = applied_on(vl, &target, 0, 0);
+        let p = defaults(0);
+        // Column 1 sits at x 1300..1600 on the target.
+        assert_eq!(
+            resolve_drop_zone(&l, &target, 1310, 500, &p),
+            Some(DropZone::Column { col: 1 })
+        );
+        assert_eq!(
+            resolve_drop_zone(&l, &target, 1450, 600, &p),
+            Some(DropZone::Row { col: 1, row: 1 })
+        );
+        assert_eq!(
+            resolve_drop_zone(&l, &target, 1450, 800, &p),
+            Some(DropZone::Row { col: 1, row: 2 })
+        );
+        assert_eq!(
+            resolve_drop_zone(&l, &target, 1800, 500, &p),
+            Some(DropZone::Column { col: 2 })
+        );
+        // The same point is no zone of the source strip (monitor 0).
+        let src = three_narrow_columns();
+        assert_eq!(resolve_drop_zone(&src, &rdz_monitor(), 1450, 600, &p), None);
+        // An empty target strip takes the window as column 0.
+        let empty = applied_on(VirtualLayout::new(), &target, 0, 0);
+        assert_eq!(
+            resolve_drop_zone(&empty, &target, 1500, 500, &p),
+            Some(DropZone::Column { col: 0 })
+        );
+    }
+
+    #[test]
+    fn preview_insert_seats_a_window_from_another_strip() {
+        let config = test_config();
+        let monitor = test_monitor();
+        let layout = two_col_layout();
+        let w = WindowId(42);
+        let col = preview_insert(&layout, w, DropZone::Column { col: 1 }, &config, &monitor)
+            .expect("column insert");
+        assert_eq!(col.virtual_layout.columns.len(), 3);
+        assert_eq!(col.virtual_layout.columns[1].rows[0].window_id, w);
+        assert!(col.actual_layout.find(w).is_some(), "projected");
+        let row = preview_insert(
+            &layout,
+            w,
+            DropZone::Row { col: 1, row: 1 },
+            &config,
+            &monitor,
+        )
+        .expect("row insert");
+        let ids: Vec<_> = row.virtual_layout.columns[1]
+            .rows
+            .iter()
+            .map(|r| r.window_id)
+            .collect();
+        assert_eq!(ids, vec![WindowId(2), w, WindowId(3)]);
+        let empty = preview_insert(
+            &VirtualLayout::new(),
+            w,
+            DropZone::Column { col: 0 },
+            &config,
+            &monitor,
+        )
+        .expect("empty strip");
+        assert_eq!(empty.virtual_layout.columns.len(), 1);
+        // Refusals: a window already seated, a scroll zone, a missing or
+        // full column.
+        let refused = |vl: &VirtualLayout, id: WindowId, z: DropZone, c: &MutationConfig| {
+            preview_insert(vl, id, z, c, &monitor).is_none()
+        };
+        assert!(refused(
+            &layout,
+            WindowId(2),
+            DropZone::Column { col: 0 },
+            &config
+        ));
+        assert!(refused(&layout, w, DropZone::ScrollUp { col: 1 }, &config));
+        assert!(refused(
+            &layout,
+            w,
+            DropZone::Row { col: 7, row: 0 },
+            &config
+        ));
+        let full = MutationConfig {
+            max_rows: 2,
+            ..config
+        };
+        assert!(refused(&layout, w, DropZone::Row { col: 1, row: 0 }, &full));
+    }
+
+    #[test]
+    fn a_drop_into_a_stack_reveals_the_dropped_row() {
+        // Moving window 1 below the visible pair of a 4-row, 2-visible
+        // column scrolls the column so the dropped row is on screen.
+        let mut config = test_config();
+        config.visible_rows = 2;
+        let monitor = test_monitor();
+        let vl = four_rows_two_visible(0).virtual_layout;
+        let p = preview_move(
+            &vl,
+            WindowId(1),
+            DropZone::Row { col: 1, row: 4 },
+            &config,
+            &monitor,
+        )
+        .expect("moved");
+        let (c, row) = p.virtual_layout.find_window(WindowId(1)).expect("seated");
+        let col = &p.virtual_layout.columns[c];
+        assert!(
+            col.row_visible(row, 2),
+            "dropped row {row} visible at offset {}",
+            col.row_offset
         );
     }
 }

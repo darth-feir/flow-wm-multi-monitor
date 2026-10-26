@@ -71,9 +71,10 @@
       "description": "Tile-drag configuration.",
       "$ref": "#/$defs/DragConfig",
       "default": {
-        "col_edge_max_px": 120,
-        "col_edge_ratio": 0.18000000715255737,
+        "col_edge_max_px": 0,
+        "col_edge_ratio": 0.33000001311302185,
         "edge_scroll_initial_delay_ms": 500,
+        "edge_scroll_ratio": 0.08330000191926956,
         "edge_scroll_repeat_interval_ms": 240,
         "edge_scroll_width": 30
       }
@@ -485,20 +486,20 @@
       ]
     },
     "DragConfig": {
-      "description": "Tile-drag configuration.\n\nControls the behavior of drag-and-drop repositioning of tiled windows.\nWhen a user drags a tiled window by its title bar, a live non-committing\npreview reflows the other windows to the prospective layout on each zone\nchange; on release the move commits and the dragged window snaps into its\nslot. Floating windows never enter the drag state machine. See\n(`docs/src/dev-guide/tile-drag.md`).\n\n# Example\n\n```toml\n[drag]\nedge_scroll_width = 30\ncol_edge_ratio = 0.18\ncol_edge_max_px = 120\nedge_scroll_initial_delay_ms = 500\nedge_scroll_repeat_interval_ms = 240\n```",
+      "description": "Tile-drag configuration.\n\nControls the behavior of drag-and-drop repositioning of tiled windows.\nWhen a user drags a tiled window by its title bar, a live non-committing\npreview reflows the other windows to the prospective layout on each zone\nchange; on release the move commits and the dragged window snaps into its\nslot. Floating windows never enter the drag state machine. See\n(`docs/src/dev-guide/tile-drag.md`).\n\n# Example\n\n```toml\n[drag]\nedge_scroll_width = 30\nedge_scroll_ratio = 0.0833\ncol_edge_ratio = 0.33\ncol_edge_max_px = 0\nedge_scroll_initial_delay_ms = 500\nedge_scroll_repeat_interval_ms = 240\n```",
       "type": "object",
       "properties": {
         "col_edge_max_px": {
-          "description": "Pixel cap on the column-insert hit band. The effective band is\n`min(col_edge_ratio * column_width, col_edge_max_px)`.",
+          "description": "Pixel cap on the column-insert hit band; `0` = no cap. The effective\nband is `col_edge_ratio * column_width`, capped by this when positive.",
           "type": "integer",
           "format": "int32",
-          "default": 120
+          "default": 0
         },
         "col_edge_ratio": {
-          "description": "Fraction of column width used as the column-insert hit-band floor;\ncombined with `col_edge_max_px` to size the left/right edge bands\nthat trigger a column-insert drop.",
+          "description": "Fraction of a column's width, on each side, that inserts the dragged\nwindow as a new column beside it (clamped to `0.5`); the middle\nremainder inserts above/below the row under the cursor.",
           "type": "number",
           "format": "float",
-          "default": 0.18000000715255737
+          "default": 0.33000001311302185
         },
         "edge_scroll_initial_delay_ms": {
           "description": "Edge-scroll auto-repeat **initial delay** in milliseconds — the gap\nbetween the immediate scroll fired on entering the band and the first\nrepeat. Clamped up to the effective repeat interval at runtime, so `0`\ncleanly means \"glide at the normal cadence with no special pause.\"",
@@ -506,6 +507,12 @@
           "format": "uint32",
           "default": 500,
           "minimum": 0
+        },
+        "edge_scroll_ratio": {
+          "description": "Edge-scroll band as a fraction of the work area: of its width for\nthe left/right bands on an outer screen edge (`max(edge_scroll_width,\nratio * width)`), of its height for the top/bottom row-scroll bands\nof a stacked column with parked rows. `0` = pixels only.",
+          "type": "number",
+          "format": "float",
+          "default": 0.08330000191926956
         },
         "edge_scroll_repeat_interval_ms": {
           "description": "Edge-scroll auto-repeat **repeat interval** in milliseconds — the gap\nbetween successive column scrolls while the cursor is held in the band.\nClamped up to the enabled animation duration and the spam-guard floor at\nruntime; a sub-floor value additionally logs a startup warning.",
@@ -515,7 +522,7 @@
           "minimum": 0
         },
         "edge_scroll_width": {
-          "description": "Width in pixels of the left/right edge-scroll bands. When the cursor\nenters this band at the screen edge during a tile drag, the viewport\nscrolls by one column (committed live, not deferred to release).",
+          "description": "Minimum width in pixels of the left/right edge-scroll bands, and the\nwhole band on an edge shared with another monitor. When the cursor\nenters a band during a tile drag, the viewport scrolls by one column\n(committed live, not deferred to release).",
           "type": "integer",
           "format": "int32",
           "default": 30

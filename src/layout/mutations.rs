@@ -337,6 +337,31 @@ pub fn ensure_row_visible(
     out
 }
 
+/// Shift column `col`'s row viewport by one row, down (`down`) or up,
+/// bounded by its content: `None` when the column does not exist, has no
+/// parked rows that way, or `visible_rows` is `0`. The tile-drag row-scroll
+/// bands (`ScrollUp` / `ScrollDown`) commit this live.
+#[must_use]
+pub fn scroll_column_rows(
+    layout: &VirtualLayout,
+    col: usize,
+    down: bool,
+    config: &MutationConfig,
+) -> Option<VirtualLayout> {
+    let mut out = layout.clone();
+    let column = out.columns.get_mut(col)?;
+    column.clamp_row_offset(config.visible_rows);
+    let max = column.max_row_offset(config.visible_rows);
+    if down && column.row_offset < max {
+        column.row_offset += 1;
+    } else if !down && column.row_offset > 0 {
+        column.row_offset -= 1;
+    } else {
+        return None;
+    }
+    Some(out)
+}
+
 /// Clamp every column's row viewport after rows were removed, then (when
 /// `focused` is in the layout) shift its column so it is visible. This is
 /// the invariant [`ScrollingSpace`](crate::workspace::ScrollingSpace)
@@ -561,8 +586,11 @@ pub fn scroll_right(layout: &VirtualLayout, config: &MutationConfig) -> Option<V
     let step = first_visible_step(layout, config)?;
     let total_canvas = total_column_span(layout, config);
     let max_offset = (total_canvas - config.monitor_width).max(0);
-    let new_offset = layout.viewport_offset + step;
-    if new_offset > max_offset {
+    // A step past the end stops at the end: the trailing gap can leave the
+    // last column a few pixels short of a full step (an edge-scroll that
+    // could never reveal it otherwise).
+    let new_offset = (layout.viewport_offset + step).min(max_offset);
+    if new_offset <= layout.viewport_offset {
         return None;
     }
     Some(VirtualLayout {
@@ -2056,6 +2084,18 @@ mod tests {
         assert!(result.viewport_offset > 0);
         // Slot model: step = col_width + window_gap = 960 + 4 = 964
         assert_eq!(result.viewport_offset, 964);
+    }
+
+    #[test]
+    fn scroll_right_stops_at_the_end_when_a_step_overshoots() {
+        // Canvas 4 + 3 * 964 = 2896, end offset 2896 - 1920 = 976: the
+        // second 964-px step would overshoot by 952, so it stops at the end
+        // (the last column fully in view) instead of refusing.
+        let config = test_config();
+        let first = scroll_right(&three_column_layout(), &config).expect("one step");
+        let end = scroll_right(&first, &config).expect("to the end");
+        assert_eq!(end.viewport_offset, 976);
+        assert!(scroll_right(&end, &config).is_none(), "at the end");
     }
 
     #[test]

@@ -164,9 +164,15 @@ foreground_sync_interval_ms = 250
 # change; on release the move commits and the dragged window snaps into its
 # slot. Floating windows never enter the drag state machine.
 #
-# - edge_scroll_width:          px band at screen edge that triggers viewport scroll
-# - col_edge_ratio:             fraction of column width for column-insert edge band
-# - col_edge_max_px:            pixel cap on the column-insert hit band
+# - edge_scroll_width:          minimum px band at a screen edge that scrolls the
+#                               viewport (the whole band on an edge shared with
+#                               another monitor)
+# - edge_scroll_ratio:          screen-edge band as a fraction of the work-area width;
+#                               also the height of the top/bottom row-scroll bands of a
+#                               stacked column with off-screen rows (0 = px only)
+# - col_edge_ratio:             fraction of a column's width, each side, that drops
+#                               the window as a new column beside it
+# - col_edge_max_px:            pixel cap on that band (0 = no cap)
 # - edge_scroll_initial_delay_ms:  gap (ms) from the immediate entry scroll to the
 #                                  first repeat; clamped up to the repeat interval
 # - edge_scroll_repeat_interval_ms: gap (ms) between successive column scrolls while
@@ -174,8 +180,9 @@ foreground_sync_interval_ms = 250
 #                                   internal spam-guard floor
 [drag]
 edge_scroll_width = 30
-col_edge_ratio = 0.18
-col_edge_max_px = 120
+edge_scroll_ratio = 0.0833
+col_edge_ratio = 0.33
+col_edge_max_px = 0
 edge_scroll_initial_delay_ms = 500
 edge_scroll_repeat_interval_ms = 240
 

@@ -981,24 +981,31 @@ pub struct FloatingConfig {
 /// ```toml
 /// [drag]
 /// edge_scroll_width = 30
-/// col_edge_ratio = 0.18
-/// col_edge_max_px = 120
+/// edge_scroll_ratio = 0.0833
+/// col_edge_ratio = 0.33
+/// col_edge_max_px = 0
 /// edge_scroll_initial_delay_ms = 500
 /// edge_scroll_repeat_interval_ms = 240
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct DragConfig {
-    /// Width in pixels of the left/right edge-scroll bands. When the cursor
-    /// enters this band at the screen edge during a tile drag, the viewport
-    /// scrolls by one column (committed live, not deferred to release).
+    /// Minimum width in pixels of the left/right edge-scroll bands, and the
+    /// whole band on an edge shared with another monitor. When the cursor
+    /// enters a band during a tile drag, the viewport scrolls by one column
+    /// (committed live, not deferred to release).
     pub edge_scroll_width: i32,
-    /// Fraction of column width used as the column-insert hit-band floor;
-    /// combined with `col_edge_max_px` to size the left/right edge bands
-    /// that trigger a column-insert drop.
+    /// Edge-scroll band as a fraction of the work area: of its width for
+    /// the left/right bands on an outer screen edge (`max(edge_scroll_width,
+    /// ratio * width)`), of its height for the top/bottom row-scroll bands
+    /// of a stacked column with parked rows. `0` = pixels only.
+    pub edge_scroll_ratio: f32,
+    /// Fraction of a column's width, on each side, that inserts the dragged
+    /// window as a new column beside it (clamped to `0.5`); the middle
+    /// remainder inserts above/below the row under the cursor.
     pub col_edge_ratio: f32,
-    /// Pixel cap on the column-insert hit band. The effective band is
-    /// `min(col_edge_ratio * column_width, col_edge_max_px)`.
+    /// Pixel cap on the column-insert hit band; `0` = no cap. The effective
+    /// band is `col_edge_ratio * column_width`, capped by this when positive.
     pub col_edge_max_px: i32,
     /// Edge-scroll auto-repeat **initial delay** in milliseconds — the gap
     /// between the immediate scroll fired on entering the band and the first
@@ -1028,8 +1035,11 @@ impl Default for DragConfig {
     fn default() -> Self {
         Self {
             edge_scroll_width: 30,
-            col_edge_ratio: 0.18,
-            col_edge_max_px: 120,
+            // A twelfth of the work area (ADR-0018).
+            edge_scroll_ratio: 0.0833,
+            // Outer third of a column = new column (ADR-0018).
+            col_edge_ratio: 0.33,
+            col_edge_max_px: 0,
             // The default repeat interval equals the default animation duration
             // (240 ms), so at the default each column's animation lands as the
             // next begins: a continuous glide with no gaps and no jank.
@@ -1305,6 +1315,7 @@ strategy = "original_slot"
             },
             drag: DragConfig {
                 edge_scroll_width: 25,
+                edge_scroll_ratio: 0.1,
                 col_edge_ratio: 0.3,
                 col_edge_max_px: 50,
                 edge_scroll_initial_delay_ms: 350,

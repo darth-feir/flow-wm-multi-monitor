@@ -383,3 +383,12 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   column on the viewport's left edge, so the view always begins on a column
   boundary. Supersedes the position rule of ADR-0014.
   `docs/adr/0017-width-patterns-are-screen-slots.md`
+- **ADR-0018 — Tile drops land by window halves, scroll bands are ratios,
+  and a tile can be dropped on another screen.** The outer third of a
+  column drops beside it, the middle third above or below the visible row
+  under the cursor by which half of it the cursor is in; a stack with
+  parked rows has top and bottom row-scroll bands; the screen-edge bands
+  are a twelfth of the work area (pixels on an edge shared with another
+  monitor); the zone is resolved on the monitor under the cursor, and a
+  drop there moves the tile through `move-to-monitor`'s tail.
+  `docs/adr/0018-drop-zones-by-window-halves.md`

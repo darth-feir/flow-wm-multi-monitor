@@ -712,6 +712,17 @@ impl ScrollingSpace {
         Some(self.apply_mutation(new_layout))
     }
 
+    /// Scroll column `col`'s row viewport by one row (down when `down`),
+    /// bounded by its content; `None` when it cannot move that way. The
+    /// focused window is **not** pulled back into view: a tile drag scrolls
+    /// a stack to reach an off-screen drop slot, and the drop then focuses
+    /// the dropped window (`docs/src/dev-guide/tile-drag.md`).
+    pub fn scroll_column_rows(&mut self, col: usize, down: bool) -> Option<AppliedLayout> {
+        let new_layout =
+            mutations::scroll_column_rows(&self.virtual_layout, col, down, &self.config)?;
+        Some(self.apply_mutation_for(new_layout, None))
+    }
+
     // -----------------------------------------------------------------------
     // Focus operations
     // -----------------------------------------------------------------------

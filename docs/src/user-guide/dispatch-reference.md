@@ -428,9 +428,15 @@ even if it was parked off-screen at the time. Closing a window on a monitor
 you are not working on only tidies that strip; focus stays where you are.
 A float you drag onto another monitor becomes that monitor's float (it rides
 along with that monitor's workspace switches, and `move-to-monitor` reasons
-from there). Dragging a tile towards a neighbouring monitor does not scroll
-the strip you came from, and releasing it over the other monitor returns it
-to its own strip.
+from there). A tile dragged onto another monitor (Mod+drag or by its title
+bar) previews and lands in that monitor's strip, in whichever zone it is
+over: the outer third of a column puts it beside that column, the middle
+third above or below the window under the cursor, an empty monitor takes it
+as its first column. That monitor becomes the active one and the window
+keeps the focus. Released between monitors, over a taskbar or after coming
+back to its own screen, it stays in its own strip. On the edge you cross to
+the neighbour the scroll band is only `edge_scroll_width` pixels, so
+crossing does not scroll the strip you came from.
 
 ### `focus-monitor <left|right|up|down>`
 
@@ -536,7 +542,18 @@ is held, then sends `drag end`:
   not managed) or when tiling is off.
 - `drag end` finishes it: the tile drops into the zone under the cursor
   (or snaps back to its own slot if released over nothing), the float's
-  final position is recorded. Prints `flow: drag ended (tile)` /
+  final position is recorded. The zones: the outer third of a column, on
+  either side, makes the tile a new column beside it; the middle third
+  puts it above the window under the cursor (top half of that window) or
+  below it (bottom half); a twelfth of the screen at the left and right
+  edges scrolls the strip, and in a column with more rows than
+  `visible_rows` the top and bottom of its middle third scroll its rows, so
+  a row that is off screen can be reached. A tile dropped into such a stack
+  stays in view; the window it pushes off screen is one Mod+Up/Down away.
+  Over another monitor the zones are that monitor's (see *Monitors*). The
+  sizes are `[drag]` settings: `edge_scroll_ratio` (`0.0833`),
+  `edge_scroll_width` (`30` px, the minimum), `col_edge_ratio` (`0.33`)
+  and `col_edge_max_px` (`0`, no cap). Prints `flow: drag ended (tile)` /
   `(float)`. Without a session it prints `flow: no drag session to end`
   and exits 0 — a no-op, since a script always sends it.
 

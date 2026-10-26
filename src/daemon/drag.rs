@@ -61,7 +61,9 @@ use windows::Win32::Foundation::HWND;
 use crate::borders::{BorderState, style_for_state};
 use crate::common::{Direction, Rect, WindowId};
 use crate::layout::mutations::ensure_column_visible;
-use crate::layout::preview::{DropZone, preview_move, resolve_drop_zone};
+use crate::layout::preview::{
+    DropZone, ZoneParams, preview_insert, preview_move, resolve_drop_zone,
+};
 use crate::layout::projection;
 use crate::layout::resize::{
     DragKind, ResizeEdge, VerticalEdge, classify_drag, resize_column_boundary_move,
@@ -202,9 +204,20 @@ pub(super) struct DragState {
     /// The raw HWND value (for `GetWindowRect`, the `DRAGGED_HWND` global).
     pub(super) dragged_hwnd: isize,
     /// Drop zone currently under the cursor (`None` until the first move, and
-    /// for the empty-workspace degenerate where [`resolve_drop_zone`] returns
-    /// `None`).
+    /// while the cursor is outside every work area, where
+    /// [`resolve_drop_zone`] returns `None`). Taken from the last move event,
+    /// never from the cursor at release: a keymap session's final move can
+    /// still be queued when `drag end` arrives.
     pub(super) current_zone: Option<DropZone>,
+    /// The monitor whose strip `current_zone` was resolved against: the one
+    /// under the cursor at the last move. Another monitor than the dragged
+    /// window's own makes the drop a cross-screen move (ADR-0018). `None`
+    /// exactly when `current_zone` is.
+    pub(super) zone_monitor: Option<usize>,
+    /// Monitors other than the source whose strip got a preview or a scroll
+    /// during this drag. Every later submission re-settles them in the same
+    /// animator batch (a new batch supersedes an in-flight one).
+    pub(super) touched: Vec<usize>,
     /// The edge-scroll auto-repeat state machine. Drives the
     /// immediate-on-entry scroll plus the timer-based repeat cadence; see
     /// [`edge_scroll`] and [`EdgeScrollScheduler`].
@@ -414,6 +427,8 @@ impl FlowWM {
                     dragged_id: classifying.dragged_id,
                     dragged_hwnd: classifying.dragged_hwnd,
                     current_zone: None,
+                    zone_monitor: None,
+                    touched: Vec::new(),
                     edge_scroll: EdgeScrollScheduler::new(),
                     edge_scroll_timings,
                     edge_scroll_deadline: None,
@@ -654,34 +669,23 @@ impl FlowWM {
             return;
         };
 
-        // 3. Snapshot the committed layout of the strip that holds the dragged
-        //    window for zone resolution. The drop zone is resolved against
-        //    THAT monitor's work area, so hovering over a neighbour monitor
-        //    falls outside every band and never auto-scrolls this strip.
-        let mi = self.drag_monitor_index();
-        let (applied, config, monitor) = {
-            let space = self.monitors[mi].active_scrolling();
-            (
-                AppliedLayout {
-                    virtual_layout: space.virtual_layout().clone(),
-                    actual_layout: space.actual_layout().clone(),
-                },
-                *space.config(),
-                *space.monitor(),
-            )
-        };
-        let drag_cfg = &self.config.drag;
-
-        let new_zone = resolve_drop_zone(
-            &applied,
-            &monitor,
-            dragged_id,
-            cx,
-            cy,
-            drag_cfg.edge_scroll_width,
-            drag_cfg.col_edge_ratio,
-            drag_cfg.col_edge_max_px,
-        );
+        // 3. The strip under the cursor: the dragged window's own, or
+        //    another monitor's (a cross-screen drag, ADR-0018). The zone is
+        //    resolved against THAT monitor's work area; a cursor on no
+        //    monitor (a gap, off the virtual screen) or outside the work
+        //    area (a taskbar) has no zone.
+        let src = self.drag_monitor_index();
+        let cursor_mon = self.monitor_index_for_rect_opt(Rect {
+            x: cx,
+            y: cy,
+            width: 1,
+            height: 1,
+        });
+        let new_zone = cursor_mon.and_then(|m| {
+            let (applied, _, monitor) = self.strip_snapshot(m);
+            resolve_drop_zone(&applied, &monitor, cx, cy, &self.zone_params(m))
+        });
+        let new_mon = new_zone.and(cursor_mon);
 
         // 4. Update the tracked zone (used by on_drag_end), then act. We capture
         //    the previous move's zone BEFORE overwriting it. Two independent
@@ -695,27 +699,37 @@ impl FlowWM {
         //      never completes under continuous cursor movement. Because a scroll
         //      band is a distinct zone value, passing through it changes the zone
         //      and naturally invalidates this gate, so the next preview after a
-        //      scroll always fires.
-        let prev_zone = match self.drag_state.as_ref() {
-            Some(DragMode::Translate(t)) => t.current_zone,
-            _ => None,
+        //      scroll always fires. The monitor is part of the key: column 0 of
+        //      one strip is not column 0 of another.
+        let (prev_zone, prev_mon) = match self.drag_state.as_mut() {
+            Some(DragMode::Translate(t)) => {
+                let prev = (t.current_zone, t.zone_monitor);
+                t.current_zone = new_zone;
+                t.zone_monitor = new_mon;
+                if let Some(m) = new_mon
+                    && m != src
+                    && !t.touched.contains(&m)
+                {
+                    t.touched.push(m);
+                }
+                prev
+            }
+            _ => return,
         };
-        if let Some(DragMode::Translate(t)) = self.drag_state.as_mut() {
-            t.current_zone = new_zone;
-        }
 
         // Edge-scroll transition detection — replaces the old per-move scroll.
         // Only band *changes* act here: entering fires the one immediate scroll
         // and arms the scheduler; leaving cancels. The repeat itself is
         // timer-driven (maybe_fire_edge_scroll), so a cursor held still in the
         // band keeps scrolling — impossible when scroll rode the move stream.
-        // A band flip (Left↔Right) is a leave-then-enter; the new entry arms the
-        // opposite direction.
-        let prev_dir = scroll_direction(prev_zone);
-        let new_dir = scroll_direction(new_zone);
-        if new_dir != prev_dir {
+        // A band flip (Left↔Right, or the same band on another strip or
+        // column) is a leave-then-enter; the new entry arms the new band.
+        let prev_band = scroll_band_key(prev_mon, prev_zone);
+        let new_band = scroll_band_key(new_mon, new_zone);
+        let changed = should_submit_preview((prev_mon, prev_zone), (new_mon, new_zone));
+        if new_band != prev_band {
             // Leaving any armed band cancels the timer.
-            if prev_dir.is_some() {
+            if prev_band.is_some() {
                 let action = match self.drag_state.as_mut() {
                     Some(DragMode::Translate(t)) => t.edge_scroll.on_leave(),
                     _ => EdgeScrollAction::Cancel,
@@ -724,7 +738,7 @@ impl FlowWM {
             }
             // Entering a new band fires the immediate defining scroll, then arms
             // the first-gap timer on success (or stays idle at the content edge).
-            if let Some(dir) = new_dir {
+            if let Some(dir) = scroll_direction(new_zone) {
                 // on_enter returns Scroll(dir) — a *request* the scheduler makes,
                 // not a scroll it performs. The caller (this method) performs the
                 // real scroll and feeds whether it moved back through
@@ -738,39 +752,96 @@ impl FlowWM {
                     }
                 }
                 self.scroll_once_and_rearm(dir);
+                if let Some(zone) = new_zone {
+                    log::debug!("drag move: hwnd={hwnd} zone={zone:?} monitor={new_mon:?}");
+                }
+                return;
             }
         }
 
-        // NON-COMMITTING preview, gated on zone change (the guard below).
-        // Resubmitting an identical target mid-flight resets the animator
-        // (see `should_submit_preview`), so this arm only fires when the zone
-        // changed. On a no-op move (`preview_move` returns None — window already
-        // at its target) target the committed layout so a stale reflow from a
-        // prior zone resets.
-        match new_zone {
-            None => {
-                // Degenerate (empty workspace). Nothing to preview.
+        // NON-COMMITTING preview, gated on zone change: resubmitting an
+        // identical target mid-flight resets the animator (see
+        // `should_submit_preview`). The strip under a placement zone shows
+        // the prospective layout (the committed one when the move is a
+        // no-op); every other strip the drag touched shows its committed
+        // layout, all in one batch. A scroll zone previews nothing (the
+        // scroll committed above, or at the content edge nothing moves).
+        if !changed || new_zone.is_some_and(|z| !z.is_placement()) {
+            if let Some(zone) = new_zone {
+                log::debug!("drag move: hwnd={hwnd} zone={zone:?} monitor={new_mon:?}");
             }
-            // Scroll bands are handled above by the transition detector; the
-            // repeat cadence runs off the timer, not here.
-            Some(DropZone::ScrollLeft | DropZone::ScrollRight) => {}
-            Some(zone @ (DropZone::Row { .. } | DropZone::Column { .. }))
-                if should_submit_preview(prev_zone, new_zone) =>
-            {
-                match preview_move(&applied.virtual_layout, dragged_id, zone, &config, &monitor) {
-                    Some(preview) => self.animate_preview_on(mi, &preview),
-                    None => self.animate_preview_on(mi, &applied),
-                }
-            }
-            // Zone unchanged from the previous move — skip the preview so a
-            // stable target doesn't reset mid-flight animations. The trailing
-            // debug log still runs.
-            Some(DropZone::Row { .. } | DropZone::Column { .. }) => {}
+            return;
         }
+        let preview = match (new_mon, new_zone) {
+            (Some(m), Some(zone)) => {
+                let (applied, config, monitor) = self.strip_snapshot(m);
+                let p = if m == src {
+                    preview_move(&applied.virtual_layout, dragged_id, zone, &config, &monitor)
+                } else {
+                    preview_insert(&applied.virtual_layout, dragged_id, zone, &config, &monitor)
+                };
+                Some((m, p.unwrap_or(applied)))
+            }
+            _ => None,
+        };
+        let mut batch = self.drag_settle_layouts(preview.as_ref().map(|(m, _)| *m));
+        batch.extend(preview);
+        let refs: Vec<(usize, &AppliedLayout)> = batch.iter().map(|(m, l)| (*m, l)).collect();
+        self.animate_previews_on(&refs);
 
         if let Some(zone) = new_zone {
-            log::debug!("drag move: hwnd={hwnd} zone={zone:?}");
+            log::debug!("drag move: hwnd={hwnd} zone={zone:?} monitor={new_mon:?}");
         }
+    }
+
+    /// The committed layout, mutation config and monitor of `mi`'s active
+    /// strip: the read-only snapshot zone resolution and previews work on.
+    fn strip_snapshot(
+        &self,
+        mi: usize,
+    ) -> (
+        AppliedLayout,
+        crate::layout::mutations::MutationConfig,
+        crate::layout::types::MonitorInfo,
+    ) {
+        let space = self.monitors[mi].active_scrolling();
+        (
+            AppliedLayout {
+                virtual_layout: space.virtual_layout().clone(),
+                actual_layout: space.actual_layout().clone(),
+            },
+            *space.config(),
+            *space.monitor(),
+        )
+    }
+
+    /// The zone-map knobs for `mi`'s strip: `[drag]` plus its `visible_rows`.
+    fn zone_params(&self, mi: usize) -> ZoneParams {
+        let d = &self.config.drag;
+        ZoneParams {
+            edge_scroll_px: d.edge_scroll_width,
+            edge_scroll_ratio: d.edge_scroll_ratio,
+            col_edge_ratio: d.col_edge_ratio,
+            col_edge_max_px: d.col_edge_max_px,
+            visible_rows: self.monitors[mi].active_scrolling().config().visible_rows,
+        }
+    }
+
+    /// The committed layouts of the strips a translate drag has to keep
+    /// settled — its own and every other one it touched — except `except`
+    /// (the strip getting a new preview or scroll in the same batch). Empty
+    /// for a drag that never left its own strip and is previewing there.
+    fn drag_settle_layouts(&self, except: Option<usize>) -> Vec<(usize, AppliedLayout)> {
+        let Some(DragMode::Translate(t)) = self.drag_state.as_ref() else {
+            return Vec::new();
+        };
+        let src = self.monitor_index_for_window(t.dragged_id);
+        let mut mons = vec![src];
+        mons.extend(t.touched.iter().copied().filter(|&m| m != src));
+        mons.into_iter()
+            .filter(|&m| Some(m) != except && m < self.monitors.len())
+            .map(|m| (m, self.strip_snapshot(m).0))
+            .collect()
     }
 
     /// End the tile drag — dispatches to the active variant's sole commit
@@ -847,48 +918,109 @@ impl FlowWM {
         log::debug!("drag end (float): hwnd={}", drag.dragged_hwnd);
     }
 
-    /// The `Translate` variant's release commit — the existing title-bar
-    /// reorder commit logic, unchanged by ticket #9.
+    /// The `Translate` variant's release commit — the only window-placement
+    /// commit of a title-bar (or keymap) move drag.
+    ///
+    /// The drop is decided by the last move's zone and monitor
+    /// ([`DragState::current_zone`] / [`DragState::zone_monitor`]). A
+    /// placement zone on another monitor's strip moves the window there
+    /// ([`Self::drop_on_other_monitor`]); a placement zone on its own strip
+    /// reorders it; anything else (a scroll band, no zone, a full column)
+    /// snaps it back into its tile. The dropped window becomes its strip's
+    /// focus so its row is revealed in a stack with parked rows.
     fn on_translate_end(&mut self, drag: DragState) {
-        // Commit the final zone — the ONLY window-placement commit in the drag
-        // — into the strip that owns the dragged window. Releasing over
-        // another monitor resolves to no zone there, so the window snaps
-        // back into its own strip (a cross-monitor drop is not modelled).
-        let mi = self.monitor_index_for_window(drag.dragged_id);
-        let (vl, config, monitor) = {
-            let space = self.monitors[mi].active_scrolling();
-            (
-                space.virtual_layout().clone(),
-                *space.config(),
-                *space.monitor(),
-            )
+        let id = drag.dragged_id;
+        let src = self.monitor_index_for_window(id);
+        if let (Some(target), Some(zone)) = (drag.zone_monitor, drag.current_zone)
+            && target != src
+            && target < self.monitors.len()
+            && zone.is_placement()
+            && self.drop_on_other_monitor(&drag, src, target, zone)
+        {
+            log::debug!(
+                "drag end (translate): hwnd={} moved to monitor {target} at {zone:?}",
+                drag.dragged_hwnd
+            );
+            return;
+        }
+
+        let (applied, config, monitor) = self.strip_snapshot(src);
+        let vl = applied.virtual_layout;
+        let zone = match (drag.zone_monitor, drag.current_zone) {
+            (Some(m), Some(zone)) if m == src && zone.is_placement() => Some(zone),
+            _ => None,
         };
-        let target_vl = match drag.current_zone {
-            Some(zone @ (DropZone::Row { .. } | DropZone::Column { .. })) => {
-                preview_move(&vl, drag.dragged_id, zone, &config, &monitor)
-                    .map(|p| p.virtual_layout)
-                    .unwrap_or(vl)
-            }
-            // Scroll zone or None → no placement change; snap back to current tile.
-            _ => vl,
-        };
+        let moved = zone.and_then(|z| preview_move(&vl, id, z, &config, &monitor));
+        let placed = moved.is_some();
+        let target_vl = moved.map_or(vl, |p| p.virtual_layout);
 
         // Ensure the dragged window's column is on-screen, then commit + animate.
         // drag_state is already take()n, so animate_layout INCLUDES the dragged
         // window — it visibly snaps from its mouse position into its tile.
-        let target_vl = match target_vl.find_window(drag.dragged_id) {
+        let target_vl = match target_vl.find_window(id) {
             Some((col, _)) => ensure_column_visible(&target_vl, col, &config),
             None => target_vl,
         };
-        let applied = self.monitors[mi]
-            .active_scrolling_mut()
-            .commit_layout(target_vl);
-        self.animate_layout_on(mi, &applied);
+        let strip = self.monitors[src].active_scrolling_mut();
+        if placed {
+            // The drop reveals its row (a stack with parked rows scrolls
+            // the others off), so the strip's focus follows it.
+            strip.set_focus(id);
+        }
+        let committed = strip.commit_layout(target_vl);
+        let others = self.settle_touched(&drag, &[src]);
+        let mut batch: Vec<(usize, &AppliedLayout)> = vec![(src, &committed)];
+        batch.extend(others.iter().map(|(m, l)| (*m, l)));
+        self.animate_layouts_on(&batch);
 
         // Re-resolve border style + position for the (unchanged) window state.
         self.refresh_border_for(drag.dragged_hwnd);
 
-        log::debug!("drag end (translate): hwnd={}", drag.dragged_hwnd);
+        log::debug!(
+            "drag end (translate): hwnd={} zone={zone:?} placed={placed}",
+            drag.dragged_hwnd
+        );
+    }
+
+    /// Commit a cross-screen drop: `drag`'s window leaves `src`'s strip and
+    /// is inserted into `target`'s at `zone`, which was resolved against
+    /// that strip. Returns `false`, changing nothing, when the target
+    /// refuses the zone (a full column), so the caller snaps it back.
+    fn drop_on_other_monitor(
+        &mut self,
+        drag: &DragState,
+        src: usize,
+        target: usize,
+        zone: DropZone,
+    ) -> bool {
+        let id = drag.dragged_id;
+        let (applied, config, monitor) = self.strip_snapshot(target);
+        let Some(p) = preview_insert(&applied.virtual_layout, id, zone, &config, &monitor) else {
+            return false;
+        };
+        let from = self.monitors[src].active_scrolling_mut().remove_window(id);
+        let new_vl = match p.virtual_layout.find_window(id) {
+            Some((col, _)) => ensure_column_visible(&p.virtual_layout, col, &config),
+            None => p.virtual_layout,
+        };
+        let strip = self.monitors[target].active_scrolling_mut();
+        strip.set_focus(id);
+        let dst = strip.commit_layout(new_vl);
+        let others = self.settle_touched(drag, &[src, target]);
+        self.finish_tiled_monitor_move(id, (src, &from), (target, &dst), &others);
+        true
+    }
+
+    /// The committed layouts of the strips `drag` touched other than the
+    /// ones in `skip`, for the release batch: a strip that showed a preview
+    /// but did not receive the drop settles back in the same submission.
+    fn settle_touched(&self, drag: &DragState, skip: &[usize]) -> Vec<(usize, AppliedLayout)> {
+        drag.touched
+            .iter()
+            .copied()
+            .filter(|m| !skip.contains(m) && *m < self.monitors.len())
+            .map(|m| (m, self.strip_snapshot(m).0))
+            .collect()
     }
 
     /// The `Resize` variant's release commit — the sole commit of an edge/corner
@@ -1023,21 +1155,43 @@ impl FlowWM {
     /// window is excluded by `animate_layout`'s filter; the others animate to
     /// their scrolled slots. Returns whether a scroll happened (the boolean the
     /// scheduler's outcome feedback consumes).
+    ///
+    /// The scroll acts on the strip the band was resolved on (the one under
+    /// the cursor, which a cross-screen drag makes another monitor's), and a
+    /// row band (`Up` / `Down`) on the column it names. The other strips the
+    /// drag touched are re-settled in the same animator batch.
     fn perform_edge_scroll(&mut self, direction: Direction) -> bool {
-        let mi = self.drag_monitor_index();
-        let scrolled = match direction {
-            Direction::Left => self.monitors[mi].active_scrolling_mut().scroll_left(),
-            Direction::Right => self.monitors[mi].active_scrolling_mut().scroll_right(),
-            // Edge scroll is horizontal only; Up/Down never reach here.
-            Direction::Up | Direction::Down => return false,
+        let (mi, zone) = match self.drag_state.as_ref() {
+            Some(DragMode::Translate(t)) => (
+                t.zone_monitor.unwrap_or_else(|| self.drag_monitor_index()),
+                t.current_zone,
+            ),
+            _ => return false,
         };
-        match scrolled {
-            Some(applied) => {
-                self.animate_layout_on(mi, &applied);
-                true
-            }
-            None => false,
+        if mi >= self.monitors.len() {
+            return false;
         }
+        let strip = self.monitors[mi].active_scrolling_mut();
+        let scrolled = match (direction, zone) {
+            (Direction::Left, _) => strip.scroll_left(),
+            (Direction::Right, _) => strip.scroll_right(),
+            (Direction::Up, Some(DropZone::ScrollUp { col })) => {
+                strip.scroll_column_rows(col, false)
+            }
+            (Direction::Down, Some(DropZone::ScrollDown { col })) => {
+                strip.scroll_column_rows(col, true)
+            }
+            (Direction::Up | Direction::Down, _) => None,
+        };
+        let others = self.drag_settle_layouts(Some(mi));
+        let mut batch: Vec<(usize, &AppliedLayout)> = others.iter().map(|(m, l)| (*m, l)).collect();
+        if let Some(applied) = scrolled.as_ref() {
+            batch.push((mi, applied));
+        }
+        if !batch.is_empty() {
+            self.animate_layouts_on(&batch);
+        }
+        scrolled.is_some()
     }
 
     /// Index of the monitor whose strip holds the window being dragged, or
@@ -1161,8 +1315,11 @@ impl FlowWM {
 /// transitioning through it changes the zone, so the next preview after a
 /// scroll always fires without a special reset.
 #[must_use]
-fn should_submit_preview(prev_zone: Option<DropZone>, new_zone: Option<DropZone>) -> bool {
-    prev_zone != new_zone
+fn should_submit_preview(
+    prev: (Option<usize>, Option<DropZone>),
+    new: (Option<usize>, Option<DropZone>),
+) -> bool {
+    prev != new
 }
 
 /// The edge-scroll band direction a drop zone sits in, or `None` off-band.
@@ -1176,25 +1333,79 @@ fn scroll_direction(zone: Option<DropZone>) -> Option<Direction> {
     match zone {
         Some(DropZone::ScrollLeft) => Some(Direction::Left),
         Some(DropZone::ScrollRight) => Some(Direction::Right),
+        Some(DropZone::ScrollUp { .. }) => Some(Direction::Up),
+        Some(DropZone::ScrollDown { .. }) => Some(Direction::Down),
         _ => None,
     }
+}
+
+/// Identity of the scroll band a zone sits in — the strip, the zone (which
+/// names the column for a row band) — or `None` off-band. A change in this
+/// value is a band leave/enter for the transition detector.
+#[must_use]
+fn scroll_band_key(
+    monitor: Option<usize>,
+    zone: Option<DropZone>,
+) -> Option<(Option<usize>, DropZone)> {
+    let zone = zone?;
+    scroll_direction(Some(zone)).map(|_| (monitor, zone))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The gate on one strip (monitor 0).
+    fn sp(prev: Option<DropZone>, new: Option<DropZone>) -> bool {
+        should_submit_preview((Some(0), prev), (Some(0), new))
+    }
+
+    #[test]
+    fn the_same_zone_on_another_monitor_submits() {
+        // A cross-screen drag: column 0 of monitor 1 is not column 0 of
+        // monitor 0.
+        let z = Some(DropZone::Column { col: 0 });
+        assert!(should_submit_preview((Some(0), z), (Some(1), z)));
+        assert!(!should_submit_preview((Some(1), z), (Some(1), z)));
+    }
+
+    #[test]
+    fn row_bands_map_to_vertical_directions_and_key_on_the_column() {
+        assert_eq!(
+            scroll_direction(Some(DropZone::ScrollUp { col: 1 })),
+            Some(Direction::Up)
+        );
+        assert_eq!(
+            scroll_direction(Some(DropZone::ScrollDown { col: 1 })),
+            Some(Direction::Down)
+        );
+        assert_ne!(
+            scroll_band_key(Some(0), Some(DropZone::ScrollDown { col: 1 })),
+            scroll_band_key(Some(0), Some(DropZone::ScrollDown { col: 2 })),
+            "the same band on another column is a new band"
+        );
+        assert_ne!(
+            scroll_band_key(Some(0), Some(DropZone::ScrollRight)),
+            scroll_band_key(Some(1), Some(DropZone::ScrollRight)),
+            "the same band on another strip is a new band"
+        );
+        assert_eq!(
+            scroll_band_key(Some(0), Some(DropZone::Row { col: 1, row: 0 })),
+            None
+        );
+    }
+
     #[test]
     fn same_zone_is_skipped() {
         // The bug case: cursor holds still inside one zone; resubmitting would
         // reset mid-flight windows and stall the reflow.
         let z = Some(DropZone::Column { col: 2 });
-        assert!(!should_submit_preview(z, z));
+        assert!(!sp(z, z));
     }
 
     #[test]
     fn different_column_zone_submits() {
-        assert!(should_submit_preview(
+        assert!(sp(
             Some(DropZone::Column { col: 2 }),
             Some(DropZone::Column { col: 3 }),
         ));
@@ -1202,7 +1413,7 @@ mod tests {
 
     #[test]
     fn row_vs_column_zone_submits() {
-        assert!(should_submit_preview(
+        assert!(sp(
             Some(DropZone::Column { col: 2 }),
             Some(DropZone::Row { col: 2, row: 0 }),
         ));
@@ -1210,10 +1421,7 @@ mod tests {
 
     #[test]
     fn first_preview_after_idle_submits() {
-        assert!(should_submit_preview(
-            None,
-            Some(DropZone::Column { col: 1 })
-        ));
+        assert!(sp(None, Some(DropZone::Column { col: 1 })));
     }
 
     #[test]
@@ -1222,15 +1430,15 @@ mod tests {
         // the same Column zone — the gate must fire (the committed layout
         // scrolled, so the preview target moved).
         let col = Some(DropZone::Column { col: 2 });
-        assert!(should_submit_preview(col, Some(DropZone::ScrollLeft)));
-        assert!(should_submit_preview(Some(DropZone::ScrollLeft), col));
+        assert!(sp(col, Some(DropZone::ScrollLeft)));
+        assert!(sp(Some(DropZone::ScrollLeft), col));
     }
 
     #[test]
     fn leaving_to_none_and_back_submits() {
         let col = Some(DropZone::Column { col: 2 });
-        assert!(should_submit_preview(col, None));
-        assert!(should_submit_preview(None, col));
+        assert!(sp(col, None));
+        assert!(sp(None, col));
     }
 
     #[test]
