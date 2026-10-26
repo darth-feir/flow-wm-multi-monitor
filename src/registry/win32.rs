@@ -48,9 +48,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HWND_NOTOPMOST,
     HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SM_CXSCREEN,
     SM_CYSCREEN, SW_MAXIMIZE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SetForegroundWindow, SetWindowPlacement, SetWindowPos, ShowWindow,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT, WM_CLOSE, WS_CAPTION, WS_EX_APPWINDOW,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_THICKFRAME,
+    SetForegroundWindow, SetWindowPlacement, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WINDOWPLACEMENT, WM_CLOSE, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_THICKFRAME,
 };
 use windows::core::PWSTR;
 
@@ -1093,9 +1093,11 @@ pub fn is_fullscreen_on_its_monitor(hwnd_val: isize) -> bool {
 ///
 /// # Z-order and focus
 ///
-/// Uses `SWP_NOZORDER | SWP_NOACTIVATE` — the same flags used by the
-/// animator's `apply_batch` — so the window's Z-order and keyboard-focus
-/// state are preserved. This is critical for workspace switches: a
+/// Goes through the animator backend's `place_window`, so it uses the same
+/// flags as `apply_batch`: `SWP_NOZORDER | SWP_NOACTIVATE`, so the window's
+/// Z-order and keyboard-focus state are preserved, plus `SWP_NOSIZE` for a
+/// pure move and `SWP_NOSENDCHANGING` for a resize into a parking slot
+/// (ADR-0019). This is critical for workspace switches: a
 /// teleport must not steal focus from the destination workspace's window.
 ///
 /// # Arguments
@@ -1120,12 +1122,9 @@ pub fn is_fullscreen_on_its_monitor(hwnd_val: isize) -> bool {
 /// ```
 #[must_use]
 pub fn set_window_rect(hwnd_val: isize, x: i32, y: i32, w: i32, h: i32) -> bool {
-    let target_hwnd = HWND(hwnd_val as *mut _);
-    // hwnd_insert_after = None + SWP_NOZORDER → preserve existing Z-order.
-    // SWP_NOACTIVATE → do not steal keyboard focus (critical for workspace switches).
-    let result =
-        unsafe { SetWindowPos(target_hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE) };
-    if let Err(e) = result {
+    // SWP_NOZORDER | SWP_NOACTIVATE plus the size flags of ADR-0019.
+    let rect = crate::animation::types::Rect { x, y, w, h };
+    if let Err(e) = crate::animation::backend::win32::place_window(hwnd_val, rect) {
         log::warn!("set_window_rect SetWindowPos failed for hwnd {hwnd_val}: {e}");
         false
     } else {
@@ -2020,24 +2019,43 @@ mod tests {
         let _ = fn_ptr; // Compile-time signature check.
     }
 
-    /// Positive: `SetWindowPos` flags used by `set_window_rect` are
-    /// importable and non-zero. Guards against a future import resolving
-    /// to a different symbol.
+    /// Positive: `set_window_rect` places through `swp_flags`, whose mask
+    /// always holds `SWP_NOZORDER | SWP_NOACTIVATE`, adds `SWP_NOSIZE` to a
+    /// pure move and `SWP_NOSENDCHANGING` to a resize into a parking slot,
+    /// and never both (ADR-0019).
     #[test]
     fn win32_set_window_pos_flags_are_usable() {
-        // SWP_NOZORDER and SWP_NOACTIVATE are non-zero single-bit flags.
-        // We verify the imports resolve and that the combined mask still
-        // contains each individual flag (bitfield algebra sanity check),
-        // mirroring how `set_window_rect` combines them.
-        let combined = SWP_NOZORDER | SWP_NOACTIVATE;
-        assert!(
-            combined.contains(SWP_NOZORDER),
-            "SWP_NOZORDER should be present in the combined mask"
-        );
-        assert!(
-            combined.contains(SWP_NOACTIVATE),
-            "SWP_NOACTIVATE should be present in the combined mask"
-        );
+        use crate::animation::backend::win32::swp_flags;
+        use crate::animation::types::Rect;
+        use windows::Win32::UI::WindowsAndMessaging::{SWP_NOSENDCHANGING, SWP_NOZORDER};
+        let vs = Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        };
+        let on = Rect {
+            x: 100,
+            y: 0,
+            w: 900,
+            h: 1000,
+        };
+        let parked = Rect { x: 1936, ..on };
+        let parked_narrow = Rect { w: 600, ..parked };
+        for (cur, next, nosize, nosend) in [
+            (on, parked, true, false),
+            (parked, parked_narrow, false, true),
+            (on, Rect { w: 600, ..on }, false, false),
+        ] {
+            let f = swp_flags(Some(cur), next, vs);
+            assert!(f.contains(SWP_NOZORDER) && f.contains(SWP_NOACTIVATE));
+            assert_eq!(f.contains(SWP_NOSIZE), nosize, "{cur:?} -> {next:?}");
+            assert_eq!(
+                f.contains(SWP_NOSENDCHANGING),
+                nosend,
+                "{cur:?} -> {next:?}"
+            );
+        }
     }
 
     /// Positive: `WM_CLOSE` is the well-known message id (0x0010) and the

@@ -392,3 +392,11 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   monitor); the zone is resolved on the monitor under the cursor, and a
   drop there moves the tile through `move-to-monitor`'s tail.
   `docs/adr/0018-drop-zones-by-window-halves.md`
+- **ADR-0019 — A move carries no size, and a resize into a parking slot is
+  not offered to the app.** Every `SetWindowPos` on a managed window goes
+  through `place_window`: `SWP_NOSIZE` for a pure move, `SWP_NOSENDCHANGING`
+  for a resize whose target is off the virtual screen, the plain flags for
+  an on-screen resize and for the first placement back on screen. Fixes
+  Visual Studio-shell apps (SSMS 21) that jumped onto the left monitor
+  instead of parking right.
+  `docs/adr/0019-pure-moves-and-silent-parked-resizes.md`

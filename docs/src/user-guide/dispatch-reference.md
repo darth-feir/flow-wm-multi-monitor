@@ -79,6 +79,15 @@ At the end of a strip, `focus` hops to the monitor in that direction when
 there is one (see [Monitors](#monitors)); set `[navigation] edge_hop = false`
 in `flow.toml` to make it stop at the edge instead.
 
+Columns that scroll out of view are **parked** just beyond the outer edge of
+your screens, not hidden. Some apps — SQL Server Management Studio 21 and
+other Visual Studio-based windows — try to pull themselves back onto a screen
+when they are moved and resized off-screen in one step, and used to land on
+the left monitor. FlowWM moves parked windows without resizing them, and
+resizes a parked window (a `width` change) without asking the app, so they
+stay parked. On screen, an app's own minimum size still applies; a window
+resized below its minimum while parked gets its minimum back when it returns.
+
 ```powershell
 flow dispatch focus right
 flow dispatch focus up

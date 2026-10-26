@@ -171,6 +171,19 @@ elevated admin window (protected by UIPI) causes the entire batch to fail with
 `ERROR_ACCESS_DENIED`. Individual calls mean one failure logs a warning but does
 not block the remaining windows.
 
+Each call goes through `place_window`, the one helper that positions a managed
+window (the teleports in `registry::win32::set_window_rect`, fail-back and
+`flow rescue` use it too). It reads the window's current rect and lets the pure
+`swp_flags(current, next, virtual_screen)` pick the flags: always
+`SWP_NOZORDER | SWP_NOACTIVATE`; plus `SWP_NOSIZE` when the size is unchanged,
+so a tween frame is a pure move; plus `SWP_NOSENDCHANGING` when the size changes
+and the target lies entirely off the virtual screen (a parking slot), so the app
+cannot rewrite a parked position; the plain flags for an on-screen resize and
+for the first placement back from a parking slot, so the app's min/max tracking
+size applies there. Visual Studio-shell windows (SSMS 21) answer a *sized* move
+past the right edge by moving themselves to `x = -width`, onto the left monitor
+(ADR-0019, `docs/adr/0019-pure-moves-and-silent-parked-resizes.md`).
+
 **`MockBackend`** ([`src/animation/backend/mock.rs`](../../src/animation/backend/mock.rs))
 stores rects in a `HashMap` and records call history. Always compiled (no feature
 gate) so both unit tests and integration tests can use it freely.
