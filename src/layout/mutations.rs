@@ -37,7 +37,7 @@
 //! slot-ladder width math.
 
 use crate::common::{Direction, WindowId};
-use crate::layout::projection::{canvas_width, column_step_width};
+use crate::layout::projection::{canvas_width, column_left, column_step_width};
 use crate::layout::types::{Column, Padding, Row, VirtualLayout};
 
 /// Location of a neighboring window returned by [`find_neighbor_window`].
@@ -570,7 +570,7 @@ pub fn scroll_left(layout: &VirtualLayout, config: &MutationConfig) -> Option<Vi
         return None;
     }
     // Find the first visible column and scroll by its step width
-    let step = first_visible_step(layout, config)?;
+    let (_, step) = first_visible(layout, config)?;
     let new_offset = (layout.viewport_offset - step).max(0);
     Some(VirtualLayout {
         viewport_offset: new_offset,
@@ -583,13 +583,19 @@ pub fn scroll_left(layout: &VirtualLayout, config: &MutationConfig) -> Option<Vi
 /// Returns `None` if already at the rightmost position.
 #[must_use]
 pub fn scroll_right(layout: &VirtualLayout, config: &MutationConfig) -> Option<VirtualLayout> {
-    let step = first_visible_step(layout, config)?;
+    let (first, step) = first_visible(layout, config)?;
     let total_canvas = total_column_span(layout, config);
     let max_offset = (total_canvas - config.monitor_width).max(0);
     // A step past the end stops at the end: the trailing gap can leave the
     // last column a few pixels short of a full step (an edge-scroll that
-    // could never reveal it otherwise).
-    let new_offset = (layout.viewport_offset + step).min(max_offset);
+    // could never reveal it otherwise). Off a fullscreen column with
+    // columns after it the step is taken whole: stopping at the end would
+    // leave it starting the view (ADR-0021).
+    let new_offset = if layout.columns[first].fullscreen && first + 1 < layout.columns.len() {
+        layout.viewport_offset + step
+    } else {
+        (layout.viewport_offset + step).min(max_offset)
+    };
     if new_offset <= layout.viewport_offset {
         return None;
     }
@@ -686,48 +692,79 @@ pub fn focus(
 /// - **Right scroll**: `viewport_offset = col_right + gap − monitor_width`
 ///   (column's right edge lands `gap` pixels from the screen's right edge),
 ///   clamped to `≥ 0`.
+///
+/// # Fullscreen columns (ADR-0021)
+///
+/// - A fullscreen target is in view only when it starts the view, exactly:
+///   `viewport_offset = col_left − gap`, whether or not it overlapped.
+/// - A fullscreen column **left** of the target that would still overlap
+///   the new view would start it (and hide the target behind its full
+///   screen): the view starts at the target instead (`col_left − gap`).
+/// - When the camera had to move and a fullscreen column **right** of the
+///   target would still overlap the view (focus leaving a fullscreen column
+///   leftwards), the view ends at the target instead, so the columns before
+///   it show rather than an empty strip where the parked fullscreen column
+///   would be.
 #[must_use]
 pub(crate) fn ensure_column_visible(
     layout: &VirtualLayout,
     col_idx: usize,
     config: &MutationConfig,
 ) -> VirtualLayout {
-    let gap = config.padding.window_gap;
-    let mut canvas_x: i32 = gap;
-    for (i, col) in layout.columns.iter().enumerate() {
-        let col_px = col.width_px;
-        if i == col_idx {
-            let col_left = canvas_x;
-            let col_right = canvas_x + col_px;
-            let vp_left = layout.viewport_offset;
-            let vp_right = vp_left + config.monitor_width;
-
-            if col_left < vp_left {
-                // Column is off-screen left — scroll left by the minimum amount
-                // that reveals it with a `gap` margin on the left. Free-form
-                // offset (no column_shift grid snapping — see Ripple #1).
-                let ideal_vp = (col_left - gap).max(0);
-                return VirtualLayout {
-                    viewport_offset: ideal_vp,
-                    ..layout.clone()
-                };
-            }
-            if col_right > vp_right {
-                // Column is off-screen right — scroll right by the minimum amount
-                // that reveals it with a `gap` margin on the right. Free-form
-                // offset (no column_shift grid snapping — see Ripple #1).
-                let ideal_vp = (col_right + gap - config.monitor_width).max(0);
-                return VirtualLayout {
-                    viewport_offset: ideal_vp,
-                    ..layout.clone()
-                };
-            }
-            // Already visible
-            return layout.clone();
-        }
-        canvas_x += col_px + gap;
+    if col_idx >= layout.columns.len() {
+        return layout.clone();
     }
-    layout.clone()
+    let gap = config.padding.window_gap;
+    let w = config.monitor_width;
+    let col_left = column_left(layout, col_idx, gap, w);
+    let col_right = col_left + layout.columns[col_idx].canvas_width(w, gap);
+    let vp_left = layout.viewport_offset;
+    let vp_right = vp_left + w;
+    let with_offset = |viewport_offset: i32| {
+        if viewport_offset == layout.viewport_offset {
+            layout.clone()
+        } else {
+            VirtualLayout {
+                viewport_offset,
+                ..layout.clone()
+            }
+        }
+    };
+
+    if layout.columns[col_idx].fullscreen {
+        return with_offset(col_left - gap);
+    }
+
+    let mut vp = if col_left < vp_left {
+        // Column is off-screen left — scroll left by the minimum amount
+        // that reveals it with a `gap` margin on the left. Free-form
+        // offset (no column_shift grid snapping — see Ripple #1).
+        (col_left - gap).max(0)
+    } else if col_right > vp_right {
+        // Column is off-screen right — scroll right by the minimum amount
+        // that reveals it with a `gap` margin on the right. Free-form
+        // offset (no column_shift grid snapping — see Ripple #1).
+        (col_right + gap - w).max(0)
+    } else {
+        // Already visible
+        vp_left
+    };
+    let moved = vp != vp_left;
+
+    // A fullscreen column in `range` overlapping the view `[at, at + w)`.
+    let fullscreen_overlaps = |range: std::ops::Range<usize>, at: i32| {
+        range.into_iter().any(|i| {
+            let left = column_left(layout, i, gap, w);
+            let right = left + layout.columns[i].canvas_width(w, gap);
+            layout.columns[i].fullscreen && right > at && left < at + w
+        })
+    };
+    if fullscreen_overlaps(0..col_idx, vp) {
+        vp = col_left - gap;
+    } else if moved && fullscreen_overlaps(col_idx + 1..layout.columns.len(), vp) {
+        vp = (col_right + gap - w).max(0);
+    }
+    with_offset(vp)
 }
 
 // ---------------------------------------------------------------------------
@@ -818,6 +855,13 @@ pub fn swap_window(
     if src_col == dst_col && src_row == dst_row {
         return None;
     }
+    // The fullscreen flag belongs to the column: exchanging windows across
+    // a fullscreen column would hand it to the other window (ADR-0021).
+    if src_col != dst_col
+        && (layout.columns[src_col].fullscreen || layout.columns[dst_col].fullscreen)
+    {
+        return None;
+    }
 
     let mut new_layout = layout.clone();
 
@@ -878,6 +922,10 @@ pub fn set_column_width(
     config: &MutationConfig,
 ) -> Option<VirtualLayout> {
     let (col, _) = layout.find_window(focused)?;
+    // A fullscreen column has no width to set (ADR-0021).
+    if layout.columns[col].fullscreen {
+        return None;
+    }
 
     // Free-form bounds: drag-resize may land anywhere in this range.
     let min = config.min_column_width_px as i32;
@@ -943,6 +991,9 @@ pub fn expand_column(
     config: &MutationConfig,
 ) -> Option<VirtualLayout> {
     let (col, _) = layout.find_window(focused)?;
+    if layout.columns[col].fullscreen {
+        return None;
+    }
     let w = layout.columns[col].width_px;
     let base = config.column_width as i32;
     let shift = config.column_shift();
@@ -990,6 +1041,9 @@ pub fn shrink_column(
     config: &MutationConfig,
 ) -> Option<VirtualLayout> {
     let (col, _) = layout.find_window(focused)?;
+    if layout.columns[col].fullscreen {
+        return None;
+    }
     let w = layout.columns[col].width_px;
     let base = config.column_width as i32;
     let shift = config.column_shift();
@@ -1035,6 +1089,9 @@ pub fn toggle_monocle(
     config: &MutationConfig,
 ) -> Option<(VirtualLayout, Option<i32>)> {
     let (col, _) = layout.find_window(focused)?;
+    if layout.columns[col].fullscreen {
+        return None;
+    }
     let current = layout.columns[col].width_px;
 
     if current == config.abs_max_width {
@@ -1062,7 +1119,8 @@ pub fn toggle_monocle(
 /// even when all columns fit on screen — this is the **explicit center**
 /// command behavior. The `canvas_x` prefix-sum uses the slot model:
 /// `Σ(width[i] for i in 0..f) + (f + 1) * window_gap`. See
-/// (`docs/src/dev-guide/layout/mutations.md`).
+/// (`docs/src/dev-guide/layout/mutations.md`). A fullscreen column has no
+/// centre: the view starts at it (ADR-0021).
 #[must_use]
 pub fn center_viewport_on_focused(
     layout: &VirtualLayout,
@@ -1076,14 +1134,12 @@ pub fn center_viewport_on_focused(
     );
 
     let gap = config.padding.window_gap;
+    // canvas_x(f) = Σ(canvas width[i] for i in 0..f) + (f + 1) * window_gap
+    let canvas_x = column_left(layout, focus_col, gap, config.monitor_width);
+    if layout.columns[focus_col].fullscreen {
+        return canvas_x - gap;
+    }
     let focused_width = layout.columns[focus_col].width_px;
-
-    // canvas_x(f) = Σ(width[i] for i in 0..f) + (f + 1) * window_gap
-    let canvas_x: i32 = layout.columns[..focus_col]
-        .iter()
-        .map(|c| c.width_px)
-        .sum::<i32>()
-        + (focus_col as i32 + 1) * gap;
 
     canvas_x - (config.monitor_width - focused_width) / 2
 }
@@ -1097,7 +1153,7 @@ pub fn center_viewport_on_focused(
 /// See (`docs/src/dev-guide/layout/mutations.md`).
 #[must_use]
 pub fn center_viewport_canvas(layout: &VirtualLayout, config: &MutationConfig) -> i32 {
-    let cw = canvas_width(layout, config.padding.window_gap);
+    let cw = canvas_width(layout, config.padding.window_gap, config.monitor_width);
     (cw - config.monitor_width) / 2
 }
 
@@ -1179,7 +1235,7 @@ pub fn initialize_windows(
     } else {
         let gap = config.padding.window_gap;
         let temp_layout = VirtualLayout::with_columns(columns.clone(), 0);
-        let cw = canvas_width(&temp_layout, gap);
+        let cw = canvas_width(&temp_layout, gap, config.monitor_width);
         if cw <= config.monitor_width {
             // Fit: center the entire canvas.
             center_viewport_canvas(&temp_layout, config)
@@ -1437,7 +1493,9 @@ pub fn add_window_to_column(
     let Some(col) = new_layout.columns.get_mut(col_idx) else {
         return new_layout;
     };
-    if config.column_full(col.rows.len()) {
+    // A fullscreen column holds one window (ADR-0021): like a full one, the
+    // window follows it instead.
+    if col.fullscreen || config.column_full(col.rows.len()) {
         new_layout.columns.insert(
             col_idx + 1,
             single_row_column(window, config.column_width as i32, config),
@@ -1570,6 +1628,12 @@ pub fn merge_column(
             return None;
         }
     };
+
+    // A fullscreen column neither gives its window away nor takes another
+    // one (ADR-0021).
+    if layout.columns[src_col].fullscreen || layout.columns[dst_col].fullscreen {
+        return None;
+    }
 
     // A full destination (`max_rows`) is walked past, never exceeded.
     if config.column_full(layout.columns[dst_col].rows.len()) {
@@ -1707,7 +1771,7 @@ pub fn promote_window(
     let (src_col, src_row) = layout.find_window(focused)?;
 
     // Already in its own column — nothing to promote.
-    if layout.columns[src_col].rows.len() <= 1 {
+    if layout.columns[src_col].rows.len() <= 1 || layout.columns[src_col].fullscreen {
         return None;
     }
 
@@ -1745,22 +1809,117 @@ pub fn promote_window(
 }
 
 // ---------------------------------------------------------------------------
+// Fullscreen columns (ADR-0021)
+// ---------------------------------------------------------------------------
+
+/// Set the fullscreen flag of `window`'s column to `on`. Entering, a window
+/// that shares its column is first expelled into a column of its own right
+/// after the stack ([`expel_to_column`]), so a fullscreen column always
+/// holds one window. The camera is not moved here: the caller brings the
+/// column into view ([`ensure_column_visible`]). `None` when the window is
+/// not in the layout or the flag already is `on`.
+#[must_use]
+pub fn set_fullscreen(
+    layout: &VirtualLayout,
+    window: WindowId,
+    on: bool,
+    config: &MutationConfig,
+) -> Option<VirtualLayout> {
+    let (col, _) = layout.find_window(window)?;
+    if layout.columns[col].fullscreen == on {
+        return None;
+    }
+    let mut out = if on && layout.columns[col].rows.len() > 1 {
+        expel_to_column(layout, window, config)?
+    } else {
+        layout.clone()
+    };
+    let (col, _) = out.find_window(window)?;
+    out.columns[col].fullscreen = on;
+    Some(out)
+}
+
+/// Take `window` out of its stacked column into a new single-row column
+/// right after it, at the stack's width; the stack's remaining rows re-share
+/// its height. `None` when the window is not in the layout or is alone in
+/// its column. The way into a fullscreen column for a stacked window.
+#[must_use]
+pub fn expel_to_column(
+    layout: &VirtualLayout,
+    window: WindowId,
+    config: &MutationConfig,
+) -> Option<VirtualLayout> {
+    let (col, row) = layout.find_window(window)?;
+    if layout.columns[col].rows.len() <= 1 {
+        return None;
+    }
+    let mut out = layout.clone();
+    let moved = out.columns[col].rows.remove(row);
+    let width = out.columns[col].width_px;
+    let src = &mut out.columns[col];
+    reheight_column(src, config);
+    src.clamp_row_offset(config.visible_rows);
+    out.columns
+        .insert(col + 1, single_row_column(moved.window_id, width, config));
+    Some(out)
+}
+
+/// Put `window`, alone in its column, back into the column that holds
+/// `sibling` as row `row` (clamped), the column it was expelled from when it
+/// went fullscreen. Its own column disappears; the stack re-shares its
+/// height and scrolls its row viewport to it. `None` (nothing changes) when
+/// either window is not in the layout, they already share a column, the
+/// window's column holds other rows, or the stack is fullscreen, full
+/// (`max_rows`) or would push a row below `min_window_height_px`.
+#[must_use]
+pub fn merge_back(
+    layout: &VirtualLayout,
+    window: WindowId,
+    sibling: WindowId,
+    row: usize,
+    config: &MutationConfig,
+) -> Option<VirtualLayout> {
+    let (src_col, _) = layout.find_window(window)?;
+    let (dst_col, _) = layout.find_window(sibling)?;
+    if src_col == dst_col || layout.columns[src_col].rows.len() != 1 {
+        return None;
+    }
+    let n = layout.columns[dst_col].rows.len();
+    if layout.columns[dst_col].fullscreen || config.column_full(n) || !config.rows_fit(n + 1) {
+        return None;
+    }
+    let mut out = layout.clone();
+    out.columns.remove(src_col);
+    let dst_col = if src_col < dst_col {
+        dst_col - 1
+    } else {
+        dst_col
+    };
+    let dst = &mut out.columns[dst_col];
+    let at = row.min(dst.rows.len());
+    dst.rows.insert(at, Row::new(window, 0));
+    reheight_column(dst, config);
+    dst.reveal_row(at, config.visible_rows);
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Compute the step width of the first visible column (slot width).
-fn first_visible_step(layout: &VirtualLayout, config: &MutationConfig) -> Option<i32> {
+/// The first visible column's index and step width (slot width).
+fn first_visible(layout: &VirtualLayout, config: &MutationConfig) -> Option<(usize, i32)> {
     let gap = config.padding.window_gap;
+    let w = config.monitor_width;
     let mut canvas_x: i32 = gap;
-    let vp_right = layout.viewport_offset + config.monitor_width;
-    for col in &layout.columns {
-        let col_px = col.width_px;
+    let vp_right = layout.viewport_offset + w;
+    for (i, col) in layout.columns.iter().enumerate() {
         let col_left = canvas_x;
-        let col_right = canvas_x + col_px;
+        let col_right = canvas_x + col.canvas_width(w, gap);
         if col_right > layout.viewport_offset && col_left < vp_right {
-            return Some(column_step_width(col, gap));
+            return Some((i, column_step_width(col, gap, w)));
         }
-        canvas_x += col_px + gap;
+        canvas_x = col_right + gap;
     }
     None
 }
@@ -1768,9 +1927,9 @@ fn first_visible_step(layout: &VirtualLayout, config: &MutationConfig) -> Option
 /// Total pixel span of all columns (the virtual canvas width).
 ///
 /// Delegates to [`projection::canvas_width`] so the canvas model lives in
-/// exactly one place: `window_gap` (leading) + `sum(width_px + window_gap)`.
+/// exactly one place: `window_gap` (leading) + `sum(canvas width + window_gap)`.
 fn total_column_span(layout: &VirtualLayout, config: &MutationConfig) -> i32 {
-    canvas_width(layout, config.padding.window_gap)
+    canvas_width(layout, config.padding.window_gap, config.monitor_width)
 }
 
 // ---------------------------------------------------------------------------
@@ -5447,5 +5606,99 @@ mod tests {
                 .collect::<Vec<_>>(),
             column_heights(4, &config)
         );
+    }
+
+    // --- fullscreen columns (ADR-0021) ---
+
+    fn w(id: isize) -> WindowId {
+        WindowId(id)
+    }
+
+    /// [A 600] [B 600] [F fs] [C 600] [D 600], view at A.
+    fn strip_with_fullscreen() -> VirtualLayout {
+        let col = |id| Column::with_row(600, Row::new(w(id), 1072));
+        VirtualLayout::with_columns(
+            vec![col(1), col(2), col(3).with_fullscreen(true), col(4), col(5)],
+            0,
+        )
+    }
+
+    fn left(vl: &VirtualLayout, idx: usize) -> i32 {
+        column_left(vl, idx, 4, 1920)
+    }
+
+    #[test]
+    fn a_fullscreen_target_starts_the_view_exactly() {
+        let config = test_config();
+        let vl = strip_with_fullscreen();
+        // F overlaps the view at 0 (A and B take 1208 px) but must start it.
+        let out = ensure_column_visible(&vl, 2, &config);
+        assert_eq!(out.viewport_offset, left(&vl, 2) - 4);
+        // Already exact: unchanged.
+        assert_eq!(ensure_column_visible(&out, 2, &config), out);
+        // Centre on it: the same.
+        assert_eq!(
+            center_viewport_on_focused(&vl, 2, &config),
+            left(&vl, 2) - 4
+        );
+    }
+
+    #[test]
+    fn leaving_a_fullscreen_column_shows_the_set_beside_it() {
+        let config = test_config();
+        let vl = ensure_column_visible(&strip_with_fullscreen(), 2, &test_config());
+        // Right to C: the minimal scroll would leave F starting the view,
+        // so the view starts at C.
+        let r = focus(&vl, w(3), Direction::Right, &config).expect("C");
+        assert_eq!(r.focused, w(4));
+        assert_eq!(r.new_layout.viewport_offset, left(&vl, 3) - 4);
+        // Left to B: the view ends at B (A and B in view, F parked right).
+        let l = focus(&vl, w(3), Direction::Left, &config).expect("B");
+        assert_eq!(l.focused, w(2));
+        let b_right = left(&vl, 1) + 600;
+        assert_eq!(l.new_layout.viewport_offset, (b_right + 4 - 1920).max(0));
+        // One step scrolls a whole screen off a fullscreen column.
+        let s = scroll_right(&vl, &config).expect("scrolls");
+        assert_eq!(s.viewport_offset, vl.viewport_offset + 1920);
+    }
+
+    #[test]
+    fn set_fullscreen_expels_a_stacked_window_and_merge_back_returns_it() {
+        let config = test_config();
+        let stack = Column::with_rows(700, vec![Row::new(w(1), 534), Row::new(w(2), 534)]);
+        let vl = VirtualLayout::with_columns(
+            vec![stack, Column::with_row(600, Row::new(w(3), 1072))],
+            0,
+        );
+        let on = set_fullscreen(&vl, w(1), true, &config).expect("on");
+        assert_eq!(on.columns.len(), 3);
+        assert_eq!(on.find_window(w(1)), Some((1, 0)));
+        assert!(on.columns[1].fullscreen);
+        assert_eq!(on.columns[1].width_px, 700);
+        assert_eq!(on.columns[0].rows.len(), 1);
+        assert_eq!(on.columns[0].rows[0].height, 1072);
+        // Already on: None.
+        assert!(set_fullscreen(&on, w(1), true, &config).is_none());
+        // A fullscreen column takes no rows and gives none.
+        assert!(merge_column(&on, w(2), Direction::Right, &config).is_none());
+        assert!(merge_column(&on, w(1), Direction::Left, &config).is_none());
+        assert!(swap_window(&on, w(3), Direction::Left, &config).is_none());
+        assert!(expand_column(&on, w(1), &config).is_none());
+        assert!(shrink_column(&on, w(1), &config).is_none());
+        assert!(set_column_width(&on, w(1), 800, &config).is_none());
+        assert!(toggle_monocle(&on, w(1), None, &config).is_none());
+        let added = add_window_to_column(&on, 1, w(9), &config);
+        assert_eq!(added.find_window(w(9)), Some((2, 0)));
+        assert_eq!(added.columns[1].rows.len(), 1);
+
+        let off = set_fullscreen(&on, w(1), false, &config).expect("off");
+        assert!(!off.columns[1].fullscreen);
+        let back = merge_back(&off, w(1), w(2), 0, &config).expect("merged");
+        assert_eq!(back.columns.len(), 2);
+        assert_eq!(back.find_window(w(1)), Some((0, 0)));
+        assert_eq!(back.find_window(w(2)), Some((0, 1)));
+        // Not when they already share a column, or the sibling is gone.
+        assert!(merge_back(&back, w(1), w(2), 0, &config).is_none());
+        assert!(merge_back(&off, w(1), w(42), 0, &config).is_none());
     }
 }

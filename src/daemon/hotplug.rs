@@ -832,11 +832,11 @@ impl FlowWM {
             .unwrap_or(primary_new)
             .min(self.monitors.len() - 1);
 
-        self.reseat_fullscreen_after_hotplug();
+        // A fullscreen window's column travelled with it: flag it again in
+        // whichever strip it landed (ADR-0021).
+        self.resync_fullscreen_columns();
         self.seat_all_monitors_instantly();
         self.rebuild_float_hwnds();
-        // A fullscreen window whose display vanished became a plain float:
-        // it enters the floating layer like any float.
         self.sync_all_top_layer();
 
         // Restores never activate, but push the foreground once to where the

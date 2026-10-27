@@ -96,6 +96,12 @@ pub struct Column {
     /// row fits (no viewport). Kept in `0 ..= rows.len() - slots` by
     /// [`clamp_row_offset`](Self::clamp_row_offset).
     pub row_offset: usize,
+    /// The column is **fullscreen** (`set-window fullscreen`, ADR-0021): it
+    /// holds one row, takes a whole screen on the canvas
+    /// ([`canvas_width`](Self::canvas_width)) and is shown at the monitor's
+    /// full screen rect while it starts the view. `width_px` is kept
+    /// untouched meanwhile: it is the width the column returns to.
+    pub fullscreen: bool,
 }
 
 impl Column {
@@ -112,6 +118,7 @@ impl Column {
             width_px,
             rows: vec![row],
             row_offset: 0,
+            fullscreen: false,
         }
     }
 
@@ -125,6 +132,7 @@ impl Column {
             width_px,
             rows,
             row_offset: 0,
+            fullscreen: false,
         }
     }
 
@@ -134,6 +142,27 @@ impl Column {
     pub fn with_row_offset(mut self, row_offset: usize) -> Self {
         self.row_offset = row_offset;
         self
+    }
+
+    /// The same column with its fullscreen flag set to `on`.
+    #[must_use]
+    pub fn with_fullscreen(mut self, on: bool) -> Self {
+        self.fullscreen = on;
+        self
+    }
+
+    /// The column's extent on the canvas: `width_px`, or one whole screen
+    /// minus the slot's trailing gap (`monitor_width - gap`) while it is
+    /// fullscreen, so its slot is exactly `monitor_width` wide. Every
+    /// prefix sum over the strip reads this (see
+    /// [`projection::column_left`](super::projection::column_left)).
+    #[must_use]
+    pub fn canvas_width(&self, monitor_width: i32, gap: i32) -> i32 {
+        if self.fullscreen {
+            (monitor_width - gap).max(1)
+        } else {
+            self.width_px
+        }
     }
 
     /// How many of this column's rows are shown at once: every row when

@@ -219,12 +219,7 @@ impl FlowWM {
     /// after a float changes monitor, so that floats visible on the other
     /// monitors never drop out of tracking (B8).
     pub(super) fn rebuild_float_hwnds(&self) {
-        // Fullscreen windows live in the floating spaces but are placed by
-        // the daemon, never dragged: they are not tracked.
-        let hwnds: Vec<isize> = float_hwnds_union(&self.monitors)
-            .into_iter()
-            .filter(|h| !self.is_fullscreen(*h))
-            .collect();
+        let hwnds: Vec<isize> = float_hwnds_union(&self.monitors);
         set_float_hwnds(&hwnds);
     }
 

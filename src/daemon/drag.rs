@@ -371,8 +371,12 @@ impl FlowWM {
     pub(super) fn on_drag_move_with<P: DragProbe>(&mut self, probe: &P, hwnd: isize) {
         // First, classify if we are still in the provisional state. Promotion
         // may install a Translate or Resize state; we then dispatch the move to
-        // whichever variant is active afterwards.
-        if matches!(self.drag_state.as_ref(), Some(DragMode::Classifying(_))) {
+        // whichever variant is active afterwards. A fullscreen column is
+        // never promoted (ADR-0021): a native drag of its caption stays
+        // Classifying, shows nothing, and snaps back on release.
+        if matches!(self.drag_state.as_ref(), Some(DragMode::Classifying(_)))
+            && !self.is_fullscreen(hwnd)
+        {
             self.classify_and_promote(probe, hwnd);
         }
         match self.drag_state.as_ref() {
@@ -753,7 +757,9 @@ impl FlowWM {
                 }
                 self.scroll_once_and_rearm(dir);
                 if let Some(zone) = new_zone {
-                    log::debug!("drag move: hwnd={hwnd} zone={zone:?} monitor={new_mon:?}");
+                    log::debug!(
+                        "drag move: hwnd={hwnd} zone={zone:?} monitor={new_mon:?} cursor=({cx},{cy})"
+                    );
                 }
                 return;
             }
@@ -768,7 +774,9 @@ impl FlowWM {
         // scroll committed above, or at the content edge nothing moves).
         if !changed || new_zone.is_some_and(|z| !z.is_placement()) {
             if let Some(zone) = new_zone {
-                log::debug!("drag move: hwnd={hwnd} zone={zone:?} monitor={new_mon:?}");
+                log::debug!(
+                    "drag move: hwnd={hwnd} zone={zone:?} monitor={new_mon:?} cursor=({cx},{cy})"
+                );
             }
             return;
         }
@@ -790,7 +798,9 @@ impl FlowWM {
         self.animate_previews_on(&refs);
 
         if let Some(zone) = new_zone {
-            log::debug!("drag move: hwnd={hwnd} zone={zone:?} monitor={new_mon:?}");
+            log::debug!(
+                "drag move: hwnd={hwnd} zone={zone:?} monitor={new_mon:?} cursor=({cx},{cy})"
+            );
         }
     }
 

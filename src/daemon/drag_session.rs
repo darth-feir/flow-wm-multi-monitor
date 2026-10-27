@@ -171,10 +171,10 @@ impl FlowWM {
             return DragTarget::Untracked;
         };
         match &window.state {
-            WindowState::Tiling(TilingState::Active { .. }) => DragTarget::Tile,
-            WindowState::Floating(FloatingState::Active { .. }) if self.is_fullscreen(hwnd) => {
+            WindowState::Tiling(TilingState::Active { .. }) if self.is_fullscreen(hwnd) => {
                 DragTarget::Fullscreen
             }
+            WindowState::Tiling(TilingState::Active { .. }) => DragTarget::Tile,
             WindowState::Floating(FloatingState::Active { .. }) => DragTarget::Float,
             WindowState::Tiling(TilingState::Minimized)
             | WindowState::Floating(FloatingState::Minimized) => DragTarget::Minimized,

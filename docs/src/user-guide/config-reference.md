@@ -279,8 +279,8 @@ Note that `[columns]` also switches column widths to presets: a table with
 only `visible_rows` / `max_rows` uses the default `presets`.
 
 `flow query all` reports, per monitor, each column's `row_count`,
-`row_offset` (the first visible row) and `visible_rows`, and every window's
-`parked_row`.
+`row_offset` (the first visible row), `visible_rows` and `fullscreen`, and
+every window's `parked_row`.
 
 ### `[padding]` — spacing
 

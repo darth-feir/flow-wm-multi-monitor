@@ -11,8 +11,9 @@ use crate::layout::types::VirtualLayout;
 use super::types::FlowWM;
 
 /// `flow query all` / `query layout virtual` view of one strip's columns:
-/// index, width, row count, the row viewport offset and how many rows the
-/// viewport shows (`visible_rows`, `0` = all).
+/// index, width, row count, the row viewport offset, how many rows the
+/// viewport shows (`visible_rows`, `0` = all) and whether the column is
+/// fullscreen (its `width_px` is then the width it returns to, ADR-0021).
 fn columns_json(vl: &VirtualLayout, visible_rows: u32) -> Vec<serde_json::Value> {
     vl.columns
         .iter()
@@ -24,6 +25,7 @@ fn columns_json(vl: &VirtualLayout, visible_rows: u32) -> Vec<serde_json::Value>
                 "row_count": col.rows.len(),
                 "row_offset": col.row_offset,
                 "visible_rows": col.slots(visible_rows),
+                "fullscreen": col.fullscreen,
             })
         })
         .collect()
@@ -77,11 +79,12 @@ impl FlowWM {
     /// `null` for a window seated nowhere (ignored, minimized, hidden and
     /// never seated) — and a `mode` field: `"tiled"`, `"floating"`,
     /// `"fullscreen"` (a `set-window fullscreen` window, which the `state`
-    /// records as a float), `"minimized"`, `"hidden"` or `"ignored"`. A
+    /// records as a tile: its column is fullscreen), `"minimized"`,
+    /// `"hidden"` or `"ignored"`. A
     /// `parked_row` field says whether a tile is hidden inside its column by
     /// the row viewport (`[columns] visible_rows`); `null` for a window in
     /// no strip. Each monitor lists its active strip's `columns` with their
-    /// `row_count`, `row_offset` and `visible_rows`.
+    /// `row_count`, `row_offset`, `visible_rows` and `fullscreen`.
     pub(super) fn query_windows_all(&self) -> SocketResponse {
         let viewport_offset = self.active_scrolling().virtual_layout().viewport_offset;
         let mut payload = self.registry.to_json_value(viewport_offset);

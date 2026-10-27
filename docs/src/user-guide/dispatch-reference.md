@@ -79,6 +79,10 @@ At the end of a strip, `focus` hops to the monitor in that direction when
 there is one (see [Monitors](#monitors)); set `[navigation] edge_hop = false`
 in `flow.toml` to make it stop at the edge instead.
 
+On a fullscreen window `focus left` / `focus right` move to the
+neighbouring column and park the fullscreen window off screen; focusing it
+again shows it full screen (see [`set-window fullscreen`](#set-window-fullscreen)).
+
 Columns that scroll out of view are **parked** just beyond the outer edge of
 your screens, not hidden. Some apps — SQL Server Management Studio 21 and
 other Visual Studio-based windows — try to pull themselves back onto a screen
@@ -186,6 +190,13 @@ No default hotkey in `flow.ahk` — bind it yourself.
 
 ## Column sizing & the viewport
 
+A fullscreen column has no width of its own while it is fullscreen:
+`expand-column`, `shrink-column`, `set-column-width` and `toggle-monocle`
+are refused on it with a message (see
+[`set-window fullscreen`](#set-window-fullscreen)), and so are the stack
+commands (`merge-column`, `consume-or-expel`, `promote`, `swap-window
+left|right`) on it or into it.
+
 ### `expand-column`
 
 Widen the focused column to the next `column_width` boundary and animate. Every
@@ -253,7 +264,8 @@ restart. No default hotkey in `flow.ahk` — bind it yourself (`Mod+R` →
 
 Slide the viewport so the focused column lands at the monitor midpoint. Uses the
 variable-width prefix sum, so it stays correct even with expanded or shrunk
-columns.
+columns. On a fullscreen column it starts the view at it (it fills the
+screen).
 
 ```powershell
 flow dispatch center
@@ -270,7 +282,7 @@ Change the focused window's tiling mode. `mode` is one of:
 - `float` — detach the window from the layout and let it float freely.
 - `tile` — insert the window into the scrolling column layout.
 - `cycle` — toggle between float and tile (the most common choice). On a
-  fullscreen window it goes back to tiled.
+  fullscreen window it leaves fullscreen and stays tiled.
 - `fullscreen` — toggle fullscreen (see below).
 
 FlowWM **remembers** your decision: it writes the app's tile/float choice to
@@ -327,29 +339,55 @@ them, so this path is mostly for windows FlowWM never saw at all.
 
 #### `set-window fullscreen`
 
-Put the focused tiled or floating window over its monitor's **whole screen**
-— the full screen rect, not the work area, so it covers the taskbar — kept
-above the tiles and without a border. FlowWM remembers where it came from:
-the monitor, workspace, column, row and column width of a tile, or the rect
-of a float. Issuing `set-window fullscreen` again puts it back there — into
-the same column and row when that column still exists (else appended at the
-end of the strip; with `[columns]` presets the column takes the monitor's
-current preset width), or back to its float rect.
+Make the focused window's column **fullscreen**, as in niri: the window
+stays in its strip, at its place, but while its column is the one the view
+starts at it covers its monitor's **whole screen** — the full screen rect,
+not the work area, so it covers the taskbar — kept above the tiles and
+without a border. A window that shares a stack is first taken out into a
+column of its own right after the stack; a floating window joins the strip
+after the focused column. Issuing `set-window fullscreen` again puts it back:
+the column takes its width again (the monitor's current preset width when
+the preset changed meanwhile), a window from a stack goes back into it at its
+row, the view goes back to what it was, and a window that was floating
+floats again at its old rect.
 
-While fullscreen the window still belongs to its workspace: switching
-workspaces parks and unparks it with the workspace like a float, and
-`move-to-monitor` carries it fullscreen to the other monitor (leaving
-fullscreen there appends it to that strip). The tiled-only commands (`focus`,
-`move-window`, `expand-column`, …) ignore it. `set-window tile` or `cycle`
-on a fullscreen window tiles it; `set-window float` floats it (at its old
-rect if it was a float, else centred). Closing it forgets it; minimizing and
-restoring brings it back fullscreen. `flow dispatch tiling off` hands it back
-as a plain float inside the work area, and `tiling on` keeps it a float.
-`flow query all` lists it with `"mode": "fullscreen"`. The choice is not
-learned (it never changes an app's tile/float rule). A fullscreen window is
-topmost by itself; with `[floating] always_on_top` the floats share that
-band, so a float and a fullscreen window stack by whichever was activated
-last.
+While fullscreen the window is a column like any other:
+
+- **`focus left` / `focus right`** (Mod+Left / Mod+Right, also from inside a
+  Remote Desktop full screen) move to the neighbouring column; the view
+  scrolls so the screen's columns show again — under a width pattern such as
+  `2/3+1/3`, focus right shows the set that starts after the fullscreen
+  column and focus left the set that ends just before it — and the
+  fullscreen window is parked off screen like any column. Focusing it again
+  shows it full screen.
+- **`center`** on it starts the view at it.
+- **`move-window left|right`** / `swap-column` move it, `move-to-monitor`
+  and `move-to-workspace` carry it (still fullscreen, in view), switching
+  workspaces parks and unparks it with its workspace.
+- **Refused** on a fullscreen window, with a message naming the command:
+  `expand-column`, `shrink-column`, `set-column-width`, `toggle-monocle`,
+  `merge-column`, `consume-or-expel`, `promote` and `swap-window
+  left|right`. A merge or consume *into* a fullscreen column is refused too
+  ("holds one window"). `width <preset>` still applies to the whole screen;
+  the fullscreen column comes back at the new width.
+- A window opened while it is focused opens after it and takes the view;
+  one Mod+Left goes back.
+- A tile dragged onto it is placed beside it (the outer third of the screen
+  on either side); dropped in the middle it snaps back. `drag begin` on a
+  fullscreen window is refused, and dragging its title bar snaps it back.
+
+`set-window tile` or `cycle` on a fullscreen window leaves fullscreen and
+keeps it in the strip; `set-window float` floats it (at its old rect if it
+was a float, else centred). Closing it forgets it; minimizing and restoring
+brings it back fullscreen, in view. `flow dispatch tiling off` takes it out
+of fullscreen where it is and puts it on screen like any tile; `tiling on`
+keeps it an ordinary tile. A daemon restart does not remember it (it comes
+back as an ordinary column). `flow query all` lists it with `"mode":
+"fullscreen"` (its `state` is a tile) and marks its column `"fullscreen":
+true`. The choice is not learned (it never changes an app's tile/float
+rule). A fullscreen window is topmost by itself; with `[floating]
+always_on_top` the floats share that band, so a float and a fullscreen
+window stack by whichever was activated last.
 
 **The app's own full screen.** Some apps only behave as fullscreen when
 they switch themselves: Remote Desktop (`mstsc.exe`) keeps its scrollbars
@@ -358,16 +396,16 @@ when its frame is merely sized over the screen. For a window under a
 the bundled rules set it for Remote Desktop) `set-window fullscreen` sends
 the app what its title-bar maximize button sends (`SC_MAXIMIZE`), waits up to
 2 s for it to fill the screen, and then treats it exactly like any other
-fullscreen window (same mode in `flow query all`, same toggling, workspace
-switching and `move-to-monitor`), except that FlowWM never sizes its frame.
+fullscreen window (same mode in `flow query all`, same toggling, focus
+moves, workspace switching and `move-to-monitor`), except that FlowWM never
+sizes its frame, only moves it.
 Leaving sends `SC_RESTORE` and re-seats it once the app has its caption
 back. The app's own switches are followed: clicking its maximize button
 while it is tiled makes it fullscreen in FlowWM too, and restoring it from
 inside (Remote Desktop's connection bar, Ctrl+Alt+Break) puts it back into
 its slot. If the app does not switch within 2 s the command fails and the
 window stays where it was. `flow stop`, `tiling off` and the fail-back ask
-the app to restore itself before the window is put back inside the work
-area.
+the app to restore itself before the window is put back on screen.
 
 ```powershell
 flow dispatch set-window fullscreen    # and again to come back
@@ -517,8 +555,9 @@ FlowWM had un-maximized to manage (`adopt_maximized`, or `set-window` on an
 ignored window) is maximized again instead. Windows you open, close, minimize
 or drag meanwhile are plain Windows windows; a minimized window whose restore
 position was off-screen is fixed so it comes back on-screen. A fullscreen
-window (`set-window fullscreen`) is handed back as a plain float inside its
-work area, and with `[floating] always_on_top` every floating window goes
+window (`set-window fullscreen`) leaves fullscreen and is put on screen like
+any tile (an app in its own full screen is asked to restore itself first),
+and with `[floating] always_on_top` every floating window goes
 back to the normal z-order (`tiling on` raises them again). The daemon and
 the hotkey script keep running, so the same chord turns tiling back on.
 

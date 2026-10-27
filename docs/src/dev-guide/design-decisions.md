@@ -414,3 +414,15 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   (Remote Desktop keeps the Win key from Windows); the daemon gives the
   keymap a dated log next to its own.
   `docs/adr/0020-app-fullscreen.md`
+- **ADR-0021 — Fullscreen is a column of the strip.** Mod+F flags the
+  window's column: it spans one screen on the canvas, covers the monitor's
+  screen rect while it starts the view and is parked at that size anywhere
+  else (pure moves), so focus moves through it like niri and Mod+F out
+  restores its width, slot, stack row and the view. A stacked window is
+  expelled into its own column and merged back; a float joins the strip
+  and floats back. Width and stack commands are refused on it; a pattern's
+  run never holds it unless it is the anchor (a run of one), so scrolling
+  off it shows the set before or after it (amends ADR-0017). Retires the
+  float-space fullscreen model; no partial visibility, because Windows does
+  not clip a window to its monitor.
+  `docs/adr/0021-fullscreen-is-a-column.md`

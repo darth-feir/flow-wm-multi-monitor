@@ -295,8 +295,14 @@ impl ScrollingSpace {
                     .last_focused_window
                     .and_then(|w| new_layout.find_window(w).map(|(c, _)| c));
                 if let (Some(anchor), Some(focus)) = (anchor, focus) {
+                    // Slots are counted over the columns that take a term
+                    // (a fullscreen column takes none, ADR-0021).
                     let n = pattern.len() as i64;
-                    self.slot_shift = (anchor as i64 - focus as i64).rem_euclid(n) as usize;
+                    let (a, f) = (
+                        slot_rank(&new_layout, anchor),
+                        slot_rank(&new_layout, focus),
+                    );
+                    self.slot_shift = (a as i64 - f as i64).rem_euclid(n) as usize;
                 }
                 self.apply_mutation(new_layout)
             }
@@ -317,32 +323,69 @@ impl ScrollingSpace {
         let gap = self.config.padding.window_gap;
         let last = new_layout.columns.len() - 1;
         let anchor = (0..old.columns.len())
-            .find(|&i| column_left(old, i, gap) >= old.viewport_offset)
+            .find(|&i| self.column_left(old, i) >= old.viewport_offset)
             .unwrap_or(last)
             .min(last);
-        let canvas = projection::canvas_width(new_layout, gap);
+        let canvas = projection::canvas_width(new_layout, gap, self.config.monitor_width);
         let max_offset = (canvas - self.config.monitor_width).max(0);
-        new_layout.viewport_offset = (column_left(new_layout, anchor, gap) - gap)
+        new_layout.viewport_offset = (self.column_left(new_layout, anchor) - gap)
             .max(0)
             .min(max_offset);
         let focus_col = self.focus_col_index().min(last);
         *new_layout = mutations::ensure_column_visible(new_layout, focus_col, &self.config);
     }
 
+    /// Canvas x of column `idx`'s left edge in `layout` on this strip's
+    /// monitor ([`projection::column_left`]).
+    fn column_left(&self, layout: &VirtualLayout, idx: usize) -> i32 {
+        projection::column_left(
+            layout,
+            idx,
+            self.config.padding.window_gap,
+            self.config.monitor_width,
+        )
+    }
+
     /// The anchor of `layout`: the first column whose left edge is at or
     /// past the viewport's left edge under the widths it carries, capped so
     /// a whole run of `n` slots still fits before the strip's end. `None`
     /// without columns.
+    ///
+    /// Fullscreen columns (ADR-0021): a fullscreen column found there is
+    /// the anchor as it is (a run of one, never capped), and the cap never
+    /// pulls the anchor back onto or across a fullscreen column.
     fn anchor_of(&self, layout: &VirtualLayout) -> Option<usize> {
         let len = layout.columns.len();
         if len == 0 {
             return None;
         }
-        let gap = self.config.padding.window_gap;
         let first_full = (0..len)
-            .find(|&i| column_left(layout, i, gap) >= layout.viewport_offset)
+            .find(|&i| self.column_left(layout, i) >= layout.viewport_offset)
             .unwrap_or(len - 1);
-        Some(first_full.min(len.saturating_sub(self.width_pattern.len())))
+        if layout.columns[first_full].fullscreen {
+            return Some(first_full);
+        }
+        let capped = first_full.min(len.saturating_sub(self.width_pattern.len()));
+        Some(capped.max(after_fullscreen_before(layout, first_full)))
+    }
+
+    /// The anchor a run of slots from `anchor` really starts at (ADR-0021):
+    /// a run never holds a fullscreen column other than its anchor, so when
+    /// one would fall inside it the run is moved to end just before it
+    /// (`fullscreen − n`), never back onto or across an earlier fullscreen
+    /// column. A fullscreen anchor is a run of one.
+    fn fit_run(&self, layout: &VirtualLayout, anchor: usize) -> usize {
+        if layout.columns[anchor].fullscreen {
+            return anchor;
+        }
+        let n = self.width_pattern.len();
+        let end = (anchor + n).min(layout.columns.len());
+        match (anchor + 1..end).find(|&i| layout.columns[i].fullscreen) {
+            Some(fs) => fs
+                .saturating_sub(n)
+                .max(after_fullscreen_before(layout, anchor)),
+            None => anchor,
+        }
     }
 
     /// Pin `layout` to the screen slots (ADR-0017): the anchor column
@@ -357,33 +400,48 @@ impl ScrollingSpace {
         if !self.widths_pinned() {
             return None;
         }
-        let mut anchor = self.anchor_of(layout)?;
+        let mut anchor = self.fit_run(layout, self.anchor_of(layout)?);
         self.pin_run(layout, anchor);
-        let gap = self.config.padding.window_gap;
         let keep = keep
             .or(self.last_focused_window)
             .and_then(|w| layout.find_window(w).map(|(c, _)| c));
         if let Some(col) = keep {
-            let right = column_left(layout, col, gap) + layout.columns[col].width_px;
+            let right = self.column_left(layout, col)
+                + layout.columns[col]
+                    .canvas_width(self.config.monitor_width, self.config.padding.window_gap);
             if right > layout.viewport_offset + self.config.monitor_width {
-                anchor = (col + 1).saturating_sub(self.width_pattern.len());
+                anchor = if layout.columns[col].fullscreen {
+                    col
+                } else {
+                    let start = (col + 1).saturating_sub(self.width_pattern.len());
+                    self.fit_run(layout, start.max(after_fullscreen_before(layout, col)))
+                };
                 self.pin_run(layout, anchor);
             }
         }
         Some(anchor)
     }
 
-    /// Widths and camera for the run of slots starting at `anchor`.
+    /// Widths and camera for the run of slots starting at `anchor`. A
+    /// fullscreen column takes no term and keeps its width (the width it
+    /// returns to); the terms are counted over the other columns
+    /// ([`slot_rank`]).
     fn pin_run(&self, layout: &mut VirtualLayout, anchor: usize) {
         let gap = self.config.padding.window_gap;
         let n = self.width_pattern.len() as i64;
-        for (i, col) in layout.columns.iter_mut().enumerate() {
-            let term = (i as i64 - anchor as i64 + self.slot_shift as i64).rem_euclid(n) as usize;
+        let anchor_rank = slot_rank(layout, anchor) as i64;
+        let mut rank: i64 = 0;
+        for col in &mut layout.columns {
+            if col.fullscreen {
+                continue;
+            }
+            let term = (rank - anchor_rank + self.slot_shift as i64).rem_euclid(n) as usize;
             col.width_px = (self.width_pattern[term] as i32)
                 .min(self.config.abs_max_width)
                 .max(1);
+            rank += 1;
         }
-        layout.viewport_offset = (column_left(layout, anchor, gap) - gap).max(0);
+        layout.viewport_offset = (self.column_left(layout, anchor) - gap).max(0);
     }
 
     /// Re-derive this space's cached geometry from new layout params without
@@ -1348,6 +1406,69 @@ impl ScrollingSpace {
             .unwrap_or(0)
     }
 
+    // -----------------------------------------------------------------------
+    // Fullscreen columns (ADR-0021)
+    // -----------------------------------------------------------------------
+
+    /// Whether `window`'s column is fullscreen.
+    #[must_use]
+    pub fn is_fullscreen_column(&self, window: WindowId) -> bool {
+        self.virtual_layout
+            .find_window(window)
+            .is_some_and(|(c, _)| self.virtual_layout.columns[c].fullscreen)
+    }
+
+    /// Make `window`'s column fullscreen (a stacked window is expelled into
+    /// its own column right after the stack first), focus it and start the
+    /// view at it. `None` when the window is not in this strip or its
+    /// column already is fullscreen.
+    pub fn enter_fullscreen(&mut self, window: WindowId) -> Option<AppliedLayout> {
+        let new_layout =
+            mutations::set_fullscreen(&self.virtual_layout, window, true, &self.config)?;
+        let (col, _) = new_layout.find_window(window)?;
+        let new_layout = mutations::ensure_column_visible(&new_layout, col, &self.config);
+        self.last_focused_window = Some(window);
+        self.monocle_saved_width = None;
+        Some(self.apply_mutation_for(new_layout, Some(window)))
+    }
+
+    /// Take `window`'s column out of fullscreen: `merge` = `(sibling, row)`
+    /// puts it back into the stack that holds `sibling` at `row`
+    /// ([`mutations::merge_back`]; it stays a column of its own when that
+    /// cannot be done), `viewport_offset` restores the view it was entered
+    /// from. The window keeps the focus and stays in view. `None` when the
+    /// window is not in this strip or its column is not fullscreen.
+    pub fn leave_fullscreen(
+        &mut self,
+        window: WindowId,
+        merge: Option<(WindowId, usize)>,
+        viewport_offset: Option<i32>,
+    ) -> Option<AppliedLayout> {
+        let mut new_layout =
+            mutations::set_fullscreen(&self.virtual_layout, window, false, &self.config)?;
+        if let Some((sibling, row)) = merge
+            && let Some(merged) =
+                mutations::merge_back(&new_layout, window, sibling, row, &self.config)
+        {
+            new_layout = merged;
+        }
+        if let Some(vp) = viewport_offset {
+            new_layout.viewport_offset = vp;
+        }
+        let (col, _) = new_layout.find_window(window)?;
+        let new_layout = mutations::ensure_column_visible(&new_layout, col, &self.config);
+        self.last_focused_window = Some(window);
+        Some(self.apply_mutation_for(new_layout, Some(window)))
+    }
+
+    /// Set `window`'s column flag to `on` without moving the camera or the
+    /// focus, for bookkeeping after the window was re-seated (restore,
+    /// another strip, a hotplug or a loadout). `None` when nothing changed.
+    pub fn mark_fullscreen(&mut self, window: WindowId, on: bool) -> Option<AppliedLayout> {
+        let new_layout = mutations::set_fullscreen(&self.virtual_layout, window, on, &self.config)?;
+        Some(self.apply_mutation(new_layout))
+    }
+
     /// Replace the committed virtual layout with a pre-computed one and
     /// re-project.
     ///
@@ -1362,19 +1483,34 @@ impl ScrollingSpace {
     }
 }
 
-/// Canvas x of column `idx`'s left edge: the leading gap plus every earlier
-/// column's slot (`width_px + gap`), the prefix sum the projection walks.
-fn column_left(layout: &VirtualLayout, idx: usize, gap: i32) -> i32 {
-    gap + layout.columns[..idx]
+/// The index just past the last fullscreen column before `idx` (0 when there
+/// is none): the leftmost column a run of slots ending at or after `idx` may
+/// start at (ADR-0021).
+fn after_fullscreen_before(layout: &VirtualLayout, idx: usize) -> usize {
+    (0..idx.min(layout.columns.len()))
+        .rev()
+        .find(|&i| layout.columns[i].fullscreen)
+        .map_or(0, |i| i + 1)
+}
+
+/// Column `idx`'s position among the columns that take a pattern term (every
+/// column but a fullscreen one): the number of those before it.
+fn slot_rank(layout: &VirtualLayout, idx: usize) -> usize {
+    layout.columns[..idx.min(layout.columns.len())]
         .iter()
-        .map(|c| c.width_px + gap)
-        .sum::<i32>()
+        .filter(|c| !c.fullscreen)
+        .count()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::common::Rect;
+
+    /// The strip's prefix sum on the 1920 px test monitor.
+    fn column_left(layout: &VirtualLayout, idx: usize, gap: i32) -> i32 {
+        projection::column_left(layout, idx, gap, 1920)
+    }
 
     fn test_monitor() -> MonitorInfo {
         MonitorInfo::single(Rect {
@@ -1761,7 +1897,8 @@ mod tests {
         assert_eq!(engine.config().column_width, 600);
         assert_eq!(applied.actual_layout.entries.len(), 3);
         // Three 600 px columns fit: the camera is pulled back onto the canvas.
-        let canvas = projection::canvas_width(&applied.virtual_layout, test_padding().window_gap);
+        let canvas =
+            projection::canvas_width(&applied.virtual_layout, test_padding().window_gap, 1920);
         assert!(canvas <= 1920);
         assert!(applied.virtual_layout.viewport_offset <= 0);
         // Monocle memory belongs to the old ladder and is forgotten.
@@ -4001,5 +4138,177 @@ mod tests {
         );
         assert_eq!(engine.virtual_layout().columns[0].row_offset, 2);
         assert!(!parked(&engine, 4) && parked(&engine, 1));
+    }
+
+    // --- fullscreen columns (ADR-0021) ---
+
+    const SCREEN: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 1920,
+        height: 1080,
+    };
+
+    fn rect(engine: &ScrollingSpace, id: isize) -> Rect {
+        engine
+            .actual_layout()
+            .find(WindowId(id))
+            .map(|e| e.rect)
+            .expect("in the strip")
+    }
+
+    fn on_screen(engine: &ScrollingSpace, id: isize) -> bool {
+        rect(engine, id).overlaps(SCREEN)
+    }
+
+    /// [A, B, F, C, D] = windows 1..=5 under "2/3+1/3" (1272 + 636 + 3 gaps
+    /// of 4 = 1920), F (3) fullscreen and in view.
+    fn pattern_strip_with_fullscreen() -> ScrollingSpace {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        for id in 1..=5 {
+            engine.add_window(WindowId(id));
+        }
+        engine.set_focus(WindowId(1));
+        engine.apply_width_pattern(&[1272, 636]);
+        engine.enter_fullscreen(WindowId(3)).expect("entered");
+        engine
+    }
+
+    /// The two columns in view fill the screen as one 2/3 + 1/3 set.
+    fn assert_set(engine: &ScrollingSpace, first: isize, second: isize) {
+        let (a, b) = (rect(engine, first), rect(engine, second));
+        assert_eq!(a.x, 4, "{first} starts the view");
+        assert_eq!(b.x, a.x + a.width + 4);
+        assert_eq!(b.x + b.width, 1916, "{second} ends it");
+        let mut w = [a.width, b.width];
+        w.sort_unstable();
+        assert_eq!(w, [636, 1272]);
+        for id in 1..=5 {
+            if id != first && id != second {
+                assert!(!on_screen(engine, id), "{id} is parked");
+            }
+        }
+    }
+
+    #[test]
+    fn a_fullscreen_column_is_a_run_of_one_and_focus_shows_the_sets_beside_it() {
+        let mut engine = pattern_strip_with_fullscreen();
+        let vl = engine.virtual_layout();
+        assert!(vl.columns[2].fullscreen);
+        assert_eq!(engine.slot_anchor(), Some(2));
+        assert_eq!(vl.viewport_offset, column_left(vl, 2, 4) - 4);
+        assert_eq!(rect(&engine, 3), SCREEN);
+        for id in [1, 2, 4, 5] {
+            assert!(!on_screen(&engine, id));
+        }
+        let before = engine.virtual_layout().columns[2].width_px;
+
+        // Mod+Right: [C, D], F parked left at the screen size.
+        let (f, diff) = engine.focus(WindowId(3), Direction::Right).expect("C");
+        assert_eq!(f, WindowId(4));
+        assert!(diff.is_some());
+        assert_set(&engine, 4, 5);
+        let parked = rect(&engine, 3);
+        assert_eq!((parked.width, parked.height, parked.y), (1920, 1080, 0));
+        assert!(parked.right() <= 0);
+
+        // Mod+Left: F full again.
+        engine.focus(WindowId(4), Direction::Left).expect("F");
+        assert_eq!(rect(&engine, 3), SCREEN);
+
+        // Mod+Left from F: the set that ends before it, [A, B].
+        let (f, _) = engine.focus(WindowId(3), Direction::Left).expect("B");
+        assert_eq!(f, WindowId(2));
+        assert_set(&engine, 1, 2);
+        let parked = rect(&engine, 3);
+        assert!(parked.x >= 1920);
+        assert_eq!((parked.width, parked.height), (1920, 1080));
+        // Its way-back width never took a term.
+        assert_eq!(engine.virtual_layout().columns[2].width_px, before);
+    }
+
+    #[test]
+    fn a_fullscreen_column_at_the_strip_end_and_two_adjacent_ones_are_runs_of_one() {
+        // [A, B, F]: the end cap must not pull the anchor back off F.
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        for id in 1..=3 {
+            engine.add_window(WindowId(id));
+        }
+        engine.apply_width_pattern(&[1272, 636]);
+        engine.enter_fullscreen(WindowId(3)).expect("entered");
+        assert_eq!(engine.slot_anchor(), Some(2));
+        assert_eq!(rect(&engine, 3), SCREEN);
+        engine.focus(WindowId(3), Direction::Left).expect("B");
+        assert_eq!(rect(&engine, 1).x, 4);
+        assert!(on_screen(&engine, 2));
+        assert!(!on_screen(&engine, 3));
+
+        // [A, F1, F2, B]: each fullscreen column on its own, and after F2
+        // the run starts at B (the cap never reaches back across F2).
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        for id in 1..=4 {
+            engine.add_window(WindowId(id));
+        }
+        engine.apply_width_pattern(&[1272, 636]);
+        engine.enter_fullscreen(WindowId(2)).expect("F1");
+        engine.enter_fullscreen(WindowId(3)).expect("F2");
+        assert_eq!(rect(&engine, 3), SCREEN);
+        engine.focus(WindowId(3), Direction::Left).expect("F1");
+        assert_eq!(rect(&engine, 2), SCREEN);
+        assert!(!on_screen(&engine, 3));
+        engine.focus(WindowId(2), Direction::Right).expect("F2");
+        engine.focus(WindowId(3), Direction::Right).expect("B");
+        assert_eq!(engine.slot_anchor(), Some(3));
+        assert_eq!(rect(&engine, 4).x, 4);
+        assert!(!on_screen(&engine, 2) && !on_screen(&engine, 3));
+    }
+
+    #[test]
+    fn leaving_fullscreen_restores_the_view_and_the_stack() {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        engine.add_window(WindowId(1));
+        engine.add_window(WindowId(2));
+        engine.add_window(WindowId(3));
+        // 3 joins 2's column: [1] [2/3].
+        let vl = engine.virtual_layout().clone();
+        let merged = mutations::merge_column(&vl, WindowId(3), Direction::Left, engine.config())
+            .expect("merged");
+        engine.commit_layout(merged);
+        let vp = engine.virtual_layout().viewport_offset;
+
+        let on = engine.enter_fullscreen(WindowId(3)).expect("on");
+        assert_eq!(on.virtual_layout.columns.len(), 3);
+        assert!(on.virtual_layout.columns[2].fullscreen);
+        assert_eq!(engine.last_focused_window(), Some(WindowId(3)));
+
+        let off = engine
+            .leave_fullscreen(WindowId(3), Some((WindowId(2), 1)), Some(vp))
+            .expect("off");
+        assert_eq!(off.virtual_layout.columns.len(), 2);
+        assert_eq!(off.virtual_layout.find_window(WindowId(3)), Some((1, 1)));
+        assert_eq!(off.virtual_layout.viewport_offset, vp);
+        assert!(off.virtual_layout.columns.iter().all(|c| !c.fullscreen));
+        // Not fullscreen any more: nothing to leave.
+        assert!(engine.leave_fullscreen(WindowId(3), None, None).is_none());
+    }
+
+    #[test]
+    fn without_a_pattern_focus_off_a_fullscreen_column_starts_or_ends_the_view_at_the_target() {
+        // [1, 2, 3, 4, F=5, 6], columns 600 wide.
+        let mut engine = ScrollingSpace::new(test_monitor(), 600, 320, 100, 100, test_padding(), 4);
+        for id in 1..=6 {
+            engine.add_window(WindowId(id));
+        }
+        engine.enter_fullscreen(WindowId(5)).expect("entered");
+        engine.focus(WindowId(5), Direction::Right).expect("6");
+        assert_eq!(rect(&engine, 6).x, 4);
+        assert!(!on_screen(&engine, 5));
+        engine.focus(WindowId(6), Direction::Left).expect("5");
+        assert_eq!(rect(&engine, 5), SCREEN);
+        engine.focus(WindowId(5), Direction::Left).expect("4");
+        let b = rect(&engine, 4);
+        assert_eq!(b.x + b.width, 1916);
+        assert!(on_screen(&engine, 3));
+        assert!(!on_screen(&engine, 5));
     }
 }

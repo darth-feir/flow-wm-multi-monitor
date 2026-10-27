@@ -103,6 +103,16 @@ pub const PARK_MARGIN: i32 = 16;
 /// parking: just beyond the monitor's physical screen rect on a free side,
 /// beyond the whole virtual screen when another monitor is stacked on that
 /// side, so a parked row never lands on a neighbour.
+///
+/// # Fullscreen columns (ADR-0021)
+///
+/// A [`fullscreen`](Column::fullscreen) column spans one whole screen on
+/// the canvas ([`Column::canvas_width`]). It is shown only when it
+/// **starts the view** â€” it is the first column overlapping the viewport â€”
+/// and then at the monitor's full [`screen_rect`](MonitorInfo::screen_rect)
+/// (taskbar covered, no gap), with every other column parked. Anywhere
+/// else it is parked on its side at the screen rect's size, so moving it
+/// in and out of view is always a pure move.
 #[must_use]
 pub fn project(
     virtual_layout: &VirtualLayout,
@@ -117,15 +127,52 @@ pub fn project(
 
     let mut entries = Vec::new();
     let mut canvas_x: i32 = slot_gap;
+    let screen = monitor.screen_rect;
+    // A fullscreen column that starts the view hides every other column.
+    let fullscreen_in_view = virtual_layout
+        .columns
+        .iter()
+        .scan(slot_gap, |x, c| {
+            let left = *x;
+            let right = left + c.canvas_width(monitor_rect.width, slot_gap);
+            *x = right + slot_gap;
+            Some((c.fullscreen, left, right))
+        })
+        .find(|&(_, left, right)| right > viewport_left && left < viewport_right)
+        .is_some_and(|(fs, _, _)| fs);
+    let mut first_visible_seen = false;
 
     for column in &virtual_layout.columns {
         let col_width = column.width_px;
         let canvas_col_left = canvas_x;
-        let canvas_col_right = canvas_x + col_width;
+        let canvas_col_right = canvas_x + column.canvas_width(monitor_rect.width, slot_gap);
+        canvas_x = canvas_col_right + slot_gap;
 
         let visible = canvas_col_right > viewport_left && canvas_col_left < viewport_right;
+        let first = visible && !first_visible_seen;
+        first_visible_seen |= visible;
 
-        let x = if visible {
+        if column.fullscreen {
+            let x = if first {
+                screen.x
+            } else if canvas_col_right <= viewport_left {
+                park_left_x(monitor, screen.width)
+            } else {
+                park_right_x(monitor)
+            };
+            for row in &column.rows {
+                entries.push(ActualEntry {
+                    window_id: row.window_id,
+                    rect: Rect { x, ..screen },
+                });
+            }
+            continue;
+        }
+
+        let x = if visible && fullscreen_in_view {
+            // A fullscreen column starts the view: this one is behind it.
+            park_right_x(monitor)
+        } else if visible {
             let on_screen_x = monitor_rect.x + (canvas_col_left - viewport_left);
             // A column that overhangs an edge with a neighbouring monitor
             // beyond it would spill onto that neighbour. Park it instead —
@@ -158,10 +205,29 @@ pub fn project(
             visible_rows,
             &mut entries,
         );
-        canvas_x += col_width + slot_gap;
     }
 
     ActualLayout { entries }
+}
+
+/// Canvas x of column `idx`'s left edge: the leading gap plus every earlier
+/// column's slot (`canvas_width + gap`, a fullscreen column taking one
+/// whole `monitor_width`). The one prefix sum every reader of the strip's
+/// geometry shares with [`project`].
+#[must_use]
+pub fn column_left(layout: &VirtualLayout, idx: usize, gap: i32, monitor_width: i32) -> i32 {
+    gap + layout.columns[..idx.min(layout.columns.len())]
+        .iter()
+        .map(|c| c.canvas_width(monitor_width, gap) + gap)
+        .sum::<i32>()
+}
+
+/// Canvas x of column `idx`'s right edge ([`column_left`] plus its
+/// [`canvas_width`](Column::canvas_width)).
+#[must_use]
+pub fn column_right(layout: &VirtualLayout, idx: usize, gap: i32, monitor_width: i32) -> i32 {
+    column_left(layout, idx, gap, monitor_width)
+        + layout.columns[idx].canvas_width(monitor_width, gap)
 }
 
 /// X coordinate of the left parking zone: just beyond the virtual screen's
@@ -263,11 +329,15 @@ fn stack_column_rows(
 ///
 /// When `window_gap = 0`, this degenerates to the packed model (sum of col widths).
 #[must_use]
-pub fn canvas_width(layout: &VirtualLayout, window_gap: i32) -> i32 {
+pub fn canvas_width(layout: &VirtualLayout, window_gap: i32, monitor_width: i32) -> i32 {
     if layout.columns.is_empty() {
         return 0;
     }
-    let total_slots: i32 = layout.columns.iter().map(|c| c.width_px + window_gap).sum();
+    let total_slots: i32 = layout
+        .columns
+        .iter()
+        .map(|c| c.canvas_width(monitor_width, window_gap) + window_gap)
+        .sum();
     // Leading edge gap is the window_gap at the very start of the canvas.
     // But each slot already includes its trailing gap, and the first slot starts
     // at window_gap. So the total span from canvas_x=0 to the end of the last
@@ -276,11 +346,12 @@ pub fn canvas_width(layout: &VirtualLayout, window_gap: i32) -> i32 {
     window_gap + total_slots
 }
 
-/// Compute the pixel width of a single step (one slot = column's own width + window gap).
+/// Compute the pixel width of a single step (one slot = the column's
+/// canvas width + window gap; a fullscreen column's step is one screen).
 /// Used by scroll operations to determine viewport offset changes.
 #[must_use]
-pub fn column_step_width(column: &Column, window_gap: i32) -> i32 {
-    column.width_px + window_gap
+pub fn column_step_width(column: &Column, window_gap: i32, monitor_width: i32) -> i32 {
+    column.canvas_width(monitor_width, window_gap) + window_gap
 }
 
 #[cfg(test)]
@@ -417,7 +488,7 @@ mod tests {
     #[test]
     fn canvas_width_empty() {
         let layout = VirtualLayout::new();
-        assert_eq!(canvas_width(&layout, 4), 0);
+        assert_eq!(canvas_width(&layout, 4, 1920), 0);
     }
 
     #[test]
@@ -430,7 +501,7 @@ mod tests {
             0,
         );
         // Slot model: window_gap(4) + (960+4) + (960+4) = 4 + 964 + 964 = 1932
-        assert_eq!(canvas_width(&layout, 4), 1932);
+        assert_eq!(canvas_width(&layout, 4, 1920), 1932);
     }
 
     // --- Integration: Projection correctness ---
@@ -617,7 +688,7 @@ mod tests {
         let layout =
             VirtualLayout::with_columns(vec![Column::with_row(1920, Row::new(WindowId(1), 0))], 0);
         // 4 + (1920 + 4) = 1928
-        assert_eq!(canvas_width(&layout, 4), 1928);
+        assert_eq!(canvas_width(&layout, 4, 1920), 1928);
     }
 
     #[test]
@@ -633,7 +704,7 @@ mod tests {
             ],
             0,
         );
-        assert_eq!(canvas_width(&layout, 4), 4824);
+        assert_eq!(canvas_width(&layout, 4, 1920), 4824);
     }
 
     #[test]
@@ -1418,5 +1489,94 @@ mod tests {
         let below = rect_of(&actual, 3);
         assert_eq!(below.y, screen.bottom() + PARK_MARGIN);
         assert!(m.is_parked(below));
+    }
+
+    // --- fullscreen columns (ADR-0021) ---
+
+    /// A taskbar'd primary (work area 1920x1040) with a monitor to its left.
+    fn taskbar_primary() -> MonitorInfo {
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let work = Rect {
+            height: 1040,
+            ..screen
+        };
+        let left = Rect { x: -1920, ..screen };
+        let vs = Rect {
+            x: -1920,
+            y: 0,
+            width: 3840,
+            height: 1080,
+        };
+        MonitorInfo::in_desktop(work, screen, vs, &[left])
+    }
+
+    /// [A 600] [F fs, 900 to return to] [B 600] on the taskbar'd primary.
+    fn with_fullscreen(viewport_offset: i32) -> VirtualLayout {
+        VirtualLayout::with_columns(
+            vec![
+                Column::with_row(600, Row::new(WindowId(1), 1032)),
+                Column::with_row(900, Row::new(WindowId(2), 1032)).with_fullscreen(true),
+                Column::with_row(600, Row::new(WindowId(3), 1032)),
+            ],
+            viewport_offset,
+        )
+    }
+
+    #[test]
+    fn a_fullscreen_column_spans_one_screen_on_the_canvas() {
+        let vl = with_fullscreen(0);
+        let gap = 4;
+        assert_eq!(vl.columns[1].canvas_width(1920, gap), 1916);
+        assert_eq!(column_left(&vl, 1, gap, 1920), 4 + 600 + 4);
+        assert_eq!(column_left(&vl, 2, gap, 1920), 608 + 1920);
+        assert_eq!(column_right(&vl, 1, gap, 1920), 608 + 1916);
+        assert_eq!(canvas_width(&vl, gap, 1920), 4 + 604 + 1920 + 604);
+        assert_eq!(column_step_width(&vl.columns[1], gap, 1920), 1920);
+        // The width it returns to is untouched.
+        assert_eq!(vl.columns[1].width_px, 900);
+    }
+
+    #[test]
+    fn a_fullscreen_column_that_starts_the_view_covers_the_screen_and_parks_the_rest() {
+        let m = taskbar_primary();
+        let vl = with_fullscreen(608 - 4);
+        let actual = project(&vl, &m, &test_padding(), 0);
+        // The SCREEN rect, taskbar covered, no gap.
+        assert_eq!(rect_of(&actual, 2), m.screen_rect);
+        assert!(m.is_parked(rect_of(&actual, 1)));
+        assert!(m.is_parked(rect_of(&actual, 3)));
+        assert!(rect_of(&actual, 1).right() <= m.virtual_screen.x);
+        assert_eq!(rect_of(&actual, 3).x, park_right_x(&m));
+    }
+
+    #[test]
+    fn a_fullscreen_column_off_the_start_of_the_view_is_parked_at_the_screen_size() {
+        let m = taskbar_primary();
+        // The view starts at A: F overlaps it but does not start it.
+        let actual = project(&with_fullscreen(0), &m, &test_padding(), 0);
+        let a = rect_of(&actual, 1);
+        assert_eq!((a.x, a.width), (4, 600));
+        let f = rect_of(&actual, 2);
+        assert_eq!(f.x, park_right_x(&m));
+        assert_eq!((f.y, f.width, f.height), (0, 1920, 1080));
+        // The view starts at B: F is parked left, again at the screen size,
+        // beyond the neighbour.
+        let vl = with_fullscreen(column_left(&with_fullscreen(0), 2, 4, 1920) - 4);
+        let actual = project(&vl, &m, &test_padding(), 0);
+        assert_eq!(rect_of(&actual, 3).x, 4);
+        let f = rect_of(&actual, 2);
+        assert_eq!(
+            f,
+            Rect {
+                x: park_left_x(&m, 1920),
+                ..m.screen_rect
+            }
+        );
+        assert!(f.right() <= m.virtual_screen.x);
     }
 }

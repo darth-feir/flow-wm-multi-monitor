@@ -44,8 +44,9 @@
 //!   the phase-1 logoff rescue)
 //! - [`startup`] — staged startup reporting ([`StartupStage`],
 //!   [`StartupError`], the `flowd.status` file, `FLOW_FAIL_AT` injection)
-//! - `fullscreen` — `set-window fullscreen`: a tile or float over the whole
-//!   screen, above the tiles, remembering where it came from
+//! - `fullscreen` — `set-window fullscreen`: a fullscreen column of the
+//!   strip, over the whole screen while in view, above the tiles,
+//!   remembering where it came from (ADR-0021)
 //! - `width_preset` — per-monitor column width presets (`[columns]`,
 //!   `flow dispatch width`)
 //! - `tiling` — the tiling on/off toggle: pause (every tile back

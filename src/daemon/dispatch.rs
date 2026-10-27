@@ -418,6 +418,11 @@ impl FlowWM {
             log::debug!("dispatch_swap_window: no-op (focused window is not an active tile)");
             return SocketResponse::Ok;
         }
+        if matches!(dir, Direction::Left | Direction::Right)
+            && let Some(refusal) = self.fullscreen_refusal(id, "swap-window")
+        {
+            return refusal;
+        }
         match self.active_scrolling_mut().swap_window(id, dir) {
             Some(diff) => {
                 self.animate_layout(&diff);
@@ -451,6 +456,12 @@ impl FlowWM {
             log::debug!("dispatch_merge_column: no-op (focused window is not an active tile)");
             return SocketResponse::Ok;
         }
+        if let Some(refusal) = self.fullscreen_refusal(id, "merge-column") {
+            return refusal;
+        }
+        if let Some(refusal) = self.fullscreen_neighbour_refusal(id, dir) {
+            return refusal;
+        }
         match self.active_scrolling_mut().merge_column(id, dir) {
             Some(diff) => {
                 self.animate_layout(&diff);
@@ -482,6 +493,9 @@ impl FlowWM {
         if !matches!(win.state, WindowState::Tiling(TilingState::Active { .. })) {
             log::debug!("dispatch_promote_window: no-op (focused window is not an active tile)");
             return SocketResponse::Ok;
+        }
+        if let Some(refusal) = self.fullscreen_refusal(id, "promote") {
+            return refusal;
         }
         match self.active_scrolling_mut().promote_window(id, dir) {
             Some(diff) => {
@@ -518,6 +532,9 @@ impl FlowWM {
             log::debug!("dispatch_consume_or_expel: no-op (focused window is not an active tile)");
             return SocketResponse::Ok;
         }
+        if let Some(refusal) = self.fullscreen_refusal(id, "consume-or-expel") {
+            return refusal;
+        }
         let strip = self.active_scrolling().virtual_layout();
         let Some((col, _)) = strip.find_window(id) else {
             log::debug!(
@@ -536,16 +553,58 @@ impl FlowWM {
                     message: format!("cannot expel window {}", direction_word(dir)),
                 },
             },
-            ColumnAction::Consume => match self.active_scrolling_mut().merge_column(id, dir) {
-                Some(diff) => {
-                    self.animate_layout(&diff);
-                    SocketResponse::Ok
+            ColumnAction::Consume => {
+                if let Some(refusal) = self.fullscreen_neighbour_refusal(id, dir) {
+                    return refusal;
                 }
-                None => SocketResponse::Error {
-                    message: format!("no column {} to consume into", direction_word(dir)),
-                },
+                self.consume_into_neighbour(id, dir)
+            }
+        }
+    }
+
+    /// The consume half of [`dispatch_consume_or_expel`](Self::dispatch_consume_or_expel).
+    fn consume_into_neighbour(&mut self, id: WindowId, dir: Direction) -> SocketResponse {
+        match self.active_scrolling_mut().merge_column(id, dir) {
+            Some(diff) => {
+                self.animate_layout(&diff);
+                SocketResponse::Ok
+            }
+            None => SocketResponse::Error {
+                message: format!("no column {} to consume into", direction_word(dir)),
             },
         }
+    }
+
+    /// The refusal of column command `what` on a fullscreen window: a
+    /// fullscreen column has no width, stack or neighbour exchange of its
+    /// own (ADR-0021). `None` for any other window.
+    fn fullscreen_refusal(&self, id: WindowId, what: &str) -> Option<SocketResponse> {
+        self.is_fullscreen(id.0).then(|| SocketResponse::Error {
+            message: format!(
+                "{what}: the window is fullscreen; leave fullscreen first (set-window fullscreen)"
+            ),
+        })
+    }
+
+    /// The refusal of a merge / consume from `id` into the column on its
+    /// `dir` side when that column is fullscreen (it holds one window).
+    fn fullscreen_neighbour_refusal(&self, id: WindowId, dir: Direction) -> Option<SocketResponse> {
+        let vl = self.active_scrolling().virtual_layout();
+        let (col, _) = vl.find_window(id)?;
+        let beside = match dir {
+            Direction::Left => col.checked_sub(1)?,
+            Direction::Right => col + 1,
+            Direction::Up | Direction::Down => return None,
+        };
+        vl.columns
+            .get(beside)
+            .is_some_and(|c| c.fullscreen)
+            .then(|| SocketResponse::Error {
+                message: format!(
+                    "the column {} is fullscreen and holds one window",
+                    direction_word(dir)
+                ),
+            })
     }
 
     /// Dispatch a semantic "move window" command.
@@ -815,13 +874,10 @@ impl FlowWM {
         mut push: impl FnMut(isize) -> ForegroundPush,
     ) -> LayerFocus {
         let mi = self.active_monitor;
-        // A daemon-fullscreen window sits in the floating space but is the
-        // tiling side's business, as in niri (fullscreen is a scrolling
-        // state there): it neither makes the layer active nor is offered
-        // by `focus-floating`.
+        // A daemon-fullscreen window is a column of the strip (ADR-0021),
+        // so it is the tiling side's, as in niri.
         let floating_is_active = self.registry.focused().is_some_and(|id| {
             self.registry.is_floating_active(id.0)
-                && !self.is_fullscreen(id.0)
                 && self.monitors[mi].active_workspace().floating.contains(id)
         });
         let layer = layer_to_focus(target, floating_is_active);
@@ -831,10 +887,7 @@ impl FlowWM {
             let candidate =
                 layer_focus_candidates(layer, &ws.scrolling, &ws.floating, ws.last_focused_float)
                     .into_iter()
-                    .find(|c| {
-                        !skipped.contains(&c.0)
-                            && !(layer == Layer::Floating && self.is_fullscreen(c.0))
-                    });
+                    .find(|c| !skipped.contains(&c.0));
             let Some(candidate) = candidate else {
                 log::debug!(
                     "focus-layer: no {} window to focus on monitor {mi} ({} skipped)",
@@ -915,9 +968,6 @@ impl FlowWM {
             WindowState::Tiling(TilingState::Active { .. }) => {
                 self.move_tiled_to_monitor(id, from, target, dir)
             }
-            WindowState::Floating(FloatingState::Active { .. }) if self.is_fullscreen(id.0) => {
-                self.move_fullscreen_to_monitor(id, from, target)
-            }
             WindowState::Floating(FloatingState::Active { rect }) => {
                 self.move_float_to_monitor(id, from, target, rect)
             }
@@ -958,6 +1008,12 @@ impl FlowWM {
             .ensure_focused_visible()
         {
             dst = diff;
+        }
+        // A fullscreen column stays one on the other monitor, in view
+        // (ADR-0021).
+        let ws_id = self.monitors[target].active_workspace_id();
+        if let Some(fs) = self.reflag_fullscreen(id, target, ws_id, true) {
+            dst = fs;
         }
         self.finish_tiled_monitor_move(id, (from, &src), (target, &dst), &[]);
         SocketResponse::Ok
@@ -1077,6 +1133,9 @@ impl FlowWM {
             log::debug!("dispatch_expand: no-op (focused window is not an active tile)");
             return SocketResponse::Ok;
         }
+        if let Some(refusal) = self.fullscreen_refusal(id, "expand-column") {
+            return refusal;
+        }
         if let Some(message) = self.pinned_widths_refusal() {
             return SocketResponse::Error { message };
         }
@@ -1105,6 +1164,9 @@ impl FlowWM {
         if !matches!(win.state, WindowState::Tiling(TilingState::Active { .. })) {
             log::debug!("dispatch_shrink: no-op (focused window is not an active tile)");
             return SocketResponse::Ok;
+        }
+        if let Some(refusal) = self.fullscreen_refusal(id, "shrink-column") {
+            return refusal;
         }
         if let Some(message) = self.pinned_widths_refusal() {
             return SocketResponse::Error { message };
@@ -1139,6 +1201,9 @@ impl FlowWM {
         if !matches!(win.state, WindowState::Tiling(TilingState::Active { .. })) {
             log::debug!("dispatch_set_column_width: no-op (focused window is not an active tile)");
             return SocketResponse::Ok;
+        }
+        if let Some(refusal) = self.fullscreen_refusal(id, "set-column-width") {
+            return refusal;
         }
         if let Some(message) = self.pinned_widths_refusal() {
             return SocketResponse::Error { message };
@@ -1223,6 +1288,9 @@ impl FlowWM {
         if !matches!(win.state, WindowState::Tiling(TilingState::Active { .. })) {
             log::debug!("dispatch_toggle_monocle: no-op (focused window is not an active tile)");
             return SocketResponse::Ok;
+        }
+        if let Some(refusal) = self.fullscreen_refusal(id, "toggle-monocle") {
+            return refusal;
         }
         if let Some(message) = self.pinned_widths_refusal() {
             return SocketResponse::Error { message };
@@ -1625,7 +1693,11 @@ impl FlowWM {
                     .scrolling
                     .insert_window_with_width(focused, moved_width_px);
                 let gap = ws.scrolling.config().padding.window_gap;
-                let canvas_w = projection::canvas_width(&post_insert.virtual_layout, gap);
+                let canvas_w = projection::canvas_width(
+                    &post_insert.virtual_layout,
+                    gap,
+                    ws.scrolling.config().monitor_width,
+                );
                 let monitor_w = ws.scrolling.config().monitor_width;
                 if canvas_w <= monitor_w {
                     // Fit: center the entire canvas (offset may be negative
@@ -1647,6 +1719,12 @@ impl FlowWM {
                 };
             }
         };
+        // A fullscreen column stays one on the other workspace, in view
+        // (ADR-0021).
+        let mi = self.active_monitor;
+        let dest_applied = self
+            .reflag_fullscreen(focused, mi, dest_id, true)
+            .unwrap_or(dest_applied);
 
         // Refresh registry state for the destination workspace. This call
         // wins for the moved window — its slot/rect now reflect the
@@ -1735,9 +1813,9 @@ impl FlowWM {
             win.state,
             WindowState::Floating(FloatingState::Active { .. })
         );
-        // A fullscreen window is recorded as a float; the daemon's map is
-        // what tells it apart.
-        let currently_fullscreen = currently_floating && self.is_fullscreen(focused.0);
+        // A fullscreen window is a tile of the strip (ADR-0021); the
+        // daemon's map is what tells it apart.
+        let currently_fullscreen = currently_tiling && self.is_fullscreen(focused.0);
         let currently_ignored = matches!(win.state, WindowState::Ignored(_));
 
         // Capture the window's identity for history recording before the
@@ -2489,18 +2567,18 @@ enum SetWindowAction {
 /// | Cycle      | true             | false              | false      | false   | MakeFloating               |
 /// | Cycle      | false            | true               | false      | false   | MakeTiling                 |
 /// | Fullscreen | either           |                    | false      | false   | MakeFullscreen             |
-/// | Fullscreen | (floating)       |                    | true       | false   | LeaveFullscreen(Origin)    |
-/// | Tile       | (floating)       |                    | true       | false   | LeaveFullscreen(Tile)      |
-/// | Cycle      | (floating)       |                    | true       | false   | LeaveFullscreen(Tile)      |
-/// | Float      | (floating)       |                    | true       | false   | LeaveFullscreen(Float)     |
+/// | Fullscreen | (tiling)         |                    | true       | false   | LeaveFullscreen(Origin)    |
+/// | Tile       | (tiling)         |                    | true       | false   | LeaveFullscreen(Tile)      |
+/// | Cycle      | (tiling)         |                    | true       | false   | LeaveFullscreen(Tile)      |
+/// | Float      | (tiling)         |                    | true       | false   | LeaveFullscreen(Float)     |
 /// | Tile       | false            | false              | false      | true    | AdoptTiling                |
 /// | Cycle      | false            | false              | false      | true    | AdoptTiling                |
 /// | Float      | false            | false              | false      | true    | AdoptFloating              |
 /// | Fullscreen | false            | false              | false      | true    | AdoptFullscreen            |
 /// | any        | false            | false              | false      | false   | Err (minimized / hidden)   |
 ///
-/// A fullscreen window is recorded as a float, so `currently_fullscreen`
-/// implies `currently_floating`; it is checked first. `cycle` keeps its
+/// A fullscreen window is a column of the strip (ADR-0021), so
+/// `currently_fullscreen` implies `currently_tiling`; it is checked first. `cycle` keeps its
 /// float/tile meaning for everything else — on a fullscreen window it only
 /// ever leads back to tiled, and on an ignored window (which has no
 /// float/tile state to flip) it means `tile`. Adoption covers every ignore
@@ -3572,25 +3650,18 @@ mod tests {
         assert_eq!(out, LayerFocus::Empty(Layer::Tiling));
     }
 
-    /// A daemon-fullscreen window is a float in the space but counts as the
-    /// tiling side: the switch from it goes to a real float, and it is never
-    /// offered by `focus-floating`.
+    /// A daemon-fullscreen window is a column of the strip (ADR-0021), even
+    /// one that was a float: the switch from it goes to a real float.
     #[test]
     fn a_fullscreen_window_is_not_the_floating_layer() {
         let mut flow = flow_with_two_layers(FLOAT_G);
-        flow.fullscreen.insert(
-            FLOAT_G,
-            super::super::fullscreen::FullscreenOrigin::Float {
-                monitor: 0,
-                workspace: WorkspaceId(1),
-                rect: Rect {
-                    x: 600,
-                    y: 100,
-                    width: 400,
-                    height: 300,
-                },
-            },
+        // A float put fullscreen joins the strip as a fullscreen column.
+        assert_eq!(
+            flow.set_window_to_fullscreen(WindowId(FLOAT_G)),
+            SocketResponse::Ok
         );
+        assert!(flow.registry.is_tiling_active(FLOAT_G));
+        flow.registry.set_focused(FLOAT_G);
         let (out, _) = focus_layer(&mut flow, LayerTarget::Other);
         assert_eq!(
             out,

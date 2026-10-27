@@ -212,8 +212,10 @@ impl FlowWM {
         // `[floating] always_on_top` says.
         let _ = self.release_top_layer();
         // Fullscreen windows: the topmost flag is the daemon's and must not
-        // outlive it; the window itself goes back inside its work area.
-        for (hwnd, rect) in self.demote_all_fullscreen_to_floats() {
+        // outlive it, an app's own full screen is ended, and the one in view
+        // goes back inside its work area (a parked one is stranded and
+        // rescued below).
+        for (hwnd, rect) in self.release_all_fullscreen() {
             let bounds = self
                 .registry
                 .get_window(HWND(hwnd as *mut _))

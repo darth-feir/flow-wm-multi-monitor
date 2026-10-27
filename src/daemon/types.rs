@@ -340,8 +340,8 @@ pub struct FlowWM {
 
     /// Windows the daemon put fullscreen (`set-window fullscreen`), keyed
     /// by HWND value, with where each came from so it can be put back. A
-    /// fullscreen window sits in its workspace's floating space at the
-    /// monitor's screen rect; this map is what tells it apart from a float.
+    /// fullscreen window is a tile whose column is flagged fullscreen
+    /// (ADR-0021); this map is the authority, the column flag follows it.
     /// See `daemon::fullscreen`.
     pub(super) fullscreen: std::collections::HashMap<isize, super::fullscreen::FullscreenOrigin>,
 

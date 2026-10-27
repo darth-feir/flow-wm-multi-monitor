@@ -19,7 +19,9 @@ classDiagram
         +i32 width_px
         +Vec~Row~ rows
         +usize row_offset
+        +bool fullscreen
         +with_row(width_px, row) Column
+        +canvas_width(monitor_width, gap) i32
         +slots(visible_rows) usize
         +row_visible(row, visible_rows) bool
         +is_valid_width() bool
@@ -57,7 +59,7 @@ classDiagram
     AppliedLayout --> ActualLayout : wraps
 ```
 
-[`VirtualLayout`](../../src/layout/types.rs) holds the ordered `columns` vector and a `viewport_offset` — the camera position measured in pixels from the canvas origin. [`Column`](../../src/layout/types.rs) stores only a `width_px`, a `rows` list and a `row_offset` — the first row of its **row viewport** when the column holds more rows than `[columns] visible_rows` shows (see [Projection](./projection.md#row-viewports-stacked-columns)); it carries no x-position. [`ActualLayout`](../../src/layout/types.rs) is produced by the projection step and contains one [`ActualEntry`](../../src/layout/types.rs) per window, each with a concrete `Rect` in screen coordinates. [`AppliedLayout`](../../src/layout/types.rs) bundles both the new virtual and actual layouts together — the animation layer diffs every window's target rect against its real on-screen position to decide what needs tweening.
+[`VirtualLayout`](../../src/layout/types.rs) holds the ordered `columns` vector and a `viewport_offset` — the camera position measured in pixels from the canvas origin. [`Column`](../../src/layout/types.rs) stores only a `width_px`, a `rows` list, a `row_offset` — the first row of its **row viewport** when the column holds more rows than `[columns] visible_rows` shows (see [Projection](./projection.md#row-viewports-stacked-columns)) — and a `fullscreen` flag (one window over the whole screen while it starts the view, one screen wide on the canvas; see [Projection](./projection.md#fullscreen-columns)); it carries no x-position. [`ActualLayout`](../../src/layout/types.rs) is produced by the projection step and contains one [`ActualEntry`](../../src/layout/types.rs) per window, each with a concrete `Rect` in screen coordinates. [`AppliedLayout`](../../src/layout/types.rs) bundles both the new virtual and actual layouts together — the animation layer diffs every window's target rect against its real on-screen position to decide what needs tweening.
 
 ## The camera model
 

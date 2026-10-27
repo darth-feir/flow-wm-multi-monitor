@@ -421,16 +421,16 @@ Full decision table:
 | Cycle | true | false | false | false | MakeFloating |
 | Cycle | false | true | false | false | MakeTiling |
 | Fullscreen | either | | false | false | MakeFullscreen |
-| Fullscreen | (floating) | | true | false | LeaveFullscreen(Origin) |
-| Tile / Cycle | (floating) | | true | false | LeaveFullscreen(Tile) |
-| Float | (floating) | | true | false | LeaveFullscreen(Float) |
+| Fullscreen | (tiling) | | true | false | LeaveFullscreen(Origin) |
+| Tile / Cycle | (tiling) | | true | false | LeaveFullscreen(Tile) |
+| Float | (tiling) | | true | false | LeaveFullscreen(Float) |
 | Tile / Cycle | false | false | false | true | AdoptTiling |
 | Float | false | false | false | true | AdoptFloating |
 | Fullscreen | false | false | false | true | AdoptFullscreen |
 | *any* | false | false | false | false | Err (minimized / hidden) |
 
-A fullscreen window is recorded as a float, so "fullscreen" implies
-"currently floating" and is checked first. `cycle` keeps its float/tile
+A fullscreen window is a tile of the strip (ADR-0021), so "fullscreen"
+implies "currently tiling" and is checked first. `cycle` keeps its float/tile
 meaning for everything else — on a fullscreen window it only ever leads back
 to tiled, and on an ignored window (which has no float/tile state to flip)
 it means `tile`. Adoption covers every ignore reason: maximized and
@@ -469,30 +469,66 @@ See [Window Registry](./window-registry.md#state-transitions).
 
 ## Fullscreen windows
 
-`set-window fullscreen` (`src/daemon/fullscreen.rs`) reuses the floating
-space as its home: the window is removed from the layout like a float and
-added to its workspace's `FloatingSpace` at the monitor's **screen rect**
-(taskbar included), recorded in the registry as `Floating(Active)`, and kept
-above the tiles with `HWND_TOPMOST`. A daemon-side map
-(`FlowWM::fullscreen`, HWND → `FullscreenOrigin`) is what distinguishes it
-from a float: no border (`border_style_for`), no float-location tracking
-(`rebuild_float_hwnds` skips it), no ring inset in the animation bridge, and
-`mode: "fullscreen"` in `flow query all`. The origin remembers the monitor,
-workspace, column, row, width and whether the window had the column to
-itself (or the float rect); the second toggle restores it through
-`ScrollingSpace::restore_window_at` (same column/row when the column still
-exists, else appended) or `register_float`. Minimize / hide keep the origin
-and the restore hook re-asserts the screen rect and the topmost flag; destroy
-drops it; `tiling off` and the shutdown rescue demote every fullscreen window
-to a float inside its work area and clear the topmost flag.
+Fullscreen is a **column of the strip**, not a float (ADR-0021,
+`src/daemon/fullscreen.rs`). `set-window fullscreen` flags the focused
+window's column (`Column::fullscreen`); the window stays a tile
+(`Tiling(Active)`) at its place in the strip:
+
+- **Entering.** A tile's column is flagged; a window that shares a stack is
+  first expelled into a column of its own right after the stack
+  (`mutations::expel_to_column`). A float leaves its floating space, joins
+  the strip after the focused column (`insert_window`, its float rect noted
+  as its pre-tiling anchor for `tiling off`) and is flagged. The view starts
+  at the column (`ScrollingSpace::enter_fullscreen`), the window goes into
+  the topmost band and loses its border.
+- **In view and parked.** On the canvas the column spans one screen
+  (`Column::canvas_width = monitor_width − gap`). While it starts the view
+  it is projected at the monitor's **screen rect** (taskbar covered) and
+  every other column is parked; scrolled or focused off, it is parked at the
+  screen rect's size, so the move is a pure one (ADR-0019). The animation
+  bridge places it without the ring inset (`tile_geometry`). See
+  [Projection](./layout/projection.md) and
+  [Mutations](./layout/mutations.md).
+- **Leaving.** `set-window fullscreen` again: a tile is merged back into
+  its stack at its row when it came from one and the stack still has room
+  (`mutations::merge_back`), else it stays a column of its own; its width
+  was never touched, and the strip's `viewport_offset` from before is
+  restored when it is still on that strip
+  (`ScrollingSpace::leave_fullscreen`). A float-origin window floats again
+  at its rect (`register_float`). `set-window tile|cycle` leave it in the
+  strip; `set-window float` floats it (its old rect, else centred).
+- **Bookkeeping.** `FlowWM::fullscreen` (HWND → `FullscreenOrigin`) is the
+  authority; the column flag follows it. The origin remembers the monitor
+  and workspace, and for a tile its row, one window of its stack (`None`
+  when it had the column to itself) and the view; for a float its rect.
+  `reflag_fullscreen` flags the column again whenever the window is
+  re-seated: restore / show (`readd_tile_to_home_monitor`, in the same
+  batch), `move-to-monitor`, `move-to-workspace`; `resync_fullscreen_columns`
+  re-flags every strip after a hotplug or a loadout (which do not save the
+  flag: a fullscreen window comes back as a column at its width).
+  Minimize / hide take the column out of the strip and keep the origin;
+  destroy forgets it.
+- **Pause and exit.** `tiling off` takes every window out of fullscreen
+  where it is (`leave_all_fullscreen_for_pause`: an app's own full screen
+  ended, topmost cleared, a plain column) before the usual pause, so
+  `tiling on` finds an ordinary tile. `flow stop`, the fail-back and session
+  end (`release_all_fullscreen`) clear topmost, end an app's full screen and
+  move the one in view inside its work area; a parked one is rescued like
+  any stranded window.
+- **What it is not.** It is not in the floating layer (`layer_wanted`
+  excludes daemon-fullscreen windows, the fullscreen code owns its topmost
+  flag), it is the tiling side for `focus-floating` / `focus-tiling`, and
+  its column refuses width and stack commands (see the dispatch reference).
+  `drag begin` refuses it; a native title-bar drag of it snaps back.
 
 A window under a `fullscreen = "app"` rule (Remote Desktop) is put there by
-the app itself: `SC_MAXIMIZE` in, `SC_RESTORE` out, with the same
-bookkeeping plus `FlowWM::app_fullscreen` (the captioned frame's invisible
-borders for the way back). The daemon never places such a frame unless the
-move is real (parking, `move-to-monitor`), and it follows the app's own
-switches through a location-change watch (`sync_app_fullscreen`). The
-demote paths ask the app to restore itself first. ADR-0020.
+the app itself: `SC_MAXIMIZE` in, `SC_RESTORE` out, with the same column
+and bookkeeping plus `FlowWM::app_fullscreen` (the captioned frame's
+invisible borders for the way back). The daemon never sizes such a frame:
+the rect the app chose is recorded as sent and every batch skips a target
+equal to it (`app_owns_rect`); parking by column or by workspace is sent as
+a pure move. The app's own switches are followed through a location-change
+watch (`sync_app_fullscreen`). ADR-0020.
 
 ## The floating layer (`[floating] always_on_top`)
 
@@ -608,7 +644,7 @@ ex-style only for a window that is wanted or held:
 |------------|-------|------|
 | Window becomes a float (toggle, rule at creation, startup adoption, adopt from ignored, restore of a float registered minimized, back from fullscreen, moved to another monitor) | `register_float` | enter (while raised; a float toggled while dropped enters at the next raise) |
 | Window registered / recovered as `Ignored(ExplicitRule)` | `on_window_created`, `on_window_state_change`, the startup `sync_all_top_layer` | enter |
-| Float restored or shown | `on_window_restored`, `on_window_shown` (after the fullscreen re-assert) | enter |
+| Float restored or shown | `on_window_restored`, `on_window_shown` | enter |
 | `tiling on`, config reload turning the option on, loadout load, display change | `sync_all_top_layer` (re-decides against the last foreground first) | enter |
 | Foreground moves to a tile / float / explicit-rule ignore that is not fullscreen, or that window's chrome comes back (F11 off) | `on_focus_changed`, the foreground's `LOCATIONCHANGE` / `STATECHANGE`, `reassert_top_layer` → `evaluate_top_layer` | **raise**: enter for every member |
 | Foreground moves to a fullscreen / untracked / OS-ignored window, or the foreground tile goes fullscreen (F11) | the same three paths | **drop**: leave for every member, seated under the foreground |
@@ -642,12 +678,12 @@ keymap) — acts on the **active monitor's** workspace:
 
 - **Which side is active** (`layer_to_focus`, pure): the floating layer when
   the registry's focus is an active float of that workspace's
-  `FloatingSpace` that the daemon did not put fullscreen; otherwise the
-  tiling side. `Other` goes to the side that is not active, so with nothing
+  `FloatingSpace`; otherwise the tiling side (a fullscreen window is a
+  column of the strip, ADR-0021). `Other` goes to the side that is not active, so with nothing
   focused it goes to the floats, as in niri.
 - **Candidates** (`layer_focus_candidates`, pure): floating — the
   workspace's `last_focused_float` while it is still in the space, then the
-  floats top-most first, never a daemon-fullscreen window; tiling — the
+  floats top-most first; tiling — the
   strip's `last_focused_window`, then every tile in column/row order.
 - **The walk** (`FlowWM::focus_layer_with`) is `focus_monitor`'s: a dead
   candidate is purged from its space, a hidden one skipped, a refused push

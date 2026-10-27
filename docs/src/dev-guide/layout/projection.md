@@ -152,6 +152,37 @@ clamped, so a column never hides every row.
 When a column has no more rows than `visible_rows`, or `visible_rows` is
 `0`, the output is identical to the flat model above.
 
+## Fullscreen columns
+
+A column with `fullscreen` set (`set-window fullscreen`, ADR-0021) holds one
+window and takes **one whole screen on the canvas**:
+`Column::canvas_width(monitor_width, gap)` is `monitor_width − gap` for it
+(`width_px` otherwise), so its slot is exactly `monitor_width` and the
+camera can start on it like on any column. Its `width_px` is left alone:
+it is the width the column returns to.
+
+The prefix sum the projection walks lives in one helper,
+`projection::column_left(layout, idx, gap, monitor_width)` (with
+`column_right`, `canvas_width` and `column_step_width` beside it); every
+other reader of the strip's geometry — `ensure_column_visible`, the scroll
+step, `center_viewport_on_focused`, the width-pattern pin and anchor —
+calls it, so they all agree on where a fullscreen column sits.
+
+The projection rule:
+
+| Fullscreen column is …                                   | Its rect                                                    | The other columns |
+|----------------------------------------------------------|-------------------------------------------------------------|-------------------|
+| the first column overlapping the viewport ("starts the view") | the monitor's **screen rect** (taskbar covered, no gap)       | all parked, on their side |
+| overlapping, but not first                               | parked right, at the screen rect's size (`y = screen.y`)   | as usual          |
+| left / right of the viewport                             | parked left / right, at the screen rect's size              | as usual          |
+
+Parking at the screen rect's size makes every move in and out of view a
+pure move (ADR-0019), which an app in its own full screen (ADR-0020)
+needs. Camera math stays in work-area units; only the emitted rect is the
+screen rect. A partly visible fullscreen window (niri's continuous
+scrolling) is not possible: Windows does not clip a window to its monitor,
+so the part out of view would be drawn on the neighbour.
+
 ## Why projection is the only place padding lives
 
 Padding is applied exclusively during projection and never stored on `Column`, `VirtualLayout`, or individual windows. This design choice keeps the virtual canvas model clean: columns are pure containers of windows with widths, and the spatial realities of screen edges, gaps, and margins are deferred to the one function that converts canvas geometry to screen coordinates. The `ActualEntry` rects produced by projection are the **final HWND rects** — they can be passed directly to `SetWindowPos` without any further adjustment.

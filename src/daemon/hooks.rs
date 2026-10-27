@@ -556,11 +556,8 @@ impl FlowWM {
         } else {
             self.seat_float_if_unseated(hwnd);
         }
-        // A fullscreen window comes back fullscreen (the registry restored
-        // it as a float at its pre-manage rect).
-        self.reassert_fullscreen(hwnd);
-        // A restored float is back in the floating layer (after the
-        // fullscreen check above: a fullscreen window is not a member).
+        // A restored float is back in the floating layer (a fullscreen
+        // window, re-seated as a fullscreen column above, is not a member).
         self.sync_top_layer(hwnd);
         // Border overlay: registry now records Active ⇒ refresh re-attaches.
         self.refresh_border_for(hwnd);
@@ -674,9 +671,6 @@ impl FlowWM {
         }
         if change == VisibilityChange::Shown && self.registry.is_tiling_active(hwnd) {
             self.readd_tile_to_home_monitor(hwnd);
-        }
-        if change == VisibilityChange::Shown {
-            self.reassert_fullscreen(hwnd);
         }
         // A re-shown float is back in the floating layer.
         self.sync_top_layer(hwnd);
@@ -959,8 +953,18 @@ impl FlowWM {
             return;
         }
         let idx = self.home_monitor_for_hwnd(hwnd);
-        let applied = self.monitors[idx].active_scrolling_mut().add_window(wid);
+        let mut applied = self.monitors[idx].active_scrolling_mut().add_window(wid);
         self.remember_monitor(wid, idx);
+        // A fullscreen window comes back as a fullscreen column, in view
+        // (ADR-0021), in the same batch.
+        let ws_id = self.monitors[idx].active_workspace_id();
+        if let Some(fs) = self.reflag_fullscreen(wid, idx, ws_id, true) {
+            applied = fs;
+            // An app brings its own full screen back with it, in place.
+            if self.is_app_fullscreen(hwnd) {
+                self.note_app_frame_at_screen(hwnd, idx, 0);
+            }
+        }
         self.animate_layout_on(idx, &applied);
     }
 

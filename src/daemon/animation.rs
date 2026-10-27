@@ -284,12 +284,22 @@ impl FlowWM {
             // independent copies without invalidating `window`.
             let window = self.registry.get_window(HWND(entry.window_id.0 as *mut _));
             let invisible_bounds = window.map(|w| w.invisible_bounds).unwrap_or_default();
-            let border_hwnd = window.and_then(|w| w.border.as_ref()).map(|b| b.hwnd());
+            // A fullscreen column has no ring: its overlay is dropped right after
+            // this batch, so the animator must not keep moving it (ADR-0021).
+            let border_hwnd = window
+                .and_then(|w| w.border.as_ref())
+                .map(|b| b.hwnd())
+                .filter(|_| !self.is_fullscreen(entry.window_id.0));
 
             // Skip the dragged window's border overlay.
             if let Some(eb) = excluded_border_hwnd
                 && border_hwnd == Some(eb)
             {
+                continue;
+            }
+            // An app in its own full screen owns its rect: only a move
+            // somewhere new (parking) is sent (ADR-0020).
+            if self.app_owns_rect(entry.window_id.0, entry.rect) {
                 continue;
             }
 
@@ -298,10 +308,15 @@ impl FlowWM {
             // that SetWindowPos places the window's visible content
             // exactly where the layout engine intended. Then shrink by
             // the configured border thickness to leave room for the
-            // colored overlay ring.
-            let window_rect = invisible_bounds
-                .visible_to_window(entry.rect)
-                .inset(border_thickness - border_overlap);
+            // colored overlay ring, except for a fullscreen column, which
+            // has no ring (`tile_geometry`).
+            let window_rect = tile_geometry(
+                self.is_fullscreen(entry.window_id.0),
+                invisible_bounds,
+                entry.rect,
+                border_thickness,
+                border_overlap,
+            );
 
             // The last commanded rect first (a preview may have moved the
             // window without committing); the registry's tiled rect — still
@@ -539,13 +554,13 @@ impl FlowWM {
                 }
                 // An app in its own full screen owns its rect: only a move
                 // somewhere new (parking) is sent (ADR-0020).
-                if self.is_app_fullscreen(entry.window_id.0)
-                    && self.last_submitted_rect(entry.window_id.0)
-                        == Some(Rect {
-                            y: entry.rect.y + y_offset,
-                            ..entry.rect
-                        })
-                {
+                if self.app_owns_rect(
+                    entry.window_id.0,
+                    Rect {
+                        y: entry.rect.y + y_offset,
+                        ..entry.rect
+                    },
+                ) {
                     continue;
                 }
                 if !has_float_target && crate::registry::hooks::is_float_hwnd(entry.window_id.0) {
@@ -553,7 +568,12 @@ impl FlowWM {
                 }
                 let window = self.registry.get_window(HWND(entry.window_id.0 as *mut _));
                 let invisible_bounds = window.map(|w| w.invisible_bounds).unwrap_or_default();
-                let border_hwnd = window.and_then(|w| w.border.as_ref()).map(|b| b.hwnd());
+                // A fullscreen column has no ring: its overlay is dropped right after
+                // this batch, so the animator must not keep moving it (ADR-0021).
+                let border_hwnd = window
+                    .and_then(|w| w.border.as_ref())
+                    .map(|b| b.hwnd())
+                    .filter(|_| !self.is_fullscreen(entry.window_id.0));
 
                 // Translate visible-rect → window-rect, shrink by the border
                 // inset (thickness - overlap) to make room for the ring, then apply the
@@ -568,10 +588,11 @@ impl FlowWM {
                 };
                 // A float's stored rect IS its visible rect (the float-sync
                 // path reads it back from the window), so it is never inset:
-                // its ring is seated around it instead. A fullscreen window
-                // (a float in the registry) has no ring at all. See
-                // `float_geometry` and `docs/src/dev-guide/floating-space.md`.
-                let (window_rect, border_rect) = float_geometry(
+                // its ring is seated around it instead. A fullscreen column
+                // has no ring at all. See `float_geometry` and
+                // `docs/src/dev-guide/floating-space.md`.
+                let (window_rect, border_rect) = window_geometry(
+                    self.is_fullscreen(entry.window_id.0),
                     is_active_float(window),
                     invisible_bounds,
                     shift(entry.rect),
@@ -659,14 +680,13 @@ impl FlowWM {
                 };
                 // An app in its own full screen owns its rect: only a move
                 // somewhere new (parking) is sent (ADR-0020).
-                if self.is_app_fullscreen(entry.window_id.0)
-                    && self.last_submitted_rect(entry.window_id.0) == Some(visible)
-                {
+                if self.app_owns_rect(entry.window_id.0, visible) {
                     continue;
                 }
                 // Floats keep their visible rect (ring seated around it);
                 // tiles are inset for the ring. See `float_geometry`.
-                let (window_rect, border_rect) = float_geometry(
+                let (window_rect, border_rect) = window_geometry(
+                    self.is_fullscreen(entry.window_id.0),
                     is_active_float(window),
                     invisible_bounds,
                     visible,
@@ -745,10 +765,17 @@ impl FlowWM {
             {
                 continue;
             }
+            if self.app_owns_rect(entry.window_id.0, entry.rect) {
+                continue;
+            }
 
-            let window_rect = invisible_bounds
-                .visible_to_window(entry.rect)
-                .inset(border_thickness - border_overlap);
+            let window_rect = tile_geometry(
+                self.is_fullscreen(entry.window_id.0),
+                invisible_bounds,
+                entry.rect,
+                border_thickness,
+                border_overlap,
+            );
             // Direct SetWindowPos — bypass the animator entirely so the boundary
             // follows the cursor with no tween lag. A successful move is the
             // window's new last-submitted rect (the preview never commits to
@@ -1063,8 +1090,7 @@ fn push_targets(
     decision
 }
 
-/// Whether `window` is an active float (fullscreen windows included: they
-/// are floats in the registry).
+/// Whether `window` is an active float.
 fn is_active_float(window: Option<&Window>) -> bool {
     window.is_some_and(|w| matches!(w.state, WindowState::Floating(FloatingState::Active { .. })))
 }
@@ -1092,9 +1118,49 @@ fn float_geometry(
         )
     } else {
         (
-            bounds.visible_to_window(visible).inset(thickness - overlap),
+            tile_geometry(false, bounds, visible, thickness, overlap),
             visible,
         )
+    }
+}
+
+/// The window rect to command for a tile whose layout rect is `visible`:
+/// translated for its invisible borders and inset by `thickness - overlap`
+/// for its ring, except a fullscreen column, which has no ring and covers
+/// its rect exactly (ADR-0021).
+fn tile_geometry(
+    fullscreen: bool,
+    bounds: crate::common::InvisibleBounds,
+    visible: Rect,
+    thickness: i32,
+    overlap: i32,
+) -> Rect {
+    let window = bounds.visible_to_window(visible);
+    if fullscreen {
+        window
+    } else {
+        window.inset(thickness - overlap)
+    }
+}
+
+/// [`float_geometry`] for any window of a workspace batch: a fullscreen
+/// column first ([`tile_geometry`], its border rect unused), else a float
+/// or a tile.
+fn window_geometry(
+    fullscreen: bool,
+    is_float: bool,
+    bounds: crate::common::InvisibleBounds,
+    visible: Rect,
+    thickness: i32,
+    overlap: i32,
+) -> (Rect, Rect) {
+    if fullscreen {
+        (
+            tile_geometry(true, bounds, visible, thickness, overlap),
+            visible,
+        )
+    } else {
+        float_geometry(is_float, bounds, visible, thickness, overlap)
     }
 }
 

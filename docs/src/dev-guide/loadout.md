@@ -120,10 +120,11 @@ offset, focus) with per-window registry metadata, swaps `WindowId` for
 fullscreen, or rule-ignored) are excluded from both save and restore. A
 minimized window is in no strip or floating space, so it is never saved
 either — including one the startup scan registered minimized. A fullscreen
-window (`set-window fullscreen`) is written as the float it comes back as
-after a restart: at the rect it was floating at before, else its screen
-rect clamped into the work area — never the taskbar-covering screen rect
-itself.
+window (`set-window fullscreen`) is a column of its strip (ADR-0021) and is
+written as one, at the width it returns to; the flag is not saved, so it
+comes back as an ordinary column. A load re-flags the columns of windows
+that are fullscreen at that moment (`resync_fullscreen_columns`), and one
+the file seats as a float leaves fullscreen.
 
 ### Restore
 

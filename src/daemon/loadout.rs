@@ -721,6 +721,21 @@ impl FlowWM {
             self.remember_monitor(wid, active_idx);
         }
 
+        // 6b. Fullscreen windows (ADR-0021): one the loadout seated as a
+        //     float leaves fullscreen; the columns of the others are
+        //     flagged again in the rebuilt strips (the file carries no
+        //     flag, so they come back as columns at their saved width).
+        let floated: Vec<isize> = self
+            .fullscreen
+            .keys()
+            .copied()
+            .filter(|h| !self.registry.is_tiling(*h))
+            .collect();
+        for hwnd in floated {
+            self.forget_fullscreen(hwnd, true);
+        }
+        self.resync_fullscreen_columns();
+
         // 7. Resolve the seating target. Preferred: the workspace that holds
         //    the OS foreground window — read-only (`GetForegroundWindow`, never
         //    `SetForegroundWindow`), so seating it keeps the focused window
@@ -927,27 +942,15 @@ impl FlowWM {
 
     /// Snapshot the floating area of a single workspace.
     ///
-    /// A fullscreen window (`set-window fullscreen`) is written as the
-    /// float it comes back as after a restart: at the rect it was floating
-    /// at before, else its screen rect clamped into the work area — never
-    /// the taskbar-covering screen rect itself.
+    /// A fullscreen window is a column of the strip (ADR-0021) and is
+    /// written there, at the width it returns to; the flag itself is not
+    /// saved.
     fn snapshot_floating(&self, ws: &crate::workspace::Workspace) -> Vec<FloatingEntry> {
         ws.floating
             .windows()
             .iter()
             .filter_map(|entry| {
-                let rect = match self.fullscreen.get(&entry.window_id.0) {
-                    Some(super::fullscreen::FullscreenOrigin::Float { rect, .. }) => *rect,
-                    Some(super::fullscreen::FullscreenOrigin::Tile { monitor, .. }) => {
-                        let wa = self
-                            .monitors
-                            .get(*monitor)
-                            .map(|m| m.work_area())
-                            .unwrap_or(entry.rect);
-                        entry.rect.clamped_into(wa)
-                    }
-                    None => entry.rect,
-                };
+                let rect = entry.rect;
                 self.window_ref_for(entry.window_id)
                     .map(|wr| FloatingEntry {
                         window: wr,

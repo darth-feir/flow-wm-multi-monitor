@@ -265,6 +265,16 @@ the same slot, the top half of the top window is "above all" and the bottom
 half of the bottom window "below all". A cursor in the gap between two rows
 belongs to the lower row's top half.
 
+**A fullscreen column** (ADR-0021) in view covers the work area, so the
+whole map is its column: its outer bands insert a new column beside it, and
+a row zone in its middle is refused by `insert_at_zone` (a fullscreen
+column holds one window) — the drop is a no-op and the tile snaps back. The
+dragged tile is under the fullscreen window (topmost) while it crosses it;
+accepted. `drag begin` on a fullscreen window is refused, and a native
+title-bar drag of a frame-fullscreen tile is never promoted from
+`Classifying` (`on_drag_move_with`), so it shows nothing and snaps back on
+release.
+
 **Totality.** Every cursor position in the work area maps to a zone,
 including an empty strip (`Column { col: 0 }`, the target of a cross-screen
 drop onto an empty monitor) and a strip whose columns are all off screen

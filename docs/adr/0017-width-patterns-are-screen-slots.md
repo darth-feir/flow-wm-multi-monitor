@@ -121,3 +121,13 @@ on the left-edge column; this record keeps that rule and builds on it).
   `docs/src/user-guide/config-reference.md` (*Width patterns*) and
   `docs/src/dev-guide/layout/mutations.md` (*Width patterns pin columns to
   screen slots*).
+
+## Amendment (stage 28, 2026-10-27): fullscreen columns
+
+A fullscreen column (ADR-0021) is a run of one: found at the left edge it is
+the anchor, never capped. A run of `n` slots never holds a fullscreen column
+other than its anchor; when one would fall inside it the run ends just before
+it (anchor `fullscreen − n`), and no anchor moves back onto or across an
+earlier fullscreen column. A fullscreen column takes no term; the terms are
+counted over the other columns. See
+[ADR-0021](0021-fullscreen-is-a-column.md), *Amendment to ADR-0017*.

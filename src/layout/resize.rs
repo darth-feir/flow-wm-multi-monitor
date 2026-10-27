@@ -272,6 +272,14 @@ pub fn resize_column_boundary_move(
     if neighbor_offset == 0 {
         return None;
     }
+    // A fullscreen column has no width to drag, and gives none to its
+    // neighbour (ADR-0021).
+    let beside = usize::try_from(col as i32 + neighbor_offset)
+        .ok()
+        .and_then(|i| layout.columns.get(i));
+    if column.fullscreen || beside.is_some_and(|n| n.fullscreen) {
+        return None;
+    }
 
     let min = config.min_column_width_px as i32;
     let max = config.abs_max_width;
@@ -1162,5 +1170,15 @@ mod tests {
         // The ceiling is derived from the two visible slots, not three rows.
         let max = derived_max_row_height(&layout.columns[0], &config);
         assert_eq!(max, 1080 - 3 * 4 - 100);
+    }
+
+    #[test]
+    fn a_fullscreen_column_takes_no_boundary_move_on_either_side() {
+        let mut layout = two_column_layout();
+        layout.columns[1].fullscreen = true;
+        let cfg = test_config();
+        // Its own edge, and its neighbour's edge facing it.
+        assert!(resize_column_boundary_move(&layout, 1, ResizeEdge::Left, 1200, &cfg).is_none());
+        assert!(resize_column_boundary_move(&layout, 0, ResizeEdge::Right, 1200, &cfg).is_none());
     }
 }

@@ -205,7 +205,10 @@ fn insert_at_zone(
             }
             // A full column (`max_rows`) refuses the drop: a drag has no
             // "past the column" to walk to, the user picks another zone.
-            if config.column_full(layout.columns[col].rows.len()) {
+            // So does a fullscreen column, which holds one window
+            // (ADR-0021).
+            if layout.columns[col].fullscreen || config.column_full(layout.columns[col].rows.len())
+            {
                 return None;
             }
             insert_row_at(layout, col, row, window, config);
@@ -304,7 +307,7 @@ fn can_scroll_right(vl: &VirtualLayout, wa_width: i32, vis_cols: &[VisibleColumn
         // their screen positions: gap = screen_x_1 - (screen_x_0 + col0_width).
         let col0_w = vl.columns[vis_cols[0].idx].width_px;
         let gap = (vis_cols[1].rect.x - (vis_cols[0].rect.x + col0_w)).max(0);
-        let total_span = projection::canvas_width(vl, gap);
+        let total_span = projection::canvas_width(vl, gap, wa_width);
         // canvas_width includes the trailing right-edge gap, which is not
         // scrollable content; compare the last column's content right edge.
         let content_right = total_span - gap;
@@ -2598,5 +2601,35 @@ mod tests {
             "dropped row {row} visible at offset {}",
             col.row_offset
         );
+    }
+
+    #[test]
+    fn a_row_drop_into_a_fullscreen_column_is_refused_but_a_column_beside_it_is_not() {
+        let mut layout = two_col_layout();
+        // Column 0 = [A] fullscreen; drag B out of column 1.
+        layout.columns[0].fullscreen = true;
+        for row in [0, 1] {
+            assert!(
+                preview_move(
+                    &layout,
+                    WindowId(2),
+                    DropZone::Row { col: 0, row },
+                    &test_config(),
+                    &test_monitor(),
+                )
+                .is_none()
+            );
+        }
+        let beside = preview_move(
+            &layout,
+            WindowId(2),
+            DropZone::Column { col: 1 },
+            &test_config(),
+            &test_monitor(),
+        )
+        .expect("a column beside it");
+        assert_eq!(beside.virtual_layout.find_window(WindowId(2)), Some((1, 0)));
+        assert!(beside.virtual_layout.columns[0].fullscreen);
+        assert!(!beside.virtual_layout.columns[1].fullscreen);
     }
 }

@@ -104,6 +104,42 @@ The offset adjustment is **free-form** — it is the minimum pixel scroll that r
 - Column off-screen right: `new_offset = max(col_right + gap - monitor_width, 0)`.
 - Column already visible: no change.
 
+Fullscreen columns (ADR-0021) add three rules, applied after the above:
+
+- A fullscreen target starts the view exactly: `new_offset = col_left − gap`,
+  visible or not.
+- A fullscreen column **left** of the target that still overlaps the new
+  view would start it (and cover the target): the view starts at the target
+  instead (`col_left − gap`). This is focus moving right off a fullscreen
+  column.
+- When the camera had to move and a fullscreen column **right** of the
+  target still overlaps the new view, the view ends at the target
+  (`col_right + gap − monitor_width`), so the columns before it show. This is
+  focus moving left off a fullscreen column.
+
+### Fullscreen columns: `set_fullscreen`, `expel_to_column`, `merge_back`
+
+`set_fullscreen(layout, window, on)` sets the flag of the window's column;
+turning it on for a window that shares a stack first expels it into a new
+single-row column right after the stack, at the stack's width
+(`expel_to_column`; the stack re-shares its height). The camera is the
+caller's (`ScrollingSpace::enter_fullscreen` / `leave_fullscreen`).
+`merge_back(layout, window, sibling, row)` puts a window that is alone in
+its column back into the column holding `sibling` at `row`; it refuses
+(`None`) a full stack, a fullscreen one, or one where the row would fall
+below `min_window_height_px`, and the window then stays a column of its own.
+
+A fullscreen column holds one window, so the pure mutations refuse what
+would change that or its width: `expand_column`, `shrink_column`,
+`set_column_width`, `toggle_monocle`, `merge_column` from or into it,
+`promote_window` on it, `swap_window` across it (the flag belongs to the
+column, not the window) and `resize_column_boundary_move` on or next to it
+return `None`; `add_window_to_column` on it appends a new column after it
+instead, like a full column. `swap_column` moves it, flag and all.
+`scroll_right` from a fullscreen column at the start of the view steps a
+whole screen even past the end-of-canvas clamp, which would otherwise
+leave it starting the view.
+
 ### `expand_column` / `shrink_column`
 
 These are the rung-climbing functions. From a column width `W`:
@@ -214,6 +250,7 @@ A `[columns]` preset with two or more terms (`"2/3+1/3"`) is a **pattern**: its 
 - **The slot order.** `slot_shift` (`0..n`) says which term the first slot shows. `apply_width_pattern` (`flow dispatch width` onto a pattern) sets it so the focused column takes term 0: pin once with shift 0 to find the anchor, then `shift = (anchor − focus) mod n`, then pin again. `set_width_pattern` (reload, hotplug, loadout carry-over) keeps the shift the strip had; a fraction resets it to 0.
 - **Where it runs.** `apply_mutation_for` pins **every** new layout before row normalization and projection, so a camera move (focus past an edge, scroll, ensure-visible after an insert, remove or swap) re-pins the run from the column now at the left edge, a structural change gives the arriving column the slot it lands in, and a sizing mutation that got through (`set_column_width` from a mouse resize commit) is undone on the spot. `refit_to_config` pins too, so a geometry change (`set_monitor_info`, `reconfigure`) keeps the slots after the daemon has recomputed the pixel widths for the new work area.
 - **Changing the number of slots.** The anchor stays and the `n` slots are filled from it; columns beyond the run leave on the right (parked), except that the focus is kept by moving the run right by the minimum, so the focus is the last slot. Growing — fewer slots to more, or a pattern to a fraction — fills to the right from the anchor; at the end of the strip the end-of-canvas clamp (`reanchor_after_reflow` for a fraction, the `len − n` cap for a pattern) moves the view left so the screen is full.
+- **Fullscreen columns** (ADR-0021, amending ADR-0017). A fullscreen column found at the left edge is the anchor as it is — a run of one, never capped. A run of `n` slots never holds a fullscreen column other than its anchor: when one would fall inside it (`fit_run`), the anchor moves to `fullscreen − n`, so the run ends just before it; neither that, the end cap nor the keep-the-focus move ever pulls the anchor back onto or across an earlier fullscreen column (`after_fullscreen_before`). A fullscreen column takes no term: terms are counted over the other columns (`slot_rank`), so its `width_px` stays the width it returns to and the columns on either side keep their slots when the view passes it. `apply_width_pattern` reads the slot shift off the same ranks.
 - The daemon refuses `expand-column`, `shrink-column`, `set-column-width` and `toggle-monocle` up front on a pinned strip (`FlowWM::pinned_widths_refusal`), so the user gets a message instead of a no-op. `flow query all` reports `slot_anchor` and `slot_shift` per monitor.
 
 `apply_width_pattern` with a single term goes through `apply_column_width_to_all` (every column resized, free afterwards, the camera re-anchored on the left-edge column). Why slots rather than widths by strip position: `docs/adr/0017-width-patterns-are-screen-slots.md`.

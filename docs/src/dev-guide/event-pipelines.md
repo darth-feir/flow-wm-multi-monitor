@@ -375,8 +375,8 @@ monitor's — see [Which monitor a returning window belongs to](#which-monitor-a
 
 With `[floating] always_on_top`, the minimize / hide handlers take a float out
 of the floating layer and the restore / show handlers put it back
-(`FlowWM::sync_top_layer`, run after the fullscreen re-assert so a fullscreen
-window is left to the fullscreen code); the created and state-change handlers
+(`FlowWM::sync_top_layer`; a fullscreen window, re-seated as a fullscreen
+column by `readd_tile_to_home_monitor`, is left to the fullscreen code); the created and state-change handlers
 put a window registered or recovered as a float or an explicit-rule ignore in,
 and the foreground handler raises an activated member again if its app
 demoted it. See [Floating Space](./floating-space.md#the-floating-layer-floating-always_on_top).
