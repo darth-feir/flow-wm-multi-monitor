@@ -189,10 +189,18 @@ pub fn default_log_path(config_dir: &Path) -> PathBuf {
     crate::config::dirs::log_file_path_in(config_dir, &today_local_date())
 }
 
+/// The keymap's daily log for today's local date:
+/// `<config_dir>/logs/flow-ahk-YYYY-MM-DD.log`. Like the daemon's own file it
+/// is named once, when the script is launched.
+#[must_use]
+pub fn default_ahk_log_path(config_dir: &Path) -> PathBuf {
+    crate::config::dirs::ahk_log_file_path_in(config_dir, &today_local_date())
+}
+
 /// Delete the daily log files under `<config_dir>/logs` that are older
 /// than `keep_days` days — judged by the date in the file name
-/// (`flowd-YYYY-MM-DD.log`), which is what the daemon wrote, not the
-/// modification time. `keep_days == 0` deletes nothing. Files with any other
+/// (`flowd-YYYY-MM-DD.log`, and the keymap's `flow-ahk-YYYY-MM-DD.log`),
+/// which is what was written, not the modification time. `keep_days == 0` deletes nothing. Files with any other
 /// name (a `--log-file` target, a user's own notes) are never touched.
 /// Returns how many files were removed; a missing `logs/` directory or an
 /// unreadable entry is not an error.
@@ -223,12 +231,14 @@ pub fn prune_old_logs(config_dir: &Path, keep_days: u32) -> usize {
     removed
 }
 
-/// `true` when `name` is a daily log file (`flowd-YYYY-MM-DD.log`) whose
-/// date is more than `keep_days` days before `today`. Pure.
+/// `true` when `name` is a daily log file (`flowd-YYYY-MM-DD.log`, or the
+/// keymap's `flow-ahk-YYYY-MM-DD.log`) whose date is more than `keep_days`
+/// days before `today`. Pure.
 #[must_use]
 pub fn is_stale_log_name(name: &str, today: NaiveDate, keep_days: u32) -> bool {
     let Some(date) = name
         .strip_prefix("flowd-")
+        .or_else(|| name.strip_prefix("flow-ahk-"))
         .and_then(|rest| rest.strip_suffix(".log"))
         .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
     else {
@@ -378,6 +388,9 @@ mod tests {
         assert!(!is_stale_log_name("debug-2026-09-22.log", today, 14));
         assert!(!is_stale_log_name("flowd-yesterday.log", today, 14));
         assert!(!is_stale_log_name("stage16.log", today, 14));
+        // The keymap's daily log ages the same way.
+        assert!(is_stale_log_name("flow-ahk-2026-09-22.log", today, 14));
+        assert!(!is_stale_log_name("flow-ahk-2026-10-22.log", today, 14));
     }
 
     #[test]

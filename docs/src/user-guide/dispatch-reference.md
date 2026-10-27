@@ -351,6 +351,24 @@ topmost by itself; with `[floating] always_on_top` the floats share that
 band, so a float and a fullscreen window stack by whichever was activated
 last.
 
+**The app's own full screen.** Some apps only behave as fullscreen when
+they switch themselves: Remote Desktop (`mstsc.exe`) keeps its scrollbars
+when its frame is merely sized over the screen. For a window under a
+`fullscreen = "app"` rule (see [`flow-rules.toml`](config-reference.md#fullscreen-field);
+the bundled rules set it for Remote Desktop) `set-window fullscreen` sends
+the app what its title-bar maximize button sends (`SC_MAXIMIZE`), waits up to
+2 s for it to fill the screen, and then treats it exactly like any other
+fullscreen window (same mode in `flow query all`, same toggling, workspace
+switching and `move-to-monitor`), except that FlowWM never sizes its frame.
+Leaving sends `SC_RESTORE` and re-seats it once the app has its caption
+back. The app's own switches are followed: clicking its maximize button
+while it is tiled makes it fullscreen in FlowWM too, and restoring it from
+inside (Remote Desktop's connection bar, Ctrl+Alt+Break) puts it back into
+its slot. If the app does not switch within 2 s the command fails and the
+window stays where it was. `flow stop`, `tiling off` and the fail-back ask
+the app to restore itself before the window is put back inside the work
+area.
+
 ```powershell
 flow dispatch set-window fullscreen    # and again to come back
 ```

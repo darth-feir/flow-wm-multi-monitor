@@ -486,6 +486,14 @@ and the restore hook re-asserts the screen rect and the topmost flag; destroy
 drops it; `tiling off` and the shutdown rescue demote every fullscreen window
 to a float inside its work area and clear the topmost flag.
 
+A window under a `fullscreen = "app"` rule (Remote Desktop) is put there by
+the app itself: `SC_MAXIMIZE` in, `SC_RESTORE` out, with the same
+bookkeeping plus `FlowWM::app_fullscreen` (the captioned frame's invisible
+borders for the way back). The daemon never places such a frame unless the
+move is real (parking, `move-to-monitor`), and it follows the app's own
+switches through a location-change watch (`sync_app_fullscreen`). The
+demote paths ask the app to restore itself first. ADR-0020.
+
 ## The floating layer (`[floating] always_on_top`)
 
 niri keeps its floating windows above the tiled strip at all times. FlowWM

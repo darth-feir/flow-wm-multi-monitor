@@ -592,6 +592,31 @@ pub fn set_foreground_hwnd(hwnd: isize) {
     FOREGROUND_HWND.store(hwnd, Ordering::Release);
 }
 
+/// Windows whose `fullscreen` rule option is `"app"` (ADR-0020): the hook
+/// callback forwards their `EVENT_OBJECT_LOCATIONCHANGE` (tile or not) so
+/// the daemon notices the app switching its own full screen on or off —
+/// a style + rect change that raises no state event of its own. Few
+/// entries (one per such window), so a plain `Vec` behind a `Mutex` that
+/// needs no initialisation.
+static APP_FULLSCREEN_WATCH: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+/// Watch (`true`) or stop watching `hwnd` for an app full-screen switch.
+pub fn set_app_fullscreen_watch(hwnd: isize, watch: bool) {
+    let mut set = unpoison(APP_FULLSCREEN_WATCH.lock());
+    let present = set.contains(&hwnd);
+    if watch && !present {
+        set.push(hwnd);
+    } else if !watch && present {
+        set.retain(|h| *h != hwnd);
+    }
+}
+
+/// Whether `hwnd` is watched for an app full-screen switch.
+#[must_use]
+pub fn is_app_fullscreen_watched(hwnd: isize) -> bool {
+    unpoison(APP_FULLSCREEN_WATCH.lock()).contains(&hwnd)
+}
+
 // ── HookThreadHandle ─────────────────────────────────────────────────
 
 /// Handle to the background hook thread.
@@ -1293,12 +1318,14 @@ fn hook_callback_body(event: u32, hwnd: HWND, id_object: i32) {
     // currently enabled (disabled while flow animates floats), OR when the
     // window is the currently-dragged tiled window (DRAGGED_HWND), OR when
     // it is the foreground window (FOREGROUND_HWND: the floating layer
-    // re-checks a foreground that resizes to fullscreen). All other event
-    // types are forwarded unconditionally as before.
+    // re-checks a foreground that resizes to fullscreen), OR when it is
+    // watched for an app full-screen switch (APP_FULLSCREEN_WATCH, ADR-0020).
+    // All other event types are forwarded unconditionally as before.
     if event == EVENT_OBJECT_LOCATIONCHANGE
         && (!FLOAT_TRACKING_ACTIVE.load(Ordering::Acquire) || !is_float_hwnd(hwnd_val))
         && DRAGGED_HWND.load(Ordering::Acquire) != hwnd_val
         && FOREGROUND_HWND.load(Ordering::Acquire) != hwnd_val
+        && !is_app_fullscreen_watched(hwnd_val)
     {
         return;
     }

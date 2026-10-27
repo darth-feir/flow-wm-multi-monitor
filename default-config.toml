@@ -207,8 +207,14 @@ default_path = "loadout.json"
 # day and deletes, at every start, the ones older than keep_days days (by the
 # date in the file name). 0 = keep every log file forever. Window titles are
 # only logged at debug level (`flow start --verbose`).
+#
+# keymap_log = true makes the daemon start the keymap with FLOW_AHK_LOG set
+# to logs/flow-ahk-YYYY-MM-DD.log (pruned by keep_days too). Off by default:
+# that log records launcher queries and the top hit's name. Read at daemon
+# start; FLOW_AHK_LOG set in the environment wins either way.
 [logging]
 keep_days = 14
+keymap_log = false
 
 # Update checker (`flow update`, and the start-time notice above). It asks
 # GitHub how this build relates to a branch or to the latest release and

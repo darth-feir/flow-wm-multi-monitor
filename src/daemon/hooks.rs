@@ -289,6 +289,7 @@ impl FlowWM {
         self.forget_submitted(hwnd);
         // A fullscreen window that closed takes its origin with it.
         self.forget_fullscreen(hwnd, false);
+        crate::registry::hooks::set_app_fullscreen_watch(hwnd, false);
 
         self.registry.remove_window(hwnd);
         // Border overlay: cleaned up automatically — `remove_window` drops the
@@ -722,6 +723,9 @@ impl FlowWM {
         // the bookkeeping below finds it; one that fails a creation gate
         // (taskbar, menu, dialog) falls through and the rest no-ops.
         let _ = self.register_if_untracked(hwnd, "on_focus_changed");
+        // A `fullscreen = "app"` window is watched from its first
+        // activation on (ADR-0020).
+        self.update_app_fullscreen_watch(hwnd);
 
         // An OS-ignored window taking the foreground may have been
         // un-maximized without a STATECHANGE reaching us (seen with Firefox
@@ -891,8 +895,14 @@ impl FlowWM {
         if self.tiling_paused {
             return;
         }
-        if let ReclassifyResult::Recovered { now_tiling: true } = outcome {
-            self.readd_tile_to_home_monitor(hwnd);
+        match outcome {
+            ReclassifyResult::Recovered { now_tiling: true } => {
+                self.readd_tile_to_home_monitor(hwnd);
+            }
+            ReclassifyResult::Recovered { now_tiling: false } => {
+                self.seat_recovered_float(hwnd);
+            }
+            _ => {}
         }
         // A window recovered as a float or as an explicit-rule ignore
         // enters the floating layer; the foreground window changing state
@@ -904,6 +914,28 @@ impl FlowWM {
         // Border overlay: covers all transitions — Ignored→Tiling (attach),
         // Tiling→Ignored (detach), and no-op cases.
         self.refresh_border_for(hwnd);
+    }
+
+    /// A window recovered from `Ignored(Maximized|Fullscreen)` as an active
+    /// float carries the classifier's placeholder rect (0x0) and sits in no
+    /// floating space: seat it like a freshly created float (centred on its
+    /// monitor, tracked, animated). No-op for any other window, or for one a
+    /// floating space already holds.
+    pub(super) fn seat_recovered_float(&mut self, hwnd: isize) {
+        let wid = WindowId(hwnd);
+        let is_float = matches!(
+            self.registry
+                .get_window(HWND(hwnd as *mut _))
+                .map(|w| &w.state),
+            Some(WindowState::Floating(FloatingState::Active { .. }))
+        );
+        if !is_float || self.monitor_index_containing(wid).is_some() {
+            return;
+        }
+        let rect = self.centered_float_rect(wid);
+        let float_actual = self.register_float(wid, rect);
+        self.animate_workspaces(&[(float_actual, 0)]);
+        log::info!("recovered float hwnd {hwnd} seated at {rect:?}");
     }
 
     /// Append a returning tiled window (restored, re-shown, or recovered
@@ -1231,6 +1263,53 @@ mod readd_tests {
         flow.readd_tile_to_home_monitor(B);
         assert_eq!(columns_holding(&flow, 1, B), 1);
         assert_eq!(columns_holding(&flow, 2, B), 0);
+    }
+
+    /// A window recovered from maximized as a float (the classifier's 0x0
+    /// placeholder, in no floating space) is seated like a new float; a
+    /// float already seated, or a tile, is left alone.
+    #[test]
+    fn a_recovered_float_is_seated_once_with_a_real_rect() {
+        const F: isize = 0xF0;
+        let mut flow = flow();
+        flow.config.borders.enabled = false;
+        tiled(&mut flow.registry, F);
+        if let Some(w) = flow.registry.get_window_mut(HWND(F as *mut _)) {
+            w.state = WindowState::Floating(FloatingState::Active {
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+            });
+        }
+        flow.registry.set_monitor(F, 0);
+        flow.seat_recovered_float(F);
+        let seated = |flow: &FlowWM| {
+            flow.monitors[0]
+                .active_workspace()
+                .floating
+                .windows()
+                .iter()
+                .filter(|e| e.window_id == WindowId(F))
+                .map(|e| e.rect)
+                .collect::<Vec<_>>()
+        };
+        let rects = seated(&flow);
+        assert_eq!(rects.len(), 1);
+        assert!(rects[0].width > 0 && rects[0].height > 0);
+        assert!(matches!(
+            flow.registry.get_window(HWND(F as *mut _)).map(|w| &w.state),
+            Some(WindowState::Floating(FloatingState::Active { rect })) if *rect == rects[0]
+        ));
+        // Again (a second STATECHANGE): nothing changes.
+        flow.seat_recovered_float(F);
+        assert_eq!(seated(&flow), rects);
+        // A tile is not a float.
+        flow.seat_recovered_float(A);
+        assert_eq!(columns_holding(&flow, 1, A), 1);
+        crate::registry::hooks::remove_float_hwnd(F);
     }
 }
 

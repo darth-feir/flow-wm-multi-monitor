@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "WindowRulesConfig",
-  "description": "Window classification configuration, loaded from `flow-rules.toml`.\n\nThis is the user-facing window rules file. Rules are evaluated top-to-bottom,\nfirst match wins. If no rule matches, `default_action` is used.\n\nLoaded from `%USERPROFILE%\\.config\\flow\\flow-rules.toml` (see [`config::dirs`](crate::config::dirs)\nfor overrides). If the file doesn't exist,\ndefaults to an empty rule list with `default_action: float`.\n\n# Example\n\n```toml\ndefault_action = \"float\"\n\n[[rules]]\nmatch = { exe = \"explorer.exe\", title_contains = \"Open\" }\naction = \"ignore\"\n\n[[rules]]\nmatch = { class = \"Chrome_WidgetWin_1\" }\naction = \"tile\"\ninitial_width_px = 960\n```",
+  "description": "Window classification configuration, loaded from `flow-rules.toml`.\n\nThis is the user-facing window rules file. Rules are evaluated top-to-bottom,\nfirst match wins. If no rule matches, `default_action` is used.\n\nLoaded from `%USERPROFILE%\\.config\\flow\\flow-rules.toml` (see [`config::dirs`](crate::config::dirs)\nfor overrides). If the file doesn't exist,\ndefaults to an empty rule list with `default_action: float`.\n\n# Example\n\n```toml\ndefault_action = \"float\"\n\n[[rules]]\nmatch = { exe = \"explorer.exe\", title_contains = \"Open\" }\naction = \"ignore\"\n\n[[rules]]\nmatch = { class = \"Chrome_WidgetWin_1\" }\naction = \"tile\"\ninitial_width_px = 960\n\n[[rules]]\nmatch = { exe = \"mstsc.exe\", class = \"TscShellContainerClass\" }\nfullscreen = \"app\"\n```",
   "type": "object",
   "properties": {
     "default_action": {
@@ -21,6 +21,21 @@
     "default_action"
   ],
   "$defs": {
+    "FullscreenStyle": {
+      "description": "How `set-window fullscreen` (Mod+F) is realised for a window.",
+      "oneOf": [
+        {
+          "description": "FlowWM sizes the window's frame over the monitor's screen rect; the\napp is not told (it keeps its caption).",
+          "type": "string",
+          "const": "frame"
+        },
+        {
+          "description": "FlowWM asks the app to switch to its own full screen\n(`WM_SYSCOMMAND SC_MAXIMIZE`, what the title-bar maximize button\nsends) and leaves the rect to it; `SC_RESTORE` brings it back. For\napps such as Remote Desktop (`mstsc.exe`) that only drop their\nscrollbars in their own full-screen mode.",
+          "type": "string",
+          "const": "app"
+        }
+      ]
+    },
     "MatchRule": {
       "description": "Match criteria for a window rule.\n\nAll fields are optional — a rule matches if **all specified fields** match\n(AND logic). Unspecified (`None`) fields are ignored entirely.\n\nEach field supports a different matching mode:\n\n- **Exact match** (`exe`, `title`, `class`, `process_path`) — the candidate\n  string must equal the rule value exactly.\n\n- **Substring match** (`title_contains`) — the rule value must appear as a\n  contiguous substring of the candidate string.\n\n- **Regex match** (`exe_regex`, `title_regex`, `class_regex`,\n  `process_path_regex`) — the rule value is compiled as a Rust regex and the\n  full candidate string must match (not just a substring). Uses the `regex`\n  crate's syntax.\n\n# Case Sensitivity\n\n| Field               | Semantics                                         |\n|---------------------|---------------------------------------------------|\n| `exe`               | Case-insensitive (Windows paths are case-insensitive) |\n| `exe_regex`         | Case-insensitive by default (Windows paths)       |\n| `title`             | Case-sensitive                                    |\n| `title_contains`    | Case-sensitive                                    |\n| `title_regex`       | Case-sensitive (use `(?i)` for case-insensitive)  |\n| `class`             | Case-sensitive                                    |\n| `class_regex`       | Case-sensitive (use `(?i)` for case-insensitive)  |\n| `process_path`      | Case-insensitive (Windows paths)                  |\n| `process_path_regex` | Case-insensitive by default (Windows paths)      |\n\n**Why are `exe` and `process_path` case-insensitive?**\n\nOn Windows, the filesystem is case-insensitive — `chrome.exe` and `Chrome.exe`\nrefer to the same file. Window class names (`class`) and titles (`title`) are\ncase-sensitive strings that applications control, so they are matched exactly.\nRegex fields use the `(?i)` / `(?-i)` inline flags if the user needs different\nbehavior.",
       "type": "object",
@@ -115,8 +130,26 @@
       "type": "object",
       "properties": {
         "action": {
-          "description": "Action to take when matched.",
-          "$ref": "#/$defs/WindowAction"
+          "description": "Action to take when matched. A rule without one only carries\noptions (such as `fullscreen`): classification skips it and goes on\nto the next rule.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WindowAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fullscreen": {
+          "description": "How `set-window fullscreen` is realised for a matching window\n(default `\"frame\"`). Looked up on its own: the first rule of any\nlayer that matches and sets it wins, so a learned rule (which never\nsets it) does not hide it. See ADR-0020.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FullscreenStyle"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "initial_width_px": {
           "description": "Optional initial column width in pixels.\n\nWhen set, a window matching this rule is created at this width instead\nof the default `column_width`. The value must fall within the engine's\ncurrent bounds (`[min_column_width_px, abs_max_width]`) at apply time.",
@@ -137,8 +170,7 @@
         }
       },
       "required": [
-        "match",
-        "action"
+        "match"
       ]
     }
   }

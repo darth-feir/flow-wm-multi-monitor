@@ -9,7 +9,8 @@
 # checked first).
 #
 # Format: first match wins. Each rule has a "match" clause (AND logic) and
-# an "action" (tile, float, or ignore).
+# an "action" (tile, float, or ignore). A rule may instead carry only options
+# (`fullscreen = "app"`); classification skips such a rule.
 #
 # For match field documentation, see the MatchRule docstring in src/config/types.rs.
 
@@ -236,3 +237,14 @@ action = "float"
 [rules.match]
 exe = "WindowsTerminal.exe"
 class = "CASCADIA_HOSTING_WINDOW_CLASS"
+
+# ── Remote Desktop (mstsc.exe) ──────
+
+# Mod+F asks Remote Desktop for its own full screen (the title-bar maximize
+# button's SC_MAXIMIZE) instead of sizing the frame: only then does the remote
+# desktop fill the monitor without scrollbars. Options-only rule (no action):
+# how mstsc is classified is left to your rules, your learned rules and
+# default_action. ADR-0020.
+[[rules]]
+match = { exe = "mstsc.exe", class = "TscShellContainerClass" }
+fullscreen = "app"

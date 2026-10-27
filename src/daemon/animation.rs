@@ -537,6 +537,17 @@ impl FlowWM {
                 if Some(entry.window_id.0) == excluded_float {
                     continue;
                 }
+                // An app in its own full screen owns its rect: only a move
+                // somewhere new (parking) is sent (ADR-0020).
+                if self.is_app_fullscreen(entry.window_id.0)
+                    && self.last_submitted_rect(entry.window_id.0)
+                        == Some(Rect {
+                            y: entry.rect.y + y_offset,
+                            ..entry.rect
+                        })
+                {
+                    continue;
+                }
                 if !has_float_target && crate::registry::hooks::is_float_hwnd(entry.window_id.0) {
                     has_float_target = true;
                 }
@@ -646,6 +657,13 @@ impl FlowWM {
                     width: entry.rect.width,
                     height: entry.rect.height,
                 };
+                // An app in its own full screen owns its rect: only a move
+                // somewhere new (parking) is sent (ADR-0020).
+                if self.is_app_fullscreen(entry.window_id.0)
+                    && self.last_submitted_rect(entry.window_id.0) == Some(visible)
+                {
+                    continue;
+                }
                 // Floats keep their visible rect (ring seated around it);
                 // tiles are inset for the ring. See `float_geometry`.
                 let (window_rect, border_rect) = float_geometry(

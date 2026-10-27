@@ -515,6 +515,33 @@ impl WindowRegistry {
         self.windows.get(&hwnd_val).and_then(|w| w.monitor)
     }
 
+    /// How `set-window fullscreen` is realised for tracked `hwnd_val`
+    /// ([`ClassificationPipeline::fullscreen_style`](classification::ClassificationPipeline::fullscreen_style)
+    /// over its exe, title, class and path); `Frame` for an untracked one.
+    #[must_use]
+    pub fn fullscreen_style(&self, hwnd_val: isize) -> crate::config::types::FullscreenStyle {
+        self.windows
+            .get(&hwnd_val)
+            .map(|w| {
+                self.pipeline
+                    .fullscreen_style(&classification::WindowCandidate {
+                        exe: w.exe.clone(),
+                        title: w.title.clone(),
+                        class: w.class.clone(),
+                        process_path: w.process_path.to_string_lossy().into_owned(),
+                    })
+            })
+            .unwrap_or_default()
+    }
+
+    /// Set `hwnd_val`'s invisible frame borders (a window whose chrome the
+    /// app took away or gave back, ADR-0020). No-op for an untracked one.
+    pub fn set_invisible_bounds(&mut self, hwnd_val: isize, bounds: InvisibleBounds) {
+        if let Some(w) = self.windows.get_mut(&hwnd_val) {
+            w.invisible_bounds = bounds;
+        }
+    }
+
     /// Replace the classification pipeline's learned-rules layer.
     ///
     /// See (`docs/src/dev-guide/classification.md`).
@@ -2232,7 +2259,8 @@ mod tests {
                     exe: Some("olk.exe".into()),
                     ..Default::default()
                 },
-                action: crate::config::types::WindowAction::Tile,
+                action: Some(crate::config::types::WindowAction::Tile),
+                fullscreen: None,
                 initial_width_px: None,
                 override_persist: false,
             }],
@@ -3877,7 +3905,8 @@ mod tests {
                     exe: Some("pinned.exe".into()),
                     ..Default::default()
                 },
-                action: WindowAction::Ignore,
+                action: Some(WindowAction::Ignore),
+                fullscreen: None,
                 initial_width_px: None,
                 override_persist: false,
             }],

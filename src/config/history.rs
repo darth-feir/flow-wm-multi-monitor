@@ -96,8 +96,8 @@ impl HistoryStore {
             });
 
         if let Some(rule) = existing {
-            if rule.action != action {
-                rule.action = action;
+            if rule.action != Some(action) {
+                rule.action = Some(action);
                 return true;
             }
             // Same action — no change.
@@ -107,7 +107,8 @@ impl HistoryStore {
         // No existing entry — push a new rule.
         self.config.rules.push(WindowRule {
             match_: match_rule,
-            action,
+            action: Some(action),
+            fullscreen: None,
             initial_width_px: None,
             override_persist: false,
         });
@@ -203,7 +204,7 @@ action = "tile"
         std::fs::write(&path, toml_content).unwrap();
         let store = HistoryStore::load(&path);
         assert_eq!(store.len(), 1);
-        assert_eq!(store.rules()[0].action, WindowAction::Tile);
+        assert_eq!(store.rules()[0].action, Some(WindowAction::Tile));
     }
 
     // ── record tests ───────────────────────────────────────────────────────
@@ -220,7 +221,7 @@ action = "tile"
             store.rules()[0].match_.class.as_deref(),
             Some("Chrome_WidgetWin_1")
         );
-        assert_eq!(store.rules()[0].action, WindowAction::Tile);
+        assert_eq!(store.rules()[0].action, Some(WindowAction::Tile));
     }
 
     /// Recording an existing app with the same exe + class updates the action.
@@ -235,7 +236,7 @@ action = "tile"
         );
         assert!(changed);
         assert_eq!(store.len(), 1, "should still be exactly one rule (dedup)");
-        assert_eq!(store.rules()[0].action, WindowAction::Float);
+        assert_eq!(store.rules()[0].action, Some(WindowAction::Float));
     }
 
     /// When class is None, identity falls back to exe-only.
@@ -296,9 +297,9 @@ action = "tile"
 
         let loaded = HistoryStore::load(&path);
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded.rules()[0].action, WindowAction::Tile);
+        assert_eq!(loaded.rules()[0].action, Some(WindowAction::Tile));
         assert_eq!(loaded.rules()[0].match_.exe.as_deref(), Some("chrome.exe"));
-        assert_eq!(loaded.rules()[1].action, WindowAction::Float);
+        assert_eq!(loaded.rules()[1].action, Some(WindowAction::Float));
         assert_eq!(loaded.rules()[1].match_.exe.as_deref(), Some("notepad.exe"));
     }
 

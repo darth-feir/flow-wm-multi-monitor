@@ -18,6 +18,12 @@ A good bug report is reproducible. Please include:
 
   (one file per day, appended across restarts).
 
+  For a key binding that did nothing, add the keymap's log of the same day,
+  `logs\flow-ahk-YYYY-MM-DD.log` in the same folder. It is off by default:
+  set `keymap_log = true` under `[logging]` in `flow.toml`, restart the
+  daemon, and reproduce the miss. It records each dispatch the keys sent;
+  launcher queries are in it too, so look it over before attaching it.
+
   The cleanest way to capture a bug is to reproduce it with an isolated log:
 
   ```

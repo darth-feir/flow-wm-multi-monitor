@@ -400,3 +400,17 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   Visual Studio-shell apps (SSMS 21) that jumped onto the left monitor
   instead of parking right.
   `docs/adr/0019-pure-moves-and-silent-parked-resizes.md`
+- **ADR-0020 — An app that has a full screen of its own is asked for it,
+  and its own switches are followed.** A `fullscreen = "app"` rule option
+  (bundled for Remote Desktop) makes `set-window fullscreen` post
+  `SC_MAXIMIZE` / `SC_RESTORE` instead of sizing the frame, and never place
+  the frame while the app is in its full screen; the app's own maximize and
+  restore are adopted through a location-change watch on such windows. A
+  rule's `action` became optional (options-only rules), and the keymap
+  re-installs its keyboard hook in front of Remote Desktop's. Amended by
+  stage 27: Mod+F into the full screen waits for the Win release, the hook
+  re-install is periodic but never while a modifier is down, and bound Win
+  chords get Win-less twins that fire on the keymap's own Win tracking
+  (Remote Desktop keeps the Win key from Windows); the daemon gives the
+  keymap a dated log next to its own.
+  `docs/adr/0020-app-fullscreen.md`

@@ -58,7 +58,7 @@ Flow(cmd) {
 AhkLog(msg) {
     static path := EnvGet("FLOW_AHK_LOG")
     if path
-        try FileAppend(FormatTime(, "HH:mm:ss") " " msg "`n", path)
+        try FileAppend(FormatTime(, "HH:mm:ss") "." A_MSec " " msg "`n", path)
 }
 
 ; Short on-screen message in the bottom-right corner of the primary screen,
@@ -328,6 +328,33 @@ AlwaysGate(*) {
     global DaemonUp
     return DaemonUp
 }
+; The gate of a registration scope: "tiling", "always", or either with "rdp-"
+; for a Remote Desktop twin.
+BindGate(scope) {
+    switch scope {
+        case "tiling": return TilingGate
+        case "rdp-tiling": return RdpTilingGate
+        case "rdp-always": return RdpAlwaysGate
+    }
+    return AlwaysGate
+}
+
+; A dispatch bind. Asking a windowed Remote Desktop for its full screen
+; waits (at most 2 s) until the Windows keys are released: Remote Desktop arms
+; its own keyboard hook as it switches, and a Win key still held then has its
+; release eaten (a stuck Win key) or let through unmasked (the Start menu).
+; docs/adr/0020-app-fullscreen.md (amendment of stage 27).
+DispatchBind(cmd) {
+    if (InStr(cmd, "fullscreen") && WinActive("ahk_class TscShellContainerClass")) {
+        style := 0
+        try style := WinGetStyle("A")
+        if (style & 0xC40000) {
+            KeyWait("LWin", "T2")
+            KeyWait("RWin", "T2")
+        }
+    }
+    D(cmd)
+}
 
 ; What a bind runs. 0 for a kind this script does not know (a newer daemon).
 BindCallback(kind, argvText, admin) {
@@ -337,7 +364,7 @@ BindCallback(kind, argvText, admin) {
             cmd := ""
             for a in argv
                 cmd .= (cmd = "" ? "" : " ") Quote(a)
-            return (*) => D(cmd)
+            return (*) => DispatchBind(cmd)
         case "spawn":
             return (*) => Launch(argv, admin)
         case "launcher":
@@ -358,7 +385,7 @@ BindCallback(kind, argvText, admin) {
 ApplyBinds(text) {
     global Registered, HelpRows, BindsText
     for r in Registered {
-        HotIf(r[2] = "tiling" ? TilingGate : AlwaysGate)
+        HotIf(BindGate(r[2]))
         try Hotkey(r[1], "Off")
     }
     Registered := [], HelpRows := []
@@ -377,7 +404,7 @@ ApplyBinds(text) {
                     failed++
                     continue
                 }
-                HotIf(f[3] = "tiling" ? TilingGate : AlwaysGate)
+                HotIf(BindGate(f[3]))
                 try {
                     Hotkey(f[2], cb, "On")
                     Registered.Push([f[2], f[3]])
@@ -385,6 +412,17 @@ ApplyBinds(text) {
                 } catch as e {
                     AhkLog("binds: " f[6] " (" f[2] ") not registered: " e.Message)
                     failed++
+                    continue
+                }
+                ; The Remote Desktop twin of a Win chord (see CheckRdpFullscreen).
+                if RegExMatch(f[2], "^([#^!+<>*~$]*)(.+)$", &m) && InStr(m[1], "#") {
+                    twin := StrReplace(m[1], "#") m[2]
+                    HotIf(BindGate("rdp-" f[3]))
+                    try {
+                        Hotkey(twin, RdpTwin.Bind(cb), "On")
+                        Registered.Push([twin, "rdp-" f[3]])
+                    } catch as e
+                        AhkLog("binds: " f[6] " (" twin ", Remote Desktop twin) not registered: " e.Message)
                 }
             case "row", "hardwired":
                 HelpRows.Push([f[2], f[3]])
@@ -437,6 +475,101 @@ AhkLog("startup: tiling " (TilingOn ? "on" : "off"))
 DaemonUp := true
 try CfgSeen := FileGetTime(CfgPath, "M")
 SetTimer(CheckDaemon, 2000)
+
+; Remote Desktop in its own full screen (Mod+F under fullscreen = "app") runs
+; a low-level keyboard hook that sends the Windows key to the remote session
+; (keyboardhook:i:2, the mstsc default), so Windows never sees it go down and
+; AutoHotkey's own modifier state, which follows Windows', reads it as up: a
+; bound Win chord would not fire. While such a full screen is active:
+; - this script keeps its hook in front of mstsc's: re-installed when the full
+;   screen becomes active and every RdpHookEveryMs after (in a typing pause:
+;   a re-install can drop a keystroke), but never while a modifier is down or
+;   right after a hotkey (a re-install forgets that a Win chord fired, and the
+;   Win release then opens the Start menu);
+; - it follows the Win key itself (RdpWinWatch) and every bound Win chord has a
+;   twin without the Win modifier that fires only while that key is held
+;   (ApplyBinds, RdpTwin). Chords the table does not bind still reach the
+;   session. docs/adr/0020-app-fullscreen.md (stage 27 amendment).
+RdpHookEveryMs := 1000
+RdpFullscreenSeen := 0  ; the full-screen frame the hook was last re-installed for (0: none active)
+RdpHookAt := 0          ; A_TickCount of that re-install
+RdpDeferred := false    ; a re-install is waiting for the modifiers (logged once)
+RdpHookCount := 0       ; re-installs while the current full screen is active (logged when it is left)
+RdpWinDown := false     ; LWin or RWin physically down, as this script's hook saw it
+RdpWinAt := 0           ; A_TickCount of its last key-down event
+CheckRdpFullscreen() {
+    global RdpFullscreenSeen, RdpHookAt, RdpDeferred, RdpHookEveryMs, RdpHookCount
+    hwnd := RdpFullscreenActive()
+    if !hwnd {
+        if RdpFullscreenSeen
+            AhkLog("rdp: full screen " Format("0x{:x}", RdpFullscreenSeen) " no longer active; " RdpHookCount " re-install(s) while it was")
+        RdpFullscreenSeen := 0, RdpDeferred := false, RdpHookCount := 0
+        return
+    }
+    if (hwnd = RdpFullscreenSeen && (A_TickCount - RdpHookAt < RdpHookEveryMs || A_TimeIdleKeyboard < 300))
+        return
+    held := RdpWinHeld() ? " Win" : ""
+    for k in ["LWin", "RWin", "LControl", "RControl", "LAlt", "RAlt", "LShift", "RShift"]
+        if GetKeyState(k, "P")
+            held .= " " k
+    since := A_TimeSincePriorHotkey
+    if (held != "" || (since != "" && since >= 0 && since < 400)) {
+        if !RdpDeferred
+            AhkLog("rdp: full screen " Format("0x{:x}", hwnd) " re-install deferred (" (held != "" ? "held:" held : "hotkey " since " ms ago") ")")
+        RdpDeferred := true
+        return
+    }
+    InstallKeybdHook(true, true)
+    RdpHookCount := hwnd = RdpFullscreenSeen ? RdpHookCount + 1 : 1
+    if (hwnd != RdpFullscreenSeen || RdpDeferred)
+        AhkLog("rdp: full screen " Format("0x{:x}", hwnd) " active; keyboard hook re-installed in front (every " RdpHookEveryMs " ms while active)")
+    RdpFullscreenSeen := hwnd, RdpHookAt := A_TickCount, RdpDeferred := false
+}
+; The active window when it is a Remote Desktop frame without caption or thick
+; frame (its own full screen), else 0.
+RdpFullscreenActive() {
+    try {
+        h := WinExist("A")
+        if (h && WinGetClass(h) = "TscShellContainerClass" && !(WinGetStyle(h) & 0xC40000))
+            return h
+    }
+    return 0
+}
+RdpWinWatch := InputHook("V L0 I")   ; listens only: V passes every key on, L0 collects nothing
+RdpWinWatch.KeyOpt("{LWin}{RWin}", "N")
+RdpWinWatch.OnKeyDown := RdpWinChanged.Bind(true)
+RdpWinWatch.OnKeyUp := RdpWinChanged.Bind(false)
+RdpWinWatch.Start()
+RdpWinChanged(down, *) {
+    global RdpWinDown := down, RdpWinAt
+    if down
+        RdpWinAt := A_TickCount
+}
+; The Win key is held: seen down and not up, for at most 5 s since its last
+; key-down, so a release mstsc swallowed cannot leave the twins armed.
+RdpWinHeld() {
+    global RdpWinDown, RdpWinAt
+    return RdpWinDown && A_TickCount - RdpWinAt < 5000
+}
+; Gates of the twins: an mstsc full screen is active, the Win key is held, and
+; the scope's own gate holds.
+RdpTilingGate(*) {
+    return RdpWinHeld() && RdpFullscreenActive() && TilingGate()
+}
+RdpAlwaysGate(*) {
+    return RdpWinHeld() && RdpFullscreenActive() && AlwaysGate()
+}
+; A twin's action. The session got the Win key down (mstsc forwarded it), so
+; first mask it and release it there while mstsc still forwards keys: when the
+; chord leaves the full screen the physical release stays local, and the
+; session would keep a Win key held (its next "l" locks it). The mask is a
+; Ctrl tap, not AutoHotkey's vkE8, which has no scan code and never reaches
+; the session (its Start menu opened).
+RdpTwin(cb, *) {
+    Send("{Blind}{LCtrl}{LWin up}{RWin up}")
+    cb()
+}
+SetTimer(CheckRdpFullscreen, 250)
 
 ; No bare-Win-tap swallow on purpose: the `~LWin::Send "{Blind}{vkE8}"` trick
 ; dropped about one chord in eight in testing (see README.md).

@@ -9,12 +9,21 @@
 //! (minimize, hide, destroy, `tiling off`, the shutdown rescue) and how it
 //! hands the topmost flag over to the floating layer are in
 //! `docs/src/dev-guide/floating-space.md`, *Fullscreen windows*.
+//!
+//! A window under a `fullscreen = "app"` rule is put fullscreen by the app
+//! itself (`SC_MAXIMIZE` / `SC_RESTORE`): the same mode and bookkeeping,
+//! but the daemon never sizes its frame, and the app's own switches are
+//! adopted ([`app_fullscreen_step`]). Why, and the state machine, are in
+//! ADR-0020 (`docs/adr/0020-app-fullscreen.md`).
+
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
 
-use crate::common::{Rect, WindowId};
+use crate::common::{InvisibleBounds, Rect, WindowId};
+use crate::config::types::FullscreenStyle;
 use crate::ipc::message::SocketResponse;
-use crate::registry::hooks::remove_float_hwnd;
+use crate::registry::hooks::{remove_float_hwnd, set_app_fullscreen_watch};
 use crate::registry::types::{FloatingState, TilingState, WindowState};
 use crate::registry::win32 as registry_win32;
 use crate::workspace::{WorkspaceId, WorkspaceParking};
@@ -53,6 +62,98 @@ impl FullscreenOrigin {
     }
 }
 
+/// How long the daemon waits for an app to finish switching its own full
+/// screen on or off after `SC_MAXIMIZE` / `SC_RESTORE` (ADR-0020).
+pub(super) const APP_FULLSCREEN_WAIT: Duration = Duration::from_millis(2000);
+
+/// What an app-fullscreen window's live state asks of the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AppFullscreenStep {
+    /// The app went full screen by itself (title-bar maximize): enter
+    /// FlowWM's fullscreen mode for it without asking it again.
+    Adopt,
+    /// The app left its full screen by itself (connection-bar restore,
+    /// Ctrl+Alt+Break): leave fullscreen and re-seat it.
+    Leave,
+}
+
+/// The decision behind [`FlowWM::sync_app_fullscreen`], pure: `known` =
+/// the daemon has it in app fullscreen, `seatable` = it is an active tile
+/// or float not in any fullscreen, `live_fullscreen` = it covers its
+/// monitor without chrome, `chrome` = it has a caption / thick frame
+/// (`None`: gone). Leaving is judged by the chrome alone, so the daemon's
+/// own parking move of a fullscreen window (off its monitor, still
+/// chromeless) never reads as a leave.
+#[must_use]
+pub(super) fn app_fullscreen_step(
+    known: bool,
+    seatable: bool,
+    live_fullscreen: bool,
+    chrome: Option<bool>,
+) -> Option<AppFullscreenStep> {
+    match (known, chrome) {
+        (_, None) => None,
+        (true, Some(true)) => Some(AppFullscreenStep::Leave),
+        (false, Some(false)) if seatable && live_fullscreen => Some(AppFullscreenStep::Adopt),
+        _ => None,
+    }
+}
+
+/// The Win32 side of an app's own full screen, injectable for tests.
+pub(super) trait AppFullscreenProbe {
+    /// Post `SC_MAXIMIZE` (`enter`) or `SC_RESTORE`; `true` when queued.
+    fn request(&self, hwnd: isize, enter: bool) -> bool;
+    /// Wait (bounded by [`APP_FULLSCREEN_WAIT`]) until the window is full
+    /// screen on its monitor (`enter`) or has its chrome back; `true` when
+    /// it got there.
+    fn wait(&self, hwnd: isize, enter: bool) -> bool;
+    /// Covers its monitor's full rect without chrome.
+    fn is_fullscreen_live(&self, hwnd: isize) -> bool;
+    /// Has a caption or thick frame; `None` when the window is gone.
+    fn has_chrome(&self, hwnd: isize) -> Option<bool>;
+    /// Its invisible frame borders as they are now.
+    fn invisible_bounds(&self, hwnd: isize) -> InvisibleBounds;
+}
+
+/// The production [`AppFullscreenProbe`]: plain Win32, polling every 15 ms.
+pub(super) struct Win32AppFullscreen;
+
+impl AppFullscreenProbe for Win32AppFullscreen {
+    fn request(&self, hwnd: isize, enter: bool) -> bool {
+        registry_win32::post_syscommand(hwnd, enter)
+    }
+
+    fn wait(&self, hwnd: isize, enter: bool) -> bool {
+        let deadline = Instant::now() + APP_FULLSCREEN_WAIT;
+        loop {
+            let reached = if enter {
+                self.is_fullscreen_live(hwnd)
+            } else {
+                self.has_chrome(hwnd) != Some(false)
+            };
+            if reached {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+
+    fn is_fullscreen_live(&self, hwnd: isize) -> bool {
+        registry_win32::is_fullscreen_on_its_monitor(hwnd)
+    }
+
+    fn has_chrome(&self, hwnd: isize) -> Option<bool> {
+        registry_win32::has_chrome(hwnd)
+    }
+
+    fn invisible_bounds(&self, hwnd: isize) -> InvisibleBounds {
+        registry_win32::get_invisible_bounds(HWND(hwnd as *mut _))
+    }
+}
+
 /// Where `set-window` sends a window that leaves fullscreen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FullscreenExit {
@@ -76,13 +177,191 @@ impl FlowWM {
     /// Forget `hwnd`'s fullscreen origin (the window is gone or became a
     /// plain float). Clears the topmost flag when asked.
     pub(super) fn forget_fullscreen(&mut self, hwnd: isize, clear_topmost: bool) {
+        self.app_fullscreen.remove(&hwnd);
         if self.fullscreen.remove(&hwnd).is_some() && clear_topmost {
             let _ = registry_win32::set_topmost(hwnd, false);
         }
     }
 
-    /// Put the focused tile or float fullscreen on its monitor.
+    /// Whether `hwnd` is fullscreen by the app's own full screen (ADR-0020).
+    #[must_use]
+    pub(super) fn is_app_fullscreen(&self, hwnd: isize) -> bool {
+        self.app_fullscreen.contains_key(&hwnd)
+    }
+
+    /// Watch `hwnd` for the app switching its own full screen when a
+    /// `fullscreen = "app"` rule governs it (the hook callback then
+    /// forwards its location changes); stop watching otherwise.
+    pub(super) fn update_app_fullscreen_watch(&self, hwnd: isize) {
+        let app = self.registry.is_tracked(hwnd)
+            && self.registry.fullscreen_style(hwnd) == FullscreenStyle::App;
+        set_app_fullscreen_watch(hwnd, app);
+    }
+
+    /// Put the focused tile or float fullscreen on its monitor: by sizing
+    /// its frame, or, under a `fullscreen = "app"` rule, by asking the app
+    /// for its own full screen.
     pub(super) fn set_window_to_fullscreen(&mut self, focused: WindowId) -> SocketResponse {
+        if self.registry.fullscreen_style(focused.0) == FullscreenStyle::App {
+            return self.enter_app_fullscreen_with(focused, &Win32AppFullscreen, true);
+        }
+        self.enter_fullscreen(focused, None)
+    }
+
+    /// App fullscreen for `focused`: post `SC_MAXIMIZE` and wait for the
+    /// app to get there when `request` (Mod+F), or take the app's own
+    /// switch as it is (adoption). The daemon's bookkeeping is then that of
+    /// any fullscreen window, minus every placement of the frame.
+    pub(super) fn enter_app_fullscreen_with<P: AppFullscreenProbe>(
+        &mut self,
+        focused: WindowId,
+        probe: &P,
+        request: bool,
+    ) -> SocketResponse {
+        let hwnd = focused.0;
+        let seatable = matches!(
+            self.registry
+                .get_window(HWND(hwnd as *mut _))
+                .map(|w| &w.state),
+            Some(
+                WindowState::Tiling(TilingState::Active { .. })
+                    | WindowState::Floating(FloatingState::Active { .. })
+            )
+        );
+        if !seatable || self.is_fullscreen(hwnd) {
+            // The generic path reports the state.
+            return self.enter_fullscreen(focused, None);
+        }
+        set_app_fullscreen_watch(hwnd, true);
+        if request {
+            if !probe.request(hwnd, true) {
+                return SocketResponse::Error {
+                    message: "could not post SC_MAXIMIZE to the window".into(),
+                };
+            }
+            if !probe.wait(hwnd, true) {
+                log::warn!(
+                    "fullscreen: hwnd {hwnd} did not switch to its own full screen within {} ms",
+                    APP_FULLSCREEN_WAIT.as_millis()
+                );
+                return SocketResponse::Error {
+                    message: format!(
+                        "the app did not switch to its own full screen within {} ms",
+                        APP_FULLSCREEN_WAIT.as_millis()
+                    ),
+                };
+            }
+        }
+        // The borders of the captioned frame, for the way back.
+        let windowed = self
+            .registry
+            .get_window(HWND(hwnd as *mut _))
+            .map(|w| w.invisible_bounds)
+            .unwrap_or_default();
+        let response = self.enter_fullscreen(focused, Some(windowed));
+        if response != SocketResponse::Ok {
+            return response;
+        }
+        // Chromeless now: its frame has no invisible borders, so a parking
+        // move by the screen rect lands exactly where the app put it.
+        self.registry
+            .set_invisible_bounds(hwnd, probe.invisible_bounds(hwnd));
+        log::info!(
+            "fullscreen: hwnd {hwnd} in the app's own full screen ({})",
+            if request { "asked" } else { "adopted" }
+        );
+        response
+    }
+
+    /// The app full screen of `hwnd` ends (it is leaving fullscreen mode):
+    /// post `SC_RESTORE` and wait for the chrome when it is still
+    /// chromeless, re-measure its invisible borders, and forget the flag.
+    fn leave_app_fullscreen_with<P: AppFullscreenProbe>(&mut self, hwnd: isize, probe: &P) {
+        let Some(windowed) = self.app_fullscreen.remove(&hwnd) else {
+            return;
+        };
+        if probe.has_chrome(hwnd) == Some(false) {
+            if !probe.request(hwnd, false) {
+                log::warn!("fullscreen: could not post SC_RESTORE to hwnd {hwnd}");
+            } else if !probe.wait(hwnd, false) {
+                log::warn!(
+                    "fullscreen: hwnd {hwnd} still has no chrome {} ms after SC_RESTORE",
+                    APP_FULLSCREEN_WAIT.as_millis()
+                );
+            }
+        }
+        // Right after the switch DWM may still report the chromeless frame
+        // (no borders): the captioned frame's borders from before stand in.
+        let measured = probe.invisible_bounds(hwnd);
+        let bounds = if measured == InvisibleBounds::default() {
+            windowed
+        } else {
+            measured
+        };
+        self.registry.set_invisible_bounds(hwnd, bounds);
+        // The app put its frame back somewhere the daemon never sent it:
+        // the next batch moves it from the registry rect.
+        self.forget_submitted(hwnd);
+    }
+
+    /// A watched window's style or rect changed: adopt the app's own full
+    /// screen, or follow it out of it ([`app_fullscreen_step`]). Cheap for
+    /// every other window (one set lookup).
+    pub(super) fn sync_app_fullscreen(&mut self, hwnd: isize) {
+        self.sync_app_fullscreen_with(hwnd, &Win32AppFullscreen);
+    }
+
+    /// [`sync_app_fullscreen`](Self::sync_app_fullscreen) over `probe`.
+    pub(super) fn sync_app_fullscreen_with<P: AppFullscreenProbe>(
+        &mut self,
+        hwnd: isize,
+        probe: &P,
+    ) {
+        if self.tiling_paused {
+            return;
+        }
+        let known = self.is_app_fullscreen(hwnd);
+        if !known && !crate::registry::hooks::is_app_fullscreen_watched(hwnd) {
+            return;
+        }
+        let seatable = !self.is_fullscreen(hwnd)
+            && matches!(
+                self.registry
+                    .get_window(HWND(hwnd as *mut _))
+                    .map(|w| &w.state),
+                Some(
+                    WindowState::Tiling(TilingState::Active { .. })
+                        | WindowState::Floating(FloatingState::Active { .. })
+                )
+            );
+        let chrome = probe.has_chrome(hwnd);
+        // The live geometry is only asked when it can matter.
+        let live = !known && seatable && chrome == Some(false) && probe.is_fullscreen_live(hwnd);
+        match app_fullscreen_step(known, seatable, live, chrome) {
+            Some(AppFullscreenStep::Adopt) => {
+                log::info!("fullscreen: hwnd {hwnd} went full screen by itself; adopting");
+                let _ = self.enter_app_fullscreen_with(WindowId(hwnd), probe, false);
+            }
+            Some(AppFullscreenStep::Leave) => {
+                log::info!("fullscreen: hwnd {hwnd} left its own full screen; re-seating");
+                let _ = self.restore_from_fullscreen_with(
+                    WindowId(hwnd),
+                    FullscreenExit::Origin,
+                    probe,
+                );
+            }
+            None => {}
+        }
+    }
+
+    /// Put the focused tile or float fullscreen on its monitor. `app`: the
+    /// app is there already, so its frame is never placed; it carries the
+    /// captioned frame's invisible borders for the way back.
+    fn enter_fullscreen(
+        &mut self,
+        focused: WindowId,
+        app: Option<InvisibleBounds>,
+    ) -> SocketResponse {
         let hwnd = focused.0;
         let Some(state) = self
             .registry
@@ -147,6 +426,12 @@ impl FlowWM {
         let screen = self.monitors[idx].screen_rect();
         let float_actual = self.seat_fullscreen(focused, idx, ws_id, screen);
         self.fullscreen.insert(hwnd, origin);
+        if let Some(windowed) = app {
+            self.app_fullscreen.insert(hwnd, windowed);
+            // The app put its frame there: the batch below has nothing to
+            // send for it (see `workspace_targets`).
+            self.record_submitted(&[(hwnd, screen)]);
+        }
         // A float leaves the floating layer here (its original topmost
         // flag put back): from now on the fullscreen code owns the flag.
         self.sync_top_layer(hwnd);
@@ -184,6 +469,17 @@ impl FlowWM {
         focused: WindowId,
         exit: FullscreenExit,
     ) -> SocketResponse {
+        self.restore_from_fullscreen_with(focused, exit, &Win32AppFullscreen)
+    }
+
+    /// [`restore_from_fullscreen`](Self::restore_from_fullscreen) over
+    /// `probe`, through which an app full screen is ended first.
+    pub(super) fn restore_from_fullscreen_with<P: AppFullscreenProbe>(
+        &mut self,
+        focused: WindowId,
+        exit: FullscreenExit,
+        probe: &P,
+    ) -> SocketResponse {
         let hwnd = focused.0;
         let Some(origin) = self.fullscreen.get(&hwnd).copied() else {
             return SocketResponse::Error {
@@ -211,6 +507,9 @@ impl FlowWM {
         let offset = self.parking_offset(idx, ws_id);
         self.set_active_monitor(idx);
 
+        // An app full screen ends first: the app gives its frame back
+        // before the daemon seats it.
+        self.leave_app_fullscreen_with(hwnd, probe);
         self.remove_float_from_all_spaces(focused);
         self.fullscreen.remove(&hwnd);
         if !registry_win32::set_topmost(hwnd, false) {
@@ -268,6 +567,10 @@ impl FlowWM {
             .workspace(ws_id)
             .map(|ws| ws.floating.to_actual_layout())
             .unwrap_or_default();
+        // A tile again before its target is built: a tile's frame is inset
+        // for its border ring, a float's is not (`float_geometry`).
+        self.registry
+            .update_tiling_slots_from_layout(&applied.virtual_layout);
         self.animate_workspaces_on(
             idx,
             &[
@@ -276,8 +579,6 @@ impl FlowWM {
             ],
             PrevRects::Registry,
         );
-        self.registry
-            .update_tiling_slots_from_layout(&applied.virtual_layout);
         self.registry.update_tiled_rects(&applied.actual_layout);
         self.refresh_border_for(hwnd);
         log::info!("fullscreen: hwnd {hwnd} back in the strip of monitor {idx}");
@@ -335,6 +636,11 @@ impl FlowWM {
         let offset = self.parking_offset(idx, ws_id);
         let float_actual = self.seat_fullscreen(wid, idx, ws_id, screen);
         let _ = registry_win32::set_topmost(hwnd, true);
+        // The app brings its own full screen back with it; a frame that
+        // came back with chrome is followed out by the watch.
+        if self.is_app_fullscreen(hwnd) {
+            return;
+        }
         self.animate_workspaces_on(idx, &[(float_actual, offset)], PrevRects::Registry);
     }
 
@@ -376,6 +682,9 @@ impl FlowWM {
         let hwnds: Vec<isize> = self.fullscreen.keys().copied().collect();
         let mut out = Vec::with_capacity(hwnds.len());
         for hwnd in hwnds {
+            // An app full screen is ended by the app (`SC_RESTORE`) before
+            // its frame is moved into the work area.
+            self.leave_app_fullscreen_with(hwnd, &Win32AppFullscreen);
             self.fullscreen.remove(&hwnd);
             let _ = registry_win32::set_topmost(hwnd, false);
             let wid = WindowId(hwnd);
@@ -418,8 +727,7 @@ impl FlowWM {
         for hwnd in hwnds {
             let wid = WindowId(hwnd);
             let Some(idx) = self.monitor_index_containing(wid) else {
-                self.fullscreen.remove(&hwnd);
-                let _ = registry_win32::set_topmost(hwnd, false);
+                self.forget_fullscreen(hwnd, true);
                 continue;
             };
             let Some(ws_id) = self.monitors[idx].find_workspace_containing(wid) else {
@@ -910,5 +1218,254 @@ mod tests {
         let vl = strip(&flow, 0);
         let (col, _) = vl.find_window(WindowId(C)).expect("C back");
         assert_eq!(vl.columns[col].width_px, 618);
+    }
+
+    // --- app fullscreen (ADR-0020) ---
+
+    use std::cell::{Cell, RefCell};
+
+    /// A scripted app: `SC_MAXIMIZE` takes its chrome away and fills the
+    /// monitor (when `obeys`), `SC_RESTORE` gives the chrome back.
+    struct FakeApp {
+        obeys: bool,
+        /// DWM still reports the chromeless frame after the switch back.
+        stale: Cell<bool>,
+        chrome: Cell<Option<bool>>,
+        live: Cell<bool>,
+        requests: RefCell<Vec<(isize, bool)>>,
+    }
+
+    impl FakeApp {
+        fn new(obeys: bool) -> Self {
+            Self {
+                obeys,
+                stale: Cell::new(false),
+                chrome: Cell::new(Some(true)),
+                live: Cell::new(false),
+                requests: RefCell::new(Vec::new()),
+            }
+        }
+        fn set(&self, chrome: bool, live: bool) {
+            self.chrome.set(Some(chrome));
+            self.live.set(live);
+        }
+    }
+
+    impl AppFullscreenProbe for FakeApp {
+        fn request(&self, hwnd: isize, enter: bool) -> bool {
+            self.requests.borrow_mut().push((hwnd, enter));
+            if self.obeys {
+                self.set(!enter, enter);
+            }
+            true
+        }
+        fn wait(&self, _hwnd: isize, enter: bool) -> bool {
+            if enter {
+                self.live.get()
+            } else {
+                self.chrome.get() != Some(false)
+            }
+        }
+        fn is_fullscreen_live(&self, _hwnd: isize) -> bool {
+            self.live.get()
+        }
+        fn has_chrome(&self, _hwnd: isize) -> Option<bool> {
+            self.chrome.get()
+        }
+        fn invisible_bounds(&self, _hwnd: isize) -> InvisibleBounds {
+            if self.chrome.get() == Some(false) || self.stale.get() {
+                InvisibleBounds::default()
+            } else {
+                FRAME
+            }
+        }
+    }
+
+    const FRAME: InvisibleBounds = InvisibleBounds {
+        left: 7,
+        top: 0,
+        right: 7,
+        bottom: 7,
+    };
+
+    fn bounds(flow: &FlowWM, hwnd: isize) -> InvisibleBounds {
+        flow.registry
+            .get_window(HWND(hwnd as *mut _))
+            .map(|w| w.invisible_bounds)
+            .expect("tracked")
+    }
+
+    fn float_layout(flow: &FlowWM) -> crate::layout::types::ActualLayout {
+        flow.monitors[0]
+            .active_workspace()
+            .floating
+            .to_actual_layout()
+    }
+
+    fn targets_for(
+        t: &super::super::animation::WorkspaceTargets,
+        hwnd: isize,
+    ) -> Vec<crate::animation::types::WindowTarget> {
+        t.targets
+            .iter()
+            .filter(|t| t.window_ref == crate::animation::types::WindowRef(hwnd))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn app_fullscreen_step_adopts_and_leaves_by_the_chrome() {
+        use AppFullscreenStep::{Adopt, Leave};
+        // Gone: nothing (the destroy event cleans up).
+        assert_eq!(app_fullscreen_step(true, false, false, None), None);
+        // Known and the chrome is back: the app left.
+        assert_eq!(
+            app_fullscreen_step(true, false, false, Some(true)),
+            Some(Leave)
+        );
+        // Known, chromeless, parked off its monitor: still fullscreen.
+        assert_eq!(app_fullscreen_step(true, false, false, Some(false)), None);
+        // Not known: a seated window that went chromeless over its monitor.
+        assert_eq!(
+            app_fullscreen_step(false, true, true, Some(false)),
+            Some(Adopt)
+        );
+        // ... but not mid-switch (not covering yet), not a window that is
+        // not seated (minimized, frame fullscreen), not one with chrome.
+        assert_eq!(app_fullscreen_step(false, true, false, Some(false)), None);
+        assert_eq!(app_fullscreen_step(false, false, true, Some(false)), None);
+        assert_eq!(app_fullscreen_step(false, true, true, Some(true)), None);
+    }
+
+    #[test]
+    fn mod_f_asks_the_app_and_never_places_its_frame_then_restores_it_into_its_seat() {
+        let mut flow = fixture();
+        if let Some(w) = flow.registry.get_window_mut(HWND(B as *mut _)) {
+            w.invisible_bounds = FRAME;
+        }
+        let app = FakeApp::new(true);
+        assert_eq!(
+            flow.enter_app_fullscreen_with(WindowId(B), &app, true),
+            SocketResponse::Ok
+        );
+        assert_eq!(*app.requests.borrow(), vec![(B, true)]);
+        // Same mode and bookkeeping as a frame fullscreen ...
+        assert!(flow.is_fullscreen(B));
+        assert!(flow.is_app_fullscreen(B));
+        assert_eq!(flow.window_mode(B), "fullscreen");
+        assert_eq!(strip(&flow, 0).find_window(WindowId(B)), None);
+        assert_eq!(float_rect(&flow, 0, B), Some(PRIMARY));
+        assert_eq!(registry_rect(&flow, B), Some(PRIMARY));
+        // ... but its chromeless frame has no invisible borders and the rect
+        // the app chose counts as sent: a batch of its floating space has
+        // nothing for it.
+        assert_eq!(bounds(&flow, B), InvisibleBounds::default());
+        assert_eq!(flow.last_submitted_rect(B), Some(PRIMARY));
+        let t = flow.workspace_targets(0, &[(float_layout(&flow), 0)], PrevRects::Registry);
+        assert!(targets_for(&t, B).is_empty());
+
+        // Mod+F again: SC_RESTORE, the chrome's borders re-measured, back
+        // in column 0 row 1 as a tile.
+        assert_eq!(
+            flow.restore_from_fullscreen_with(WindowId(B), FullscreenExit::Origin, &app),
+            SocketResponse::Ok
+        );
+        assert_eq!(*app.requests.borrow(), vec![(B, true), (B, false)]);
+        assert!(!flow.is_fullscreen(B));
+        assert!(!flow.is_app_fullscreen(B));
+        assert_eq!(bounds(&flow, B), FRAME);
+        assert_eq!(strip(&flow, 0).find_window(WindowId(B)), Some((0, 1)));
+        assert_eq!(flow.window_mode(B), "tiled");
+        crate::registry::hooks::set_app_fullscreen_watch(B, false);
+    }
+
+    #[test]
+    fn an_app_that_ignores_sc_maximize_stays_where_it_was() {
+        let mut flow = fixture();
+        let app = FakeApp::new(false);
+        assert!(matches!(
+            flow.enter_app_fullscreen_with(WindowId(C), &app, true),
+            SocketResponse::Error { .. }
+        ));
+        assert_eq!(*app.requests.borrow(), vec![(C, true)]);
+        assert!(!flow.is_fullscreen(C));
+        assert_eq!(strip(&flow, 0).find_window(WindowId(C)), Some((1, 0)));
+        crate::registry::hooks::set_app_fullscreen_watch(C, false);
+    }
+
+    #[test]
+    fn the_apps_own_switches_are_adopted_and_followed() {
+        const R: isize = 0x5E1;
+        let mut flow = fixture();
+        fake_window(&mut flow.registry, R, tile());
+        flow.registry.set_invisible_bounds(R, FRAME);
+        flow.registry.set_monitor(R, 0);
+        let _ = flow.monitors[0]
+            .active_scrolling_mut()
+            .add_window(WindowId(R));
+        let app = FakeApp::new(true);
+
+        // Not watched (no `app` rule): a chromeless full-screen switch is
+        // none of the daemon's business.
+        app.set(false, true);
+        flow.sync_app_fullscreen_with(R, &app);
+        assert!(!flow.is_fullscreen(R));
+
+        // Watched: the title-bar maximize is adopted, nothing is posted.
+        crate::registry::hooks::set_app_fullscreen_watch(R, true);
+        flow.sync_app_fullscreen_with(R, &app);
+        assert!(flow.is_app_fullscreen(R));
+        assert_eq!(flow.window_mode(R), "fullscreen");
+        assert!(strip(&flow, 0).find_window(WindowId(R)).is_none());
+        assert!(app.requests.borrow().is_empty());
+
+        // Parked (workspace switch): chromeless, off its monitor: kept.
+        app.set(false, false);
+        flow.sync_app_fullscreen_with(R, &app);
+        assert!(flow.is_app_fullscreen(R));
+
+        // The connection bar's restore: chrome back, followed out into the
+        // strip, again without posting anything. DWM still reports no
+        // borders at that moment: the captioned frame's from before stand.
+        app.set(true, false);
+        app.stale.set(true);
+        flow.sync_app_fullscreen_with(R, &app);
+        assert!(!flow.is_fullscreen(R));
+        assert!(strip(&flow, 0).find_window(WindowId(R)).is_some());
+        assert_eq!(flow.window_mode(R), "tiled");
+        assert_eq!(bounds(&flow, R), FRAME);
+        assert!(app.requests.borrow().is_empty());
+
+        // Tiling off: nothing is adopted.
+        app.set(false, true);
+        flow.tiling_paused = true;
+        flow.sync_app_fullscreen_with(R, &app);
+        assert!(!flow.is_fullscreen(R));
+        crate::registry::hooks::set_app_fullscreen_watch(R, false);
+    }
+
+    #[test]
+    fn a_parked_app_fullscreen_window_moves_by_its_screen_rect_and_closing_forgets_it() {
+        let mut flow = fixture();
+        let app = FakeApp::new(true);
+        assert_eq!(
+            flow.enter_app_fullscreen_with(WindowId(C), &app, true),
+            SocketResponse::Ok
+        );
+        // A parking offset is a real move: one target, exactly the screen
+        // rect shifted (no invisible-border compensation, no resize).
+        let t = flow.workspace_targets(0, &[(float_layout(&flow), 2000)], PrevRects::Registry);
+        let mine = targets_for(&t, C);
+        assert_eq!(mine.len(), 1);
+        assert_eq!(
+            (mine[0].final_position.x, mine[0].final_position.y),
+            (0, 2000)
+        );
+        assert_eq!((mine[0].final_size.x, mine[0].final_size.y), (1920, 1080));
+
+        flow.on_window_destroyed(C);
+        assert!(!flow.is_fullscreen(C));
+        assert!(!flow.is_app_fullscreen(C));
+        assert!(!crate::registry::hooks::is_app_fullscreen_watched(C));
     }
 }

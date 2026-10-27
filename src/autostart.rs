@@ -278,7 +278,7 @@ impl AhkProcess {
 ///
 /// Returns a string if `flow.ahk` is missing, the job cannot be created, or
 /// both launch paths fail.
-pub fn launch_ahk_in_job(config_dir: &Path) -> Result<AhkProcess, String> {
+pub fn launch_ahk_in_job(config_dir: &Path, keymap_log: bool) -> Result<AhkProcess, String> {
     let script = flow_ahk_path_in(config_dir);
     if !script.exists() {
         return Err(format!(
@@ -303,8 +303,24 @@ pub fn launch_ahk_in_job(config_dir: &Path) -> Result<AhkProcess, String> {
 
     // The script gets the config dir as cwd and FLOW_BIN in its environment
     // so it never resolves `flow` through the daemon's inherited cwd
-    // (`CreateProcess` searches it before PATH).
+    // (`CreateProcess` searches it before PATH), and, when `[logging]
+    // keymap_log` is on, FLOW_AHK_LOG (its daily log next to the daemon's)
+    // unless the user set their own.
     let flow_bin = flow_bin_dir();
+    let user_ahk_log = std::env::var_os(AHK_LOG_ENV).filter(|v| !v.is_empty());
+    let ahk_log = ahk_log_env(
+        keymap_log,
+        user_ahk_log.as_deref(),
+        &crate::logging::default_ahk_log_path(config_dir),
+    );
+    if let Some(dir) = ahk_log.as_ref().and_then(|(_, p)| Path::new(p).parent())
+        && let Err(e) = fs::create_dir_all(dir)
+    {
+        log::warn!(
+            "could not create the keymap log folder {}: {e}",
+            dir.display()
+        );
+    }
     let process = match resolve_ahk_interpreter() {
         Some(exe) => {
             let opts = crate::job::SpawnOptions {
@@ -313,17 +329,23 @@ pub fn launch_ahk_in_job(config_dir: &Path) -> Result<AhkProcess, String> {
                 env: flow_bin
                     .iter()
                     .map(|d| (OsString::from(FLOW_BIN_ENV), d.as_os_str().to_owned()))
+                    .chain(ahk_log.clone())
                     .collect(),
             };
             let child = job.spawn(&exe, &[script.as_os_str()], &opts)?;
             let pid = child.pid();
             log::info!(
-                "launched flow.ahk with {} (pid {pid}) inside a kill-on-close job; cwd {}, {FLOW_BIN_ENV}={}",
+                "launched flow.ahk with {} (pid {pid}) inside a kill-on-close job; cwd {}, {FLOW_BIN_ENV}={}, {AHK_LOG_ENV}={}",
                 exe.display(),
                 config_dir.display(),
                 flow_bin
                     .as_deref()
-                    .map_or_else(|| "<unset>".to_owned(), |d| d.display().to_string())
+                    .map_or_else(|| "<unset>".to_owned(), |d| d.display().to_string()),
+                match (&ahk_log, &user_ahk_log) {
+                    (Some((_, p)), _) => Path::new(p).display().to_string(),
+                    (None, Some(own)) => format!("{} (the user's own)", Path::new(own).display()),
+                    (None, None) => "<unset: [logging] keymap_log is off>".to_owned(),
+                }
             );
             AhkProcess {
                 _job: job,
@@ -528,6 +550,28 @@ fn registry_string(root: HKEY, subkey: &str, value: &str) -> Option<String> {
 /// Name of the environment variable the daemon sets for the hotkey script:
 /// the directory of the running `flowd.exe`, where `flow.exe` lives too.
 pub const FLOW_BIN_ENV: &str = "FLOW_BIN";
+
+/// Name of the environment variable that turns the keymap's log on (every
+/// dispatch and its exit code, the Remote Desktop hook re-installs).
+pub const AHK_LOG_ENV: &str = "FLOW_AHK_LOG";
+
+/// The `FLOW_AHK_LOG` entry the daemon adds for the script it launches.
+/// `None` when `enabled` (`[logging] keymap_log`) is off, or when the user's
+/// own value `current` is set and not empty (the script then inherits it
+/// unchanged); otherwise `default`, the dated keymap log next to the
+/// daemon's. Pure.
+#[must_use]
+pub fn ahk_log_env(
+    enabled: bool,
+    current: Option<&OsStr>,
+    default: &Path,
+) -> Option<(OsString, OsString)> {
+    match current {
+        _ if !enabled => None,
+        Some(v) if !v.is_empty() => None,
+        _ => Some((OsString::from(AHK_LOG_ENV), default.as_os_str().to_owned())),
+    }
+}
 
 /// The directory of the running executable (`flowd.exe`), which is also
 /// where `flow.exe` is installed. `None` only if `current_exe` fails.
@@ -1241,9 +1285,35 @@ mod tests {
     }
 
     #[test]
+    fn ahk_log_env_is_unset_when_the_switch_is_off() {
+        let default = Path::new("C:\\cfg\\logs\\flow-ahk-2026-10-27.log");
+        assert_eq!(ahk_log_env(false, None, default), None);
+        assert_eq!(ahk_log_env(false, Some(OsStr::new("")), default), None);
+    }
+
+    #[test]
+    fn ahk_log_env_is_the_dated_path_when_the_switch_is_on() {
+        let default = Path::new("C:\\cfg\\logs\\flow-ahk-2026-10-27.log");
+        let want = Some((
+            OsString::from("FLOW_AHK_LOG"),
+            default.as_os_str().to_owned(),
+        ));
+        assert_eq!(ahk_log_env(true, None, default), want);
+        assert_eq!(ahk_log_env(true, Some(OsStr::new("")), default), want);
+    }
+
+    #[test]
+    fn ahk_log_env_leaves_the_users_own_value_untouched() {
+        let default = Path::new("C:\\cfg\\logs\\flow-ahk-2026-10-27.log");
+        let own = Some(OsStr::new("D:\\mine.log"));
+        assert_eq!(ahk_log_env(true, own, default), None);
+        assert_eq!(ahk_log_env(false, own, default), None);
+    }
+
+    #[test]
     fn launch_ahk_in_job_errors_when_script_missing() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let err = launch_ahk_in_job(tmp.path()).expect_err("no flow.ahk");
+        let err = launch_ahk_in_job(tmp.path(), false).expect_err("no flow.ahk");
         assert!(err.contains("flow.ahk not found"), "{err}");
         assert!(!ahk_pidfile_path_in(tmp.path()).exists());
     }

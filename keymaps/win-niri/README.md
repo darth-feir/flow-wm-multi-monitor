@@ -94,8 +94,8 @@ in step and prints the block to paste when `binds.toml` changes.
 
 To change a chord: add it to `[binds]` in `flow.toml` and save. `flow query
 binds` shows the result; `flow config check` names mistakes
-(`binds."Mod+Bogus": unknown key ...`); set `FLOW_AHK_LOG` to see each
-registration (`binds: 59 registered`).
+(`binds."Mod+Bogus": unknown key ...`); turn on the keymap log (see
+*Tracing*) to see each registration (`binds: 59 registered`).
 
 ## Daemon liveness and fail-back
 
@@ -149,6 +149,31 @@ present). The resident script reports a start that has not produced a
 daemon after 8 s.
 
 ## What stays Windows, what is shadowed
+
+Remote Desktop in its own full screen (Mod+F, `fullscreen = "app"`)
+installs a keyboard hook of its own and sends the Windows key to the remote
+session, so Windows (and with it AutoHotkey's modifier state) never sees the
+Win key go down. `flow.ahk` handles that in three parts (ADR-0020, stage 27
+amendment):
+
+- **Entering.** Mod+F on a windowed Remote Desktop is sent once the Win key
+  is released (at most 2 s): with the key still down when mstsc switches, its
+  release was either swallowed (a stuck Win key) or let through unmasked
+  (the local Start menu opened).
+- **Hook in front.** While such a full screen is the active window the
+  script re-installs its keyboard hook when it becomes active and then every
+  second in a typing pause (250 ms poll), never while a modifier is down or
+  within 400 ms of a hotkey: a re-install forgets that a Win chord fired, and
+  the Win release then opens the Start menu.
+- **Win chords.** The script follows the Win key itself and registers, for
+  every bound Win chord, a twin without the Win modifier that fires only
+  while that key is held in a Remote Desktop full screen. So Mod+F leaves the
+  full screen and Mod+arrows act locally there too; unbound chords (Win+I,
+  Win+E, ...) still reach the session. A twin first releases the Win key
+  in the session (masked), which got it from mstsc before the chord was
+  known. A Win key seen down for more than 5 s
+  counts as released (a release mstsc swallows cannot leave the twins armed).
+  The hardwired chords (Mod+Ctrl+T, Mod+drag) have no twins.
 
 Win+L (lock) is handled by Windows below the hook layer and is untouched;
 the only ways around that are a keyboard-firmware or registry remap of the
@@ -340,6 +365,20 @@ overwrite the list with its stale rows (seen in the VM, 2026-10-26).
 
 ## Tracing
 
-Set `FLOW_AHK_LOG=<path>` in the environment to trace every dispatch and
-its exit code, the liveness gate transitions, the launcher's fuzzy
-self-check and every refilter, and the OSD messages.
+The script traces every dispatch and its exit code, the liveness gate
+transitions, the Remote Desktop hook re-installs (`rdp:` lines), the
+launcher's fuzzy self-check and every refilter (query and top row), and the
+OSD messages, with millisecond times. The trace is off by default, since it
+records launcher queries. To turn it on for the script the daemon starts
+(`flow start --ahk`), add to `flow.toml`
+
+```toml
+[logging]
+keymap_log = true
+```
+
+and restart the daemon: it then writes to `logs\flow-ahk-YYYY-MM-DD.log`
+next to the daemon's `flowd-YYYY-MM-DD.log` (same folder, same
+`[logging] keep_days`). Setting `FLOW_AHK_LOG=<path>` in the environment
+also turns it on and sends it elsewhere (it wins over `keymap_log`), and is
+the way to trace a script started by hand.

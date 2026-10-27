@@ -396,8 +396,15 @@ shipped keymaps (`keymaps/win-niri/flow-exe.ahk`, included by `flow.ahk`
 and `flow-resident.ahk`) resolve `%FLOW_BIN%\flow.exe`, then
 `%LOCALAPPDATA%\Programs\flow\flow.exe`, then plain `flow`, and run the
 result by absolute path everywhere; the resolved path is the first line
-of the `FLOW_AHK_LOG` trace. The shell-association fallback gets the
-working directory (`lpDirectory`) but not `FLOW_BIN`.
+of the `FLOW_AHK_LOG` trace. When `[logging] keymap_log` is on (default
+off: the trace records launcher queries) and the user's environment does
+not already set `FLOW_AHK_LOG`, the same block sets it to
+`logs/flow-ahk-YYYY-MM-DD.log` under the config directory
+(`autostart::ahk_log_env`, `logging::default_ahk_log_path`), so the keymap
+leaves a trace next to the daemon's log; `[logging] keep_days` prunes both
+whatever the switch says. The
+shell-association fallback gets the working directory (`lpDirectory`) but
+neither variable.
 
 The job handle lives in `FlowWM` and is never closed explicitly: process
 teardown closes it — clean stop, panic, `abort`, `taskkill /f` — and the

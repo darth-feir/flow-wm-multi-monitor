@@ -616,6 +616,7 @@ impl FlowWM {
                     // The handler re-classifies only tracked, OS-ignored
                     // windows, so this is cheap when nothing is recoverable.
                     self.on_window_state_change(hwnd);
+                    self.sync_app_fullscreen(hwnd);
                 }
                 HookEvent::NameChange { hwnd } => {
                     // Option A recovery: a window whose title arrived late
@@ -638,6 +639,9 @@ impl FlowWM {
                     if is_dragged {
                         self.on_drag_move(hwnd);
                     } else {
+                        // An app switching its own full screen on or off
+                        // (ADR-0020) is a style + rect change.
+                        self.sync_app_fullscreen(hwnd);
                         self.on_float_location_changed(hwnd);
                         if self.foreground == Some(hwnd) {
                             self.evaluate_top_layer(Some(hwnd));

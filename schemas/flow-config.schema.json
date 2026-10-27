@@ -101,10 +101,11 @@
       }
     },
     "logging": {
-      "description": "Daemon log retention (`[logging]`).",
+      "description": "Daemon log retention and the keymap log switch (`[logging]`).",
       "$ref": "#/$defs/LoggingConfig",
       "default": {
-        "keep_days": 14
+        "keep_days": 14,
+        "keymap_log": false
       }
     },
     "min_column_width_px": {
@@ -581,7 +582,7 @@
       }
     },
     "LoggingConfig": {
-      "description": "Daemon log retention (`[logging]`).\n\nThe daemon writes one `logs/flowd-YYYY-MM-DD.log` per day under the\nconfig directory and, at every start, deletes the ones older than\n`keep_days` days (by the date in the file name). Those files record\nevery window the daemon met — executable, class and, at `debug` level,\nthe title — so they should not pile up forever by default.",
+      "description": "Daemon log retention and the keymap's log switch (`[logging]`).\n\nThe daemon writes one `logs/flowd-YYYY-MM-DD.log` per day under the\nconfig directory and, at every start, deletes the ones older than\n`keep_days` days (by the date in the file name). Those files record\nevery window the daemon met — executable, class and, at `debug` level,\nthe title — so they should not pile up forever by default.",
       "type": "object",
       "properties": {
         "keep_days": {
@@ -590,6 +591,11 @@
           "format": "uint32",
           "default": 14,
           "minimum": 0
+        },
+        "keymap_log": {
+          "description": "Turn on the keymap's daily log (`logs/flow-ahk-YYYY-MM-DD.log`): the\ndaemon then sets `FLOW_AHK_LOG` for the script it launches, unless\n`FLOW_AHK_LOG` is already set in its environment. Off by default, as\nthe log records launcher queries and their top hits. Read when the\ndaemon launches the keymap.",
+          "type": "boolean",
+          "default": false
         }
       }
     },

@@ -166,7 +166,7 @@ pub struct FlowConfig {
     /// Navigation behaviour at the edges of a strip (`[navigation]`).
     pub navigation: NavigationConfig,
 
-    /// Daemon log retention (`[logging]`).
+    /// Daemon log retention and the keymap log switch (`[logging]`).
     pub logging: LoggingConfig,
 
     /// Key bindings (`[binds]`): niri's chord and action names, laid over
@@ -251,7 +251,7 @@ impl LoadoutConfig {
     }
 }
 
-/// Daemon log retention (`[logging]`).
+/// Daemon log retention and the keymap's log switch (`[logging]`).
 ///
 /// The daemon writes one `logs/flowd-YYYY-MM-DD.log` per day under the
 /// config directory and, at every start, deletes the ones older than
@@ -264,11 +264,20 @@ pub struct LoggingConfig {
     /// How many days of daily log files to keep; older ones are deleted at
     /// daemon start. `0` keeps every file forever (the upstream behaviour).
     pub keep_days: u32,
+    /// Turn on the keymap's daily log (`logs/flow-ahk-YYYY-MM-DD.log`): the
+    /// daemon then sets `FLOW_AHK_LOG` for the script it launches, unless
+    /// `FLOW_AHK_LOG` is already set in its environment. Off by default, as
+    /// the log records launcher queries and their top hits. Read when the
+    /// daemon launches the keymap.
+    pub keymap_log: bool,
 }
 
 impl Default for LoggingConfig {
     fn default() -> Self {
-        Self { keep_days: 14 }
+        Self {
+            keep_days: 14,
+            keymap_log: false,
+        }
     }
 }
 
@@ -501,8 +510,17 @@ pub struct WindowRule {
     /// Criteria to match against a window.
     #[serde(rename = "match")]
     pub match_: MatchRule,
-    /// Action to take when matched.
-    pub action: WindowAction,
+    /// Action to take when matched. A rule without one only carries
+    /// options (such as `fullscreen`): classification skips it and goes on
+    /// to the next rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<WindowAction>,
+    /// How `set-window fullscreen` is realised for a matching window
+    /// (default `"frame"`). Looked up on its own: the first rule of any
+    /// layer that matches and sets it wins, so a learned rule (which never
+    /// sets it) does not hide it. See ADR-0020.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fullscreen: Option<FullscreenStyle>,
     /// Optional initial column width in pixels.
     ///
     /// When set, a window matching this rule is created at this width instead
@@ -613,6 +631,22 @@ pub enum WindowAction {
     Ignore,
 }
 
+/// How `set-window fullscreen` (Mod+F) is realised for a window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FullscreenStyle {
+    /// FlowWM sizes the window's frame over the monitor's screen rect; the
+    /// app is not told (it keeps its caption).
+    #[default]
+    Frame,
+    /// FlowWM asks the app to switch to its own full screen
+    /// (`WM_SYSCOMMAND SC_MAXIMIZE`, what the title-bar maximize button
+    /// sends) and leaves the rect to it; `SC_RESTORE` brings it back. For
+    /// apps such as Remote Desktop (`mstsc.exe`) that only drop their
+    /// scrollbars in their own full-screen mode.
+    App,
+}
+
 /// Window classification configuration, loaded from `flow-rules.toml`.
 ///
 /// This is the user-facing window rules file. Rules are evaluated top-to-bottom,
@@ -635,6 +669,10 @@ pub enum WindowAction {
 /// match = { class = "Chrome_WidgetWin_1" }
 /// action = "tile"
 /// initial_width_px = 960
+///
+/// [[rules]]
+/// match = { exe = "mstsc.exe", class = "TscShellContainerClass" }
+/// fullscreen = "app"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WindowRulesConfig {
@@ -1271,6 +1309,8 @@ strategy = "original_slot"
         assert_eq!(FlowConfig::default().logging.keep_days, 14);
         let parsed: FlowConfig = toml::from_str("[logging]\nkeep_days = 0\n").unwrap();
         assert_eq!(parsed.logging.keep_days, 0);
+        assert!(!parsed.logging.keymap_log);
+        assert!(!FlowConfig::default().logging.keymap_log);
     }
 
     // --- Integration: Full field preservation through round-trip ---
@@ -1325,7 +1365,10 @@ strategy = "original_slot"
                 default_path: "my-loadout.json".into(),
             },
             navigation: NavigationConfig { edge_hop: false },
-            logging: LoggingConfig { keep_days: 3 },
+            logging: LoggingConfig {
+                keep_days: 3,
+                keymap_log: true,
+            },
             binds: crate::config::binds::BindsConfig {
                 defaults: false,
                 entries: vec![(
@@ -1389,6 +1432,7 @@ default = \"1/2\"",
         assert_eq!(parsed.loadout.default_path, "my-loadout.json");
         assert!(!parsed.navigation.edge_hop);
         assert_eq!(parsed.logging.keep_days, 3);
+        assert!(parsed.logging.keymap_log);
         let columns = parsed.columns.as_ref().expect("columns round-trips");
         assert_eq!(columns.labels(), vec!["1/3", "1/2"]);
         assert_eq!(columns.default_index(), 1);
@@ -1848,8 +1892,47 @@ initial_width_px = 960
         let config: WindowRulesConfig = toml::from_str(toml_str).expect("parse");
         assert_eq!(config.default_action, WindowAction::Float);
         assert_eq!(config.rules.len(), 2);
-        assert_eq!(config.rules[0].action, WindowAction::Ignore);
+        assert_eq!(config.rules[0].action, Some(WindowAction::Ignore));
         assert_eq!(config.rules[1].initial_width_px, Some(960));
+        assert_eq!(config.rules[1].fullscreen, None);
+    }
+
+    /// A rule may carry only options: no `action`, `fullscreen = "app"`.
+    /// Unknown style names are rejected; the option round-trips.
+    #[test]
+    fn window_rule_fullscreen_option_parses_without_an_action() {
+        let toml_str = r#"
+default_action = "float"
+
+[[rules]]
+match = { exe = "mstsc.exe", class = "TscShellContainerClass" }
+fullscreen = "app"
+
+[[rules]]
+match = { exe = "notepad.exe" }
+action = "tile"
+fullscreen = "frame"
+"#;
+        let config: WindowRulesConfig = toml::from_str(toml_str).expect("parse");
+        assert_eq!(config.rules[0].action, None);
+        assert_eq!(config.rules[0].fullscreen, Some(FullscreenStyle::App));
+        assert_eq!(config.rules[1].action, Some(WindowAction::Tile));
+        assert_eq!(config.rules[1].fullscreen, Some(FullscreenStyle::Frame));
+        assert_eq!(FullscreenStyle::default(), FullscreenStyle::Frame);
+
+        let back: WindowRulesConfig =
+            toml::from_str(&toml::to_string(&config).expect("serialize")).expect("reparse");
+        assert_eq!(back.rules[0].fullscreen, Some(FullscreenStyle::App));
+        assert_eq!(back.rules[0].action, None);
+
+        let bad = r#"
+default_action = "float"
+
+[[rules]]
+match = { exe = "a.exe" }
+fullscreen = "borderless"
+"#;
+        assert!(toml::from_str::<WindowRulesConfig>(bad).is_err());
     }
 
     /// Positive: TOML with only `default_action` parses correctly (rules defaults to empty).
@@ -1888,7 +1971,8 @@ initial_width_px = 960
                     exe_regex: Some("chrome\\.exe".into()),
                     process_path_regex: Some(".*\\\\Google\\\\Chrome\\\\.*".into()),
                 },
-                action: WindowAction::Float,
+                action: Some(WindowAction::Float),
+                fullscreen: None,
                 initial_width_px: None,
                 override_persist: false,
             }],

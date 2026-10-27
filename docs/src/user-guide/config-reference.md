@@ -454,9 +454,18 @@ handle, executable and window class; **window titles are only logged at
 conversations. The saved loadout file records executables and handles,
 never titles.
 
+The keymap the daemon starts (`flow start --ahk`) can write its own trace
+next to it, `logs/flow-ahk-YYYY-MM-DD.log`: every dispatch and its exit code,
+the Remote Desktop hook re-installs, and the launcher's queries with the name
+of the top row (an app, a file or a window title). Because of those queries
+the trace is **off by default**; `keymap_log = true` turns it on from the next
+daemon start. Setting `FLOW_AHK_LOG` to a path in the environment also turns
+it on, writes there instead, and wins over `keymap_log` either way.
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `keep_days` | `u32` | `14` | How many days of daily log files to keep. At every start the daemon deletes `logs/flowd-*.log` files whose date (in the file name) is older than this many days. `0` keeps every file forever. Files with other names are never touched. |
+| `keep_days` | `u32` | `14` | How many days of daily log files to keep. At every start the daemon deletes `logs/flowd-*.log` and `logs/flow-ahk-*.log` files whose date (in the file name) is older than this many days. `0` keeps every file forever. Files with other names are never touched. |
+| `keymap_log` | `bool` | `false` | Write the keymap's trace to `logs/flow-ahk-YYYY-MM-DD.log`: the daemon sets `FLOW_AHK_LOG` for the script it launches, unless `FLOW_AHK_LOG` is already set in its environment. Read when the daemon launches the keymap, so a change takes effect at the next `flow start --ahk`. |
 
 Example:
 
@@ -632,7 +641,9 @@ Accepted `default_action` values:
 ### `[[rules]]` — individual rules
 
 Each rule is a table in the `rules` array. Every rule has a `match` clause
-(fields AND'ed together) and an `action`.
+(fields AND'ed together) and an `action`, an option such as `fullscreen`, or
+both. A rule without an `action` only carries its options: classification
+skips it and goes on to the next rule.
 
 #### Match fields
 
@@ -657,6 +668,36 @@ with AND logic — all must match.
 
 Each rule's `action` is one of the `WindowAction` values (`"tile"` / `"float"`
 / `"ignore"`), same as `default_action`.
+
+#### `fullscreen` field
+
+How `set-window fullscreen` (Mod+F) is done for a matching window:
+
+- `"frame"` (default) — FlowWM sizes the window's frame over the monitor's
+  whole screen; the app is not told and keeps its caption.
+- `"app"` — FlowWM asks the app for its own full screen, as its title-bar
+  maximize button would, and leaves the rect to the app. The app's own
+  maximize and restore are followed. See
+  [`set-window fullscreen`](dispatch-reference.md#set-window-fullscreen).
+
+The option is looked up on its own: the first rule, over your rules, then the
+learned rules, then the bundled ones, that matches **and sets** `fullscreen`
+decides it. A learned rule never sets it, so learning that an app tiles does
+not undo it. The bundled rules set `"app"` for Remote Desktop:
+
+```toml
+[[rules]]
+match = { exe = "mstsc.exe", class = "TscShellContainerClass" }
+fullscreen = "app"
+```
+
+Put `fullscreen = "frame"` on a rule for the same window in your
+`flow-rules.toml` to go back to the frame. In its own full screen Remote
+Desktop sends the Windows key combinations to the remote session (the
+`.rdp` setting `keyboardhook:i:2`, its default); the bundled keymap
+(`flow.ahk`) puts its keyboard hook back in front whenever a Remote Desktop
+full screen becomes active, so the FlowWM chords keep working there and
+every other Windows key combination still reaches the session.
 
 ### Example
 

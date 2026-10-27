@@ -927,6 +927,44 @@ pub fn close_window(hwnd_val: isize) -> bool {
     queued.is_ok()
 }
 
+/// Post `WM_SYSCOMMAND` `SC_MAXIMIZE` (`maximize`) or `SC_RESTORE` to
+/// `hwnd_val`: what the title-bar maximize / restore buttons send. An app
+/// with a full-screen mode of its own (Remote Desktop) switches to it on
+/// `SC_MAXIMIZE` (ADR-0020). Posted, not sent, for the same reason as
+/// [`close_window`]: a hung app must not stall the daemon. `true` when
+/// queued.
+#[must_use]
+pub fn post_syscommand(hwnd_val: isize, maximize: bool) -> bool {
+    const WM_SYSCOMMAND: u32 = 0x0112;
+    const SC_MAXIMIZE: usize = 0xF030;
+    const SC_RESTORE: usize = 0xF120;
+    let cmd = if maximize { SC_MAXIMIZE } else { SC_RESTORE };
+    // SAFETY: PostMessageW only queues; a stale handle fails cleanly.
+    unsafe {
+        PostMessageW(
+            Some(HWND(hwnd_val as *mut _)),
+            WM_SYSCOMMAND,
+            WPARAM(cmd),
+            LPARAM(0),
+        )
+    }
+    .is_ok()
+}
+
+/// Whether `hwnd_val` has window chrome right now (`WS_CAPTION` or
+/// `WS_THICKFRAME` bits in its style); `None` for a handle that is gone.
+/// An app in its own full screen has none (ADR-0020).
+#[must_use]
+pub fn has_chrome(hwnd_val: isize) -> Option<bool> {
+    let hwnd = HWND(hwnd_val as *mut _);
+    // SAFETY: IsWindow accepts any value; GetWindowLongW on a live handle.
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return None;
+    }
+    let style = WINDOW_STYLE(unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32);
+    Some(style & (WS_CAPTION | WS_THICKFRAME) != WINDOW_STYLE(0))
+}
+
 /// Whether `hwnd_val` is in the topmost band of the z-order right now
 /// (`WS_EX_TOPMOST` in its extended style). One `GetWindowLongW` read;
 /// `false` for a handle that is gone or from a unit test.

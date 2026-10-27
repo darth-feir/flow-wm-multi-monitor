@@ -356,6 +356,15 @@ pub fn log_file_path_in(dir: &Path, date: &str) -> PathBuf {
     logs_dir_in(dir).join(format!("flowd-{date}.log"))
 }
 
+/// The keymap's log for `date` (`YYYY-MM-DD`) next to the daemon's:
+/// `logs_dir_in(dir).join(format!("flow-ahk-{date}.log"))`. The daemon hands
+/// it to the hotkey script it launches as `FLOW_AHK_LOG` (see
+/// `crate::autostart::launch_ahk_in_job`).
+#[must_use]
+pub fn ahk_log_file_path_in(dir: &Path, date: &str) -> PathBuf {
+    logs_dir_in(dir).join(format!("flow-ahk-{date}.log"))
+}
+
 /// Compute the default config directory: `%USERPROFILE%\.config\flow\`.
 ///
 /// Falls back to `%APPDATA%` with `\AppData\Roaming` stripped, and ultimately
@@ -569,6 +578,16 @@ mod tests {
     }
 
     // ── Logs path tests ────────────────────────────────────────────────
+
+    /// Positive: the keymap's daily log sits next to the daemon's.
+    #[test]
+    fn ahk_log_file_path_in_is_dated_in_the_logs_dir() {
+        let dir = Path::new("C:\\flow");
+        assert_eq!(
+            ahk_log_file_path_in(dir, "2026-10-27"),
+            dir.join("logs").join("flow-ahk-2026-10-27.log")
+        );
+    }
 
     /// Positive: `logs_dir_in` appends "logs" to the given directory.
     #[test]

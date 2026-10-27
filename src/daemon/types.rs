@@ -344,6 +344,12 @@ pub struct FlowWM {
     /// monitor's screen rect; this map is what tells it apart from a float.
     /// See `daemon::fullscreen`.
     pub(super) fullscreen: std::collections::HashMap<isize, super::fullscreen::FullscreenOrigin>,
+
+    /// The subset of [`fullscreen`](Self::fullscreen) whose full screen is
+    /// the app's own (`fullscreen = "app"` rule, ADR-0020): the app owns
+    /// the rect, so the daemon never sizes the frame. See
+    /// `daemon::fullscreen`.
+    pub(super) app_fullscreen: std::collections::HashMap<isize, crate::common::InvisibleBounds>,
 }
 
 impl FlowWM {
@@ -358,7 +364,8 @@ impl FlowWM {
         if let Some(existing) = &self.ahk {
             return Some(existing.pid());
         }
-        match crate::autostart::launch_ahk_in_job(&self.config_dir) {
+        match crate::autostart::launch_ahk_in_job(&self.config_dir, self.config.logging.keymap_log)
+        {
             Ok(proc) => {
                 let pid = proc.pid();
                 if !proc.is_job_tied() {

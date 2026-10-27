@@ -1080,7 +1080,7 @@ initial_width_px = 960
         let config = load_rules_config(f.path()).unwrap();
         assert_eq!(config.default_action, WindowAction::Float);
         assert_eq!(config.rules.len(), 2);
-        assert_eq!(config.rules[0].action, WindowAction::Ignore);
+        assert_eq!(config.rules[0].action, Some(WindowAction::Ignore));
         assert_eq!(config.rules[1].initial_width_px, Some(960));
     }
 
@@ -1146,7 +1146,8 @@ initial_width_px = 960
                     process_path_regex: Some(".*\\\\Chrome\\\\.*".into()),
                     ..Default::default()
                 },
-                action: WindowAction::Tile,
+                action: Some(WindowAction::Tile),
+                fullscreen: None,
                 initial_width_px: None,
                 override_persist: false,
             }],

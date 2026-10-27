@@ -29,7 +29,9 @@
 //! flowchart and the default-rule catalogue.
 
 use crate::common::Rect;
-use crate::config::types::{MatchRule, WindowAction, WindowRule, WindowRulesConfig};
+use crate::config::types::{
+    FullscreenStyle, MatchRule, WindowAction, WindowRule, WindowRulesConfig,
+};
 use crate::registry::types::{FloatingState, IgnoredReason, TilingState, WindowState};
 
 // ── WindowCandidate ────────────────────────────────────────────────
@@ -474,27 +476,54 @@ impl ClassificationPipeline {
     pub fn classify(&self, candidate: &WindowCandidate) -> WindowAction {
         // 1. User rules (first match wins)
         for compiled in &self.user_rules {
-            if matches_compiled_rule(candidate, compiled) {
-                return compiled.rule.action;
+            if let Some(action) = compiled.rule.action
+                && matches_compiled_rule(candidate, compiled)
+            {
+                return action;
             }
         }
 
         // 2. Learned rules (first match wins)
         for compiled in &self.learned_rules {
-            if matches_compiled_rule(candidate, compiled) {
-                return compiled.rule.action;
+            if let Some(action) = compiled.rule.action
+                && matches_compiled_rule(candidate, compiled)
+            {
+                return action;
             }
         }
 
         // 3. Default rules (first match wins)
         for compiled in &self.default_rules {
-            if matches_compiled_rule(candidate, compiled) {
-                return compiled.rule.action;
+            if let Some(action) = compiled.rule.action
+                && matches_compiled_rule(candidate, compiled)
+            {
+                return action;
             }
         }
 
         // 4. Fallback
         self.default_action
+    }
+
+    /// How `set-window fullscreen` is realised for `candidate`: the
+    /// `fullscreen` option of the first rule, over the layers in the same
+    /// order as [`classify`](Self::classify) (user → learned → default),
+    /// that matches **and sets it**; [`FullscreenStyle::Frame`] when none
+    /// does. Looked up apart from the action so a learned rule (which
+    /// records only an action) never hides a user or bundled option.
+    #[must_use]
+    pub fn fullscreen_style(&self, candidate: &WindowCandidate) -> FullscreenStyle {
+        self.user_rules
+            .iter()
+            .chain(&self.learned_rules)
+            .chain(&self.default_rules)
+            .find_map(|compiled| {
+                compiled
+                    .rule
+                    .fullscreen
+                    .filter(|_| matches_compiled_rule(candidate, compiled))
+            })
+            .unwrap_or_default()
     }
 
     /// Replace the learned-rules layer with recompiled versions of `rules`.
@@ -589,7 +618,8 @@ mod tests {
     fn rule(match_rule: MatchRule, action: WindowAction) -> WindowRule {
         WindowRule {
             match_: match_rule,
-            action,
+            action: Some(action),
+            fullscreen: None,
             initial_width_px: None,
             override_persist: false,
         }
@@ -2198,5 +2228,104 @@ mod tests {
             WindowAction::Tile,
             "set_user_rules must drop rules absent from the reload"
         );
+    }
+
+    // --- fullscreen option (ADR-0020) ---
+
+    fn mstsc_match() -> MatchRule {
+        MatchRule {
+            exe: Some("mstsc.exe".into()),
+            class: Some("TscShellContainerClass".into()),
+            ..MatchRule::default()
+        }
+    }
+
+    fn option_rule(match_rule: MatchRule, style: FullscreenStyle) -> WindowRule {
+        WindowRule {
+            match_: match_rule,
+            action: None,
+            fullscreen: Some(style),
+            initial_width_px: None,
+            override_persist: false,
+        }
+    }
+
+    fn rules(default_action: WindowAction, rules: Vec<WindowRule>) -> WindowRulesConfig {
+        WindowRulesConfig {
+            default_action,
+            rules,
+        }
+    }
+
+    /// An options-only rule never decides the action: classification goes
+    /// on to the next rule (here the learned tile) or the fallback.
+    #[test]
+    fn an_options_only_rule_is_skipped_by_classify() {
+        let mstsc = candidate("mstsc.exe", "rdp", "TscShellContainerClass", "");
+        let mut pipeline = ClassificationPipeline::new(
+            rules(
+                WindowAction::Float,
+                vec![option_rule(mstsc_match(), FullscreenStyle::App)],
+            ),
+            WindowRulesConfig::default(),
+        );
+        assert_eq!(pipeline.classify(&mstsc), WindowAction::Float);
+        pipeline.set_learned_rules(vec![rule(mstsc_match(), WindowAction::Tile)]);
+        assert_eq!(pipeline.classify(&mstsc), WindowAction::Tile);
+        assert_eq!(pipeline.fullscreen_style(&mstsc), FullscreenStyle::App);
+    }
+
+    /// The bundled `fullscreen = "app"` rule survives a learned rule for the
+    /// same exe + class (the learned layer sits above the bundled one but
+    /// sets no option); a user rule that sets the option wins over both; a
+    /// window no rule sets it for gets `frame`.
+    #[test]
+    fn fullscreen_style_takes_the_first_rule_that_sets_it() {
+        let mstsc = candidate("mstsc.exe", "rdp", "TscShellContainerClass", "");
+        let notepad = candidate("notepad.exe", "n", "Notepad", "");
+        let mut pipeline = ClassificationPipeline::new(
+            WindowRulesConfig::default(),
+            rules(
+                WindowAction::Float,
+                vec![option_rule(mstsc_match(), FullscreenStyle::App)],
+            ),
+        );
+        pipeline.set_learned_rules(vec![rule(mstsc_match(), WindowAction::Tile)]);
+        assert_eq!(pipeline.fullscreen_style(&mstsc), FullscreenStyle::App);
+        assert_eq!(pipeline.fullscreen_style(&notepad), FullscreenStyle::Frame);
+
+        // A user rule saying `frame` turns it off for that app.
+        pipeline.set_user_rules(rules(
+            WindowAction::Float,
+            vec![option_rule(
+                MatchRule {
+                    exe: Some("MSTSC.EXE".into()),
+                    ..MatchRule::default()
+                },
+                FullscreenStyle::Frame,
+            )],
+        ));
+        assert_eq!(pipeline.fullscreen_style(&mstsc), FullscreenStyle::Frame);
+        // Its class does not match the bundled rule: frame.
+        let other = candidate("mstsc.exe", "dialog", "#32770", "");
+        pipeline.set_user_rules(WindowRulesConfig::default());
+        assert_eq!(pipeline.fullscreen_style(&other), FullscreenStyle::Frame);
+    }
+
+    /// The shipped `default-flow-rules.toml` carries the mstsc rule.
+    #[test]
+    fn bundled_rules_make_remote_desktop_fullscreen_by_the_app() {
+        let bundled: WindowRulesConfig =
+            toml::from_str(crate::config::lifecycle::DEFAULT_RULES_TOML).expect("bundled rules");
+        let pipeline = ClassificationPipeline::new(WindowRulesConfig::default(), bundled);
+        let mstsc = candidate(
+            "mstsc.exe",
+            "rdp-target - 1.2.3.4 - Remote Desktop Connection",
+            "TscShellContainerClass",
+            r"C:\Windows\System32\mstsc.exe",
+        );
+        assert_eq!(pipeline.fullscreen_style(&mstsc), FullscreenStyle::App);
+        // The option-only rule leaves its classification to the fallback.
+        assert_eq!(pipeline.classify(&mstsc), WindowAction::Float);
     }
 }

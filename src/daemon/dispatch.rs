@@ -3124,7 +3124,7 @@ mod tests {
             .expect("tracked");
         assert!(!w.adopted_from_maximized, "fake window was not zoomed");
         assert_eq!(flow.history.len(), 1, "the adoption is learned");
-        assert_eq!(flow.history.rules()[0].action, WindowAction::Tile);
+        assert_eq!(flow.history.rules()[0].action, Some(WindowAction::Tile));
         // Already a tile now: tile again is a no-op and records nothing.
         assert_eq!(
             flow.dispatch_set_window(WindowMode::Tile),
@@ -3161,7 +3161,7 @@ mod tests {
                 .contains(WindowId(TEST_HWND)),
             "adopted float is seated in the floating space"
         );
-        assert_eq!(flow.history.rules()[0].action, WindowAction::Float);
+        assert_eq!(flow.history.rules()[0].action, Some(WindowAction::Float));
 
         let mut flow = flow_with_focused_state(WindowState::Ignored(IgnoredReason::ExplicitRule));
         flow.config_dir = tmp.path().to_path_buf();
