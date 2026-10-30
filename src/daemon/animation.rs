@@ -157,6 +157,8 @@ impl FlowWM {
         let mut submitted: Vec<(isize, Rect)> = Vec::new();
         for (idx, layout) in layouts {
             self.collect_targets(layout, *idx, &mut targets, &mut submitted);
+            // Book mode: members under their tops before anything moves.
+            self.order_piles(*idx, &layout.virtual_layout, &layout.actual_layout);
         }
         if !targets.is_empty() {
             log::debug!(
@@ -194,6 +196,7 @@ impl FlowWM {
         let mut submitted: Vec<(isize, Rect)> = Vec::new();
         for (monitor_idx, layout) in layouts {
             self.collect_targets(layout, *monitor_idx, &mut targets, &mut submitted);
+            self.order_piles(*monitor_idx, &layout.virtual_layout, &layout.actual_layout);
         }
         self.record_submitted(&submitted);
         if targets.is_empty() {
@@ -325,7 +328,13 @@ impl FlowWM {
             let prev_rect = self
                 .last_submitted_rect(entry.window_id.0)
                 .or_else(|| registry_prev_rect(window));
-            push_targets(
+            // A window going into a book-mode pile is placed instantly: it
+            // lands under its top, and a tween across the middle columns
+            // would show in the gaps (ADR-0022). With the animator idle no
+            // tween is in flight, so a member already at its pile rect is
+            // left alone.
+            let settled = !self.animator.is_animating();
+            push_targets_as(
                 targets,
                 submitted,
                 &monitor_info,
@@ -335,6 +344,8 @@ impl FlowWM {
                 window_rect,
                 entry.rect,
                 border_hwnd,
+                entry.pile.is_some(),
+                settled,
             );
         }
     }
@@ -488,6 +499,16 @@ impl FlowWM {
             submitted,
         } = self.workspace_targets(monitor_idx, batches, prev);
         self.record_submitted(&submitted);
+        // Book mode: the incoming (active) strip's piles in order before it
+        // slides in; its members travel with their tops.
+        if batches.iter().any(|(_, y)| *y == 0) {
+            let space = self.monitors[monitor_idx].active_scrolling();
+            let (vl, actual) = (
+                space.virtual_layout().clone(),
+                space.actual_layout().clone(),
+            );
+            self.order_piles(monitor_idx, &vl, &actual);
+        }
 
         if targets.is_empty() {
             return;
@@ -1051,7 +1072,48 @@ fn push_targets(
     border_rect: Rect,
     border_hwnd: Option<isize>,
 ) -> Move {
-    let decision = plan_move(monitor, prev, next);
+    push_targets_as(
+        targets,
+        submitted,
+        monitor,
+        hwnd,
+        prev,
+        next,
+        window_rect,
+        border_rect,
+        border_hwnd,
+        false,
+        false,
+    )
+}
+
+/// [`push_targets`] for a window whose target may be a book-mode pile slot
+/// (`piled`): a move that [`plan_move`] would tween becomes
+/// [`Move::Instant`] — the window lands under its pile's top, already
+/// seated below it by `daemon::piles`, so the jump is hidden, while a tween
+/// would cross the visible columns and show in the gaps (ADR-0022). When
+/// `settled` (no tween can be in flight: the animator is idle) a member
+/// whose target is the rect it was last sent to gets [`Move::Stay`], so a
+/// flip moves only the windows that change place.
+#[allow(clippy::too_many_arguments)]
+fn push_targets_as(
+    targets: &mut Vec<WindowTarget>,
+    submitted: &mut Vec<(isize, Rect)>,
+    monitor: &MonitorInfo,
+    hwnd: isize,
+    prev: Option<Rect>,
+    next: Rect,
+    window_rect: Rect,
+    border_rect: Rect,
+    border_hwnd: Option<isize>,
+    piled: bool,
+    settled: bool,
+) -> Move {
+    let decision = match plan_move(monitor, prev, next) {
+        Move::Tween if piled && settled && prev == Some(next) => Move::Stay,
+        Move::Tween if piled => Move::Instant,
+        other => other,
+    };
     submitted.push((hwnd, next));
     log::debug!(
         "animate: hwnd={hwnd} {decision:?} ({},{},{},{}) [visible] → ({},{},{},{}) [window]",
@@ -1168,7 +1230,7 @@ fn window_geometry(
 mod tests {
     use super::{
         FlowWM, Move, PrevRects, WindowTarget, WorkspaceParking, plan_move, push_targets,
-        tween_crosses_neighbour,
+        push_targets_as, tween_crosses_neighbour,
     };
     use crate::common::{Rect, WindowId};
     use crate::layout::types::MonitorInfo;
@@ -1294,6 +1356,94 @@ mod tests {
         let m = primary_with_left_neighbour();
         let parked_right = col(1936);
         assert_eq!(plan_move(&m, Some(parked_right), parked_right), Move::Tween);
+    }
+
+    #[test]
+    fn a_window_going_into_a_book_pile_is_placed_instantly() {
+        // On-screen to on-screen would tween; into a pile it is instant, a
+        // blocked-side parking decision is left as it is.
+        let m = primary_with_left_neighbour();
+        let mut targets = Vec::new();
+        let mut submitted = Vec::new();
+        let decision = push_targets_as(
+            &mut targets,
+            &mut submitted,
+            &m,
+            7,
+            Some(col(11)),
+            col(487),
+            col(487),
+            col(487),
+            Some(8),
+            true,
+            true,
+        );
+        assert_eq!(decision, Move::Instant);
+        assert!(targets.iter().all(|t| t.instant));
+        assert_eq!(targets.len(), 2);
+        // Already at its pile rect with nothing in flight: no target; with a
+        // tween in flight it is placed again.
+        let mut none = Vec::new();
+        let stay = push_targets_as(
+            &mut none,
+            &mut submitted,
+            &m,
+            7,
+            Some(col(487)),
+            col(487),
+            col(487),
+            col(487),
+            None,
+            true,
+            true,
+        );
+        assert_eq!(stay, Move::Stay);
+        assert!(none.is_empty());
+        let again = push_targets_as(
+            &mut none,
+            &mut submitted,
+            &m,
+            7,
+            Some(col(487)),
+            col(487),
+            col(487),
+            col(487),
+            None,
+            true,
+            false,
+        );
+        assert_eq!(again, Move::Instant);
+        let mut targets = Vec::new();
+        let decision = push_targets_as(
+            &mut targets,
+            &mut submitted,
+            &m,
+            7,
+            Some(col(11)),
+            col(487),
+            col(487),
+            col(487),
+            None,
+            false,
+            true,
+        );
+        assert_eq!(decision, Move::Tween);
+        let parked_left = col(-2401);
+        let mut targets = Vec::new();
+        let decision = push_targets_as(
+            &mut targets,
+            &mut submitted,
+            &m,
+            7,
+            Some(parked_left),
+            parked_left,
+            parked_left,
+            parked_left,
+            None,
+            true,
+            true,
+        );
+        assert_eq!(decision, Move::Stay);
     }
 
     #[test]

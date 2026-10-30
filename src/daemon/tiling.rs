@@ -293,6 +293,8 @@ impl FlowWM {
             // Overlays are real windows: attached here, outside the
             // mock-testable core.
             self.refresh_all_border_styles();
+            // Book mode: members under their tops again.
+            self.seat_all_piles();
         }
         summary
     }

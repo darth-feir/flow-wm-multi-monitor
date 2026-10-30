@@ -625,8 +625,13 @@ impl FlowWM {
         // Project with the FROZEN viewport (boundary-move preserves
         // viewport_offset) and teleport bystanders. The dragged window is
         // excluded by the active-drag filter inside teleport_preview.
-        let actual =
-            projection::project(&preview_vl, &monitor, &config.padding, config.visible_rows);
+        let actual = projection::project_with(
+            &preview_vl,
+            &monitor,
+            &config.padding,
+            config.visible_rows,
+            config.layout_mode,
+        );
         let applied = AppliedLayout {
             virtual_layout: preview_vl,
             actual_layout: actual,
@@ -788,6 +793,7 @@ impl FlowWM {
                 } else {
                     preview_insert(&applied.virtual_layout, dragged_id, zone, &config, &monitor)
                 };
+                let p = p.map(|p| self.card_camera(m, p, dragged_id, zone));
                 Some((m, p.unwrap_or(applied)))
             }
             _ => None,
@@ -801,6 +807,29 @@ impl FlowWM {
             log::debug!(
                 "drag move: hwnd={hwnd} zone={zone:?} monitor={new_mon:?} cursor=({cx},{cy})"
             );
+        }
+    }
+
+    /// A book-mode card drop's camera (ADR-0022): for a
+    /// [`DropZone::Card`] the preview `p` of `mi`'s strip is re-aimed so
+    /// `window` is that pile's new top
+    /// ([`ScrollingSpace::edge_layout`](crate::workspace::ScrollingSpace::edge_layout))
+    /// and re-projected; every other zone's preview is returned as it is.
+    fn card_camera(
+        &self,
+        mi: usize,
+        p: AppliedLayout,
+        window: crate::common::WindowId,
+        zone: DropZone,
+    ) -> AppliedLayout {
+        let Some(side) = zone.card_side() else {
+            return p;
+        };
+        let space = self.monitors[mi].active_scrolling();
+        let virtual_layout = space.edge_layout(p.virtual_layout, window, side);
+        AppliedLayout {
+            actual_layout: space.project_layout(&virtual_layout),
+            virtual_layout,
         }
     }
 
@@ -960,7 +989,9 @@ impl FlowWM {
             (Some(m), Some(zone)) if m == src && zone.is_placement() => Some(zone),
             _ => None,
         };
-        let moved = zone.and_then(|z| preview_move(&vl, id, z, &config, &monitor));
+        let moved = zone.and_then(|z| {
+            preview_move(&vl, id, z, &config, &monitor).map(|p| self.card_camera(src, p, id, z))
+        });
         let placed = moved.is_some();
         let target_vl = moved.map_or(vl, |p| p.virtual_layout);
 
@@ -1008,6 +1039,7 @@ impl FlowWM {
         let Some(p) = preview_insert(&applied.virtual_layout, id, zone, &config, &monitor) else {
             return false;
         };
+        let p = self.card_camera(target, p, id, zone);
         let from = self.monitors[src].active_scrolling_mut().remove_window(id);
         let new_vl = match p.virtual_layout.find_window(id) {
             Some((col, _)) => ensure_column_visible(&p.virtual_layout, col, &config),

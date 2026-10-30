@@ -293,6 +293,12 @@ impl FlowWM {
             // same interval; walks only the windows held in the layer.
             self.reassert_top_layer();
 
+            // Book mode's backstop: a pile member that raised itself above
+            // its top without being activated is lowered again. Same
+            // interval; one z-order read, nothing when every screen is in
+            // strip mode (`daemon::piles`).
+            self.check_piles();
+
             // Block until a hook event, an IPC client connection, OR a Win32
             // window message arrives. When there are pending window creations
             // or a float-resume deadline, use the sooner finite timeout so

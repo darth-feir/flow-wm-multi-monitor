@@ -32,6 +32,7 @@
 
 - [Workspace Hierarchy](./dev-guide/workspace.md)
 - [Floating Space](./dev-guide/floating-space.md)
+- [Book Mode: Piles](./dev-guide/piles.md)
 - [Window Registry](./dev-guide/window-registry.md)
 - [Classification & Learned Rules](./dev-guide/classification.md)
 - [Animation](./dev-guide/animation.md)

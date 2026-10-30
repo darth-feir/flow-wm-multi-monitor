@@ -75,6 +75,7 @@ mod hooks;
 mod hotplug;
 mod loadout;
 mod new;
+mod piles;
 mod query;
 mod run;
 pub mod session;

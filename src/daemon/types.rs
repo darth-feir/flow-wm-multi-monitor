@@ -59,6 +59,13 @@ pub(super) struct LayoutConfig {
     /// without `[columns]`. See
     /// [`ScrollingSpace::set_width_pattern`](crate::workspace::ScrollingSpace::set_width_pattern).
     pub(super) width_pattern_px: Vec<u32>,
+
+    /// The screen's layout mode (`[columns] layout`, or its
+    /// `[[columns.screen]]` rule's), see ADR-0022.
+    pub(super) layout_mode: crate::layout::types::LayoutMode,
+
+    /// `[columns] wrap_around`.
+    pub(super) wrap_around: crate::layout::types::WrapAround,
 }
 
 /// The single orchestrator for the FlowWM daemon.
@@ -260,6 +267,15 @@ pub struct FlowWM {
     /// band, once per `[focus] foreground_sync_interval_ms`. See
     /// `daemon::top_layer`.
     pub(super) last_top_layer_reassert: std::time::Instant,
+
+    /// When the book-mode piles were last checked against the live
+    /// z-order ([`check_piles`](super::FlowWM::check_piles), once per
+    /// `[focus] foreground_sync_interval_ms`). See `daemon::piles`.
+    pub(super) last_pile_check: std::time::Instant,
+
+    /// The windows the last pile check found out of order, so a repeated
+    /// repair of the same windows is logged once.
+    pub(super) pile_drift: Vec<isize>,
 
     /// The floating layer's current decision: `true` while flow owns the
     /// foreground (members are kept topmost), `false` after the foreground

@@ -426,3 +426,17 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   float-space fullscreen model; no partial visibility, because Windows does
   not clip a window to its monitor.
   `docs/adr/0021-fullscreen-is-a-column.md`
+- **ADR-0022 — Book mode: the columns out of view pile up behind the edge
+  columns.** `[columns] layout = "book"` (per screen too, `set-layout` /
+  Mod+Shift+B at runtime until the next reload) keeps the strip, its
+  patterns and its camera, and gives a column strip mode would park the
+  slot rect of the leftmost or rightmost visible column instead, so every
+  window stays on screen and a one-column scroll flips the next card to the
+  top. The daemon keeps each pile below its top, nearest first, before
+  every batch and on the foreground-sync interval (one `EnumWindows`, a
+  `SetWindowPos` only for a pile out of order); a window going into a pile
+  is placed instantly. Activation (taskbar, Alt+Tab) flips the book in one
+  jump; a drop on a top card makes the window the new top; fullscreen
+  columns keep off-screen parking. Adds `[columns] wrap_around =
+  "off" | "on" | "book"` for focus left/right at the strip ends.
+  `docs/adr/0022-book-mode-piles.md`

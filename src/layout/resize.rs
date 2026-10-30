@@ -476,6 +476,8 @@ mod tests {
             columns_per_screen: 4,
             visible_rows: 0,
             max_rows: 0,
+            layout_mode: crate::layout::types::LayoutMode::Strip,
+            wrap_around: crate::layout::types::WrapAround::Off,
         }
     }
 

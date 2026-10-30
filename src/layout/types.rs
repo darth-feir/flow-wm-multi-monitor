@@ -21,7 +21,93 @@
 //! configured `column_width` and monitor resolution — is accepted; the
 //! `window_gap` is already pixel-based everywhere else.
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
 use crate::common::{Rect, WindowId};
+
+/// Where a strip puts the columns outside its view (`[columns] layout`,
+/// ADR-0022). The strip order, the width patterns and the camera are the
+/// same in both modes; only the rects of the columns out of view differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LayoutMode {
+    /// Columns out of view are parked off-screen (the historical
+    /// behaviour).
+    #[default]
+    Strip,
+    /// Columns out of view pile up behind the leftmost and rightmost
+    /// visible columns, at their slot rect (`docs/adr/0022-book-mode-piles.md`).
+    Book,
+}
+
+impl LayoutMode {
+    /// `"strip"` / `"book"`, as written in `flow.toml`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Strip => "strip",
+            Self::Book => "book",
+        }
+    }
+
+    /// The other mode (`set-layout toggle`).
+    #[must_use]
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::Strip => Self::Book,
+            Self::Book => Self::Strip,
+        }
+    }
+}
+
+/// Whether `focus-column-left/right` wraps from one end of the strip to
+/// the other (`[columns] wrap_around`). Moving a column never wraps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WrapAround {
+    /// Never wraps; at the strip's end focus hops to the next monitor
+    /// (`[navigation] edge_hop`) or stops.
+    #[default]
+    Off,
+    /// Always wraps, in strip and in book mode.
+    On,
+    /// Wraps only on a screen in book mode.
+    Book,
+}
+
+impl WrapAround {
+    /// Whether focus wraps on a strip in `mode`.
+    #[must_use]
+    pub const fn wraps(self, mode: LayoutMode) -> bool {
+        match self {
+            Self::Off => false,
+            Self::On => true,
+            Self::Book => matches!(mode, LayoutMode::Book),
+        }
+    }
+}
+
+/// Which pile of a book-mode strip a column out of view sits in
+/// (ADR-0022): behind the leftmost or the rightmost visible column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PileSide {
+    /// Behind the leftmost visible column (columns before the view).
+    Left,
+    /// Behind the rightmost visible column (columns after the view).
+    Right,
+}
+
+impl PileSide {
+    /// `"left"` / `"right"` for `flow query all`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
 
 /// A single row (window slot) inside a [`Column`].
 ///
@@ -322,6 +408,23 @@ pub struct ActualEntry {
     pub window_id: WindowId,
     /// The computed on-screen rectangle (real pixel coordinates for Windows OS).
     pub rect: Rect,
+    /// The pile this window sits in when its column is out of view on a
+    /// book-mode strip (its `rect` is then the pile top's slot rect, on
+    /// screen); `None` in strip mode, for visible columns and for parked
+    /// fullscreen columns (ADR-0022).
+    pub pile: Option<PileSide>,
+}
+
+impl ActualEntry {
+    /// An entry outside any pile (strip mode, a visible column, a float).
+    #[must_use]
+    pub const fn new(window_id: WindowId, rect: Rect) -> Self {
+        Self {
+            window_id,
+            rect,
+            pile: None,
+        }
+    }
 }
 
 /// The on-screen projection of the virtual layout — what Windows OS must render.

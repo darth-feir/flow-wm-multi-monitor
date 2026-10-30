@@ -28,6 +28,7 @@
 
 use std::fmt;
 
+pub use crate::layout::types::{LayoutMode, WrapAround};
 use schemars::JsonSchema;
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize, Serializer};
@@ -415,7 +416,7 @@ impl ScreenMatch {
 }
 
 /// One `[[columns.screen]]` rule: the presets a matching screen uses
-/// instead of the top-level list.
+/// instead of the top-level list, and/or its own layout mode.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScreenPresetRule {
@@ -423,9 +424,15 @@ pub struct ScreenPresetRule {
     #[serde(rename = "match")]
     pub match_: ScreenMatch,
     /// Ordered presets for those screens; `flow dispatch width` walks this
-    /// list on them.
+    /// list on them. May be left out when the rule only sets `layout`: the
+    /// screen then uses the top-level list.
     #[schemars(with = "Vec<String>")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub presets: Vec<WidthPreset>,
+    /// `"strip"` or `"book"` for these screens in place of the top-level
+    /// `layout`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<LayoutMode>,
     /// The preset such a screen starts on. Must be one of `presets`; when
     /// omitted the first preset is the default.
     #[schemars(with = "Option<String>")]
@@ -450,6 +457,15 @@ pub struct PresetList<'a> {
     /// Index of the `[[columns.screen]]` rule this list came from; `None`
     /// for the top-level list.
     pub rule: Option<usize>,
+}
+
+impl ScreenPresetRule {
+    /// Whether the rule brings its own preset list (a rule may set only
+    /// `layout`).
+    #[must_use]
+    pub fn has_presets(&self) -> bool {
+        !self.presets.is_empty()
+    }
 }
 
 impl PresetList<'_> {
@@ -521,6 +537,18 @@ pub struct ColumnsConfig {
     /// Merging into a full column moves the window past it instead. Must be
     /// at least `visible_rows` when both are set.
     pub max_rows: u32,
+    /// Where columns out of view go: `"strip"` (the default) parks them
+    /// off-screen; `"book"` piles them behind the leftmost and rightmost
+    /// visible columns, so flipping through the strip is a one-column
+    /// scroll and every window stays on screen. A `[[columns.screen]]` rule
+    /// can set its own.
+    pub layout: LayoutMode,
+    /// Whether `focus-column-left/right` wraps from one end of the strip to
+    /// the other: `"off"` (the default; at the end focus hops to the next
+    /// screen or stops), `"on"` (always wraps, strip and book mode) or
+    /// `"book"` (wraps only on a screen in book mode). Moving a column never
+    /// wraps.
+    pub wrap_around: WrapAround,
     /// `[[columns.screen]]`: screens matched by a rule use its list instead;
     /// the first matching rule wins.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -537,6 +565,8 @@ impl Default for ColumnsConfig {
             default: None,
             visible_rows: 0,
             max_rows: 0,
+            layout: LayoutMode::Strip,
+            wrap_around: WrapAround::Off,
             screen: Vec::new(),
         }
     }
@@ -588,6 +618,19 @@ impl ColumnsConfig {
                     "{where_}.min_column_width_px must be positive, got 0"
                 ));
             }
+            if !rule.has_presets() {
+                if rule.layout.is_none() {
+                    return Err(format!(
+                        "{where_}.presets: give at least one preset, or set layout"
+                    ));
+                }
+                if rule.default.is_some() || rule.min_column_width_px.is_some() {
+                    return Err(format!(
+                        "{where_}: default and min_column_width_px need the rule's own presets"
+                    ));
+                }
+                continue;
+            }
             validate_list(&where_, &rule.presets, rule.default.as_ref())?;
         }
         Ok(())
@@ -604,7 +647,7 @@ impl ColumnsConfig {
     #[must_use]
     pub fn list_for(&self, facts: &ScreenFacts) -> PresetList<'_> {
         match self.rule_for(facts) {
-            Some(i) => {
+            Some(i) if self.screen[i].has_presets() => {
                 let rule = &self.screen[i];
                 PresetList {
                     presets: &rule.presets,
@@ -613,8 +656,18 @@ impl ColumnsConfig {
                     rule: Some(i),
                 }
             }
-            None => self.top_level(),
+            _ => self.top_level(),
         }
+    }
+
+    /// The layout mode a screen described by `facts` uses: the first
+    /// matching rule's `layout` when it sets one, else the top-level
+    /// `layout`.
+    #[must_use]
+    pub fn layout_for(&self, facts: &ScreenFacts) -> LayoutMode {
+        self.rule_for(facts)
+            .and_then(|i| self.screen[i].layout)
+            .unwrap_or(self.layout)
     }
 
     /// The top-level `[columns]` list (what every screen used before
@@ -1082,5 +1135,49 @@ default = "1/3"
         // No previous preset: the default.
         assert_eq!(wide.carry_over(None), 2);
         assert_eq!(tall.carry_over(None), 1);
+    }
+
+    #[test]
+    fn layout_and_wrap_around_parse_with_a_per_screen_layout() {
+        let cfg: ColumnsConfig = toml::from_str(
+            "presets = [\"1/2\"]\nlayout = \"book\"\nwrap_around = \"book\"\n\
+             [[screen]]\nmatch = { name = \"DISPLAY2\" }\nlayout = \"strip\"\n\
+             [[screen]]\nmatch = { orientation = \"portrait\" }\npresets = [\"1/1\"]",
+        )
+        .expect("parse");
+        cfg.validate().expect("valid");
+        assert_eq!(cfg.layout, LayoutMode::Book);
+        assert_eq!(cfg.wrap_around, WrapAround::Book);
+        // A layout-only rule changes the mode, not the list.
+        let d2 = facts(1920, 1080, "DISPLAY2");
+        assert_eq!(cfg.layout_for(&d2), LayoutMode::Strip);
+        assert_eq!(cfg.list_for(&d2).rule, None);
+        assert_eq!(cfg.list_for(&d2).labels(), vec!["1/2".to_owned()]);
+        // A preset rule without layout keeps the top-level mode.
+        let tall = facts(1080, 1920, "DISPLAY3");
+        assert_eq!(cfg.layout_for(&tall), LayoutMode::Book);
+        assert_eq!(cfg.list_for(&tall).rule, Some(1));
+        // Defaults: strip, no wrap.
+        let plain: ColumnsConfig = toml::from_str("presets = [\"1/2\"]").expect("parse");
+        assert_eq!(
+            (plain.layout, plain.wrap_around),
+            (LayoutMode::Strip, WrapAround::Off)
+        );
+        // Unknown values are refused.
+        assert!(toml::from_str::<ColumnsConfig>("layout = \"pages\"").is_err());
+        assert!(toml::from_str::<ColumnsConfig>("wrap_around = \"yes\"").is_err());
+        // A rule with neither presets nor layout, or a default without its
+        // own presets, is refused.
+        let bad = |body: &str| {
+            toml::from_str::<ColumnsConfig>(&format!("presets = [\"1/2\"]\n{body}"))
+                .expect("parse")
+                .validate()
+                .expect_err("refused")
+        };
+        assert!(bad("[[screen]]\nmatch = { name = \"D\" }").contains("or set layout"));
+        assert!(
+            bad("[[screen]]\nmatch = { name = \"D\" }\nlayout = \"book\"\ndefault = \"1/2\"")
+                .contains("need the rule's own presets")
+        );
     }
 }

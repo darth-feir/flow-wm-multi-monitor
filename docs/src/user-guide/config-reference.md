@@ -60,6 +60,8 @@ Not every field can change at runtime. Reload applies **live** fields in place;
 | `columns.presets`, `columns.default`, `columns.screen` | Each monitor's preset is re-resolved against its list: it stays on the preset it was on when the list still has it, else lands on that list's `default` (so a monitor that had no presets before starts on `default`). Existing per-column widths preserved for a plain fraction; a pattern re-pins them to its slots, keeping the slot order the screen had. A list with a term under the floor on any attached screen is refused and the old config kept. |
 | `columns.visible_rows` | Every column re-shares its height over the new viewport size and the focused row is kept visible (windows animate). |
 | `columns.max_rows` | Applies to the next merge/consume/insert; a column already over the new cap keeps its rows until windows leave it. |
+| `columns.layout`, `columns.screen[].layout` | Every screen switches to the mode the file gives it (columns out of view slide off-screen or onto the piles); a screen switched at runtime with `set-layout` / Mod+Shift+B goes back to the file's mode. |
+| `columns.wrap_around` | Applies to the next `focus left/right` at a strip end. |
 | `animation.*` | New duration / easing / enabled flag applies to the next animation. |
 | `navigation.edge_hop` | Applies to the next `focus` / `move-window` at a strip edge. |
 | `adopt_maximized` | Applies to the next maximized window the daemon meets (a window already parked as ignored is adopted when it is next focused, shown or moved). |
@@ -136,6 +138,8 @@ focused monitor through the list (see the
 | `default` | `Option<String>` | `None` (= the first preset) | The preset every monitor starts on. Must be one of `presets`. |
 | `visible_rows` | `u32` | `0` | How many rows of a column are on screen at once. `0` shows every row sharing the height. With `2`, a column of four windows shows two at a time and `focus up/down` scrolls through the stack. |
 | `max_rows` | `u32` | `0` | The most rows a column may hold; `0` is unlimited. Must be at least `visible_rows` when both are set. Merging into a full column moves the window past it instead. |
+| `layout` | `"strip"` / `"book"` | `"strip"` | Where the columns out of view go: `"strip"` parks them off-screen; `"book"` piles them behind the leftmost and rightmost visible columns (see [Book layout](#book-layout-layout--book)). A `[[columns.screen]]` rule can set its own. |
+| `wrap_around` | `"off"` / `"on"` / `"book"` | `"off"` | Whether `focus left/right` wraps from one end of the strip to the other: never, on every screen, or only on a screen in book layout. Moving a column never wraps. |
 | `screen` | `Vec<table>` | `[]` | `[[columns.screen]]` rules giving a matched screen its own list (see [Per-screen rules](#per-screen-rules-columnsscreen)). |
 
 A preset `1/n` is sized so that `n` columns **plus their gaps** fill the work
@@ -219,13 +223,17 @@ on that list's `default`.
 | `match.min_width_px` | `u32` | The work area must be at least this wide. |
 | `match.max_width_px` | `u32` | The work area must be at most this wide. |
 | `match.name` | `String` | Windows' device name, `"DISPLAY2"` (the `\\.\` prefix is optional, case does not matter). `flow query all` prints each monitor's `device_name`. |
-| `presets` | `Vec<String>` | The list for those screens; same grammar as the top-level `presets`. |
+| `presets` | `Vec<String>` | The list for those screens; same grammar as the top-level `presets`. May be left out when the rule sets `layout`: the screen then keeps the top-level list. |
 | `default` | `Option<String>` | The preset such a screen starts on; one of the rule's `presets`. |
 | `min_column_width_px` | `Option<u32>` | A floor for those screens instead of the top-level one, which is screen-blind. |
+| `layout` | `Option<"strip" / "book">` | The layout for those screens instead of the top-level `layout`. |
 
 Every field of `match` that is given must hold, and at least one must be
 given. Orientation and width survive display renumbering, so prefer them
-over `name` for everything but a specific display.
+over `name` for everything but a specific display. A rule must set
+`presets`, `layout` or both; `default` and `min_column_width_px` need the
+rule's own `presets`. The first matching rule decides both the list and the
+layout of a screen.
 
 ```toml
 [columns]
@@ -281,6 +289,70 @@ only `visible_rows` / `max_rows` uses the default `presets`.
 `flow query all` reports, per monitor, each column's `row_count`,
 `row_offset` (the first visible row), `visible_rows` and `fullscreen`, and
 every window's `parked_row`.
+
+#### Book layout: `layout = "book"`
+
+In the default strip layout the columns that are out of view are parked
+just off the screens. In **book** layout they stay on the screen: the
+columns before the view are **piled** behind the leftmost visible column and
+the columns after it behind the rightmost one, each pile at exactly that
+column's place and size, nearest column first. The edge columns are the
+piles' **top cards**. The strip itself does not change — same order, same
+width presets and patterns, same camera — so every command behaves as in
+strip layout; only where the columns out of view sit is different.
+
+- **Flipping** is the ordinary one-column scroll: Mod+Right past the right
+  edge brings the next card of the right pile to the top while the
+  leftmost card sinks onto the left pile. Only the window that changes
+  place moves; the others are already where they belong.
+- With **`"1/1"`** the screen is a carousel (one card on top of both
+  piles), with **`"1/2"`** there are two piles, and with three or more
+  columns on screen the middle ones are plain windows.
+- A **taskbar click**, **Alt+Tab** or anything else that activates a piled
+  window flips the book to it in one step (the columns in between change
+  piles).
+- **Dragging** a window (Mod+drag or its title bar) onto a top card (all
+  of it but the scroll band at the screen edge) makes it the new top card
+  of that pile, the old top right behind it; on a lone card (`"1/1"`) the
+  half under the cursor picks the pile. An edge column whose pile is empty
+  keeps the ordinary drop zones (beside it, or into it as a row). To drop
+  deeper, hold the window at the screen edge: the edge scroll flips the
+  book, then drop on the card shown.
+- A **fullscreen** column (Mod+F) keeps the strip behaviour: it is parked
+  off-screen when out of view; while it fills the screen the other columns
+  lie under it.
+- `wrap_around = "book"` makes Mod+Left / Mod+Right wrap round the strip on
+  book screens only — handy for a carousel. While wrapping is on for a
+  screen, Mod+Left / Right at its ends wrap instead of hopping to the next
+  screen (`[navigation] edge_hop`); a strip of one column has nothing to
+  wrap to and still hops.
+- A column less than half on screen counts as out of view and is piled
+  (under `"2/3+1/3"` the rounding can leave the next column a one-pixel
+  sliver at the right edge; strip layout is unchanged).
+- `flow dispatch set-layout strip|book|toggle` (bound to **Mod+Shift+B** by
+  the win-niri keymap) switches the screen of the focused window until the
+  next reload; `flow query all` shows each monitor's `layout` and each
+  column's and window's `pile` (`"left"`, `"right"` or `null`).
+
+What to expect: piled windows are covered, not hidden, so the taskbar and
+Alt+Tab list them as usual and a browser in a pile may throttle like one
+that is minimized. Between the rows of a stacked top card a `window_gap`
+high strip of the card underneath shows. An app that brings itself to the
+front without being activated is put back under its top card within
+`[focus] foreground_sync_interval_ms`. Why it works this way:
+`docs/adr/0022-book-mode-piles.md`.
+
+```toml
+[columns]
+presets = ["1/3", "2/3+1/3", "1/2", "1/1"]
+default = "1/2"
+layout = "strip"          # every screen unless a rule says otherwise
+wrap_around = "book"      # Mod+Left/Right wrap round on book screens
+
+[[columns.screen]]
+match = { name = "DISPLAY2" }
+layout = "book"           # this screen only, with the list above
+```
 
 ### `[padding]` — spacing
 
@@ -555,6 +627,7 @@ same table are an error.
 | `switch-focus-between-floating-and-tiling` | `switch-focus-between-floating-and-tiling` | focus the other side: the float used last (else the top one), or the strip's last tile; Mod+Shift+V by default |
 | `focus-floating`, `focus-tiling` | the same names | one side explicitly; an empty side is a no-op |
 | `fullscreen-window` | `set-window fullscreen` | |
+| `toggle-layout` | `set-layout toggle` | book / strip layout on the focused window's screen until the next reload; Mod+Shift+B by default |
 | `switch-preset-column-width`, `switch-preset-column-width-back` | `width next` / `width prev` | |
 | `set-column-width "+10%"` / `"-10%"` | `expand-column` / `shrink-column` | one step either way; refused on a width pattern |
 | `consume-or-expel-window-left` / `-right` | `consume-or-expel <dir>` | |

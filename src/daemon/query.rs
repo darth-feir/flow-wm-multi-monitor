@@ -6,19 +6,31 @@
 
 use crate::common::WindowId;
 use crate::ipc::message::SocketResponse;
-use crate::layout::types::VirtualLayout;
+use crate::layout::types::{ActualLayout, VirtualLayout};
 
 use super::types::FlowWM;
 
 /// `flow query all` / `query layout virtual` view of one strip's columns:
 /// index, width, row count, the row viewport offset, how many rows the
 /// viewport shows (`visible_rows`, `0` = all) and whether the column is
-/// fullscreen (its `width_px` is then the width it returns to, ADR-0021).
-fn columns_json(vl: &VirtualLayout, visible_rows: u32) -> Vec<serde_json::Value> {
+/// fullscreen (its `width_px` is then the width it returns to, ADR-0021),
+/// and the book-mode pile it sits in (`"left"` / `"right"`, `null` when
+/// visible or in strip mode, ADR-0022).
+fn columns_json(
+    vl: &VirtualLayout,
+    visible_rows: u32,
+    actual: &ActualLayout,
+) -> Vec<serde_json::Value> {
     vl.columns
         .iter()
         .enumerate()
         .map(|(i, col)| {
+            let pile = col
+                .rows
+                .first()
+                .and_then(|r| actual.find(r.window_id))
+                .and_then(|e| e.pile)
+                .map(|p| p.name());
             serde_json::json!({
                 "index": i,
                 "width_px": col.width_px,
@@ -26,6 +38,7 @@ fn columns_json(vl: &VirtualLayout, visible_rows: u32) -> Vec<serde_json::Value>
                 "row_offset": col.row_offset,
                 "visible_rows": col.slots(visible_rows),
                 "fullscreen": col.fullscreen,
+                "pile": pile,
             })
         })
         .collect()
@@ -70,6 +83,21 @@ impl FlowWM {
         }
     }
 
+    /// The book-mode pile tiled window `wid` sits in on its strip
+    /// (`"left"` / `"right"`); `None` when visible, in strip mode or seated
+    /// in no strip.
+    #[must_use]
+    pub(super) fn pile_of(&self, wid: WindowId) -> Option<&'static str> {
+        self.monitors.iter().find_map(|m| {
+            m.workspaces().iter().find_map(|ws| {
+                ws.scrolling
+                    .actual_layout()
+                    .find(wid)
+                    .map(|e| e.pile.map(|p| p.name()))
+            })
+        })?
+    }
+
     /// Return all tracked windows as JSON.
     ///
     /// The viewport offset from the virtual layout is included so clients
@@ -96,6 +124,9 @@ impl FlowWM {
         annotate_windows_with_mode(&mut payload, |hwnd| self.window_mode(hwnd));
         annotate_windows_with(&mut payload, "parked_row", |hwnd| {
             serde_json::json!(self.parked_row(WindowId(hwnd)))
+        });
+        annotate_windows_with(&mut payload, "pile", |hwnd| {
+            serde_json::json!(self.pile_of(WindowId(hwnd)))
         });
         if let serde_json::Value::Object(map) = &mut payload {
             let monitors: Vec<serde_json::Value> = self
@@ -126,9 +157,12 @@ impl FlowWM {
                         "tiled_windows": m.active_scrolling().virtual_layout().window_count(),
                         "visible_rows": m.active_scrolling().config().visible_rows,
                         "max_rows": m.active_scrolling().config().max_rows,
+                        "layout": m.active_scrolling().layout_mode().name(),
+                        "wrap_around": m.active_scrolling().config().wrap_around,
                         "columns": columns_json(
                             m.active_scrolling().virtual_layout(),
                             m.active_scrolling().config().visible_rows,
+                            m.active_scrolling().actual_layout(),
                         ),
                     })
                 })
@@ -154,7 +188,8 @@ impl FlowWM {
     pub(super) fn query_layout_virtual(&self) -> SocketResponse {
         let vl = self.active_scrolling().virtual_layout();
         let visible_rows = self.active_scrolling().config().visible_rows;
-        let columns_json: Vec<serde_json::Value> = columns_json(vl, visible_rows)
+        let actual = self.active_scrolling().actual_layout();
+        let columns_json: Vec<serde_json::Value> = columns_json(vl, visible_rows, actual)
             .into_iter()
             .zip(&vl.columns)
             .map(|(mut json, col)| {
@@ -205,6 +240,7 @@ impl FlowWM {
                         "width": e.rect.width,
                         "height": e.rect.height,
                     },
+                    "pile": e.pile.map(|p| p.name()),
                 })
             })
             .collect();
@@ -436,7 +472,7 @@ mod tests {
             ],
             0,
         );
-        let cols = columns_json(&vl, 2);
+        let cols = columns_json(&vl, 2, &crate::layout::types::ActualLayout::new());
         assert_eq!(cols[0]["row_count"], 4);
         assert_eq!(cols[0]["row_offset"], 1);
         assert_eq!(cols[0]["visible_rows"], 2);
@@ -445,6 +481,9 @@ mod tests {
         assert!(vl.columns[0].row_visible(1, 2) && vl.columns[0].row_visible(2, 2));
         assert!(!vl.columns[0].row_visible(0, 2) && !vl.columns[0].row_visible(3, 2));
         // Without a viewport every row is visible.
-        assert_eq!(columns_json(&vl, 0)[0]["visible_rows"], 4);
+        assert_eq!(
+            columns_json(&vl, 0, &crate::layout::types::ActualLayout::new())[0]["visible_rows"],
+            4
+        );
     }
 }

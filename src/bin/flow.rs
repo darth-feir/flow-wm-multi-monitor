@@ -40,6 +40,7 @@ use flow_wm::build_info;
 use flow_wm::common::Direction;
 use flow_wm::config;
 use flow_wm::daemon::startup::{self, StartupState, StartupStatus};
+use flow_wm::ipc::message::LayoutRequest;
 use flow_wm::ipc::message::SocketResponse;
 use flow_wm::ipc::message::WidthPresetRequest;
 use flow_wm::ipc::message::WindowMode;
@@ -321,6 +322,17 @@ enum DispatchCommands {
     Width {
         /// `next`, `prev`, `cycle` or a configured preset such as `1/2`.
         preset: String,
+    },
+    /// Switch the focused window's screen to strip or book layout.
+    ///
+    /// Sends [`SocketMessage::SetLayout`]. `MODE` is `strip` (columns out
+    /// of view parked off-screen), `book` (piled behind the edge columns)
+    /// or `toggle`. Every workspace of that screen switches; a config
+    /// reload puts it back to `[columns] layout` in flow.toml. Prints the
+    /// mode the screen landed on.
+    SetLayout {
+        /// `strip`, `book` or `toggle`.
+        mode: String,
     },
     /// Center the viewport so the focused column lands at the monitor midpoint.
     ///
@@ -1367,6 +1379,7 @@ fn cmd_dispatch(command: DispatchCommands) -> Result<(), String> {
             send_command(SocketMessage::ShrinkColumn, "column shrunk")
         }
         DispatchCommands::Width { preset } => cmd_dispatch_width(&preset),
+        DispatchCommands::SetLayout { mode } => cmd_dispatch_set_layout(&mode),
         DispatchCommands::Center => send_command(SocketMessage::Center, "viewport centered"),
         DispatchCommands::FocusFloating => cmd_dispatch_focus_layer(LayerTarget::Floating),
         DispatchCommands::FocusTiling => cmd_dispatch_focus_layer(LayerTarget::Tiling),
@@ -1549,6 +1562,38 @@ fn cmd_dispatch_width(preset: &str) -> Result<(), String> {
             println!("flow: column width set");
             Ok(())
         }
+        SocketResponse::Error { message } => Err(format!("daemon error: {message}")),
+        SocketResponse::Busy => Err("daemon is busy (drag in progress), retry shortly".to_string()),
+        SocketResponse::Pong { .. } => Err("unexpected pong reply to a command".to_string()),
+    }
+}
+
+/// Send a layout mode command and print the mode the screen landed on.
+///
+/// Maps `flow dispatch set-layout strip|book|toggle` to
+/// [`SocketMessage::SetLayout`]; the daemon answers `{"layout": "<mode>",
+/// "monitor": <index>}`, printed as `flow: layout <mode> on monitor <index>`.
+fn cmd_dispatch_set_layout(mode: &str) -> Result<(), String> {
+    let msg = SocketMessage::SetLayout {
+        layout: LayoutRequest::from_cli(mode)?,
+    };
+    grant_foreground_permission();
+    let response =
+        transport::send_message(&msg).map_err(|e| format!("failed to send command: {e}"))?;
+    match response {
+        SocketResponse::Data { payload } => {
+            let layout = payload
+                .get("layout")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("malformed reply to set-layout: {payload}"))?;
+            let monitor = payload
+                .get("monitor")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            println!("flow: layout {layout} on monitor {monitor}");
+            Ok(())
+        }
+        SocketResponse::Ok => Ok(()),
         SocketResponse::Error { message } => Err(format!("daemon error: {message}")),
         SocketResponse::Busy => Err("daemon is busy (drag in progress), retry shortly".to_string()),
         SocketResponse::Pong { .. } => Err("unexpected pong reply to a command".to_string()),

@@ -746,6 +746,7 @@ bind	#r	tiling	dispatch	0	Mod+R	cycle this screen's column widths (flow.toml [co
 bind	#f	tiling	dispatch	0	Mod+F	fullscreen toggle	set-window<US>fullscreen
 bind	#[	tiling	dispatch	0	Mod+BracketLeft	alone: merge into the column on that side; stacked: pop out to that side	consume-or-expel<US>left
 bind	#]	tiling	dispatch	0	Mod+BracketRight	alone: merge into the column on that side; stacked: pop out to that side	consume-or-expel<US>right
+bind	#+b	tiling	dispatch	0	Mod+Shift+B	book / strip layout on this screen (columns out of view piled or parked)	set-layout<US>toggle
 bind	#Space	always	launcher	0	Mod+Space	application launcher (apps; window - x and file - x search those instead)	
 bind	#d	always	launcher	0	Mod+D	application launcher (apps; window - x and file - x search those instead)	
 bind	#t	always	spawn	0	Mod+T	run alacritty	alacritty
@@ -769,6 +770,7 @@ row	Mod+Shift+V	switch focus between the floating and the tiled windows
 row	Mod+R	cycle this screen's column widths (flow.toml [columns] presets)
 row	Mod+F	fullscreen toggle
 row	Mod+BracketLeft, Mod+BracketRight	alone: merge into the column on that side; stacked: pop out to that side
+row	Mod+Shift+B	book / strip layout on this screen (columns out of view piled or parked)
 row	Mod+Space, Mod+D	application launcher (apps; window - x and file - x search those instead)
 row	Mod+T	run alacritty
 row	Mod+Shift+T	run alacritty as admin

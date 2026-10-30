@@ -42,11 +42,23 @@ min_column_width_px = 640
 # outside it parked off-screen. `max_rows` caps how many rows a column may
 # hold (0 = unlimited); merging into a full column moves the window past it.
 #
+# Layout: `layout = "strip"` (the default) parks the columns out of view
+# off-screen; `layout = "book"` piles them behind the leftmost and rightmost
+# visible columns instead, so every window stays on screen and a one-column
+# scroll flips the next card to the top (`flow dispatch set-layout
+# strip|book|toggle` switches the focused screen until the next reload). A
+# `[[columns.screen]]` rule may set its own `layout`, with or without its own
+# presets. `wrap_around` lets focus-left/right wrap from one end of the strip
+# to the other: "off" (the default), "on" (every screen) or "book" (only a
+# screen in book mode). Moving a column never wraps.
+#
 # [columns]
 # presets = ["1/3", "1/2", "1/1"]
 # default = "1/2"
 # visible_rows = 2
 # max_rows = 4
+# layout = "strip"
+# wrap_around = "off"
 
 # Minimum row height in pixels — the floor for any single window's allocated
 # height inside a column. Bounds the maximum number of rows that can stack

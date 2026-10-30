@@ -77,7 +77,11 @@ Move focus to the neighbouring window.
 
 At the end of a strip, `focus` hops to the monitor in that direction when
 there is one (see [Monitors](#monitors)); set `[navigation] edge_hop = false`
-in `flow.toml` to make it stop at the edge instead.
+in `flow.toml` to make it stop at the edge instead. With `[columns]
+wrap_around = "on"` (or `"book"` on a screen in book layout) `focus left` /
+`focus right` wrap round to the other end of the strip instead of hopping; a
+strip of one column has nothing to wrap to and still hops. `move-window`
+never wraps.
 
 On a fullscreen window `focus left` / `focus right` move to the
 neighbouring column and park the fullscreen window off screen; focusing it
@@ -91,6 +95,9 @@ the left monitor. FlowWM moves parked windows without resizing them, and
 resizes a parked window (a `width` change) without asking the app, so they
 stay parked. On screen, an app's own minimum size still applies; a window
 resized below its minimum while parked gets its minimum back when it returns.
+In book layout (`[columns] layout = "book"`, [`set-layout`](#set-layout-stripbooktoggle))
+those columns are piled on screen behind the edge columns instead; only a
+fullscreen column is still parked.
 
 ```powershell
 flow dispatch focus right
@@ -259,6 +266,26 @@ The command prints the preset the monitor landed on. `flow query all` reports
 each monitor's `width_preset`, and the loadout remembers it per monitor across a
 restart. No default hotkey in `flow.ahk` — bind it yourself (`Mod+R` →
 `width cycle` is the natural choice).
+
+### `set-layout <strip|book|toggle>`
+
+Switch the screen of the focused window (the focused monitor when no tile is
+focused) between the two layouts of `[columns] layout` (see the
+[Config Reference](./config-reference.md#book-layout-layout--book)):
+`strip` parks the columns out of view off-screen, `book` piles them behind
+the leftmost and rightmost visible columns, `toggle` takes the other one.
+Every workspace of that screen switches; the strip itself (order, widths,
+camera) does not change. The switch lasts until the next config reload,
+which puts every screen back to what `flow.toml` says.
+
+```powershell
+flow dispatch set-layout toggle   # flow: layout book on monitor 0
+flow dispatch set-layout strip    # flow: layout strip on monitor 0
+```
+
+The command prints the layout the screen landed on; `flow query all`
+reports each monitor's `layout`. The win-niri keymap binds `toggle` to
+`Mod+Shift+B` (binds action `toggle-layout`).
 
 ### `center`
 
@@ -673,7 +700,7 @@ A few other top-level commands are worth knowing:
 | `flow config check` | List every problem in `flow.toml` (each `[binds]` entry on its own line, preset lists against the attached screens) and `flow-rules.toml` without applying anything — through the running daemon, or locally when none runs. |
 | `flow loadout save [path]` / `flow loadout load [path]` | Save / restore the window arrangement. Without a path the config's `[loadout] default_path` (a plain file name in the config dir) is used. A given path must be a `.json` file with no `..` in it; relative paths are resolved against the config directory, absolute ones used as given. Anything else is refused — by the CLI before sending, and by the daemon for whatever arrives over the pipe. |
 | `flow query binds [--plain]` | The key bindings the daemon resolved from `[binds]` (or the keymap's built-in table) as JSON: chord, AutoHotkey hotkey, action, what it runs, scope, help text, plus the overlay rows. `--plain` prints the tab-separated listing `flow.ahk` registers its hotkeys from. |
-| `flow query all` | Dump every tracked window (state, `mode` — `tiled` / `floating` / `fullscreen` / `minimized` / `hidden` / `ignored` —, `on_top` — whether FlowWM currently keeps it above the tiles (`[floating] always_on_top`) —, rect, column/row, …) as JSON, plus the monitors (each with its `width_preset`) and whether tiling is on (`tiling_enabled`). |
+| `flow query all` | Dump every tracked window (state, `mode` — `tiled` / `floating` / `fullscreen` / `minimized` / `hidden` / `ignored` —, `on_top` — whether FlowWM currently keeps it above the tiles (`[floating] always_on_top`) —, rect, column/row, `pile` — `"left"` / `"right"` for a window piled in book layout, else `null` —, …) as JSON, plus the monitors (each with its `width_preset`, `layout` and `wrap_around`) and whether tiling is on (`tiling_enabled`). |
 | `flow enable-autostart [--ahk]` | Create the login shortcut in `shell:startup` (idempotent). |
 | `flow disable-autostart` | Remove the login shortcut (idempotent). |
 | `flow update` | Ask GitHub whether something newer than this build exists and print how to update — **it never downloads or installs anything**. Compares the commit the binary was built from with the `[update]` branch (by default the build's own branch of the repository its `origin` pointed at), or the crate version with the latest release when `[update] branch = ""`. Exit code `0` = up to date, `10` = something newer, `2` = api.github.com unreachable, `3` = repository / branch / release not found, `4` = other GitHub error, `5` = no commit embedded in the build. `--check` is accepted and changes nothing. |

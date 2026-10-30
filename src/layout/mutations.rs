@@ -38,7 +38,7 @@
 
 use crate::common::{Direction, WindowId};
 use crate::layout::projection::{canvas_width, column_left, column_step_width};
-use crate::layout::types::{Column, Padding, Row, VirtualLayout};
+use crate::layout::types::{Column, LayoutMode, Padding, Row, VirtualLayout, WrapAround};
 
 /// Location of a neighboring window returned by [`find_neighbor_window`].
 ///
@@ -127,6 +127,13 @@ pub struct MutationConfig {
     /// new column after the full one ([`add_window_to_column`],
     /// [`set_layout`]).
     pub max_rows: u32,
+    /// `[columns] layout` of this strip's screen (or its runtime toggle):
+    /// where columns out of view are placed
+    /// ([`project_with`](crate::layout::projection::project_with), ADR-0022).
+    pub layout_mode: LayoutMode,
+    /// `[columns] wrap_around`: whether [`focus`] left/right wraps from one
+    /// end of the strip to the other ([`WrapAround::wraps`]).
+    pub wrap_around: WrapAround,
 }
 
 impl MutationConfig {
@@ -463,6 +470,32 @@ pub fn find_neighbor_window(
     }
 }
 
+/// The neighbour [`focus`] wraps to at the end of the strip when
+/// `[columns] wrap_around` allows it on this strip's layout mode: the
+/// first column from the last one going right, the last from the first
+/// going left (same row rule as [`find_neighbor_window`]). `None` for
+/// up/down, a strip of one column, or wrapping off.
+fn wrapped_neighbor(
+    layout: &VirtualLayout,
+    focused: WindowId,
+    direction: Direction,
+    config: &MutationConfig,
+) -> Option<NeighborLocation> {
+    if !config.wrap_around.wraps(config.layout_mode) || layout.columns.len() < 2 {
+        return None;
+    }
+    let (_, row) = layout.find_window(focused)?;
+    let col = match direction {
+        Direction::Left => layout.columns.len() - 1,
+        Direction::Right => 0,
+        Direction::Up | Direction::Down => return None,
+    };
+    Some(NeighborLocation {
+        col,
+        row: closest_row(&layout.columns[col], row),
+    })
+}
+
 /// Pick the row index in `column` closest to `preferred_row`.
 ///
 /// Clamps to the valid range `[0, column.rows.len() - 1]`.
@@ -643,7 +676,8 @@ pub fn focus(
     direction: Direction,
     config: &MutationConfig,
 ) -> Option<FocusResult> {
-    let neighbor = find_neighbor_window(layout, focused, direction)?;
+    let neighbor = find_neighbor_window(layout, focused, direction)
+        .or_else(|| wrapped_neighbor(layout, focused, direction, config))?;
     let target_window = layout.columns[neighbor.col].rows[neighbor.row].window_id;
 
     match direction {
@@ -1965,6 +1999,8 @@ mod tests {
             columns_per_screen: 4,
             visible_rows: 0,
             max_rows: 0,
+            layout_mode: crate::layout::types::LayoutMode::Strip,
+            wrap_around: crate::layout::types::WrapAround::Off,
         }
     }
 
@@ -2385,6 +2421,8 @@ mod tests {
             columns_per_screen: 4,
             visible_rows: 0,
             max_rows: 0,
+            layout_mode: crate::layout::types::LayoutMode::Strip,
+            wrap_around: crate::layout::types::WrapAround::Off,
         };
         let layout = VirtualLayout::with_columns(
             vec![
@@ -2421,6 +2459,8 @@ mod tests {
             columns_per_screen: 4,
             visible_rows: 0,
             max_rows: 0,
+            layout_mode: crate::layout::types::LayoutMode::Strip,
+            wrap_around: crate::layout::types::WrapAround::Off,
         };
         let layout = VirtualLayout::with_columns(
             vec![
@@ -2624,6 +2664,8 @@ mod tests {
             columns_per_screen: 4,
             visible_rows: 0,
             max_rows: 0,
+            layout_mode: crate::layout::types::LayoutMode::Strip,
+            wrap_around: crate::layout::types::WrapAround::Off,
         };
         let layout = VirtualLayout::with_columns(
             vec![
@@ -2822,6 +2864,8 @@ mod tests {
             columns_per_screen: 4,
             visible_rows: 0,
             max_rows: 0,
+            layout_mode: crate::layout::types::LayoutMode::Strip,
+            wrap_around: crate::layout::types::WrapAround::Off,
         };
         let layout = VirtualLayout::with_columns(
             vec![
@@ -3408,6 +3452,60 @@ mod tests {
     }
 
     #[test]
+    fn wrap_around_follows_its_three_values() {
+        let layout = three_column_layout();
+        let cfg = |wrap: WrapAround, mode: LayoutMode| MutationConfig {
+            wrap_around: wrap,
+            layout_mode: mode,
+            ..test_config()
+        };
+        let wraps = |c: &MutationConfig| {
+            let r = focus(&layout, WindowId(3), Direction::Right, c).map(|r| r.focused);
+            let l = focus(&layout, WindowId(1), Direction::Left, c).map(|r| r.focused);
+            (r, l)
+        };
+        // off: no wrap in either mode.
+        for mode in [LayoutMode::Strip, LayoutMode::Book] {
+            assert_eq!(wraps(&cfg(WrapAround::Off, mode)), (None, None));
+        }
+        // on: both modes.
+        for mode in [LayoutMode::Strip, LayoutMode::Book] {
+            assert_eq!(
+                wraps(&cfg(WrapAround::On, mode)),
+                (Some(WindowId(1)), Some(WindowId(3)))
+            );
+        }
+        // book: only a book-mode strip.
+        assert_eq!(
+            wraps(&cfg(WrapAround::Book, LayoutMode::Strip)),
+            (None, None)
+        );
+        assert_eq!(
+            wraps(&cfg(WrapAround::Book, LayoutMode::Book)),
+            (Some(WindowId(1)), Some(WindowId(3)))
+        );
+        // The wrap brings the far end into view; up/down never wrap.
+        let c = cfg(WrapAround::On, LayoutMode::Book);
+        let back = focus(&layout, WindowId(1), Direction::Left, &c).expect("wraps");
+        assert!(back.new_layout.viewport_offset > 0);
+        assert!(focus(&layout, WindowId(1), Direction::Up, &c).is_none());
+        // A lone column has nothing to wrap to.
+        let one =
+            VirtualLayout::with_columns(vec![Column::with_row(960, Row::new(WindowId(1), 0))], 0);
+        assert!(focus(&one, WindowId(1), Direction::Right, &c).is_none());
+    }
+
+    #[test]
+    fn moving_a_column_never_wraps() {
+        let layout = three_column_layout();
+        let c = MutationConfig {
+            wrap_around: WrapAround::On,
+            ..test_config()
+        };
+        assert!(swap_window(&layout, WindowId(3), Direction::Right, &c).is_none());
+    }
+
+    #[test]
     fn focus_right_at_last_column_returns_none() {
         // Negative: focus right at rightmost column → None
         let layout = three_column_layout();
@@ -3648,6 +3746,8 @@ mod tests {
             columns_per_screen,
             visible_rows: 0,
             max_rows: 0,
+            layout_mode: crate::layout::types::LayoutMode::Strip,
+            wrap_around: crate::layout::types::WrapAround::Off,
         }
     }
 
@@ -3729,6 +3829,8 @@ mod tests {
             columns_per_screen: 2,
             visible_rows: 0,
             max_rows: 0,
+            layout_mode: crate::layout::types::LayoutMode::Strip,
+            wrap_around: crate::layout::types::WrapAround::Off,
         }
     }
 
@@ -3840,6 +3942,8 @@ mod tests {
             columns_per_screen: 2,
             visible_rows: 0,
             max_rows: 0,
+            layout_mode: crate::layout::types::LayoutMode::Strip,
+            wrap_around: crate::layout::types::WrapAround::Off,
         }
     }
 
@@ -3892,6 +3996,8 @@ mod tests {
             columns_per_screen: 3,
             visible_rows: 0,
             max_rows: 0,
+            layout_mode: crate::layout::types::LayoutMode::Strip,
+            wrap_around: crate::layout::types::WrapAround::Off,
         }
     }
 
@@ -4055,6 +4161,8 @@ mod tests {
             columns_per_screen: 4,
             visible_rows: 0,
             max_rows: 0,
+            layout_mode: crate::layout::types::LayoutMode::Strip,
+            wrap_around: crate::layout::types::WrapAround::Off,
         };
         assert_eq!(
             config.column_shift(),

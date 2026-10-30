@@ -291,6 +291,11 @@
             "null"
           ]
         },
+        "layout": {
+          "description": "Where columns out of view go: `\"strip\"` (the default) parks them\noff-screen; `\"book\"` piles them behind the leftmost and rightmost\nvisible columns, so flipping through the strip is a one-column\nscroll and every window stays on screen. A `[[columns.screen]]` rule\ncan set its own.",
+          "$ref": "#/$defs/LayoutMode",
+          "default": "strip"
+        },
         "max_rows": {
           "description": "The most rows a column may hold; `0` (the default) is unlimited.\nMerging into a full column moves the window past it instead. Must be\nat least `visible_rows` when both are set.",
           "type": "integer",
@@ -323,6 +328,11 @@
           "format": "uint32",
           "default": 0,
           "minimum": 0
+        },
+        "wrap_around": {
+          "description": "Whether `focus-column-left/right` wraps from one end of the strip to\nthe other: `\"off\"` (the default; at the end focus hops to the next\nscreen or stops), `\"on\"` (always wraps, strip and book mode) or\n`\"book\"` (wraps only on a screen in book mode). Moving a column never\nwraps.",
+          "$ref": "#/$defs/WrapAround",
+          "default": "off"
         }
       }
     },
@@ -570,6 +580,21 @@
         }
       }
     },
+    "LayoutMode": {
+      "description": "Where a strip puts the columns outside its view (`[columns] layout`,\nADR-0022). The strip order, the width patterns and the camera are the\nsame in both modes; only the rects of the columns out of view differ.",
+      "oneOf": [
+        {
+          "description": "Columns out of view are parked off-screen (the historical\nbehaviour).",
+          "type": "string",
+          "const": "strip"
+        },
+        {
+          "description": "Columns out of view pile up behind the leftmost and rightmost\nvisible columns, at their slot rect (`docs/adr/0022-book-mode-piles.md`).",
+          "type": "string",
+          "const": "book"
+        }
+      ]
+    },
     "LoadoutConfig": {
       "description": "Loadout save/restore configuration.\n\nControls the file path used when saving or restoring workspace loadouts.",
       "type": "object",
@@ -724,7 +749,7 @@
       "additionalProperties": false
     },
     "ScreenPresetRule": {
-      "description": "One `[[columns.screen]]` rule: the presets a matching screen uses\ninstead of the top-level list.",
+      "description": "One `[[columns.screen]]` rule: the presets a matching screen uses\ninstead of the top-level list, and/or its own layout mode.",
       "type": "object",
       "properties": {
         "default": {
@@ -732,6 +757,17 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "layout": {
+          "description": "`\"strip\"` or `\"book\"` for these screens in place of the top-level\n`layout`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LayoutMode"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "match": {
@@ -748,7 +784,7 @@
           "minimum": 0
         },
         "presets": {
-          "description": "Ordered presets for those screens; `flow dispatch width` walks this\nlist on them.",
+          "description": "Ordered presets for those screens; `flow dispatch width` walks this\nlist on them. May be left out when the rule only sets `layout`: the\nscreen then uses the top-level list.",
           "type": "array",
           "items": {
             "type": "string"
@@ -757,8 +793,7 @@
       },
       "additionalProperties": false,
       "required": [
-        "match",
-        "presets"
+        "match"
       ]
     },
     "StartupConfig": {
@@ -798,6 +833,26 @@
           ]
         }
       }
+    },
+    "WrapAround": {
+      "description": "Whether `focus-column-left/right` wraps from one end of the strip to\nthe other (`[columns] wrap_around`). Moving a column never wraps.",
+      "oneOf": [
+        {
+          "description": "Never wraps; at the strip's end focus hops to the next monitor\n(`[navigation] edge_hop`) or stops.",
+          "type": "string",
+          "const": "off"
+        },
+        {
+          "description": "Always wraps, in strip and in book mode.",
+          "type": "string",
+          "const": "on"
+        },
+        {
+          "description": "Wraps only on a screen in book mode.",
+          "type": "string",
+          "const": "book"
+        }
+      ]
     }
   }
 }

@@ -36,7 +36,10 @@
 use crate::common::{Direction, WindowId};
 use crate::layout::mutations::{self, MutationConfig};
 use crate::layout::projection;
-use crate::layout::types::{ActualLayout, AppliedLayout, MonitorInfo, Padding, VirtualLayout};
+use crate::layout::types::{
+    ActualLayout, AppliedLayout, LayoutMode, MonitorInfo, Padding, PileSide, VirtualLayout,
+    WrapAround,
+};
 
 /// The scrolling space — owns virtual layout state, tracks focus, and produces applied layouts.
 ///
@@ -145,6 +148,8 @@ fn build_mutation_config(
         // `reconfigure` / `set_monitor_info` carry the current ones over.
         visible_rows: 0,
         max_rows: 0,
+        layout_mode: crate::layout::types::LayoutMode::Strip,
+        wrap_around: crate::layout::types::WrapAround::Off,
     }
 }
 
@@ -186,7 +191,13 @@ impl ScrollingSpace {
             padding,
             columns_per_screen,
         );
-        let actual = projection::project(&virtual_layout, &monitor, &config.padding, 0);
+        let actual = projection::project_with(
+            &virtual_layout,
+            &monitor,
+            &config.padding,
+            0,
+            config.layout_mode,
+        );
 
         Self {
             virtual_layout,
@@ -482,6 +493,8 @@ impl ScrollingSpace {
         );
         self.config.visible_rows = old.visible_rows;
         self.config.max_rows = old.max_rows;
+        self.config.layout_mode = old.layout_mode;
+        self.config.wrap_around = old.wrap_around;
         self.refit_to_config(&old);
         self.reproject();
         self.actual.clone()
@@ -526,13 +539,98 @@ impl ScrollingSpace {
         self.actual.clone()
     }
 
+    /// The strip with its layout mode and wrap rule set — the
+    /// construction-time form of [`set_layout_mode`](Self::set_layout_mode).
+    #[must_use]
+    pub fn with_layout(mut self, mode: LayoutMode, wrap: WrapAround) -> Self {
+        let _ = self.set_layout_mode(mode, wrap);
+        self
+    }
+
+    /// The strip's layout mode (`[columns] layout`, ADR-0022).
+    #[must_use]
+    pub fn layout_mode(&self) -> LayoutMode {
+        self.config.layout_mode
+    }
+
+    /// Switch the strip to `mode` (strip or book) and the focus wrap rule
+    /// to `wrap` — the reload, startup and `set-layout` path. Nothing about
+    /// the strip itself changes (order, widths, camera); the columns out of
+    /// view are re-projected: off-screen parking in strip mode, piles in
+    /// book mode. Returns the applied layout for the animator.
+    pub fn set_layout_mode(&mut self, mode: LayoutMode, wrap: WrapAround) -> AppliedLayout {
+        self.config.layout_mode = mode;
+        self.config.wrap_around = wrap;
+        self.reproject();
+        AppliedLayout {
+            virtual_layout: self.virtual_layout.clone(),
+            actual_layout: self.actual.clone(),
+        }
+    }
+
+    /// Project `layout` on this strip's monitor with its padding, row
+    /// viewport and layout mode, without committing anything (drag
+    /// previews).
+    #[must_use]
+    pub fn project_layout(&self, layout: &VirtualLayout) -> ActualLayout {
+        projection::project_with(
+            layout,
+            &self.monitor,
+            &self.config.padding,
+            self.config.visible_rows,
+            self.config.layout_mode,
+        )
+    }
+
+    /// `layout` with the camera placed so `window`'s column is the view's
+    /// edge column on `side` — the leftmost (`Left`) or the rightmost
+    /// (`Right`) visible column — and, under a pattern, the slots pinned for
+    /// that run. This is the camera of a book-mode drop on a pile's top
+    /// card: the dropped window becomes the new top and the old one goes
+    /// into the pile right behind it (ADR-0022). Not committed; `layout` is
+    /// returned unchanged when `window` is not in it.
+    #[must_use]
+    pub fn edge_layout(
+        &self,
+        mut layout: VirtualLayout,
+        window: WindowId,
+        side: PileSide,
+    ) -> VirtualLayout {
+        let Some((col, _)) = layout.find_window(window) else {
+            return layout;
+        };
+        let gap = self.config.padding.window_gap;
+        if self.widths_pinned() {
+            let n = self.width_pattern.len();
+            let start = match side {
+                PileSide::Left => col,
+                PileSide::Right => (col + 1).saturating_sub(n),
+            };
+            let anchor = self.fit_run(&layout, start.max(after_fullscreen_before(&layout, col)));
+            self.pin_run(&mut layout, anchor);
+        } else {
+            let offset = match side {
+                PileSide::Left => self.column_left(&layout, col) - gap,
+                PileSide::Right => {
+                    self.column_left(&layout, col)
+                        + layout.columns[col].canvas_width(self.config.monitor_width, gap)
+                        + gap
+                        - self.config.monitor_width
+                }
+            };
+            layout.viewport_offset = offset.max(0);
+        }
+        layout
+    }
+
     /// Re-project the current virtual layout into `self.actual`.
     fn reproject(&mut self) {
-        self.actual = projection::project(
+        self.actual = projection::project_with(
             &self.virtual_layout,
             &self.monitor,
             &self.config.padding,
             self.config.visible_rows,
+            self.config.layout_mode,
         );
     }
 
@@ -634,6 +732,8 @@ impl ScrollingSpace {
         );
         self.config.visible_rows = old.visible_rows;
         self.config.max_rows = old.max_rows;
+        self.config.layout_mode = old.layout_mode;
+        self.config.wrap_around = old.wrap_around;
         self.refit_to_config(&old);
         self.reproject();
         self.actual.clone()
@@ -737,11 +837,12 @@ impl ScrollingSpace {
         // through is undone on the spot.
         let _ = self.pin_to_slots(&mut new_layout, window);
         let new_layout = mutations::normalize_row_viewports(&new_layout, window, &self.config);
-        let new_actual = projection::project(
+        let new_actual = projection::project_with(
             &new_layout,
             &self.monitor,
             &self.config.padding,
             self.config.visible_rows,
+            self.config.layout_mode,
         );
 
         let result = AppliedLayout {
@@ -1643,6 +1744,120 @@ mod tests {
         // Back to the pattern: the same column is anchored again.
         engine.apply_width_pattern(&[636, 1272]);
         assert_run(&engine, 1, &[1272, 636]);
+    }
+
+    // --- Book mode (ADR-0022) ---
+
+    /// Five columns on the 2/3 + 1/3 pattern, focus on the first, in book
+    /// mode.
+    fn book_engine() -> ScrollingSpace {
+        let mut engine = ScrollingSpace::new(test_monitor(), 960, 320, 100, 100, test_padding(), 4);
+        for i in 1..=5 {
+            engine.add_window(WindowId(i));
+        }
+        engine.set_focus(WindowId(1));
+        let _ = engine.ensure_focused_visible();
+        engine.apply_width_pattern(&[1272, 636]);
+        let _ = engine.set_layout_mode(LayoutMode::Book, WrapAround::Off);
+        engine
+    }
+
+    fn book_rect(engine: &ScrollingSpace, id: isize) -> (crate::common::Rect, Option<PileSide>) {
+        let e = engine
+            .actual_layout()
+            .find(WindowId(id))
+            .expect("projected");
+        (e.rect, e.pile)
+    }
+
+    #[test]
+    fn a_book_flip_moves_only_the_incoming_column_and_piles_the_rest() {
+        let mut engine = book_engine();
+        assert_run(&engine, 0, &[1272, 636]);
+        let (slot_b, _) = book_rect(&engine, 2);
+        for id in 3..=5 {
+            assert_eq!(book_rect(&engine, id), (slot_b, Some(PileSide::Right)));
+        }
+        let (slot_a, _) = book_rect(&engine, 1);
+        // Mod+Right twice: 2 then 3 — the run moves one column.
+        let _ = engine.focus(WindowId(1), Direction::Right);
+        let _ = engine.focus(WindowId(2), Direction::Right);
+        assert_run(&engine, 1, &[1272, 636]);
+        // 1 sank into the left pile at the slot it already had: no move.
+        assert_eq!(book_rect(&engine, 1), (slot_a, Some(PileSide::Left)));
+        // 3 surfaced at the right slot, where it already lay in its pile.
+        assert_eq!(book_rect(&engine, 3), (slot_b, None));
+        assert_eq!(book_rect(&engine, 4), (slot_b, Some(PileSide::Right)));
+        // Nothing is off-screen.
+        assert!(
+            engine
+                .actual_layout()
+                .entries
+                .iter()
+                .all(|e| !test_monitor().is_parked(e.rect))
+        );
+    }
+
+    #[test]
+    fn the_layout_mode_survives_a_reconfigure_and_a_monitor_change() {
+        let mut engine = book_engine();
+        let c = *engine.config();
+        let _ = engine.reconfigure(
+            c.column_width,
+            c.min_column_width_px,
+            c.min_window_height_px,
+            c.min_row_height_px,
+            c.padding,
+            c.columns_per_screen,
+        );
+        assert_eq!(engine.layout_mode(), LayoutMode::Book);
+        let _ = engine.set_monitor_info(test_monitor());
+        assert_eq!(engine.layout_mode(), LayoutMode::Book);
+        assert!(
+            engine
+                .actual_layout()
+                .entries
+                .iter()
+                .any(|e| e.pile.is_some())
+        );
+        // Back to strip: the same strip, parked off-screen again.
+        let applied = engine.set_layout_mode(LayoutMode::Strip, WrapAround::Off);
+        assert!(
+            applied
+                .actual_layout
+                .entries
+                .iter()
+                .all(|e| e.pile.is_none())
+        );
+        assert!(test_monitor().is_parked(book_rect(&engine, 5).0));
+    }
+
+    #[test]
+    fn edge_layout_puts_the_window_at_either_edge_of_the_run() {
+        let engine = book_engine();
+        let vl = engine.virtual_layout().clone();
+        // Window 3 (column 2) as the left top: the run starts at it.
+        let left = engine.edge_layout(vl.clone(), WindowId(3), PileSide::Left);
+        let gap = test_padding().window_gap;
+        assert_eq!(left.viewport_offset, column_left(&left, 2, gap) - gap);
+        assert_eq!(left.columns[2].width_px, 1272);
+        // As the right top: the run ends at it.
+        let right = engine.edge_layout(vl.clone(), WindowId(3), PileSide::Right);
+        assert_eq!(right.viewport_offset, column_left(&right, 1, gap) - gap);
+        assert_eq!(right.columns[2].width_px, 636);
+        // Without a pattern the camera is the minimal one for that edge.
+        let mut free = ScrollingSpace::new(test_monitor(), 954, 320, 100, 100, test_padding(), 2);
+        for i in 1..=4 {
+            free.add_window(WindowId(i));
+        }
+        let vl = free.virtual_layout().clone();
+        let r = free.edge_layout(vl.clone(), WindowId(3), PileSide::Right);
+        assert_eq!(
+            column_left(&r, 2, gap) + 954 + gap,
+            r.viewport_offset + 1920
+        );
+        let l = free.edge_layout(vl, WindowId(2), PileSide::Left);
+        assert_eq!(l.viewport_offset, column_left(&l, 1, gap) - gap);
     }
 
     /// Every column's width, left to right.

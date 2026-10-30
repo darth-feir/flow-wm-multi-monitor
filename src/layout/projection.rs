@@ -52,7 +52,7 @@
 
 use crate::common::Rect;
 use crate::layout::types::{
-    ActualEntry, ActualLayout, Column, MonitorInfo, Padding, VirtualLayout,
+    ActualEntry, ActualLayout, Column, LayoutMode, MonitorInfo, Padding, PileSide, VirtualLayout,
 };
 
 /// Margin between the virtual screen's edge and a parked column, in pixels.
@@ -120,12 +120,220 @@ pub fn project(
     padding: &Padding,
     visible_rows: u32,
 ) -> ActualLayout {
+    let places = column_places(virtual_layout, monitor, padding);
+    let mut entries = Vec::new();
+    for (column, place) in virtual_layout.columns.iter().zip(&places) {
+        let col_width = place_width(column, monitor);
+        let x = match *place {
+            Place::Shown(x) => x,
+            Place::Left => park_left_x(monitor, col_width),
+            Place::Right => park_right_x(monitor),
+        };
+        emit_column(
+            column,
+            x,
+            col_width,
+            None,
+            monitor,
+            padding,
+            visible_rows,
+            &mut entries,
+        );
+    }
+    ActualLayout { entries }
+}
+
+/// [`project`] for a strip in `mode`: strip mode is [`project`] itself;
+/// book mode keeps every visible column where [`project`] puts it and
+/// piles the columns out of view behind the edge columns instead of
+/// parking them (ADR-0022, `docs/src/dev-guide/layout/projection.md`,
+/// *Book mode*):
+///
+/// - a column [`project`] parks **left** takes the rect of the leftmost
+///   visible column (its x and width; its own rows stacked there) and is
+///   marked [`PileSide::Left`]; one parked **right** takes the rightmost
+///   visible column's rect, [`PileSide::Right`]. With one visible column
+///   both piles share its rect;
+/// - a fullscreen column keeps off-screen parking, so its moves stay pure
+///   moves (ADR-0019 / ADR-0021). While one **starts the view** there is
+///   no edge column: the others pile under it at their own width, flush
+///   with the work area's left edge (strip index before it) or right edge
+///   (after it);
+/// - a column less than half on screen counts as out of view (a pattern's
+///   rounding can leave the next column a one-pixel sliver in the view);
+/// - with no visible column at all (everything overhangs on a narrow
+///   monitor) the strip parking is kept.
+#[must_use]
+pub fn project_with(
+    virtual_layout: &VirtualLayout,
+    monitor: &MonitorInfo,
+    padding: &Padding,
+    visible_rows: u32,
+    mode: LayoutMode,
+) -> ActualLayout {
+    if mode == LayoutMode::Strip {
+        return project(virtual_layout, monitor, padding, visible_rows);
+    }
+    let wa = monitor.work_area;
+    // A column less than half on screen is a card in the pile on its side,
+    // not an edge column: a pattern's rounding can leave the next column a
+    // one-pixel sliver inside the view, and the pile must not sit there.
+    let places: Vec<Place> = column_places(virtual_layout, monitor, padding)
+        .into_iter()
+        .zip(&virtual_layout.columns)
+        .map(|(p, c)| match p {
+            Place::Shown(x) if !c.fullscreen => {
+                let on_screen = (x + c.width_px).min(wa.right()) - x.max(wa.x);
+                if 2 * on_screen >= c.width_px {
+                    p
+                } else if x < wa.x {
+                    Place::Left
+                } else {
+                    Place::Right
+                }
+            }
+            other => other,
+        })
+        .collect();
+    let cols = &virtual_layout.columns;
+    let gap = padding.window_gap;
+    // The fullscreen column that starts the view, if any.
+    let fullscreen_shown = cols
+        .iter()
+        .zip(&places)
+        .position(|(c, p)| c.fullscreen && matches!(p, Place::Shown(_)));
+    // The slot rects (x, width) of the visible columns, left to right.
+    let shown: Vec<(i32, i32)> = cols
+        .iter()
+        .zip(&places)
+        .filter_map(|(c, p)| match *p {
+            Place::Shown(x) if !c.fullscreen => Some((x, c.width_px)),
+            _ => None,
+        })
+        .collect();
+    if fullscreen_shown.is_none() && shown.is_empty() {
+        return project(virtual_layout, monitor, padding, visible_rows);
+    }
+    let mut entries = Vec::new();
+    for (i, (column, place)) in cols.iter().zip(&places).enumerate() {
+        let side = match place {
+            Place::Shown(_) => None,
+            Place::Left => Some(PileSide::Left),
+            Place::Right => Some(PileSide::Right),
+        };
+        let (x, width, pile) = match (side, column.fullscreen, fullscreen_shown) {
+            // Visible columns, and fullscreen columns anywhere: as in strip
+            // mode.
+            (None, _, _) | (Some(_), true, _) => {
+                let w = place_width(column, monitor);
+                let x = match *place {
+                    Place::Shown(x) => x,
+                    Place::Left => park_left_x(monitor, w),
+                    Place::Right => park_right_x(monitor),
+                };
+                (x, w, None)
+            }
+            // Under a fullscreen column in view: own width, flush with the
+            // side of the work area the column lies on.
+            (Some(_), false, Some(f)) => {
+                let w = column.width_px;
+                if i < f {
+                    (wa.x + gap, w, Some(PileSide::Left))
+                } else {
+                    (wa.right() - gap - w, w, Some(PileSide::Right))
+                }
+            }
+            (Some(side), false, None) => {
+                let (x, w) = match side {
+                    PileSide::Left => shown[0],
+                    PileSide::Right => shown[shown.len() - 1],
+                };
+                (x, w, Some(side))
+            }
+        };
+        emit_column(
+            column,
+            x,
+            width,
+            pile,
+            monitor,
+            padding,
+            visible_rows,
+            &mut entries,
+        );
+    }
+    ActualLayout { entries }
+}
+
+/// Where [`project`] puts a column horizontally: on screen at `x`, or
+/// parked on one side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// On screen with its left edge at this x.
+    Shown(i32),
+    /// Parked left of the virtual screen.
+    Left,
+    /// Parked right of the virtual screen.
+    Right,
+}
+
+/// The width a column is emitted at: one whole screen while fullscreen,
+/// its `width_px` otherwise.
+fn place_width(column: &Column, monitor: &MonitorInfo) -> i32 {
+    if column.fullscreen {
+        monitor.screen_rect.width
+    } else {
+        column.width_px
+    }
+}
+
+/// Emit `column`'s entries with its left edge at `x` and `width`: a
+/// fullscreen column at the screen rect's height and y, every other one
+/// with its rows stacked ([`stack_column_rows`]). Every entry carries
+/// `pile`.
+#[allow(clippy::too_many_arguments)]
+fn emit_column(
+    column: &Column,
+    x: i32,
+    width: i32,
+    pile: Option<PileSide>,
+    monitor: &MonitorInfo,
+    padding: &Padding,
+    visible_rows: u32,
+    entries: &mut Vec<ActualEntry>,
+) {
+    if column.fullscreen {
+        let screen = monitor.screen_rect;
+        for row in &column.rows {
+            entries.push(ActualEntry {
+                window_id: row.window_id,
+                rect: Rect { x, ..screen },
+                pile,
+            });
+        }
+        return;
+    }
+    let start = entries.len();
+    stack_column_rows(column, x, monitor, width, padding, visible_rows, entries);
+    for e in &mut entries[start..] {
+        e.pile = pile;
+    }
+}
+
+/// The camera shift, the visibility test and the overhang rule of
+/// [`project`], per column, without emitting any rect: the one place both
+/// layout modes take visibility from.
+fn column_places(
+    virtual_layout: &VirtualLayout,
+    monitor: &MonitorInfo,
+    padding: &Padding,
+) -> Vec<Place> {
     let monitor_rect = monitor.work_area;
     let viewport_left = virtual_layout.viewport_offset;
     let viewport_right = viewport_left + monitor_rect.width;
     let slot_gap = padding.window_gap;
 
-    let mut entries = Vec::new();
+    let mut places = Vec::with_capacity(virtual_layout.columns.len());
     let mut canvas_x: i32 = slot_gap;
     let screen = monitor.screen_rect;
     // A fullscreen column that starts the view hides every other column.
@@ -152,26 +360,17 @@ pub fn project(
         let first = visible && !first_visible_seen;
         first_visible_seen |= visible;
 
-        if column.fullscreen {
-            let x = if first {
-                screen.x
+        let place = if column.fullscreen {
+            if first {
+                Place::Shown(screen.x)
             } else if canvas_col_right <= viewport_left {
-                park_left_x(monitor, screen.width)
+                Place::Left
             } else {
-                park_right_x(monitor)
-            };
-            for row in &column.rows {
-                entries.push(ActualEntry {
-                    window_id: row.window_id,
-                    rect: Rect { x, ..screen },
-                });
+                Place::Right
             }
-            continue;
-        }
-
-        let x = if visible && fullscreen_in_view {
+        } else if visible && fullscreen_in_view {
             // A fullscreen column starts the view: this one is behind it.
-            park_right_x(monitor)
+            Place::Right
         } else if visible {
             let on_screen_x = monitor_rect.x + (canvas_col_left - viewport_left);
             // A column that overhangs an edge with a neighbouring monitor
@@ -184,30 +383,20 @@ pub fn project(
             let overhangs_left = on_screen_x < monitor_rect.x;
             let overhangs_right = on_screen_x + col_width > monitor_rect.right();
             if overhangs_left && monitor.neighbour_left {
-                park_left_x(monitor, col_width)
+                Place::Left
             } else if overhangs_right && monitor.neighbour_right {
-                park_right_x(monitor)
+                Place::Right
             } else {
-                on_screen_x
+                Place::Shown(on_screen_x)
             }
         } else if canvas_col_right <= viewport_left {
-            park_left_x(monitor, col_width)
+            Place::Left
         } else {
-            park_right_x(monitor)
+            Place::Right
         };
-
-        stack_column_rows(
-            column,
-            x,
-            monitor,
-            col_width,
-            padding,
-            visible_rows,
-            &mut entries,
-        );
+        places.push(place);
     }
-
-    ActualLayout { entries }
+    places
 }
 
 /// Canvas x of column `idx`'s left edge: the leading gap plus every earlier
@@ -309,15 +498,15 @@ fn stack_column_rows(
             y += row.height + padding.window_gap;
             at
         };
-        entries.push(ActualEntry {
-            window_id: row.window_id,
-            rect: Rect {
+        entries.push(ActualEntry::new(
+            row.window_id,
+            Rect {
                 x,
                 y: row_y,
                 width: col_width,
                 height: row.height,
             },
-        });
+        ));
     }
 }
 
@@ -1578,5 +1767,165 @@ mod tests {
             }
         );
         assert!(f.right() <= m.virtual_screen.x);
+    }
+
+    // --- Book mode (ADR-0022) -------------------------------------------
+
+    /// `n` single-row columns of `width`, ids 1..=n, camera at `offset`.
+    fn book_strip(widths: &[i32], offset: i32) -> VirtualLayout {
+        VirtualLayout::with_columns(
+            widths
+                .iter()
+                .enumerate()
+                .map(|(i, &w)| Column::with_row(w, Row::new(WindowId(i as isize + 1), 1072)))
+                .collect(),
+            offset,
+        )
+    }
+
+    fn book(vl: &VirtualLayout, m: &MonitorInfo) -> ActualLayout {
+        project_with(vl, m, &test_padding(), 0, LayoutMode::Book)
+    }
+
+    fn pile_of(actual: &ActualLayout, id: isize) -> Option<PileSide> {
+        actual.find(WindowId(id)).expect("window projected").pile
+    }
+
+    #[test]
+    fn strip_mode_is_project_itself() {
+        let m = taskbar_primary();
+        for vl in [
+            book_strip(&[958, 958, 958, 958], 962),
+            with_fullscreen(0),
+            with_fullscreen(column_left(&with_fullscreen(0), 1, 4, 1920) - 4),
+        ] {
+            let strip = project_with(&vl, &m, &test_padding(), 0, LayoutMode::Strip);
+            assert_eq!(strip, project(&vl, &m, &test_padding(), 0));
+            assert!(strip.entries.iter().all(|e| e.pile.is_none()));
+        }
+    }
+
+    #[test]
+    fn half_width_book_piles_each_side_under_its_edge_column() {
+        // 1/2 on 1920: two 954 px columns per screen; the view on 3 and 4.
+        let m = test_monitor();
+        let w = (1920 - 3 * 4) / 2;
+        let vl = book_strip(&[w, w, w, w, w, w], 2 * (w + 4));
+        let actual = book(&vl, &m);
+        let strip = project(&vl, &m, &test_padding(), 0);
+        // Visible columns are exactly where strip mode puts them.
+        for id in [3, 4] {
+            assert_eq!(rect_of(&actual, id), rect_of(&strip, id));
+            assert_eq!(pile_of(&actual, id), None);
+        }
+        for id in [1, 2] {
+            assert_eq!(
+                rect_of(&actual, id),
+                rect_of(&actual, 3),
+                "left pile at 3's slot"
+            );
+            assert_eq!(pile_of(&actual, id), Some(PileSide::Left));
+        }
+        for id in [5, 6] {
+            assert_eq!(
+                rect_of(&actual, id),
+                rect_of(&actual, 4),
+                "right pile at 4's slot"
+            );
+            assert_eq!(pile_of(&actual, id), Some(PileSide::Right));
+        }
+        // Nothing is off-screen.
+        assert!(actual.entries.iter().all(|e| !m.is_parked(e.rect)));
+    }
+
+    #[test]
+    fn a_pile_takes_the_top_slot_width_not_its_own() {
+        // 2/3 + 1/3 pinned: member widths alternate, the pile rect does not.
+        let m = test_monitor();
+        let big = 2 * (1920 - 4) / 3 - 4;
+        let small = (1920 - 4) / 3 - 4;
+        let vl = book_strip(&[big, small, big, small, big], 0);
+        let actual = book(&vl, &m);
+        assert_eq!(rect_of(&actual, 1).width, big);
+        assert_eq!(rect_of(&actual, 2).width, small);
+        for id in [3, 4, 5] {
+            assert_eq!(rect_of(&actual, id), rect_of(&actual, 2));
+            assert_eq!(pile_of(&actual, id), Some(PileSide::Right));
+        }
+    }
+
+    #[test]
+    fn one_visible_column_is_the_slot_of_both_piles() {
+        let m = test_monitor();
+        let w = 1920 - 8;
+        let vl = book_strip(&[w, w, w], w + 4);
+        let actual = book(&vl, &m);
+        let top = rect_of(&actual, 2);
+        assert_eq!(top.x, 4);
+        assert_eq!(rect_of(&actual, 1), top);
+        assert_eq!(rect_of(&actual, 3), top);
+        assert_eq!(pile_of(&actual, 1), Some(PileSide::Left));
+        assert_eq!(pile_of(&actual, 3), Some(PileSide::Right));
+    }
+
+    #[test]
+    fn a_pile_member_keeps_its_own_rows_inside_the_slot() {
+        // Member 3 has two rows: both at the top's x and width, stacked.
+        let m = test_monitor();
+        let w = (1920 - 3 * 4) / 2;
+        let vl = VirtualLayout::with_columns(
+            vec![
+                Column::with_row(w, Row::new(WindowId(1), 1072)),
+                Column::with_row(w, Row::new(WindowId(2), 1072)),
+                stacked_column(w, &[3, 4], 2, 0),
+            ],
+            0,
+        );
+        let actual = book(&vl, &m);
+        let top = rect_of(&actual, 2);
+        let (r3, r4) = (rect_of(&actual, 3), rect_of(&actual, 4));
+        assert_eq!(
+            (r3.x, r3.width, r4.x, r4.width),
+            (top.x, top.width, top.x, top.width)
+        );
+        assert_eq!(r3.y, top.y);
+        assert_eq!(r4.y, r3.bottom() + 4);
+        assert_eq!(pile_of(&actual, 4), Some(PileSide::Right));
+    }
+
+    #[test]
+    fn a_fullscreen_column_keeps_off_screen_parking_in_book_mode() {
+        let m = taskbar_primary();
+        // The view starts at column 3 (after F): F is parked left at the
+        // screen size, exactly as in strip mode; 1 piles under 3.
+        let vl = with_fullscreen(column_left(&with_fullscreen(0), 2, 4, 1920) - 4);
+        let actual = book(&vl, &m);
+        let strip = project(&vl, &m, &test_padding(), 0);
+        assert_eq!(rect_of(&actual, 2), rect_of(&strip, 2));
+        assert_eq!(pile_of(&actual, 2), None);
+        assert_eq!(rect_of(&actual, 1), rect_of(&actual, 3));
+        assert_eq!(pile_of(&actual, 1), Some(PileSide::Left));
+    }
+
+    #[test]
+    fn under_a_fullscreen_column_in_view_the_others_pile_at_their_own_width() {
+        let m = taskbar_primary();
+        let vl = with_fullscreen(column_left(&with_fullscreen(0), 1, 4, 1920) - 4);
+        let actual = book(&vl, &m);
+        assert_eq!(rect_of(&actual, 2), m.screen_rect);
+        let (a, c) = (rect_of(&actual, 1), rect_of(&actual, 3));
+        assert_eq!((a.x, a.width), (m.work_area.x + 4, 600));
+        assert_eq!((c.right(), c.width), (m.work_area.right() - 4, 600));
+        assert_eq!(pile_of(&actual, 1), Some(PileSide::Left));
+        assert_eq!(pile_of(&actual, 3), Some(PileSide::Right));
+    }
+
+    #[test]
+    fn with_no_visible_column_book_mode_falls_back_to_parking() {
+        // A column wider than the work area overhangs a neighbour: parked in
+        // strip mode, and with nothing on screen there is no slot to pile at.
+        let m = taskbar_primary();
+        let vl = book_strip(&[2400], 0);
+        assert_eq!(book(&vl, &m), project(&vl, &m, &test_padding(), 0));
     }
 }

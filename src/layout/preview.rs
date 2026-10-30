@@ -16,7 +16,7 @@ use crate::common::{Rect, WindowId};
 use crate::layout::mutations::distribute_heights;
 use crate::layout::mutations::{MutationConfig, column_heights, remove_window};
 use crate::layout::projection;
-use crate::layout::types::{AppliedLayout, Column, MonitorInfo, Row, VirtualLayout};
+use crate::layout::types::{AppliedLayout, Column, MonitorInfo, PileSide, Row, VirtualLayout};
 
 /// Where a dragged window would land when dropped.
 ///
@@ -35,6 +35,19 @@ pub enum DropZone {
     Column {
         /// Target column index in the original layout.
         col: usize,
+    },
+    /// Book mode (ADR-0022): a drop on a pile's top card. The window is
+    /// inserted as a new single-row column at index `col` (right after the
+    /// left top, right before the right top) and the camera puts it at the
+    /// `side` edge of the view, so it becomes that pile's new top and the
+    /// old top goes into the pile right behind it. The insertion is
+    /// [`preview_move`] / [`preview_insert`]'s; the camera is the strip's
+    /// ([`ScrollingSpace::edge_layout`](crate::workspace::ScrollingSpace::edge_layout)).
+    Card {
+        /// Target column index in the original layout.
+        col: usize,
+        /// The pile whose top the window becomes.
+        side: PileSide,
     },
     /// Scroll the viewport left by one column. NOT a layout mutation.
     ScrollLeft,
@@ -59,7 +72,20 @@ impl DropZone {
     /// scrolling a viewport.
     #[must_use]
     pub fn is_placement(self) -> bool {
-        matches!(self, DropZone::Row { .. } | DropZone::Column { .. })
+        matches!(
+            self,
+            DropZone::Row { .. } | DropZone::Column { .. } | DropZone::Card { .. }
+        )
+    }
+
+    /// The pile a [`Card`](DropZone::Card) drop makes the window the top
+    /// of; `None` for every other zone.
+    #[must_use]
+    pub fn card_side(self) -> Option<PileSide> {
+        match self {
+            DropZone::Card { side, .. } => Some(side),
+            _ => None,
+        }
     }
 }
 
@@ -130,6 +156,10 @@ pub fn preview_move(
         DropZone::Column { col } => DropZone::Column {
             col: adjust_index(col, src_col, src_had_single_row),
         },
+        DropZone::Card { col, side } => DropZone::Card {
+            col: adjust_index(col, src_col, src_had_single_row),
+            side,
+        },
         DropZone::Row { col, row } => DropZone::Row {
             col: adjust_index(col, src_col, src_had_single_row),
             row,
@@ -141,13 +171,20 @@ pub fn preview_move(
     // Restore the viewport offset.
     layout.viewport_offset = original_offset;
 
-    // Step 3: No-op check.
-    if layout == *virtual_layout {
+    // Step 3: No-op check. A card drop that keeps the order still moves
+    // the camera (the caller's), so it is not a no-op here.
+    if layout == *virtual_layout && zone.card_side().is_none() {
         return None;
     }
 
     // Step 4: Project to actual screen coordinates.
-    let actual = projection::project(&layout, monitor, &config.padding, config.visible_rows);
+    let actual = projection::project_with(
+        &layout,
+        monitor,
+        &config.padding,
+        config.visible_rows,
+        config.layout_mode,
+    );
 
     Some(AppliedLayout {
         virtual_layout: layout,
@@ -177,7 +214,13 @@ pub fn preview_insert(
     }
     let mut layout = virtual_layout.clone();
     insert_at_zone(&mut layout, zone, window, config)?;
-    let actual = projection::project(&layout, monitor, &config.padding, config.visible_rows);
+    let actual = projection::project_with(
+        &layout,
+        monitor,
+        &config.padding,
+        config.visible_rows,
+        config.layout_mode,
+    );
     Some(AppliedLayout {
         virtual_layout: layout,
         actual_layout: actual,
@@ -193,7 +236,7 @@ fn insert_at_zone(
     config: &MutationConfig,
 ) -> Option<()> {
     match zone {
-        DropZone::Column { col } => {
+        DropZone::Column { col } | DropZone::Card { col, .. } => {
             let pos = col.min(layout.columns.len());
             let new_col = make_single_row_column(window, config.column_width as i32, config);
             layout.columns.insert(pos, new_col);
@@ -327,6 +370,8 @@ struct VisibleColumn {
     idx: usize,
     rect: Rect,
     rows: Vec<(usize, Rect)>,
+    /// A fullscreen column (never a pile top).
+    fullscreen: bool,
     /// Rows are parked above the row viewport.
     parked_above: bool,
     /// Rows are parked below the row viewport.
@@ -337,8 +382,10 @@ struct VisibleColumn {
 ///
 /// Only the rows inside each column's row viewport (`row_offset ..
 /// row_offset + slots`) count: a row parked above or below the monitor is
-/// not a drop target. Columns entirely outside `wa` are excluded. Does NOT
-/// exclude the dragged window's own column.
+/// not a drop target. Columns entirely outside `wa` are excluded, and so
+/// are the members of a book-mode pile (on screen, but under their top:
+/// the top is the target). Does NOT exclude the dragged window's own
+/// column.
 fn build_visible_columns(
     applied: &AppliedLayout,
     wa: &Rect,
@@ -349,6 +396,7 @@ fn build_visible_columns(
         .actual_layout
         .entries
         .iter()
+        .filter(|e| e.pile.is_none())
         .map(|e| (e.window_id, e.rect))
         .collect();
 
@@ -381,11 +429,50 @@ fn build_visible_columns(
                 height: bottom.y + bottom.height - top.y,
             },
             rows,
+            fullscreen: col.fullscreen,
             parked_above: first > 0,
             parked_below: first + slots < col.rows.len(),
         });
     }
     result
+}
+
+/// Which pile's top card `vc` is in a book-mode layout, for a cursor at
+/// `mx`: the first visible column tops the left pile and the last one the
+/// right pile, each only while that pile has a member; a lone visible
+/// column tops both and the half under the cursor picks one. `None` for a
+/// middle column, a fullscreen one, an edge column whose pile is empty and
+/// in strip mode (no pile at all).
+fn card_side(
+    applied: &AppliedLayout,
+    vis_cols: &[VisibleColumn],
+    vc: &VisibleColumn,
+    mx: i32,
+) -> Option<PileSide> {
+    if vc.fullscreen {
+        return None;
+    }
+    let has = |side: PileSide| {
+        applied
+            .actual_layout
+            .entries
+            .iter()
+            .any(|e| e.pile == Some(side))
+    };
+    let first = vis_cols.first().map(|c| c.idx) == Some(vc.idx);
+    let last = vis_cols.last().map(|c| c.idx) == Some(vc.idx);
+    let left = first && has(PileSide::Left);
+    let right = last && has(PileSide::Right);
+    match (left, right) {
+        (true, true) => Some(if mx < vc.rect.x + vc.rect.width / 2 {
+            PileSide::Left
+        } else {
+            PileSide::Right
+        }),
+        (true, false) => Some(PileSide::Left),
+        (false, true) => Some(PileSide::Right),
+        (false, false) => None,
+    }
 }
 
 /// Resolve the drop target for a tile drag from the cursor position.
@@ -473,6 +560,16 @@ pub fn resolve_drop_zone(
         return Some(DropZone::Column { col: last.idx + 1 });
     };
     let col_right = vc.rect.x + vc.rect.width;
+
+    // Book mode: the whole of a pile's top card is one zone, a new top
+    // card for that pile (ADR-0022).
+    if let Some(side) = card_side(applied, &vis_cols, vc, mx) {
+        let col = match side {
+            PileSide::Left => vc.idx + 1,
+            PileSide::Right => vc.idx,
+        };
+        return Some(DropZone::Card { col, side });
+    }
 
     // 3. Outer bands of the column → new column beside it.
     let band = compute_col_edge_band(vc.rect.width, params.col_edge_ratio, params.col_edge_max_px);
@@ -562,6 +659,8 @@ mod tests {
             columns_per_screen: 2,
             visible_rows: 0,
             max_rows: 0,
+            layout_mode: crate::layout::types::LayoutMode::Strip,
+            wrap_around: crate::layout::types::WrapAround::Off,
         }
     }
 
@@ -2631,5 +2730,147 @@ mod tests {
         assert_eq!(beside.virtual_layout.find_window(WindowId(2)), Some((1, 0)));
         assert!(beside.virtual_layout.columns[0].fullscreen);
         assert!(!beside.virtual_layout.columns[1].fullscreen);
+    }
+
+    // --- Book mode: pile top cards (ADR-0022) ---
+
+    /// `n` columns of 485 px (1/2 on the 1000 px rdz monitor, gap 10),
+    /// ids 1..=n, the view starting at column `first` (0-based), projected
+    /// in `mode`.
+    fn book_applied(
+        n: usize,
+        first: usize,
+        mode: crate::layout::types::LayoutMode,
+    ) -> AppliedLayout {
+        let cols: Vec<Column> = (1..=n)
+            .map(|i| Column::with_row(485, Row::new(WindowId(i as isize), 980)))
+            .collect();
+        let vl = VirtualLayout::with_columns(cols, first as i32 * 495);
+        let actual = projection::project_with(&vl, &rdz_monitor(), &rdz_padding(10), 0, mode);
+        AppliedLayout {
+            virtual_layout: vl,
+            actual_layout: actual,
+        }
+    }
+
+    #[test]
+    fn a_pile_top_is_one_card_zone_and_the_seam_and_bands_stay() {
+        use crate::layout::types::LayoutMode;
+        let p = defaults(0);
+        let m = rdz_monitor();
+        let book = book_applied(4, 1, LayoutMode::Book);
+        // Anywhere on the left top (column 1, window 2): a new left top.
+        for x in [100, 250, 480] {
+            assert_eq!(
+                resolve_drop_zone(&book, &m, x, 500, &p),
+                Some(DropZone::Card {
+                    col: 2,
+                    side: PileSide::Left
+                }),
+                "x={x}"
+            );
+        }
+        // Anywhere on the right top (column 2, window 3): a new right top.
+        for x in [510, 700, 900] {
+            assert_eq!(
+                resolve_drop_zone(&book, &m, x, 500, &p),
+                Some(DropZone::Card {
+                    col: 2,
+                    side: PileSide::Right
+                }),
+                "x={x}"
+            );
+        }
+        // The seam between them is still a plain new column; the edge bands
+        // still flip.
+        assert_eq!(
+            resolve_drop_zone(&book, &m, 500, 500, &p),
+            Some(DropZone::Column { col: 2 })
+        );
+        assert_eq!(
+            resolve_drop_zone(&book, &m, 20, 500, &p),
+            Some(DropZone::ScrollLeft)
+        );
+        assert_eq!(
+            resolve_drop_zone(&book, &m, 980, 500, &p),
+            Some(DropZone::ScrollRight)
+        );
+        // The same strip in strip mode keeps the thirds and the row halves.
+        let strip = book_applied(4, 1, LayoutMode::Strip);
+        assert_eq!(
+            resolve_drop_zone(&strip, &m, 250, 300, &p),
+            Some(DropZone::Row { col: 1, row: 0 })
+        );
+    }
+
+    #[test]
+    fn an_edge_column_with_an_empty_pile_keeps_the_strip_zones() {
+        use crate::layout::types::LayoutMode;
+        let p = defaults(0);
+        let m = rdz_monitor();
+        // The view on the last two columns: no right pile.
+        let book = book_applied(3, 1, LayoutMode::Book);
+        assert_eq!(
+            resolve_drop_zone(&book, &m, 700, 300, &p),
+            Some(DropZone::Row { col: 2, row: 0 })
+        );
+        assert!(matches!(
+            resolve_drop_zone(&book, &m, 250, 300, &p),
+            Some(DropZone::Card {
+                side: PileSide::Left,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_lone_visible_column_is_the_card_of_both_piles_by_half() {
+        use crate::layout::types::LayoutMode;
+        let cols: Vec<Column> = (1..=3)
+            .map(|i| Column::with_row(980, Row::new(WindowId(i), 980)))
+            .collect();
+        let vl = VirtualLayout::with_columns(cols, 990);
+        let actual =
+            projection::project_with(&vl, &rdz_monitor(), &rdz_padding(10), 0, LayoutMode::Book);
+        let applied = AppliedLayout {
+            virtual_layout: vl,
+            actual_layout: actual,
+        };
+        let p = defaults(0);
+        let m = rdz_monitor();
+        assert_eq!(
+            resolve_drop_zone(&applied, &m, 300, 500, &p),
+            Some(DropZone::Card {
+                col: 2,
+                side: PileSide::Left
+            })
+        );
+        assert_eq!(
+            resolve_drop_zone(&applied, &m, 700, 500, &p),
+            Some(DropZone::Card {
+                col: 1,
+                side: PileSide::Right
+            })
+        );
+    }
+
+    #[test]
+    fn a_card_drop_that_keeps_the_order_is_still_offered() {
+        use crate::layout::types::LayoutMode;
+        let book = book_applied(4, 1, LayoutMode::Book);
+        // The right top (3) onto the left top's card: [1 2 3 4] again, but
+        // the camera (the caller's) makes 3 the left top.
+        let p = preview_move(
+            &book.virtual_layout,
+            WindowId(3),
+            DropZone::Card {
+                col: 2,
+                side: PileSide::Left,
+            },
+            &test_config(),
+            &rdz_monitor(),
+        )
+        .expect("offered");
+        assert_eq!(p.virtual_layout.find_window(WindowId(3)), Some((2, 0)));
     }
 }

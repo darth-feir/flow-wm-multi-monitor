@@ -783,6 +783,7 @@ impl FlowWM {
         // A window the loadout turned into a float (or a tile) changes its
         // place in the floating layer.
         self.sync_all_top_layer();
+        self.seat_all_piles();
         log::info!("loadout load: restored layout from {resolved:?}");
         Ok(())
     }

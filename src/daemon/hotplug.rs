@@ -838,6 +838,7 @@ impl FlowWM {
         self.seat_all_monitors_instantly();
         self.rebuild_float_hwnds();
         self.sync_all_top_layer();
+        self.seat_all_piles();
 
         // Restores never activate, but push the foreground once to where the
         // registry says it belongs so a restore cannot have left it elsewhere.
@@ -1038,7 +1039,8 @@ fn fresh_monitor(
                     columns_per_screen,
                 )
                 .with_row_limits(lc.visible_rows, lc.max_rows)
-                .with_width_pattern(&lc.width_pattern_px),
+                .with_width_pattern(&lc.width_pattern_px)
+                .with_layout(lc.layout_mode, lc.wrap_around),
             )
         })
         .collect();

@@ -187,6 +187,7 @@ impl FlowWM {
                     px
                 );
                 layout_config.width_pattern_px = px;
+                layout_config.layout_mode = columns.layout_for(&facts[i]);
             }
             let scrolling = ScrollingSpace::new(
                 info,
@@ -198,7 +199,8 @@ impl FlowWM {
                 app_config.columns_per_screen,
             )
             .with_row_limits(layout_config.visible_rows, layout_config.max_rows)
-            .with_width_pattern(&layout_config.width_pattern_px);
+            .with_width_pattern(&layout_config.width_pattern_px)
+            .with_layout(layout_config.layout_mode, layout_config.wrap_around);
             per_monitor.push(PerMonitor {
                 info,
                 layout_config,
@@ -436,7 +438,8 @@ impl FlowWM {
                     app_config.columns_per_screen,
                 )
                 .with_row_limits(layout_config.visible_rows, layout_config.max_rows)
-                .with_width_pattern(&layout_config.width_pattern_px);
+                .with_width_pattern(&layout_config.width_pattern_px)
+                .with_layout(layout_config.layout_mode, layout_config.wrap_around);
                 workspaces.push(Workspace::new(WorkspaceId(id), empty_scrolling));
             }
             monitors.push(
@@ -469,6 +472,8 @@ impl FlowWM {
             manual_drag: None,
             last_foreground_sync: std::time::Instant::now(),
             last_top_layer_reassert: std::time::Instant::now(),
+            last_pile_check: std::time::Instant::now(),
+            pile_drift: Vec::new(),
             top_layer_raised: true,
             foreground: None,
             top_layer_below: None,
@@ -501,6 +506,7 @@ impl FlowWM {
             manager.note_foreground(fg);
         }
         manager.sync_all_top_layer();
+        manager.seat_all_piles();
         // Initial border overlay attach for windows found during the scan.
         // Idempotent and O(N) where N = tracked windows. Runs after
         // populate_existing_floats so float overlays seat at the adopted rect.
@@ -598,6 +604,8 @@ impl FlowWM {
             manual_drag: None,
             last_foreground_sync: std::time::Instant::now(),
             last_top_layer_reassert: std::time::Instant::now(),
+            last_pile_check: std::time::Instant::now(),
+            pile_drift: Vec::new(),
             top_layer_raised: true,
             foreground: None,
             top_layer_below: None,

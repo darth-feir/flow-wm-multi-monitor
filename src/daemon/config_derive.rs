@@ -73,6 +73,15 @@ pub(super) fn derive_layout_config(app_config: &FlowConfig, monitor: &MonitorInf
         max_rows: app_config.columns.as_ref().map_or(0, |c| c.max_rows),
         // Filled in by `FlowWM::layout_config_for` from the monitor's preset.
         width_pattern_px: Vec::new(),
+        // The top-level mode; `layout_config_for` applies a screen rule's.
+        layout_mode: app_config
+            .columns
+            .as_ref()
+            .map_or(Default::default(), |c| c.layout),
+        wrap_around: app_config
+            .columns
+            .as_ref()
+            .map_or(Default::default(), |c| c.wrap_around),
     }
 }
 

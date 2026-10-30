@@ -305,6 +305,14 @@ rect so `build_tweens` drops it as a no-op. Instant targets never query
 `GetWindowRect`. A batch that contains only instant targets leaves the
 animator idle.
 
+**Book-mode piles** (ADR-0022, [Book Mode: Piles](./piles.md)). A window
+whose target is a pile slot (`ActualEntry::pile`) is placed instantly by
+the layout paths (`collect_targets` → `push_targets_as`): it lands under its
+pile's top, already seated below it, while a tween would cross the visible
+columns. With the animator idle, a member whose target is the rect it was
+last sent to gets `Stay`, so a flip moves only the windows that change
+place. Workspace batches leave piles to travel with their workspace.
+
 ## Cross-References
 
 - [Layout pipeline](./layout/pipeline.md) — how `AppliedLayout` is produced by

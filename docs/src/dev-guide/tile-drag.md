@@ -275,6 +275,23 @@ title-bar drag of a frame-fullscreen tile is never promoted from
 `Classifying` (`on_drag_move_with`), so it shows nothing and snaps back on
 release.
 
+**Book mode: top cards** (ADR-0022). `build_visible_columns` skips the
+entries of a book-mode pile (they lie under their top), and before the
+outer bands a visible edge column whose pile has a member is resolved as one
+zone, `DropZone::Card { col, side }` (`card_side`): the left top inserts the
+window right after it, the right top right before it, and the drag code
+re-aims the camera so the window is that edge of the view
+(`FlowWM::card_camera` → `ScrollingSpace::edge_layout`, pinned to the
+slots under a pattern) — in the preview and in the commit. The dropped
+window is the new top card and the old top lies right behind it. A lone
+visible column tops both piles; the half under the cursor picks the side.
+An edge column with an empty pile, the middle columns and a fullscreen
+column keep the zones above, and the screen-edge bands keep scrolling,
+which in book mode flips the book while the window is held there. A card
+drop that keeps the strip order is not a no-op (the camera still moves).
+The dragged window is left out of the pile ordering while the drag lasts,
+so an edge-scroll flip never puts it under a top.
+
 **Totality.** Every cursor position in the work area maps to a zone,
 including an empty strip (`Column { col: 0 }`, the target of a cross-screen
 drop onto an empty monitor) and a strip whose columns are all off screen

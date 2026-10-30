@@ -238,6 +238,7 @@ impl FlowWM {
                 }
                 lc.width_pattern_px = px;
             }
+            lc.layout_mode = columns.layout_for(facts);
         }
         lc
     }
@@ -373,6 +374,7 @@ impl FlowWM {
                 );
                 let _ = ws.scrolling.set_row_limits(lc.visible_rows, lc.max_rows);
                 let _ = ws.scrolling.set_width_pattern(&lc.width_pattern_px);
+                let _ = ws.scrolling.set_layout_mode(lc.layout_mode, lc.wrap_around);
             }
         }
     }

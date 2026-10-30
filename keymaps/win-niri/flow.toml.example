@@ -48,6 +48,21 @@ default = "1/2"
 visible_rows = 2
 max_rows = 4
 
+# Book layout: instead of parking the columns out of view off-screen, pile them behind the
+# leftmost and rightmost visible columns (the edge columns are the piles' top cards). Mod+Left /
+# Mod+Right flip one card, a taskbar click or Alt+Tab onto a piled window flips the book to it,
+# and dropping a dragged window anywhere on a top card makes it the new top. With 1/1 the screen
+# is a carousel, with 1/2 two piles, with 1/3 the middle column stays a plain window.
+# Mod+Shift+B toggles the focused screen between "strip" and "book" until the next reload.
+# A rule can give one screen its own layout without its own presets:
+# [[columns.screen]]
+# match = { name = "DISPLAY2" }
+# layout = "book"
+layout = "strip"
+# Focus wraps from one end of the strip to the other: "off", "on" (every screen) or "book" (only
+# on a screen in book layout). With wrapping, Mod+Left/Right never hops to the other screen.
+wrap_around = "off"
+
 # Mod+Arrows and Mod+Shift+Arrows stay on the current screen even at the end of the strip;
 # the other screen is reached explicitly with Mod+Ctrl+Arrows (focus) and Mod+Alt+Arrows (move).
 [navigation]

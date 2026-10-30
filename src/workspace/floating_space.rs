@@ -49,7 +49,7 @@ impl FloatingSpace {
         if let Some(entry) = self.windows.iter_mut().find(|e| e.window_id == window_id) {
             entry.rect = rect;
         } else {
-            self.windows.push(ActualEntry { window_id, rect });
+            self.windows.push(ActualEntry::new(window_id, rect));
         }
     }
 
@@ -93,7 +93,7 @@ impl FloatingSpace {
     pub fn replace_all(&mut self, entries: Vec<(WindowId, Rect)>) {
         self.windows = entries
             .into_iter()
-            .map(|(window_id, rect)| ActualEntry { window_id, rect })
+            .map(|(window_id, rect)| ActualEntry::new(window_id, rect))
             .collect();
     }
 
@@ -342,20 +342,8 @@ mod tests {
         fs.add(id2, r2);
         let layout = fs.to_actual_layout();
         assert_eq!(layout.entries.len(), 2);
-        assert_eq!(
-            layout.entries[0],
-            ActualEntry {
-                window_id: id1,
-                rect: r1
-            }
-        );
-        assert_eq!(
-            layout.entries[1],
-            ActualEntry {
-                window_id: id2,
-                rect: r2
-            }
-        );
+        assert_eq!(layout.entries[0], ActualEntry::new(id1, r1));
+        assert_eq!(layout.entries[1], ActualEntry::new(id2, r2));
     }
 
     // --- z-order ---

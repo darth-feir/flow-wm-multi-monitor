@@ -580,6 +580,12 @@ const FIXED_ACTIONS: &[(&str, &[&str], &str, &str)] = &[
         "switch-preset-column-width-back",
     ),
     (
+        "toggle-layout",
+        &["set-layout", "toggle"],
+        "book / strip layout on this screen (columns out of view piled or parked)",
+        "toggle-layout",
+    ),
+    (
         "fullscreen-window",
         &["set-window", "fullscreen"],
         "fullscreen toggle",
@@ -1601,6 +1607,10 @@ mod tests {
             vec!["switch-focus-between-floating-and-tiling"]
         );
         assert_eq!(find("Mod+R").action.argv, vec!["width", "next"]);
+        assert_eq!(
+            find("Mod+Shift+B").action.argv,
+            vec!["set-layout", "toggle"]
+        );
         assert_eq!(find("Mod+F").action.argv, vec!["set-window", "fullscreen"]);
         assert_eq!(
             find("Mod+BracketRight").action.argv,
@@ -1621,8 +1631,8 @@ mod tests {
                 .iter()
                 .all(|b| !matches!(b.chord.canonical().as_str(), "Mod+Minus" | "Mod+Equal"))
         );
-        // focus 8, move 8, monitors 8, workspaces 20, q c v shift+v r f [ ] = 8, programs 6, help + quit.
-        assert_eq!(binds.len(), 8 + 8 + 8 + 20 + 8 + 6 + 2);
+        // focus 8, move 8, monitors 8, workspaces 20, q c v shift+v r f shift+b [ ] = 9, programs 6, help + quit.
+        assert_eq!(binds.len(), 8 + 8 + 8 + 20 + 9 + 6 + 2);
     }
 
     #[test]
@@ -1755,8 +1765,8 @@ mod tests {
         assert!(chords.contains(&"Mod+Space, Mod+D"), "{chords:?}");
         assert!(chords.contains(&"Mod+Shift+Slash"));
         assert_eq!(*chords.last().unwrap(), "Mod+Shift+E");
-        // 2 focus + 2 move + monitors 2 + workspaces 2 + q c v shift+v r f + consume + launcher + 4 spawn + help + quit
-        assert_eq!(rows.len(), 2 + 2 + 2 + 2 + 6 + 1 + 1 + 4 + 1 + 1);
+        // 2 focus + 2 move + monitors 2 + workspaces 2 + q c v shift+v r f shift+b + consume + launcher + 4 spawn + help + quit
+        assert_eq!(rows.len(), 2 + 2 + 2 + 2 + 7 + 1 + 1 + 4 + 1 + 1);
     }
 
     #[test]

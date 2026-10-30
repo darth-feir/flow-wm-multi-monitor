@@ -82,6 +82,37 @@ impl WidthPresetRequest {
     }
 }
 
+/// Which layout mode [`SocketMessage::SetLayout`] asks for on the focused
+/// window's screen (ADR-0022).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutRequest {
+    /// Columns out of view parked off-screen.
+    Strip,
+    /// Columns out of view piled behind the edge columns.
+    Book,
+    /// The other mode.
+    Toggle,
+}
+
+impl LayoutRequest {
+    /// Parse the CLI word: `strip`, `book` or `toggle`.
+    ///
+    /// # Errors
+    ///
+    /// Any other word.
+    pub fn from_cli(word: &str) -> Result<Self, String> {
+        match word.trim().to_ascii_lowercase().as_str() {
+            "strip" => Ok(Self::Strip),
+            "book" => Ok(Self::Book),
+            "toggle" => Ok(Self::Toggle),
+            other => Err(format!(
+                "set-layout takes strip, book or toggle, got \"{other}\""
+            )),
+        }
+    }
+}
+
 /// Default named pipe path used by the daemon and CLI on Windows.
 pub const PIPE_NAME: &str = r"\\.\pipe\flow";
 
@@ -252,6 +283,16 @@ pub enum SocketMessage {
     SetWidthPreset {
         /// Which preset to move to.
         preset: WidthPresetRequest,
+    },
+    /// Switch the focused window's screen (else the focused monitor) to
+    /// strip or book layout, or toggle it, on every one of its workspaces
+    /// (`[columns] layout`, ADR-0022). Runtime only: a config reload puts
+    /// every screen back to what `flow.toml` says. Answered with
+    /// [`SocketResponse::Data`] carrying `{"layout": "strip"|"book",
+    /// "monitor": <index>}`.
+    SetLayout {
+        /// The mode to switch to.
+        layout: LayoutRequest,
     },
 
     // --- Viewport center ---
@@ -457,6 +498,7 @@ impl SocketMessage {
                 | Self::ShrinkColumn
                 | Self::SetColumnWidth { .. }
                 | Self::SetWidthPreset { .. }
+                | Self::SetLayout { .. }
                 | Self::Center
                 | Self::SetWindow { .. }
                 | Self::ToggleFloat
@@ -778,6 +820,9 @@ mod tests {
             SocketMessage::ToggleFloat,
             SocketMessage::ToggleMonocle,
             SocketMessage::PlaceAbove,
+            SocketMessage::SetLayout {
+                layout: LayoutRequest::Toggle,
+            },
             SocketMessage::Promote {
                 direction: Direction::Left,
             },

@@ -168,6 +168,7 @@ impl FlowWM {
             SocketMessage::ShrinkColumn => self.dispatch_shrink(),
             SocketMessage::SetColumnWidth { width_px } => self.dispatch_set_column_width(*width_px),
             SocketMessage::SetWidthPreset { preset } => self.dispatch_width_preset(preset),
+            SocketMessage::SetLayout { layout } => self.dispatch_set_layout(*layout),
 
             // --- Viewport center ---
             SocketMessage::Center => self.dispatch_center(),
@@ -2252,13 +2253,20 @@ impl FlowWM {
         // from `columns_per_screen` / `column_width` and its own work area.
         self.reapply_presets_after_reload(&previous_presets);
 
-        // Animate the active workspace into its new geometry (windows slide to
-        // the new gaps) and sync registry slots/rects.
-        let applied = AppliedLayout {
-            actual_layout: self.active_scrolling().actual_layout().clone(),
-            virtual_layout: self.active_scrolling().virtual_layout().clone(),
-        };
-        self.animate_layout(&applied);
+        // Animate every monitor's active workspace into its new geometry
+        // (windows slide to the new gaps, a screen whose `layout` changed
+        // piles or parks its columns out of view) in one batch, and sync
+        // registry slots/rects.
+        let applied: Vec<AppliedLayout> = self
+            .monitors
+            .iter()
+            .map(|m| AppliedLayout {
+                actual_layout: m.active_scrolling().actual_layout().clone(),
+                virtual_layout: m.active_scrolling().virtual_layout().clone(),
+            })
+            .collect();
+        let batch: Vec<(usize, &AppliedLayout)> = applied.iter().enumerate().collect();
+        self.animate_layouts_on(&batch);
 
         // Re-assert border colors/thickness for the new border config.
         self.refresh_all_border_styles();

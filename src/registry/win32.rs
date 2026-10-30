@@ -47,8 +47,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetShellWindow, GetSystemMetrics, GetWindowLongW, GetWindowPlacement,
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HWND_NOTOPMOST,
     HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SM_CXSCREEN,
-    SM_CYSCREEN, SW_MAXIMIZE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SetForegroundWindow, SetWindowPlacement, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
+    SM_CYSCREEN, SW_MAXIMIZE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOSIZE, SetForegroundWindow, SetWindowPlacement, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
     WINDOW_STYLE, WINDOWPLACEMENT, WM_CLOSE, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_THICKFRAME,
 };
@@ -1045,6 +1045,44 @@ pub fn insert_below(hwnd_val: isize, after_val: isize) -> bool {
             false
         }
     }
+}
+
+/// [`insert_below`] without also moving `hwnd_val`'s owned windows
+/// (`SWP_NOOWNERZORDER`): book mode lowers a pile member under its top on
+/// every flip (`daemon::piles`, ADR-0022) and must not drag the owner's
+/// dialogs or the owner of a dialog along. `false` when either handle is
+/// gone or the call is refused (an elevated window, UIPI).
+#[must_use]
+pub fn insert_below_quiet(hwnd_val: isize, after_val: isize) -> bool {
+    // SAFETY: SetWindowPos with a possibly-stale HWND fails cleanly.
+    let result = unsafe {
+        SetWindowPos(
+            HWND(hwnd_val as *mut _),
+            Some(HWND(after_val as *mut _)),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        )
+    };
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            log::debug!("insert_below_quiet failed for hwnd {hwnd_val} (after {after_val}): {e}");
+            false
+        }
+    }
+}
+
+/// Every top-level window, topmost first (`EnumWindows` walks the z-order
+/// from the top): the z-order the book-mode drift check reads once per
+/// pass (`daemon::piles`). Empty when the enumeration fails.
+#[must_use]
+pub fn z_order() -> Vec<isize> {
+    crate::registry::core::enum_toplevel_windows()
+        .map(|v| v.into_iter().map(|h| h.0 as isize).collect())
+        .unwrap_or_default()
 }
 
 /// The window class of `hwnd_val`, or `None` when the handle is gone (or is

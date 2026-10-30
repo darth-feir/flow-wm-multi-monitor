@@ -183,6 +183,39 @@ screen rect. A partly visible fullscreen window (niri's continuous
 scrolling) is not possible: Windows does not clip a window to its monitor,
 so the part out of view would be drawn on the neighbour.
 
+## Book mode: piles
+
+`project_with(layout, monitor, padding, visible_rows, mode)` is `project`
+for a strip in `LayoutMode::Strip` and the book projection for
+`LayoutMode::Book` (`[columns] layout`, ADR-0022). Both share one pass that
+decides, per column, whether it is shown at an x or parked left / right
+(`column_places`: the camera shift, the visibility test, the overhang rule
+and the fullscreen rule above), so the visible columns of a book strip are
+exactly where strip mode puts them. Only the columns strip mode parks get a
+different rect:
+
+| Column strip mode parks …          | Book rect                                                          | `pile`  |
+|------------------------------------|--------------------------------------------------------------------|---------|
+| left                               | the **leftmost visible column's** x and width, its own rows stacked | `Left`  |
+| right                              | the **rightmost visible column's** x and width                      | `Right` |
+| a fullscreen column, anywhere      | strip parking at the screen rect's size (pure moves stay pure)      | `None`  |
+| any, while a fullscreen column starts the view | its own width, flush with the work area's left edge (strip index before it) or right edge (after it), under the topmost fullscreen window | `Left` / `Right` |
+| any, with no visible column at all | strip parking (fallback)                                            | `None`  |
+
+A column that is shown but less than half on screen counts as out of view:
+a pattern's integer rounding can leave the next column one pixel inside
+the view (`1253 + 618 + 3 × 16 = 1919` on a 1920 px work area), and a pile
+must not sit there. With one visible column both piles share its rect (the
+1/1 carousel).
+
+A member keeps its own rows (`stack_column_rows` at the top's x and width),
+so a stacked member lies under a single-row top and vice versa; the
+`window_gap` strip between a stacked top's rows shows a slice of the card
+below (accepted). Rows beyond a member's row viewport are parked vertically
+as in strip mode. `MonitorInfo::is_parked` is false for a pile rect, which is
+what every other reader wants (it is on screen). The z-order of the piles is
+the daemon's: [Book Mode: Piles](../piles.md).
+
 ## Why projection is the only place padding lives
 
 Padding is applied exclusively during projection and never stored on `Column`, `VirtualLayout`, or individual windows. This design choice keeps the virtual canvas model clean: columns are pure containers of windows with widths, and the spatial realities of screen edges, gaps, and margins are deferred to the one function that converts canvas geometry to screen coordinates. The `ActualEntry` rects produced by projection are the **final HWND rects** — they can be passed directly to `SetWindowPos` without any further adjustment.
