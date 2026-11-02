@@ -44,9 +44,10 @@ pub struct RescueMonitor {
 /// The rescue pass itself (rules in [`FlowWM::rescue_stranded_windows`] and
 /// `docs/src/dev-guide/ipc-and-watchdog.md`, *Graceful-Shutdown Window
 /// Rescue*), as a free function so a startup failure *after* the initial
-/// layout has moved windows can still bring them back. Three passes: the
-/// controlled windows, the minimized windows' `WINDOWPLACEMENT` (re-anchored
-/// without un-minimizing), and the windows adopted from maximized
+/// layout has moved windows can still bring them back. Four passes: the
+/// controlled windows, the hidden tiles (to their pre-tiling rect), the
+/// minimized windows' `WINDOWPLACEMENT` (re-anchored without un-minimizing),
+/// and the windows adopted from maximized
 /// (maximized again, foreground put back since `SW_MAXIMIZE` activates).
 ///
 /// * `registry` — supplies the controlled windows and their rescue anchors.
@@ -94,6 +95,31 @@ pub fn rescue_stranded_windows_with(
             rescued += 1;
         }
     }
+    // Hidden tiles: back to their anchor whether or not the slot is on
+    // screen, since a hidden window is shown again where it was left. The
+    // move does not show it.
+    let mut sent_home = 0_usize;
+    for (hwnd_val, anchor, _) in registry.hidden_tiled_windows() {
+        let hwnd = HWND(hwnd_val as *mut _);
+        if !win32::is_window(hwnd_val) {
+            continue;
+        }
+        let owner = monitor_index_for_rect(monitors, anchor, active_monitor);
+        let target = anchor.clamped_into(monitors[owner].work_area);
+        if win32::get_window_rect(hwnd).is_ok_and(|r| r == target) {
+            continue;
+        }
+        if win32::set_window_rect(hwnd_val, target.x, target.y, target.width, target.height) {
+            log::info!(
+                "shutdown rescue: hidden tile hwnd {hwnd_val} back to ({},{} {}x{})",
+                target.x,
+                target.y,
+                target.width,
+                target.height
+            );
+            sent_home += 1;
+        }
+    }
     let mut re_anchored = 0_usize;
     for (hwnd_val, invisible_bounds) in registry.minimized_windows() {
         let hwnd = HWND(hwnd_val as *mut _);
@@ -134,9 +160,9 @@ pub fn rescue_stranded_windows_with(
         }
     }
     log::info!(
-        "shutdown rescue: brought {rescued} stranded window(s) back on-screen, re-anchored {re_anchored} minimized window(s), maximized {re_maximized} adopted window(s) again"
+        "shutdown rescue: brought {rescued} stranded window(s) back on-screen, sent {sent_home} hidden tile(s) home, re-anchored {re_anchored} minimized window(s), maximized {re_maximized} adopted window(s) again"
     );
-    rescued + re_anchored + re_maximized
+    rescued + sent_home + re_anchored + re_maximized
 }
 
 /// Index of the monitor whose screen rect contains `rect`'s centre, else the
@@ -175,6 +201,7 @@ impl FlowWM {
     /// `Ignored` and `Hidden` windows never reach this loop — the registry
     /// accessor filters them out, since flow does not actively place them.
     /// `Minimized` windows get their restore placement re-anchored instead,
+    /// hidden tiles are moved (still hidden) back to their pre-tiling rect,
     /// and windows adopted from maximized are maximized again (see
     /// `rescue_stranded_windows_with`).
     ///

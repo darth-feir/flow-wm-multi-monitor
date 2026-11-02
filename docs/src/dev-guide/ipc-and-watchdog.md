@@ -771,9 +771,30 @@ and only the position is nudged on-screen.
 There is no special-casing between tiling and floating: every window flow is
 actively positioning -- a `Tiling(Active)` or `Floating(Active)` window -- goes
 through the same loop. `Minimized`, `Hidden`, and `Ignored` windows never reach
-it. flow does not actively place minimized/hidden windows, so their position is
-the OS's and the user's responsibility; leaving them alone on shutdown avoids
-surprising the user by moving windows they intentionally hid.
+it. Minimized windows get their restore placement re-anchored instead, and
+hidden tiles are sent home (below).
+
+### Hidden tiles go home
+
+A tile that hides (`SW_HIDE`, tray-hide, cloaking) leaves the layout as
+`Tiling(Hidden)` but stays at the slot rect the daemon last gave it, and
+Windows shows a hidden window again exactly there. The fail-back and
+`tiling off` therefore move every hidden tile to its pre-tiling rect (else its
+`pre_manage_rect`), clamped into the work area of the screen holding that
+rect; the move carries no `SWP_SHOWWINDOW`, so the window stays hidden, and it
+is a pure move when the size is unchanged (ADR-0019). Visible tiles keep the
+rules above: the fail-back leaves a visible tile where it is, `tiling off`
+puts it back at its pre-tiling rect.
+
+Found on 2026-11-01: the shell's search host (`SearchHost.exe`), tiled by a
+learned rule (see `classification.md`, *Shell Surfaces Are Never Learned*),
+was hidden when the daemon stopped; its CoreWindow persists hidden between
+uses and kept the right-half slot, so every later search opened there, even
+under a daemon that ignores it. A position left that way by an older build is
+not repaired by a newer one (registration cannot know the rect a window had
+before an earlier run); restarting the shell process once does it
+(`SearchHost.exe` / `StartMenuExperienceHost.exe` are relaunched by Windows on
+the next Win key).
 
 ### The "pre-this-run" contract
 

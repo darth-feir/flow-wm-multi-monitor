@@ -155,6 +155,39 @@ The `default_action` field in the history file is ignored at load time; only
 the `rules` array is read. (The field exists only because the schema is shared
 with `flow-rules.toml`.)
 
+### Shell Surfaces Are Never Learned
+
+`set-window` acts on the OS foreground. Before this rule, a `set-window` (for
+example Mod+F) pressed while the Start menu or search was open landed on the
+search host (`SearchHost.exe`, class `Windows.UI.Core.CoreWindow`): it was
+adopted as a tile and the decision was learned. Learned rules outrank the
+default rules, so from then on the default `ignore` for `SearchHost.exe` lost,
+and every time the Start menu showed the search surface it was tiled into the
+strip and taken out again when it hid: the other tiles reflowed as if an app
+had opened and closed (seen on the host from 2026-10-27, fixed 2026-10-31).
+
+Two guards close it, both keyed on the shell classes of the floating layer
+(`top_layer::SHELL_CLASSES`: taskbars, desktop, `Windows.UI.Core.CoreWindow`,
+`XamlExplorerHostIslandWindow`, the daemon's own surfaces):
+
+- a shell surface in the foreground is not a dispatch target; `set-window` and
+  the manual drag use the registry's focus instead, as with no foreground;
+- a learned rule keyed on a shell class is skipped when the learned rules are
+  handed to the pipeline (at startup and after each recording), and such a
+  decision is never recorded. The file is not rewritten; an info line in the
+  log names the skipped entry so it can be deleted by hand.
+
+An explicit rule in `flow-rules.toml` can still tile or float a shell surface;
+only the learned layer is filtered.
+
+At registration a shell surface gets nothing beyond what every ignored window
+gets: it is tracked for the foreground decisions and never moved. A shell
+surface an older build tiled and left at a slot (it was hidden when that
+daemon stopped; see `ipc-and-watchdog.md`, *Hidden tiles go home*) keeps that
+position until its process restarts: end `SearchHost.exe` once (Task Manager
+or a sign-out); Windows starts it again on the next Win key. flowd never kills
+a shell process itself.
+
 ### Clearing or Overriding Learned State
 
 To forget everything flow has learned:

@@ -171,6 +171,9 @@ pub struct PauseSummary {
     pub restored: usize,
     /// Floats that sat off the virtual screen and were clamped on-screen.
     pub floats_clamped: usize,
+    /// Hidden tiles moved (still hidden) from their last slot back to their
+    /// pre-tiling rect.
+    pub hidden_home: usize,
     /// Windows the daemon had un-maximized to manage, maximized again.
     pub remaximized: usize,
     /// Minimized windows whose off-screen restore placement was fixed.
@@ -223,6 +226,8 @@ pub(super) struct PauseTargets {
     /// Tiles and floats left out of the batch to be maximized again
     /// instead ([`Window::adopted_from_maximized`]).
     pub remaximized: Vec<isize>,
+    /// See [`PauseSummary::hidden_home`].
+    pub hidden_home: usize,
 }
 
 /// Where a tiled window goes when tiling is turned off, as a **visible**
@@ -331,6 +336,7 @@ impl FlowWM {
             restored,
             floats_clamped,
             remaximized: to_remaximize,
+            hidden_home,
         } = self.pause_targets();
         if !targets.is_empty() {
             log::debug!(
@@ -420,15 +426,17 @@ impl FlowWM {
             tiles,
             restored,
             floats_clamped,
+            hidden_home,
             remaximized,
             minimized_fixed,
             borders,
             released_on_top,
         };
         log::info!(
-            "tiling: off — {} tile(s) moved on-screen ({} to their pre-tiling rect), {} float(s) clamped, {} window(s) maximized again, {} minimized placement(s) fixed, {} border(s) dropped, {} window(s) out of the floating layer; layout-mutating commands are refused until `flow dispatch tiling on`",
+            "tiling: off — {} tile(s) moved on-screen ({} to their pre-tiling rect), {} hidden tile(s) sent home, {} float(s) clamped, {} window(s) maximized again, {} minimized placement(s) fixed, {} border(s) dropped, {} window(s) out of the floating layer; layout-mutating commands are refused until `flow dispatch tiling on`",
             summary.tiles,
             summary.restored,
+            summary.hidden_home,
             summary.floats_clamped,
             summary.remaximized,
             summary.minimized_fixed,
@@ -512,6 +520,22 @@ impl FlowWM {
                     out.floats_clamped += 1;
                 }
             }
+        }
+
+        // Hidden tiles are in no layout but still sit at their last slot,
+        // where a hidden window is shown again: back to the pre-tiling rect
+        // (the move does not show them). See
+        // `docs/src/dev-guide/ipc-and-watchdog.md`, *Hidden tiles go home*.
+        for (hwnd, anchor, bounds) in self.registry.hidden_tiled_windows() {
+            let visible = bounds.window_to_visible(anchor);
+            let owner = monitor_index_for_rect_in(&screens, visible)
+                .or_else(|| self.remembered_monitor(WindowId(hwnd)))
+                .filter(|i| *i < work_areas.len())
+                .unwrap_or(self.active_monitor.min(work_areas.len() - 1));
+            let (target, _) = pause_target(Some(visible), visible, owner, &screens, &work_areas);
+            push_instant(&mut out.targets, hwnd, bounds.visible_to_window(target));
+            out.submitted.push((hwnd, target));
+            out.hidden_home += 1;
         }
         out
     }
@@ -1181,6 +1205,7 @@ mod tests {
                 tiles: 3,
                 restored: 1,
                 floats_clamped: 1,
+                hidden_home: 0,
                 remaximized: 0,
                 minimized_fixed: 1,
                 borders: 0,
@@ -1203,6 +1228,46 @@ mod tests {
         assert!(again.already_paused);
         assert_eq!(again.tiles, 0);
         assert_eq!(probe.placements.borrow().len(), 1);
+    }
+
+    /// A hidden tile (in no layout, still at its last slot) is sent back to
+    /// its pre-tiling rect by the pause, out of the tile count; one without a
+    /// pre-tiling rect goes to its pre-manage rect, clamped into the work
+    /// area of the screen holding it.
+    #[test]
+    fn pause_sends_hidden_tiles_home() {
+        const H: isize = 0x9001;
+        const K: isize = 0x9002;
+        let mut flow = fixture();
+        fake_window(
+            &mut flow.registry,
+            H,
+            WindowState::Tiling(TilingState::Hidden),
+        );
+        fake_window(
+            &mut flow.registry,
+            K,
+            WindowState::Tiling(TilingState::Hidden),
+        );
+        let h_pre = r(300, 200, 800, 600);
+        if let Some(w) = flow.registry.get_window_mut(HWND(H as *mut _)) {
+            w.pre_tiling_rect = Some(h_pre);
+            w.pre_manage_rect = r(5, 5, 10, 10);
+        }
+        if let Some(w) = flow.registry.get_window_mut(HWND(K as *mut _)) {
+            w.pre_tiling_rect = None;
+            w.pre_manage_rect = r(1800, 900, 400, 400);
+        }
+        let targets = flow.pause_targets();
+        assert_eq!(targets.tiles, 3, "hidden tiles are not counted as tiles");
+        assert_eq!(targets.hidden_home, 2);
+        assert_eq!(submitted_for(&targets, H), Some(h_pre));
+        let k = submitted_for(&targets, K).expect("K is moved");
+        assert!(
+            PRIMARY.x <= k.x && k.right() <= PRIMARY.right() && k.bottom() <= PRIMARY.bottom(),
+            "{k:?}"
+        );
+        assert_eq!((k.width, k.height), (400, 400));
     }
 
     /// A tile the daemon un-maximized to manage is not moved by the pause

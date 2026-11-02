@@ -1004,9 +1004,9 @@ impl WindowRegistry {
     /// flow is actively positioning — those in a `Tiling(Active)` or
     /// `Floating(Active)` state.
     ///
-    /// `Hidden` windows are excluded: flow does not actively place them, so
-    /// their position is the OS's/user's concern and the rescue pass leaves
-    /// them alone. `Ignored` windows are excluded for the same reason.
+    /// `Hidden` windows are excluded: flow does not actively place them
+    /// (hidden tiles are sent home by their own pass over
+    /// [`hidden_tiled_windows`](Self::hidden_tiled_windows)). `Ignored` windows are excluded for the same reason.
     /// `Minimized` windows are excluded here too — `GetWindowRect` is
     /// meaningless for them — and handled by the placement pass over
     /// [`minimized_windows`](Self::minimized_windows) instead. The rescue
@@ -1024,6 +1024,30 @@ impl WindowRegistry {
                 | WindowState::Floating(FloatingState::Active { .. }) => {
                     Some((*key, w.pre_manage_rect, w.invisible_bounds))
                 }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns `(hwnd_key, anchor, invisible_bounds)` for every tile that is
+    /// hidden right now (`Tiling(Hidden)`: tray-hidden, `SW_HIDE`, cloaked).
+    /// The anchor is the window's pre-tiling rect, else its pre-manage rect.
+    ///
+    /// A hidden tile still sits at the slot rect the daemon last gave it, and
+    /// a surface that persists hidden between uses (the shell's search host)
+    /// shows itself there again. The fail-back and `tiling off` passes move
+    /// these back to the anchor without showing them. See
+    /// `docs/src/dev-guide/ipc-and-watchdog.md`, *Hidden tiles go home*.
+    #[must_use]
+    pub fn hidden_tiled_windows(&self) -> Vec<(isize, Rect, InvisibleBounds)> {
+        self.windows
+            .iter()
+            .filter_map(|(key, w)| match &w.state {
+                WindowState::Tiling(TilingState::Hidden) => Some((
+                    *key,
+                    w.pre_tiling_rect.unwrap_or(w.pre_manage_rect),
+                    w.invisible_bounds,
+                )),
                 _ => None,
             })
             .collect()
@@ -3608,6 +3632,35 @@ mod tests {
             .into_iter()
             .map(|(k, r, _)| (k, r))
             .collect()
+    }
+
+    /// Only `Tiling(Hidden)` windows are hidden tiles; the anchor is the
+    /// pre-tiling rect when there is one, else the pre-manage rect.
+    #[test]
+    fn hidden_tiled_windows_lists_hidden_tiles_with_their_anchor() {
+        let mut reg =
+            WindowRegistry::new(&WindowRulesConfig::default(), &WindowRulesConfig::default());
+        insert_test_window(&mut reg, 1, WindowState::Tiling(TilingState::Hidden));
+        insert_test_window(&mut reg, 2, WindowState::Tiling(TilingState::Hidden));
+        insert_test_window(
+            &mut reg,
+            3,
+            WindowState::Tiling(TilingState::Active { col: 0, row: 0 }),
+        );
+        insert_test_window(&mut reg, 4, WindowState::Floating(FloatingState::Hidden));
+        insert_test_window(&mut reg, 5, WindowState::Tiling(TilingState::Minimized));
+        let pre = Rect {
+            x: 7,
+            y: 8,
+            width: 900,
+            height: 700,
+        };
+        reg.windows.get_mut(&1).expect("1").pre_tiling_rect = Some(pre);
+        let manage2 = reg.windows[&2].pre_manage_rect;
+        let mut got = reg.hidden_tiled_windows();
+        got.sort_by_key(|(h, _, _)| *h);
+        let got: Vec<(isize, Rect)> = got.into_iter().map(|(h, a, _)| (h, a)).collect();
+        assert_eq!(got, vec![(1, pre), (2, manage2)]);
     }
 
     #[test]

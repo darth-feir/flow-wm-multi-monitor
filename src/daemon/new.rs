@@ -221,7 +221,7 @@ impl FlowWM {
         let history = HistoryStore::load(&history_rules_path_in(&config_dir));
         if !history.is_empty() {
             log::info!("loaded {} learned rules from history", history.len());
-            registry.set_learned_rules(history.rules().to_vec());
+            registry.set_learned_rules(super::dispatch::learned_rules_for_pipeline(&history));
         }
 
         // Scan existing windows before hooks start.

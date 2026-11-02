@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use crate::common::{Direction, Rect, Size, WindowId};
 use crate::config::dirs::{history_rules_path_in, user_app_config_path_in, user_rules_path_in};
-use crate::config::types::WindowAction;
+use crate::config::history::HistoryStore;
+use crate::config::types::{WindowAction, WindowRule};
 use crate::config::{load_app_config, load_rules_config};
 use crate::ipc::message::{LayerTarget, SocketMessage, SocketResponse, WindowMode};
 use crate::layout::projection;
@@ -25,6 +26,7 @@ use windows::Win32::Foundation::HWND;
 use super::animation::PrevRects;
 use super::config_derive;
 use super::fullscreen::FullscreenExit;
+use super::top_layer;
 use super::types::FlowWM;
 
 // Built-in fallback policy for a floating window's default size when the user
@@ -1911,13 +1913,24 @@ impl FlowWM {
     }
 
     /// `GetForegroundWindow()` for the dispatch handlers that act on "the
-    /// focused window". `None` under `cfg(test)`: the unit tests run on a
-    /// developer's desktop whose foreground is a real window of theirs, and
-    /// registering it into a test registry would seat it (and draw a
-    /// border on it); the tests set the registry's focus instead.
+    /// focused window". A shell surface in the foreground (Start, search,
+    /// the taskbar: [`top_layer::is_shell_class`]) is not a target, so the
+    /// registry's focus is used, as with no foreground at all. `None` under
+    /// `cfg(test)`: the unit tests run on a developer's desktop whose
+    /// foreground is a real window of theirs, and registering it into a test
+    /// registry would seat it (and draw a border on it); the tests set the
+    /// registry's focus instead. See `docs/src/dev-guide/classification.md`,
+    /// *Shell Surfaces Are Never Learned*.
     #[cfg(not(test))]
     pub(super) fn os_foreground_for_dispatch(&self) -> Option<isize> {
-        registry_win32::get_foreground_window()
+        let fg = registry_win32::get_foreground_window()?;
+        if registry_win32::class_name(fg).is_some_and(|c| top_layer::is_shell_class(&c)) {
+            log::debug!(
+                "dispatch: foreground {fg:#x} is a shell surface; acting on the registry's focus"
+            );
+            return None;
+        }
+        Some(fg)
     }
 
     /// See the non-test variant: the tests drive the registry's focus.
@@ -1936,6 +1949,12 @@ impl FlowWM {
         let Some(learned) = action_to_learned(action) else {
             return;
         };
+        if top_layer::is_shell_class(class) {
+            log::info!(
+                "set-window: {exe} ({class}) is a shell surface; the decision is not learned"
+            );
+            return;
+        }
         if !self.history.record(learned, exe, Some(class)) {
             return;
         }
@@ -1943,7 +1962,7 @@ impl FlowWM {
             log::warn!("failed to persist history-flow-rules.toml: {e}");
         }
         self.registry
-            .set_learned_rules(self.history.rules().to_vec());
+            .set_learned_rules(learned_rules_for_pipeline(&self.history));
     }
 
     /// Adopt the ignored focused window as a **tile** (`set-window tile|cycle`
@@ -2666,6 +2685,36 @@ fn resolve_unknown_focus(
     }
 }
 
+/// The learned rules handed to the classification pipeline: every rule of
+/// `history-flow-rules.toml` except one keyed on a shell-surface class
+/// ([`top_layer::is_shell_class`]), which an earlier build could learn when a
+/// `set-window` landed on Start or search while it held the foreground. Such
+/// a rule would tile the search host each time the Start menu shows it. The
+/// file itself is left as it is. See `docs/src/dev-guide/classification.md`,
+/// *Shell Surfaces Are Never Learned*.
+pub(super) fn learned_rules_for_pipeline(history: &HistoryStore) -> Vec<WindowRule> {
+    history
+        .rules()
+        .iter()
+        .filter(|rule| {
+            let shell = rule
+                .match_
+                .class
+                .as_deref()
+                .is_some_and(top_layer::is_shell_class);
+            if shell {
+                log::info!(
+                    "learned rule for {:?} ({:?}) skipped: a shell surface is never tiled or floated by a learned rule",
+                    rule.match_.exe.as_deref().unwrap_or(""),
+                    rule.match_.class.as_deref().unwrap_or("")
+                );
+            }
+            !shell
+        })
+        .cloned()
+        .collect()
+}
+
 /// Map a resolved transition to the learned-rule action it should produce.
 ///
 /// Returns `None` for [`SetWindowAction::NoOp`] — a no-op transition carries
@@ -2903,6 +2952,28 @@ mod tests {
         // mode) and must not be recorded — otherwise every idempotent
         // `set-window` call would write to disk.
         assert_eq!(action_to_learned(SetWindowAction::NoOp), None);
+    }
+
+    /// A learned rule keyed on a shell-surface class (the search host's
+    /// `Windows.UI.Core.CoreWindow`, learned by an earlier build from a
+    /// `set-window` that landed on Start) never reaches the pipeline; the
+    /// app rules around it do.
+    #[test]
+    fn learned_rules_for_pipeline_skips_shell_surfaces() {
+        let mut history = HistoryStore::default();
+        history.record(WindowAction::Tile, "alacritty.exe", Some("Window Class"));
+        history.record(
+            WindowAction::Tile,
+            "SearchHost.exe",
+            Some("Windows.UI.Core.CoreWindow"),
+        );
+        history.record(WindowAction::Float, "explorer.exe", Some("Shell_TrayWnd"));
+        history.record(WindowAction::Tile, "Code.exe", None);
+        let exes: Vec<_> = learned_rules_for_pipeline(&history)
+            .into_iter()
+            .map(|r| r.match_.exe.unwrap_or_default())
+            .collect();
+        assert_eq!(exes, ["alacritty.exe", "Code.exe"]);
     }
 
     // ── resolve_unknown_focus: set-window on a window the registry never met ──
