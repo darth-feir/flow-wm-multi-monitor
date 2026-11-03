@@ -1095,6 +1095,9 @@ fn push_targets(
 /// `settled` (no tween can be in flight: the animator is idle) a member
 /// whose target is the rect it was last sent to gets [`Move::Stay`], so a
 /// flip moves only the windows that change place.
+///
+/// A window with no previous rect at all is placed instantly too
+/// ([`first_placement`]).
 #[allow(clippy::too_many_arguments)]
 fn push_targets_as(
     targets: &mut Vec<WindowTarget>,
@@ -1112,6 +1115,16 @@ fn push_targets_as(
     let decision = match plan_move(monitor, prev, next) {
         Move::Tween if piled && settled && prev == Some(next) => Move::Stay,
         Move::Tween if piled => Move::Instant,
+        Move::Tween if first_placement(prev) => {
+            log::debug!(
+                "animate: new window {hwnd:#x} placed instantly at its slot ({},{},{},{})",
+                next.x,
+                next.y,
+                next.width,
+                next.height
+            );
+            Move::Instant
+        }
         other => other,
     };
     submitted.push((hwnd, next));
@@ -1150,6 +1163,18 @@ fn push_targets_as(
         );
     }
     decision
+}
+
+/// The first-placement rule (ADR-0023, *Appearing in place*): a window
+/// with no previous rect, neither a submitted one
+/// ([`FlowWM::last_submitted_rect`]) nor a registry tiled or float rect,
+/// has never been placed by flow, so it is a new window. It is moved to its
+/// target instantly; a tween would start from wherever the app created it.
+/// The registry's tiled rect survives a minimize or a hide, so a seated
+/// window coming back still tweens.
+#[must_use]
+pub(super) fn first_placement(prev: Option<Rect>) -> bool {
+    prev.is_none()
 }
 
 /// Whether `window` is an active float.
@@ -1972,6 +1997,126 @@ mod tests {
         assert_eq!(flow.last_submitted_rect(p), None);
         let (instant, _) = decision_for(&flow, &committed, p);
         assert_eq!(instant, None, "registry says parked: Stay");
+    }
+
+    #[test]
+    fn a_window_never_placed_before_is_placed_instantly() {
+        // Positive: no previous rect, on-screen target: instant, border too.
+        let m = primary_with_left_neighbour();
+        let mut targets = Vec::new();
+        let mut submitted = Vec::new();
+        let decision = push_targets(
+            &mut targets,
+            &mut submitted,
+            &m,
+            7,
+            None,
+            col(487),
+            col(487).inset(2),
+            col(487),
+            Some(8),
+        );
+        assert_eq!(decision, Move::Instant);
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().all(|t| t.instant));
+        assert_eq!(submitted, vec![(7, col(487))]);
+        // Negative: any previous rect keeps the tween.
+        let mut targets = Vec::new();
+        let decision = push_targets(
+            &mut targets,
+            &mut submitted,
+            &m,
+            7,
+            Some(col(11)),
+            col(487),
+            col(487),
+            col(487),
+            None,
+        );
+        assert_eq!(decision, Move::Tween);
+        assert!(!targets[0].instant);
+    }
+
+    /// A daemon on `primary_with_left_neighbour` with tile A seated (its
+    /// registry rect set) and B registered but never seated, then B
+    /// inserted after A: the layout the creation seat animates.
+    fn flow_seating_a_new_tile() -> (FlowWM, crate::layout::types::AppliedLayout) {
+        use crate::config::types::WindowRulesConfig;
+        use crate::layout::types::Padding;
+        use crate::registry::WindowRegistry;
+        use crate::registry::types::{TilingState, WindowState};
+        use crate::registry::win32::WindowInfo;
+        use crate::workspace::{Monitor, ScrollingSpace, Workspace, WorkspaceId};
+
+        let rules = WindowRulesConfig::default();
+        let mut registry = WindowRegistry::new(&rules, &rules);
+        for hwnd in [0x40001_isize, 0x40002] {
+            registry.register_window_from_info(&WindowInfo {
+                hwnd: HWND(hwnd as *mut _),
+                title: "TestWindow".into(),
+                class: "TestClass".into(),
+                rect: Rect {
+                    x: 300,
+                    y: 200,
+                    width: 800,
+                    height: 600,
+                },
+                exe: "test.exe".into(),
+                process_path: "C:\\test.exe".into(),
+                is_visible: true,
+                is_maximized: false,
+                is_fullscreen: false,
+                is_iconic: false,
+            });
+            // Fake handles classify as floats (no styles to read): make
+            // them the tiles the seat sees.
+            if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {
+                w.state = WindowState::Tiling(TilingState::Active { col: 0, row: 0 });
+            }
+        }
+        let info = primary_with_left_neighbour();
+        let padding = Padding {
+            window_gap: 4,
+            up: 0,
+            down: 0,
+        };
+        let mut scrolling = ScrollingSpace::new(info, 600, 320, 100, 100, padding, 4);
+        scrolling.insert_window(WindowId(0x40001));
+        registry.update_tiling_slots_from_layout(scrolling.virtual_layout());
+        registry.update_tiled_rects(scrolling.actual_layout());
+        let screen = info.work_area;
+        let monitor = Monitor::new(
+            screen,
+            screen,
+            vec![Workspace::new(WorkspaceId(1), scrolling)],
+            0,
+        );
+        let mut flow = FlowWM::new_for_test(registry, vec![monitor]);
+        let applied = flow.monitors[0]
+            .active_scrolling_mut()
+            .insert_window(WindowId(0x40002));
+        (flow, applied)
+    }
+
+    #[test]
+    fn the_seat_of_a_new_tile_places_it_instantly_and_tweens_the_rest() {
+        let (mut flow, applied) = flow_seating_a_new_tile();
+        // Positive: B was never placed: instant.
+        let (instant, _) = decision_for(&flow, &applied, 0x40002);
+        assert_eq!(instant, Some(true));
+        // Negative: A keeps the tween (it has a registry rect; both
+        // columns fit on the screen, so neither is parked).
+        let (instant, _) = decision_for(&flow, &applied, 0x40001);
+        assert_eq!(instant, Some(false));
+        // Once seated, a later move of B tweens.
+        flow.animate_layout_on(0, &applied);
+        let (instant, _) = decision_for(&flow, &applied, 0x40002);
+        assert_eq!(instant, Some(false));
+        // A seated window back from a minimize or a hide (its submitted
+        // rect forgotten, its registry rect kept) tweens too.
+        flow.forget_submitted(0x40002);
+        let (instant, _) = decision_for(&flow, &applied, 0x40002);
+        assert_eq!(instant, Some(false));
     }
 
     #[test]

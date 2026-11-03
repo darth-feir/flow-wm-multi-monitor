@@ -186,6 +186,7 @@ format with a `"type"` field and snake_case variant names.
 | Column resize | `ExpandColumn`, `ShrinkColumn`, `SetColumnWidth { width_px }`, `SetWidthPreset { preset }` | Adjust column widths; `SetWidthPreset` (`next`/`prev`/`cycle`/`{"preset": "1/2"}`) moves the focused monitor to a `[columns]` preset and answers `Data { "width_preset", "monitor" }` |
 | Window state | `SetWindow { mode }`, `ToggleFloat`, `ToggleMonocle`, `PlaceAbove`, `Promote`, `MergeColumn`, `ConsumeOrExpel`, `CloseWindow` | Per-window operations; `SetWindow` takes `float`, `tile`, `cycle` or `fullscreen` (a toggle — see `daemon::fullscreen`); `ConsumeOrExpel { direction }` is `Promote` for a window that shares its column, `MergeColumn` for one alone in it |
 | Workspace | `SwitchWorkspace { workspace_id }`, `SwapWorkspace { workspace_id }`, `MoveWindowToWorkspace { workspace_id }` | niri-style virtual desktops (`Switch`/`Move` implemented; `Swap` stub) |
+| Programs | `Spawn { argv }` | Start a program with its first window on the focused screen (`flow spawn`, the keymap's spawn binds): `argv[0]` resolved like a `[startup] spawn` entry, an `.exe` started with `CreateProcessW` + `STARTF_USEPOSITION` at a point on the active monitor (`daemon::spawn`, ADR-0023 *Spawning on the focused screen*). Answers `Data { "pid", "path", "x", "y", "monitor" }` (position fields `null` when Windows decides: tiling off, `new_window_monitor = "placed"`, not an `.exe`), or an error when the program is not found or does not start. Not layout-mutating; accepted mid-drag and while tiling is off |
 | Query | `QueryWindowsAll`, `QueryLayoutVirtual`, `QueryLayoutActual`, `QueryState`, `QueryBinds` | Read-only introspection; `QueryBinds` answers the resolved `[binds]` table for the hotkey script (see [Key Bindings](./keybinds.md)) |
 | Config mutation | `SetConfigValue { key, value }` | Runtime config change |
 | App preferences | `ForgetApp { exe }`, `ForgetAllApps` | Clear per-app learned state |
@@ -521,6 +522,18 @@ pipeline (mutate, project, animate) as described in
 it only queues `WM_CLOSE` and lets the `EVENT_OBJECT_DESTROY` hook handle the
 actual layout removal, avoiding a race between the synchronous IPC response
 and the asynchronous window destruction.
+
+### Spawn
+
+| Command | Maps to |
+|---------|---------|
+| `flow spawn [--] <program> [args...]` | `Spawn { argv }` — prints `started <path> (pid N) at (x,y) on monitor M` (or `at the default position`; the JSON payload also carries the hint's `width` / `height`); exit 1 when the daemon does not answer or cannot start it |
+
+Each argument stays one `argv` item from the command line to the daemon,
+which quotes them again for the child's command line (MSVC CRT rules,
+`job::build_command_line`). The keymap's `Launch` uses this for every
+non-admin `.exe` spawn bind and falls back to its own `Run` when `flow
+spawn` fails; admin spawns (`*RunAs`) keep the `Run` path.
 
 ## Tiling on/off (pause and resume)
 

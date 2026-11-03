@@ -284,12 +284,73 @@ Launch(argv, admin := false) {
     args := ""
     Loop argv.Length - 1
         args .= " " Quote(argv[A_Index + 1])
+    ; An .exe started without elevation goes through the daemon (`flow spawn`), which asks
+    ; its first window to open on the focused screen; running it here is the fallback.
+    ; docs/adr/0023-new-windows-open-on-the-focused-screen.md, *Spawning on the focused screen*.
+    if (!admin && DaemonUp && RegExMatch(exe, "i)\.exe$") && SpawnViaDaemon(argv, exe, args))
+        return
+    RunHere(exe, args, admin)
+}
+; Start exe with its (already quoted) args from the home folder, not wherever the daemon
+; (and so this script) was started from.
+RunHere(exe, args, admin := false) {
     AhkLog("launch " (admin ? "(admin) " : "") exe args)
-    ; Start in the home folder, not wherever the daemon (and so this script) was started from.
     try Run((admin ? "*RunAs " : "") '"' exe '"' args, EnvGet("USERPROFILE"))
     catch as e
         if !InStr(e.Message, "cancel")       ; a declined UAC prompt is not worth a popup
             Osd("could not start " exe ": " e.Message)
+}
+; `flow spawn -- <exe> <args...>`, each item quoted for the CRT parser so the daemon gets
+; them one by one. False when flow.exe could not be run (the caller runs exe itself); a
+; non-zero exit later (no daemon, start failed) runs it here too.
+SpawnViaDaemon(argv, exe, args) {
+    global flowExe
+    cmd := "spawn -- " CrtQuote(exe)
+    Loop argv.Length - 1
+        cmd .= " " CrtQuote(argv[A_Index + 1])
+    AhkLog("launch via daemon: " cmd)
+    ; This script had the last input, so it may hand the foreground on: to the daemon,
+    ; which passes it to the program it starts.
+    if (pid := ProcessExist("flowd.exe"))
+        DllCall("AllowSetForegroundWindow", "UInt", pid)
+    try Run('"' flowExe '" ' cmd, , 'Hide', &cpid)
+    catch as e {
+        AhkLog("launch: could not run flow: " e.Message)
+        return false
+    }
+    ; PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE: enough to read the exit code.
+    h := DllCall("OpenProcess", "UInt", 0x1000 | 0x100000, "Int", 0, "UInt", cpid, "Ptr")
+    if h
+        SetTimer(DispatchDone.Bind(h, 0, SpawnDone.Bind(exe, args)), -50)
+    return true
+}
+SpawnDone(exe, args, code) {
+    if (code != 0) {
+        AhkLog("launch: flow spawn exited " code ", starting it here")
+        RunHere(exe, args)
+    }
+}
+; One argument quoted for the MSVC CRT / Rust argv parser: wrapped in quotes when it has
+; a space, tab or quote (or is empty); a quote escaped, the backslashes before it doubled.
+CrtQuote(a) {
+    if (a != "" && !RegExMatch(a, '[\s"]'))
+        return a
+    out := '"', bs := 0
+    Loop Parse a {
+        if (A_LoopField = "\") {
+            bs++
+            continue
+        }
+        out .= Backslashes(A_LoopField = '"' ? bs * 2 + 1 : bs) A_LoopField
+        bs := 0
+    }
+    return out Backslashes(bs * 2) '"'
+}
+Backslashes(n) {
+    s := ""
+    Loop n
+        s .= "\"
+    return s
 }
 
 ; --- Bindings: the table comes from the daemon -----------------------------

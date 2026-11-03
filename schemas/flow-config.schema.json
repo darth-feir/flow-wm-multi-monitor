@@ -90,7 +90,8 @@
       "description": "Focus reconciliation configuration.",
       "$ref": "#/$defs/FocusConfig",
       "default": {
-        "foreground_sync_interval_ms": 250
+        "foreground_sync_interval_ms": 250,
+        "new_window_monitor": "focused"
       }
     },
     "loadout": {
@@ -577,6 +578,11 @@
           "format": "uint64",
           "default": 250,
           "minimum": 0
+        },
+        "new_window_monitor": {
+          "description": "The screen a new window opens on: `\"focused\"` (the default, niri\nbehaviour) seats it on the screen that has the focus, `\"placed\"` on\nthe screen Windows put it on. Windows found at startup and windows\ncoming back from minimize or hide keep their own screen either way.\nSee ADR-0023.",
+          "$ref": "#/$defs/NewWindowMonitor",
+          "default": "focused"
         }
       }
     },
@@ -665,6 +671,21 @@
           "default": true
         }
       }
+    },
+    "NewWindowMonitor": {
+      "description": "`[focus] new_window_monitor`: which screen a newly created window is\nseated on.",
+      "oneOf": [
+        {
+          "description": "The screen that has the focus (the active monitor), like niri.",
+          "type": "string",
+          "const": "focused"
+        },
+        {
+          "description": "The screen Windows placed the window on.",
+          "type": "string",
+          "const": "placed"
+        }
+      ]
     },
     "Orientation": {
       "description": "Which way a screen is turned, by its work area.",

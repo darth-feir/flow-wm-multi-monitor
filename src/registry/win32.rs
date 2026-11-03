@@ -965,6 +965,111 @@ pub fn has_chrome(hwnd_val: isize) -> Option<bool> {
     Some(style & (WS_CAPTION | WS_THICKFRAME) != WINDOW_STYLE(0))
 }
 
+/// The window facts that decide whether a window flow has not classified
+/// yet may be moved before its first show (pre-placement, ADR-0023). Read
+/// by [`pre_place_facts`]; judged by the daemon without Win32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PrePlaceFacts {
+    /// `IsWindowVisible`.
+    pub visible: bool,
+    /// `GetAncestor(GA_ROOT)` is the window itself.
+    pub root: bool,
+    /// Has a `GW_OWNER` (a dialog, a popup).
+    pub owned: bool,
+    /// `WS_CHILD`.
+    pub child: bool,
+    /// `WS_EX_TOOLWINDOW`.
+    pub tool_window: bool,
+    /// `WS_CAPTION` or `WS_THICKFRAME`.
+    pub chrome: bool,
+    /// Minimized or maximized (`IsIconic` / `IsZoomed`).
+    pub min_or_max: bool,
+}
+
+/// Read [`PrePlaceFacts`] for `hwnd_val`; `None` for a handle that is gone.
+#[must_use]
+pub fn pre_place_facts(hwnd_val: isize) -> Option<PrePlaceFacts> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GA_ROOT, GW_OWNER, GetAncestor, GetWindow, WS_CHILD,
+    };
+    let hwnd = HWND(hwnd_val as *mut _);
+    // SAFETY: IsWindow accepts any value; the reads below on a handle that
+    // dies meanwhile return 0 / null, which read as "not a candidate".
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return None;
+    }
+    let style = WINDOW_STYLE(unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32);
+    let ex = WINDOW_EX_STYLE(unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32);
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) } == hwnd;
+    let owned = unsafe { GetWindow(hwnd, GW_OWNER) }.is_ok_and(|o| !o.is_invalid());
+    Some(PrePlaceFacts {
+        visible: is_window_visible(hwnd),
+        root,
+        owned,
+        child: style & WS_CHILD != WINDOW_STYLE(0),
+        tool_window: ex & WS_EX_TOOLWINDOW != WINDOW_EX_STYLE(0),
+        chrome: style & (WS_CAPTION | WS_THICKFRAME) != WINDOW_STYLE(0),
+        min_or_max: is_iconic(hwnd) || is_zoomed(hwnd),
+    })
+}
+
+/// Whether the thread of `hwnd_val` handles a sent `WM_NULL` within
+/// `timeout_ms` (`SendMessageTimeoutW`, `SMTO_ABORTIFHUNG`): it is pumping
+/// messages now, so a synchronous move of its window does not stall the
+/// daemon. Checked before pre-placing a window that is not shown yet
+/// (ADR-0023).
+#[must_use]
+pub fn answers_within(hwnd_val: isize, timeout_ms: u32) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SMTO_ABORTIFHUNG, SMTO_NORMAL, SendMessageTimeoutW, WM_NULL,
+    };
+    let mut result = 0usize;
+    // SAFETY: SendMessageTimeoutW on a stale handle fails cleanly; WM_NULL
+    // does nothing in the receiving window procedure.
+    let ok = unsafe {
+        SendMessageTimeoutW(
+            HWND(hwnd_val as *mut _),
+            WM_NULL,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_NORMAL | SMTO_ABORTIFHUNG,
+            timeout_ms,
+            Some(&mut result),
+        )
+    };
+    ok.0 != 0
+}
+
+/// Move `hwnd_val` to `(x, y)` keeping its size, z-order, activation and
+/// visibility (`SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE`, no show flag).
+/// Synchronous like every other move flow makes: an asynchronous request
+/// could land after the seat's own move and undo it. Used to pre-place a
+/// window that is not shown yet (ADR-0023). `false` (logged at `debug`)
+/// when `SetWindowPos` fails.
+#[must_use]
+pub fn move_window_keep_size(hwnd_val: isize, x: i32, y: i32) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER;
+    let hwnd = HWND(hwnd_val as *mut _);
+    // SAFETY: SetWindowPos on a stale handle fails cleanly.
+    match unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    } {
+        Ok(()) => true,
+        Err(e) => {
+            log::debug!("move_window_keep_size: SetWindowPos failed for {hwnd_val:#x}: {e}");
+            false
+        }
+    }
+}
+
 /// Whether `hwnd_val` is in the topmost band of the z-order right now
 /// (`WS_EX_TOPMOST` in its extended style). One `GetWindowLongW` read;
 /// `false` for a handle that is gone or from a unit test.
@@ -1094,6 +1199,23 @@ pub fn class_name(hwnd_val: isize) -> Option<String> {
         return None;
     }
     get_class_name(HWND(hwnd_val as *mut _)).ok()
+}
+
+/// The owner of `hwnd_val` (`GetWindow(GW_OWNER)`), or `None` for an
+/// unowned window, a handle that is gone, or null. The floating layer walks
+/// this chain to find the flow window a dialog belongs to (its *anchor*,
+/// `daemon::top_layer`, ADR-0024).
+#[must_use]
+pub fn owner_of(hwnd_val: isize) -> Option<isize> {
+    use windows::Win32::UI::WindowsAndMessaging::{GW_OWNER, GetWindow};
+    if hwnd_val == 0 {
+        return None;
+    }
+    // SAFETY: GetWindow on a stale handle fails cleanly (Err / null).
+    match unsafe { GetWindow(HWND(hwnd_val as *mut _), GW_OWNER) } {
+        Ok(owner) if !owner.is_invalid() => Some(owner.0 as isize),
+        _ => None,
+    }
 }
 
 /// Whether `hwnd_val` is fullscreen **on the desktop right now**: its

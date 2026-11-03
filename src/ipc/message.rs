@@ -421,6 +421,21 @@ pub enum SocketMessage {
         direction: Direction,
     },
 
+    // --- Programs ---
+    /// Start a program (`flow spawn <program> [args...]`, the keymap's
+    /// spawn binds) so that its first window opens on the focused screen:
+    /// the daemon resolves `argv[0]` like a `[startup] spawn` entry and
+    /// passes a position on the active monitor in the child's startup info
+    /// (ADR-0023, *Spawning on the focused screen*). Answered with
+    /// [`SocketResponse::Data`] `{"pid", "path", "x", "y", "monitor"}`
+    /// (`x`/`y`/`monitor` are `null` when no position was passed), or an
+    /// error when the program cannot be found or started. Not
+    /// layout-mutating: it moves nothing itself.
+    Spawn {
+        /// The program and its arguments, one item each (never re-split).
+        argv: Vec<String>,
+    },
+
     // --- Queries ---
     /// Query all managed windows.
     QueryWindowsAll,
@@ -632,6 +647,23 @@ mod tests {
 
         let parsed: SocketMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, SocketMessage::SetColumnWidth { width_px: 960 });
+    }
+
+    // Positive: round-trip Spawn; the argv items stay separate (a space or a
+    // quote inside one item is never re-split).
+    #[test]
+    fn roundtrip_spawn_keeps_each_argv_item() {
+        let msg = SocketMessage::Spawn {
+            argv: vec![
+                r"C:\Program Files\Alacritty\alacritty.exe".into(),
+                "-e".into(),
+                "a b \"c\"".into(),
+            ],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.starts_with(r#"{"type":"spawn","argv":["#), "{json}");
+        let parsed: SocketMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, msg);
     }
 
     // Positive: round-trip SetWidthPreset in both shapes, and the CLI words.
@@ -1489,6 +1521,10 @@ mod tests {
             // Daemon lifecycle
             SocketMessage::Stop,
             SocketMessage::CheckConfig,
+            // Starting a program moves nothing itself
+            SocketMessage::Spawn {
+                argv: vec!["alacritty".into()],
+            },
             // Queries
             SocketMessage::QueryWindowsAll,
             SocketMessage::QueryLayoutVirtual,

@@ -154,9 +154,13 @@ Shrink mirrors this: from `abs_max_width`, `ceil` lands back on `slot_max`. From
 
 Two insertion strategies exist. `add_window` simply appends a new column at the right end of the canvas — useful for batch initialization. `insert_window_after_focused` places the new column immediately after the focused window's column, so the user sees their newly opened window adjacent to where they were working. Both create the column at `column_width`; the insert variant also calls `ensure_column_visible` on the new column to scroll the viewport if needed.
 
+`ScrollingSpace::insert_preview_rect` answers "where would a window inserted now go?" without changing anything: it runs `insert_window` with a placeholder on a clone of the strip (`ScrollingSpace` is `Clone`) and returns the placeholder's projected rect. Because it is the seat's own code path, the answer includes width-pattern pinning, the viewport scroll and book-mode projection. `flow spawn` uses it as the first-window rect of the program it starts (ADR-0023, *Appearing in place*).
+
 ### `remove_window`
 
 When a window is removed, it is spliced out of its column's `rows` vector. If the column still has rows, they are redistributed via `distribute_heights(n-1, ...)` so the freed vertical space is reclaimed equally; if the column becomes empty (no remaining rows), the entire column is removed from the `columns` vector. The `viewport_offset` is then clamped to `max_offset = max(total_canvas - monitor_width, 0)` to prevent the viewport from scrolling past the (now shorter) canvas. Focus fallback — choosing which window to focus next after removal — is handled by `ScrollingSpace` using `next_available_window`, not by the mutation itself.
+
+**An emptied strip goes home.** The clamp only bounds the offset from above, so a strip centred by the fit case (a lone window at startup, a negative `viewport_offset`) kept that offset after its last window left, and the next window opened into the middle of the screen (stage 30, host report on a book-mode screen; strip mode did the same). `ScrollingSpace::apply_mutation_for` therefore resets `viewport_offset` to 0 whenever a mutation leaves the strip without columns, so the first window of an empty strip always takes the left slot.
 
 ### `merge_column` and `promote_window`
 

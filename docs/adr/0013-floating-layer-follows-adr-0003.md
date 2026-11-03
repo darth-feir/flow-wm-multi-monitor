@@ -86,10 +86,14 @@ ordinary band — still above the fullscreen window.
 - **Mod+F is unaffected.** The daemon's fullscreen window keeps its chrome,
   so it reads as a flow window; the fullscreen code keeps owning its own
   topmost flag.
-- **Visible side effects, accepted.** A dialog owned by a tile (Save As) is
-  non-flow, so the layer drops under it and raises again when the owner is
-  activated — harmless, the float lands right under the dialog, above the
-  tiles. A window that takes the foreground before it is registered (created
+- **Visible side effects, accepted.** A dialog owned by a tile (Save As) was
+  non-flow, so the layer dropped under it and raised again when the owner
+  was activated. *Superseded by
+  [ADR-0024](0024-owned-windows-ride-the-floating-layer.md):* a window owned
+  by a flow window is classed by its owner and rides in the topmost band
+  with the layer, because the drop seated an owner under its own popup and
+  the next raise covered the popup (the SSMS error box, 2026-11-02). A window
+  that takes the foreground before it is registered (created
   invisible and titled late, like Windows Terminal) drops the layer and
   re-raises when it is registered a moment later: one flash per such launch,
   inherent to "untracked = drop". A daemon started while an untracked window

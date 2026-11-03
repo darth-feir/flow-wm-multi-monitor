@@ -158,6 +158,25 @@ enum Commands {
         #[command(subcommand)]
         command: DispatchCommands,
     },
+    /// Start a program so that its first window opens on the focused
+    /// screen (the keymap's spawn binds use this).
+    ///
+    /// The daemon resolves PROGRAM like a `[startup] spawn` entry (Program
+    /// Files, %LOCALAPPDATA%\Programs, the Store's aliases, PATH; a path
+    /// must be absolute), starts it from the home folder and asks its first
+    /// window to open on the active monitor. Put `--` before the program
+    /// when an argument starts with `-`. Exits non-zero when the daemon does
+    /// not answer or cannot start the program.
+    Spawn {
+        /// The program and its arguments.
+        #[arg(
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "PROGRAM [ARGS]..."
+        )]
+        argv: Vec<String>,
+    },
     /// Create the login autostart shortcut in `shell:startup`.
     EnableAutostart {
         /// Bake `--ahk` into the shortcut's args so login also launches
@@ -589,6 +608,7 @@ fn main() {
         Commands::Config { command } => cmd_config(command),
         Commands::Query { command } => cmd_query(command),
         Commands::Dispatch { command } => cmd_dispatch(command),
+        Commands::Spawn { argv } => cmd_spawn(argv),
         Commands::EnableAutostart { ahk } => cmd_enable_autostart(ahk),
         Commands::DisableAutostart => cmd_disable_autostart(),
         Commands::Update { check: _ } => {
@@ -1298,6 +1318,37 @@ fn cmd_config_check() -> Result<(), String> {
             println!("flow: configuration is valid (no daemon running; checked locally)");
             Ok(())
         }
+    }
+}
+
+/// `flow spawn`: ask the daemon to start `argv` on the focused screen and
+/// print what it started.
+fn cmd_spawn(argv: Vec<String>) -> Result<(), String> {
+    let response = transport::send_message(&SocketMessage::Spawn { argv })
+        .map_err(|e| format!("failed to send command: {e}"))?;
+    match response {
+        SocketResponse::Data { payload } => {
+            println!("{}", spawn_reply_line(&payload));
+            Ok(())
+        }
+        SocketResponse::Error { message } => Err(format!("daemon error: {message}")),
+        other => Err(format!("unexpected reply to spawn: {other:?}")),
+    }
+}
+
+/// The line `flow spawn` prints for the daemon's `Spawn` reply.
+fn spawn_reply_line(payload: &serde_json::Value) -> String {
+    let path = payload["path"].as_str().unwrap_or("?");
+    let pid = payload["pid"].as_u64().unwrap_or(0);
+    match (
+        payload["x"].as_i64(),
+        payload["y"].as_i64(),
+        payload["monitor"].as_u64(),
+    ) {
+        (Some(x), Some(y), Some(m)) => {
+            format!("started {path} (pid {pid}) at ({x},{y}) on monitor {m}")
+        }
+        _ => format!("started {path} (pid {pid}) at the default position"),
     }
 }
 
@@ -2200,6 +2251,47 @@ mod tests {
         assert!(wait_for_daemon_stop(dir.path(), Duration::from_millis(50)));
         assert!(daemon_finished(StartupState::Error));
         assert!(!daemon_finished(StartupState::Starting));
+    }
+
+    #[test]
+    fn parse_spawn_keeps_each_argument() {
+        // Positive: the program and every argument arrive as separate items,
+        // hyphenated ones included, with or without `--`.
+        let cli = Cli::try_parse_from([
+            "flow",
+            "spawn",
+            "--",
+            r"C:\Program Files\Alacritty\alacritty.exe",
+            "-e",
+            "a b",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Spawn { argv } => assert_eq!(
+                argv,
+                [r"C:\Program Files\Alacritty\alacritty.exe", "-e", "a b"]
+            ),
+            other => panic!("{other:?}"),
+        }
+        let cli = Cli::try_parse_from(["flow", "spawn", "wt", "-p", "x"]).unwrap();
+        assert!(matches!(cli.command, Commands::Spawn { argv } if argv == ["wt", "-p", "x"]));
+        // Negative: a program is required.
+        assert!(Cli::try_parse_from(["flow", "spawn"]).is_err());
+    }
+
+    #[test]
+    fn spawn_reply_line_names_the_position_or_the_default() {
+        let at =
+            serde_json::json!({"pid": 42, "path": r"C:\a.exe", "x": -1904, "y": 16, "monitor": 1});
+        assert_eq!(
+            spawn_reply_line(&at),
+            r"started C:\a.exe (pid 42) at (-1904,16) on monitor 1"
+        );
+        let default = serde_json::json!({"pid": 7, "path": r"C:\b.cmd", "x": null, "y": null, "monitor": null});
+        assert_eq!(
+            spawn_reply_line(&default),
+            r"started C:\b.cmd (pid 7) at the default position"
+        );
     }
 
     #[test]

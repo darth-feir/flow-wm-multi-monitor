@@ -115,6 +115,14 @@ impl TopmostProbe for Win32Tiling {
     fn class_name(&self, hwnd: isize) -> Option<String> {
         registry_win32::class_name(hwnd)
     }
+
+    fn owner_of(&self, hwnd: isize) -> Option<isize> {
+        registry_win32::owner_of(hwnd)
+    }
+
+    fn is_visible(&self, hwnd: isize) -> bool {
+        registry_win32::is_window_visible(windows::Win32::Foundation::HWND(hwnd as *mut _))
+    }
 }
 
 impl TilingProbe for Win32Tiling {
@@ -1028,6 +1036,12 @@ mod tests {
         }
         fn class_name(&self, _hwnd: isize) -> Option<String> {
             None
+        }
+        fn owner_of(&self, _hwnd: isize) -> Option<isize> {
+            None
+        }
+        fn is_visible(&self, _hwnd: isize) -> bool {
+            true
         }
     }
 

@@ -17,9 +17,16 @@
 //! with `daemon::fullscreen` are in `docs/src/dev-guide/floating-space.md`,
 //! *The floating layer*.
 //!
+//! An untracked window owned by a flow window (a modal dialog, an error
+//! box) that takes the foreground is a *rider*: classed by its anchor (the
+//! first tracked window on its `GW_OWNER` chain, [`anchor_of`]) and held in
+//! the topmost band with the layer, after the members ([`Rider`],
+//! ADR-0024, `docs/adr/0024-owned-windows-ride-the-floating-layer.md`).
+//!
 //! The Win32 questions are behind [`TopmostProbe`] so the transitions run
 //! against a mock in the unit tests; the tiling on/off probe extends it.
 
+use std::cmp::Reverse;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
@@ -49,6 +56,11 @@ pub(super) trait TopmostProbe {
     /// The window class ([`registry_win32::class_name`]); `None` when the
     /// handle is gone.
     fn class_name(&self, hwnd: isize) -> Option<String>;
+    /// The window's owner (`GW_OWNER`, [`registry_win32::owner_of`]);
+    /// `None` for an unowned window or a handle that is gone.
+    fn owner_of(&self, hwnd: isize) -> Option<isize>;
+    /// `IsWindowVisible` ([`registry_win32::is_window_visible`]).
+    fn is_visible(&self, hwnd: isize) -> bool;
 }
 
 /// The production [`TopmostProbe`]: plain Win32.
@@ -74,6 +86,14 @@ impl TopmostProbe for Win32Topmost {
     fn class_name(&self, hwnd: isize) -> Option<String> {
         registry_win32::class_name(hwnd)
     }
+
+    fn owner_of(&self, hwnd: isize) -> Option<isize> {
+        registry_win32::owner_of(hwnd)
+    }
+
+    fn is_visible(&self, hwnd: isize) -> bool {
+        registry_win32::is_window_visible(HWND(hwnd as *mut _))
+    }
 }
 
 /// Window classes whose activation leaves the layer's decision alone: the
@@ -97,6 +117,77 @@ pub(super) const SHELL_CLASSES: &[&str] = &[
 #[must_use]
 pub(super) fn is_shell_class(class: &str) -> bool {
     SHELL_CLASSES.contains(&class)
+}
+
+/// How many `GW_OWNER` hops [`anchor_of`] walks before it gives up.
+pub(super) const OWNER_HOPS: usize = 8;
+
+/// The first window on `hwnd`'s owner chain (its owner, the owner's owner,
+/// ... at most [`OWNER_HOPS`] hops; a cycle ends the walk) for which
+/// `is_tracked` holds: a rider's *anchor* (ADR-0024). `None` for an unowned
+/// window or a chain that never reaches one.
+#[must_use]
+pub(super) fn anchor_of(
+    hwnd: isize,
+    owner_of: impl Fn(isize) -> Option<isize>,
+    is_tracked: impl Fn(isize) -> bool,
+) -> Option<isize> {
+    let mut seen = vec![hwnd];
+    let mut current = hwnd;
+    for _ in 0..OWNER_HOPS {
+        let owner = owner_of(current).filter(|o| *o != 0)?;
+        if seen.contains(&owner) {
+            return None;
+        }
+        if is_tracked(owner) {
+            return Some(owner);
+        }
+        seen.push(owner);
+        current = owner;
+    }
+    None
+}
+
+/// Whether `target` is on `hwnd`'s owner chain ([`anchor_of`]'s walk).
+#[must_use]
+pub(super) fn owned_by(
+    hwnd: isize,
+    target: isize,
+    owner_of: impl Fn(isize) -> Option<isize>,
+) -> bool {
+    anchor_of(hwnd, owner_of, |h| h == target).is_some()
+}
+
+/// How many owners `hwnd` has above it (capped at [`OWNER_HOPS`]): riders
+/// are raised owner first, so an owned dialog ends above its owner.
+fn owner_depth(hwnd: isize, owner_of: impl Fn(isize) -> Option<isize>) -> usize {
+    let mut depth = 0;
+    let mut current = hwnd;
+    while depth < OWNER_HOPS {
+        match owner_of(current).filter(|o| *o != 0 && *o != hwnd) {
+            Some(owner) => {
+                depth += 1;
+                current = owner;
+            }
+            None => break,
+        }
+    }
+    depth
+}
+
+/// A rider (ADR-0024): an untracked window owned by a flow window that took
+/// the foreground. It gets no registry entry, seat, border or learned rule;
+/// the layer only holds it in the topmost band with the members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Rider {
+    /// The first tracked window on its owner chain ([`anchor_of`]).
+    pub anchor: isize,
+    /// Held in the topmost band by the layer (a member's `on_top`).
+    pub on_top: bool,
+    /// Topmost on its own when it entered: topmost then and no owner on
+    /// its chain was held by the layer (a flag inherited from the daemon's
+    /// own raise is not the window's).
+    pub was_topmost: bool,
 }
 
 /// Who the layer sees holding the foreground.
@@ -264,6 +355,11 @@ impl FlowWM {
     /// over the daemon's state); `None` for an untracked window.
     fn layer_wanted_for(&self, hwnd: isize) -> Option<bool> {
         let window = self.registry.get_window(HWND(hwnd as *mut _))?;
+        // Start / search surfaces an explicit rule ignores are never members
+        // (they would get `HWND_TOPMOST` on every raise).
+        if is_shell_class(&window.class) {
+            return Some(false);
+        }
         Some(layer_wanted(
             self.config.floating.always_on_top,
             !self.tiling_paused,
@@ -295,26 +391,43 @@ impl FlowWM {
         crate::registry::hooks::set_foreground_hwnd(hwnd);
     }
 
-    /// [`classify_foreground`] over the daemon's view of `fg`: a tracked
-    /// window's class and state come from its record (no Win32), an
-    /// untracked one costs a class read; the live fullscreen check is only
-    /// asked for a window flow would otherwise own.
-    fn foreground_owner_with<P: TopmostProbe>(
+    /// [`classify_foreground`] over the daemon's view of `fg`, and the
+    /// anchor it was classed by: a tracked window's class and state come
+    /// from its record (no Win32); an untracked one costs a class read and,
+    /// unless it is a shell surface, an owner walk ([`anchor_of`]) — owned
+    /// by a flow window, it is classed by that window's state (ADR-0024).
+    /// The live fullscreen check is only asked for a window flow would
+    /// otherwise own (for a rider: the rider and its anchor).
+    fn foreground_view_with<P: TopmostProbe>(
         &self,
         fg: Option<isize>,
         probe: &P,
-    ) -> ForegroundOwner {
+    ) -> (ForegroundOwner, Option<isize>) {
         let Some(hwnd) = fg.filter(|h| *h != 0) else {
-            return ForegroundOwner::Shell;
+            return (ForegroundOwner::Shell, None);
         };
-        let window = self.registry.get_window(HWND(hwnd as *mut _));
-        let class = match window {
-            Some(w) => Some(w.class.clone()),
-            None => probe.class_name(hwnd),
-        };
-        let state = window.map(|w| &w.state);
-        let fullscreen_live = state.is_some_and(owns_foreground) && probe.is_fullscreen_live(hwnd);
-        classify_foreground(class.as_deref(), state, fullscreen_live)
+        if let Some(w) = self.registry.get_window(HWND(hwnd as *mut _)) {
+            let fullscreen_live = owns_foreground(&w.state) && probe.is_fullscreen_live(hwnd);
+            return (
+                classify_foreground(Some(&w.class), Some(&w.state), fullscreen_live),
+                None,
+            );
+        }
+        let class = probe.class_name(hwnd);
+        let anchor = class
+            .as_deref()
+            .filter(|c| !is_shell_class(c))
+            .and_then(|_| anchor_of(hwnd, |h| probe.owner_of(h), |h| self.registry.is_tracked(h)));
+        let state = anchor
+            .and_then(|a| self.registry.get_window(HWND(a as *mut _)))
+            .map(|w| &w.state);
+        let fullscreen_live = state.is_some_and(owns_foreground)
+            && (probe.is_fullscreen_live(hwnd)
+                || anchor.is_some_and(|a| probe.is_fullscreen_live(a)));
+        (
+            classify_foreground(class.as_deref(), state, fullscreen_live),
+            anchor,
+        )
     }
 
     /// Decide the layer's state for foreground `fg` (ADR-0003): raised when
@@ -331,7 +444,13 @@ impl FlowWM {
         if !self.config.floating.always_on_top || self.tiling_paused {
             return None;
         }
-        let owner = self.foreground_owner_with(fg, probe);
+        let (owner, anchor) = self.foreground_view_with(fg, probe);
+        if owner == ForegroundOwner::Flow
+            && let (Some(hwnd), Some(anchor)) = (fg, anchor)
+            && probe.is_visible(hwnd)
+        {
+            self.note_rider(hwnd, anchor);
+        }
         let raise = owner.raised()?;
         self.top_layer_below = if raise { None } else { fg };
         if raise == self.top_layer_raised {
@@ -387,8 +506,216 @@ impl FlowWM {
         hwnd: isize,
         probe: &P,
     ) -> Option<LayerStep> {
-        let wanted = self.layer_wanted_for(hwnd)?;
-        self.apply_layer_step(hwnd, wanted, probe)
+        if let Some(wanted) = self.layer_wanted_for(hwnd) {
+            return self.apply_layer_step(hwnd, wanted, probe);
+        }
+        let wanted = self.rider_wanted_with(hwnd, probe)?;
+        self.apply_rider_step(hwnd, wanted, probe)
+    }
+
+    /// Remember `hwnd` as a rider of `anchor` (the foreground is classed by
+    /// it, ADR-0024). Keeps the flags of a rider already known.
+    fn note_rider(&mut self, hwnd: isize, anchor: isize) {
+        let rider = self.riders.entry(hwnd).or_insert(Rider {
+            anchor,
+            on_top: false,
+            was_topmost: false,
+        });
+        rider.anchor = anchor;
+    }
+
+    /// Whether the rider `hwnd` is wanted in the topmost band: the layer is
+    /// on and raised, its anchor is still tracked and it is visible. `None`
+    /// for a window that is not a rider.
+    fn rider_wanted_with<P: TopmostProbe>(&self, hwnd: isize, probe: &P) -> Option<bool> {
+        let rider = self.riders.get(&hwnd)?;
+        Some(
+            self.config.floating.always_on_top
+                && !self.tiling_paused
+                && self.top_layer_raised
+                && self.registry.is_tracked(rider.anchor)
+                && probe.is_visible(hwnd),
+        )
+    }
+
+    /// Whether a window on `hwnd`'s owner chain is held in the band by the
+    /// layer (a member or a rider): a topmost flag `hwnd` has now may be
+    /// inherited from the daemon's own raise.
+    fn owner_held<P: TopmostProbe>(&self, hwnd: isize, probe: &P) -> bool {
+        anchor_of(
+            hwnd,
+            |h| probe.owner_of(h),
+            |h| {
+                self.riders.get(&h).is_some_and(|r| r.on_top)
+                    || self
+                        .registry
+                        .get_window(HWND(h as *mut _))
+                        .is_some_and(|w| w.on_top)
+            },
+        )
+        .is_some()
+    }
+
+    /// The window to seat `hwnd` under when it leaves because the layer
+    /// dropped: the dropping foreground, unless that window is owned by
+    /// `hwnd` (an owner is never placed under its own popup).
+    fn seat_below<P: TopmostProbe>(
+        &self,
+        hwnd: isize,
+        restore_to: Option<bool>,
+        probe: &P,
+    ) -> Option<isize> {
+        (restore_to == Some(false) && !self.top_layer_raised)
+            .then_some(self.top_layer_below)
+            .flatten()
+            .filter(|after| !owned_by(*after, hwnd, |h| probe.owner_of(h)))
+    }
+
+    /// [`apply_layer_step`](Self::apply_layer_step) for a rider: an entering
+    /// rider is always raised (`HWND_TOPMOST` puts it at the top of the
+    /// band, above members raised before it, even when it inherited the
+    /// flag), and the flag it had on its own is the one put back.
+    fn apply_rider_step<P: TopmostProbe>(
+        &mut self,
+        hwnd: isize,
+        wanted: bool,
+        probe: &P,
+    ) -> Option<LayerStep> {
+        let rider = *self.riders.get(&hwnd)?;
+        if !wanted && !rider.on_top {
+            return None;
+        }
+        let topmost_now = probe.is_topmost(hwnd);
+        let step = if wanted && !rider.on_top {
+            LayerStep::Enter { raise: true }
+        } else {
+            layer_step(wanted, rider.on_top, topmost_now, rider.was_topmost)?
+        };
+        match step {
+            LayerStep::Enter { .. } => {
+                let was_topmost = topmost_now && !self.owner_held(hwnd, probe);
+                if !probe.set_topmost(hwnd, true) {
+                    log::debug!("top layer: could not raise rider {hwnd:#x}");
+                }
+                if let Some(r) = self.riders.get_mut(&hwnd) {
+                    r.on_top = true;
+                    r.was_topmost = was_topmost;
+                }
+                log::info!(
+                    "top layer: rider {hwnd:#x} (anchor {:#x}) entered (was_topmost={was_topmost})",
+                    rider.anchor
+                );
+            }
+            LayerStep::Leave { restore_to } => {
+                if let Some(after) = self.seat_below(hwnd, restore_to, probe)
+                    && probe.insert_below(hwnd, after)
+                {
+                    log::debug!("top layer: rider {hwnd:#x} seated under {after:#x}");
+                } else if let Some(flag) = restore_to
+                    && !probe.set_topmost(hwnd, flag)
+                {
+                    log::debug!("top layer: could not restore topmost={flag} on rider {hwnd:#x}");
+                }
+                if let Some(r) = self.riders.get_mut(&hwnd) {
+                    r.on_top = false;
+                    r.was_topmost = false;
+                }
+                log::info!(
+                    "top layer: rider {hwnd:#x} (anchor {:#x}) left (restored to {restore_to:?})",
+                    rider.anchor
+                );
+            }
+            LayerStep::Reassert => {
+                if !probe.set_topmost(hwnd, true) {
+                    log::debug!("top layer: could not re-assert rider {hwnd:#x}");
+                }
+                log::debug!("top layer: rider {hwnd:#x} re-asserted");
+            }
+        }
+        Some(step)
+    }
+
+    /// The riders in the order they are raised: owner first (an owned
+    /// dialog above its owner), the foreground last.
+    fn rider_order<P: TopmostProbe>(&self, probe: &P) -> Vec<isize> {
+        let mut riders: Vec<(bool, usize, isize)> = self
+            .riders
+            .keys()
+            .map(|h| {
+                (
+                    Some(*h) == self.foreground,
+                    owner_depth(*h, |o| probe.owner_of(o)),
+                    *h,
+                )
+            })
+            .collect();
+        riders.sort_unstable();
+        riders.into_iter().map(|(_, _, h)| h).collect()
+    }
+
+    /// Drop the riders that are gone (no class), hidden, or whose anchor is
+    /// no longer tracked, putting back the flag of one the layer holds
+    /// (owned windows first). Run by every pass. Returns how many held
+    /// riders left.
+    fn purge_riders_with<P: TopmostProbe>(&mut self, probe: &P) -> usize {
+        let mut stale: Vec<(Reverse<usize>, isize)> = self
+            .riders
+            .iter()
+            .filter(|(h, r)| {
+                probe.class_name(**h).is_none()
+                    || !probe.is_visible(**h)
+                    || !self.registry.is_tracked(r.anchor)
+            })
+            .map(|(h, _)| (Reverse(owner_depth(*h, |o| probe.owner_of(o))), *h))
+            .collect();
+        stale.sort_unstable();
+        let mut left = 0;
+        for (_, hwnd) in stale {
+            if probe.class_name(hwnd).is_some()
+                && matches!(
+                    self.apply_rider_step(hwnd, false, probe),
+                    Some(LayerStep::Leave { .. })
+                )
+            {
+                left += 1;
+            }
+            if let Some(r) = self.riders.remove(&hwnd) {
+                log::info!(
+                    "top layer: rider {hwnd:#x} (anchor {:#x}) forgotten",
+                    r.anchor
+                );
+            }
+        }
+        left
+    }
+
+    /// A rider was hidden or destroyed: out of the band (when it is still
+    /// there to be touched) and forgotten. One map lookup for any other
+    /// window.
+    pub(super) fn forget_rider(&mut self, hwnd: isize, destroyed: bool) {
+        self.forget_rider_with(hwnd, destroyed, &Win32Topmost);
+    }
+
+    /// [`forget_rider`](Self::forget_rider) against `probe`.
+    pub(super) fn forget_rider_with<P: TopmostProbe>(
+        &mut self,
+        hwnd: isize,
+        destroyed: bool,
+        probe: &P,
+    ) {
+        if !self.riders.contains_key(&hwnd) {
+            return;
+        }
+        if !destroyed {
+            let _ = self.apply_rider_step(hwnd, false, probe);
+        }
+        if let Some(r) = self.riders.remove(&hwnd) {
+            log::info!(
+                "top layer: rider {hwnd:#x} (anchor {:#x}) forgotten ({})",
+                r.anchor,
+                if destroyed { "destroyed" } else { "hidden" }
+            );
+        }
     }
 
     /// Apply [`layer_step`] for `hwnd` given `wanted`, reading the
@@ -424,10 +751,7 @@ impl FlowWM {
                 // Leaving because the layer dropped: straight under the
                 // foreground that dropped it (one call clears the topmost
                 // flag too); otherwise the flag it had goes back.
-                let below = (restore_to == Some(false) && !self.top_layer_raised)
-                    .then_some(self.top_layer_below)
-                    .flatten();
-                if let Some(after) = below
+                if let Some(after) = self.seat_below(hwnd, restore_to, probe)
                     && probe.insert_below(hwnd, after)
                 {
                     log::debug!("top layer: hwnd {hwnd:#x} seated under {after:#x}");
@@ -467,11 +791,31 @@ impl FlowWM {
         self.apply_all_top_layer_with(probe)
     }
 
-    /// Apply the current decision to every tracked window.
+    /// Apply the current decision to every tracked window and every rider:
+    /// raising, members first and riders after them (the foreground window
+    /// last); leaving, riders first.
     fn apply_all_top_layer_with<P: TopmostProbe>(&mut self, probe: &P) -> LayerSummary {
-        let hwnds: Vec<isize> = self.registry.windows().map(|w| w.hwnd.0 as isize).collect();
-        let mut summary = LayerSummary::default();
-        for hwnd in hwnds {
+        let mut summary = LayerSummary {
+            left: self.purge_riders_with(probe),
+            ..LayerSummary::default()
+        };
+        let members: Vec<isize> = self.registry.windows().map(|w| w.hwnd.0 as isize).collect();
+        let riders = self.rider_order(probe);
+        let lifting =
+            self.config.floating.always_on_top && !self.tiling_paused && self.top_layer_raised;
+        let order: Vec<isize> = if lifting {
+            // The foreground (a member or a rider) last: it ends on top.
+            let fg = self.foreground;
+            let (mut order, last): (Vec<isize>, Vec<isize>) = members
+                .into_iter()
+                .chain(riders)
+                .partition(|h| Some(*h) != fg);
+            order.extend(last);
+            order
+        } else {
+            riders.into_iter().rev().chain(members).collect()
+        };
+        for hwnd in order {
             summary.count(self.sync_top_layer_with(hwnd, probe));
         }
         if summary.changed() {
@@ -495,13 +839,23 @@ impl FlowWM {
 
     /// [`release_top_layer`](Self::release_top_layer) against `probe`.
     pub(super) fn release_top_layer_with<P: TopmostProbe>(&mut self, probe: &P) -> usize {
+        let mut left = 0;
+        // Riders first (owned windows before their owners), then members.
+        for hwnd in self.rider_order(probe).into_iter().rev() {
+            if matches!(
+                self.apply_rider_step(hwnd, false, probe),
+                Some(LayerStep::Leave { .. })
+            ) {
+                left += 1;
+            }
+        }
+        self.riders.clear();
         let held: Vec<isize> = self
             .registry
             .windows()
             .filter(|w| w.on_top)
             .map(|w| w.hwnd.0 as isize)
             .collect();
-        let mut left = 0;
         for hwnd in held {
             if matches!(
                 self.apply_layer_step(hwnd, false, probe),
@@ -543,6 +897,7 @@ impl FlowWM {
         fg: Option<isize>,
         probe: &P,
     ) {
+        self.purge_riders_with(probe);
         if self.evaluate_top_layer_with(fg, probe).is_some() || !self.top_layer_raised {
             // Just re-applied everywhere, or nothing is held while dropped.
             return;
@@ -554,6 +909,11 @@ impl FlowWM {
             .map(|w| w.hwnd.0 as isize)
             .collect();
         for hwnd in held {
+            self.sync_top_layer_with(hwnd, probe);
+        }
+        // Riders after the members: a demoted one is raised again, and a
+        // foreground rider whose own event was missed enters.
+        for hwnd in self.rider_order(probe) {
             self.sync_top_layer_with(hwnd, probe);
         }
     }
@@ -682,6 +1042,8 @@ mod tests {
         classes: RefCell<HashMap<isize, String>>,
         calls: RefCell<Vec<(isize, bool)>>,
         below: RefCell<Vec<(isize, isize)>>,
+        owners: RefCell<HashMap<isize, isize>>,
+        hidden: RefCell<HashSet<isize>>,
     }
 
     impl MockTopmost {
@@ -695,6 +1057,12 @@ mod tests {
         fn with_window(self, hwnd: isize, class: &str) -> Self {
             self.classes.borrow_mut().insert(hwnd, class.to_owned());
             self
+        }
+
+        /// An untracked window of class `class` owned by `owner`.
+        fn with_owned(self, hwnd: isize, class: &str, owner: isize) -> Self {
+            self.owners.borrow_mut().insert(hwnd, owner);
+            self.with_window(hwnd, class)
         }
 
         fn set_fullscreen(&self, hwnd: isize, fullscreen: bool) {
@@ -733,6 +1101,14 @@ mod tests {
 
         fn class_name(&self, hwnd: isize) -> Option<String> {
             self.classes.borrow().get(&hwnd).cloned()
+        }
+
+        fn owner_of(&self, hwnd: isize) -> Option<isize> {
+            self.owners.borrow().get(&hwnd).copied()
+        }
+
+        fn is_visible(&self, hwnd: isize) -> bool {
+            !self.hidden.borrow().contains(&hwnd)
         }
     }
 
@@ -1393,6 +1769,276 @@ mod tests {
             SocketResponse::Ok
         );
         assert!(!on_top(&flow, A));
+    }
+
+    // ── riders: owned windows of flow windows (ADR-0024) ──────────────
+
+    /// A connect dialog owned by float F, an error box owned by the dialog,
+    /// an error box owned by tile A, a popup owned by a hidden untracked
+    /// helper, and an owner cycle.
+    const CONNECT: isize = 0x20;
+    const ERROR: isize = 0x21;
+    const TILE_ERR: isize = 0x22;
+    const HELPER: isize = 0x23;
+    const ORPHAN: isize = 0x24;
+    const LOOP_A: isize = 0x25;
+    const LOOP_B: isize = 0x26;
+
+    fn owned_desktop() -> MockTopmost {
+        let probe = desktop()
+            .with_owned(CONNECT, "#32770", F)
+            .with_owned(ERROR, "#32770", CONNECT)
+            .with_owned(TILE_ERR, "#32770", A)
+            .with_window(HELPER, "HelperClass")
+            .with_owned(ORPHAN, "WindowsForms10.Window", HELPER)
+            .with_owned(LOOP_A, "#32770", LOOP_B)
+            .with_owned(LOOP_B, "#32770", LOOP_A);
+        probe.hidden.borrow_mut().insert(HELPER);
+        probe
+    }
+
+    fn rider(flow: &FlowWM, hwnd: isize) -> Option<Rider> {
+        flow.riders.get(&hwnd).copied()
+    }
+
+    /// `hwnd` takes the foreground: the focus sink's two layer calls.
+    fn activate(flow: &mut FlowWM, hwnd: isize, probe: &MockTopmost) -> Option<bool> {
+        flow.note_foreground(hwnd);
+        let flipped = flow.evaluate_top_layer_with(Some(hwnd), probe);
+        if flipped.is_none() {
+            flow.sync_top_layer_with(hwnd, probe);
+        }
+        flipped
+    }
+
+    #[test]
+    fn the_anchor_is_the_first_tracked_owner_with_a_hop_cap_and_a_cycle_guard() {
+        let owners: HashMap<isize, isize> = (1..=20).map(|h| (h, h + 1)).collect();
+        let owner_of = |h: isize| owners.get(&h).copied();
+        assert_eq!(anchor_of(1, owner_of, |h| h == 5), Some(5));
+        assert_eq!(anchor_of(1, owner_of, |h| h == 1), None, "not itself");
+        let last = 1 + OWNER_HOPS as isize;
+        assert_eq!(anchor_of(1, owner_of, |h| h == last), Some(last));
+        assert_eq!(anchor_of(1, owner_of, |h| h == last + 1), None);
+        assert_eq!(anchor_of(30, owner_of, |_| true), None, "unowned");
+        let cycle = |h: isize| Some(if h == 1 { 2 } else { 1 });
+        assert_eq!(anchor_of(1, cycle, |h| h == 7), None);
+        assert!(owned_by(1, 4, owner_of));
+        assert!(!owned_by(4, 1, owner_of));
+        assert_eq!(owner_depth(5, owner_of), OWNER_HOPS);
+        assert_eq!(owner_depth(20, owner_of), 1);
+        assert_eq!(owner_depth(30, owner_of), 0);
+    }
+
+    #[test]
+    fn a_dialog_of_a_float_is_flow_and_rides_above_the_members() {
+        let mut flow = fixture();
+        let probe = owned_desktop();
+        flow.sync_all_top_layer_with(&probe);
+        // The connect dialog takes the foreground: no drop, it enters.
+        assert_eq!(activate(&mut flow, CONNECT, &probe), None);
+        assert!(flow.top_layer_raised);
+        assert_eq!(rider(&flow, CONNECT).map(|r| r.anchor), Some(F));
+        assert!(probe.is_topmost(CONNECT) && on_top(&flow, F));
+        // The error box owned by the dialog: anchored at F through it.
+        assert_eq!(activate(&mut flow, ERROR, &probe), None);
+        assert_eq!(rider(&flow, ERROR).map(|r| r.anchor), Some(F));
+        assert!(probe.is_topmost(ERROR));
+        assert!(probe.below.borrow().is_empty(), "nothing was seated");
+        // A foreign window drops everything; a tile raises it again with
+        // the members first and the riders after them, owner first and the
+        // foreground rider last.
+        assert_eq!(activate(&mut flow, G, &probe), Some(false));
+        assert!(!probe.is_topmost(ERROR) && !probe.is_topmost(CONNECT));
+        probe.calls.borrow_mut().clear();
+        flow.note_foreground(ERROR);
+        assert_eq!(flow.evaluate_top_layer_with(Some(A), &probe), Some(true));
+        let calls = probe.calls.borrow().clone();
+        let pos = |h: isize| calls.iter().position(|c| *c == (h, true)).expect("raised");
+        assert!(pos(F) < pos(CONNECT) && pos(I) < pos(CONNECT), "{calls:?}");
+        assert!(pos(CONNECT) < pos(ERROR), "{calls:?}");
+        assert!(rider(&flow, ERROR).is_some_and(|r| r.on_top && !r.was_topmost));
+    }
+
+    #[test]
+    fn a_raise_puts_the_foreground_member_above_the_riders() {
+        let mut flow = fixture();
+        let probe = owned_desktop();
+        flow.sync_all_top_layer_with(&probe);
+        activate(&mut flow, CONNECT, &probe);
+        // A message box that took the foreground before it was registered
+        // (I, an explicit-rule ignore) dropped the layer; registered, it
+        // raises it again and must end above the connect dialog.
+        assert_eq!(activate(&mut flow, G, &probe), Some(false));
+        probe.calls.borrow_mut().clear();
+        flow.note_foreground(I);
+        assert_eq!(flow.evaluate_top_layer_with(Some(I), &probe), Some(true));
+        let calls = probe.calls.borrow().clone();
+        assert_eq!(calls.last(), Some(&(I, true)), "{calls:?}");
+        assert!(calls.contains(&(CONNECT, true)));
+    }
+
+    #[test]
+    fn a_dialog_of_a_tile_is_flow_and_held_topmost() {
+        let mut flow = fixture();
+        let probe = owned_desktop();
+        flow.sync_all_top_layer_with(&probe);
+        assert_eq!(activate(&mut flow, TILE_ERR, &probe), None);
+        assert!(rider(&flow, TILE_ERR).is_some_and(|r| r.on_top && r.anchor == A));
+        assert!(probe.is_topmost(TILE_ERR) && on_top(&flow, F));
+        assert!(!on_top(&flow, A), "riders never make the anchor a member");
+        // Windows demotes it: the periodic pass raises it again.
+        probe.topmost.borrow_mut().remove(&TILE_ERR);
+        flow.reassert_top_layer_with(Some(TILE_ERR), &probe);
+        assert!(probe.is_topmost(TILE_ERR));
+        // Riders never get a registry entry.
+        assert!(!flow.registry.is_tracked(TILE_ERR));
+    }
+
+    #[test]
+    fn a_dialog_of_a_live_fullscreen_anchor_or_an_untracked_owner_is_foreign() {
+        let mut flow = fixture();
+        let probe = owned_desktop();
+        flow.sync_all_top_layer_with(&probe);
+        probe.set_fullscreen(A, true);
+        assert_eq!(activate(&mut flow, TILE_ERR, &probe), Some(false));
+        assert!(rider(&flow, TILE_ERR).is_none(), "not a rider");
+        probe.set_fullscreen(A, false);
+        assert_eq!(activate(&mut flow, A, &probe), Some(true));
+        // A popup owned by a hidden untracked helper (testwin29 -Owned).
+        assert_eq!(activate(&mut flow, ORPHAN, &probe), Some(false));
+        assert!(flow.riders.is_empty());
+        assert_eq!(activate(&mut flow, A, &probe), Some(true));
+        // An owner cycle ends the walk: foreign.
+        assert_eq!(activate(&mut flow, LOOP_A, &probe), Some(false));
+        assert!(flow.riders.is_empty());
+    }
+
+    #[test]
+    fn a_shell_surface_wins_even_when_owned() {
+        let mut flow = fixture();
+        let probe = owned_desktop().with_owned(0x30, "XamlExplorerHostIslandWindow", F);
+        flow.sync_all_top_layer_with(&probe);
+        assert_eq!(activate(&mut flow, 0x30, &probe), None);
+        assert!(flow.riders.is_empty());
+        assert!(flow.top_layer_raised);
+    }
+
+    #[test]
+    fn a_drop_demotes_riders_first_and_never_seats_an_owner_under_its_popup() {
+        let mut flow = fixture();
+        let probe = owned_desktop();
+        flow.sync_all_top_layer_with(&probe);
+        activate(&mut flow, CONNECT, &probe);
+        // A foreign window: the rider is seated before the members.
+        assert_eq!(activate(&mut flow, G, &probe), Some(false));
+        let below = probe.below.borrow().clone();
+        assert_eq!(below.first(), Some(&(CONNECT, G)), "{below:?}");
+        assert!(below.contains(&(F, G)) && below.contains(&(I, G)));
+        assert!(rider(&flow, CONNECT).is_some_and(|r| !r.on_top));
+        // Back up; then F goes fullscreen by live geometry and its own
+        // dialog takes the foreground: foreign, and F is not seated under
+        // the window it owns (NOTOPMOST instead).
+        assert_eq!(activate(&mut flow, A, &probe), Some(true));
+        probe.below.borrow_mut().clear();
+        probe.calls.borrow_mut().clear();
+        probe.set_fullscreen(F, true);
+        assert_eq!(activate(&mut flow, CONNECT, &probe), Some(false));
+        for (hwnd, after) in probe.below.borrow().iter() {
+            assert!(
+                !owned_by(*after, *hwnd, |h| probe.owner_of(h)),
+                "{hwnd:#x} seated under its own popup {after:#x}"
+            );
+        }
+        assert!(probe.calls.borrow().contains(&(F, false)));
+        assert!(!probe.is_topmost(F));
+    }
+
+    #[test]
+    fn release_and_tiling_off_take_riders_out_and_an_inherited_flag_does_not_survive() {
+        let mut flow = fixture();
+        let probe = owned_desktop();
+        flow.sync_all_top_layer_with(&probe);
+        // The dialog inherited topmost from F (raised by the daemon).
+        probe.topmost.borrow_mut().insert(CONNECT);
+        activate(&mut flow, CONNECT, &probe);
+        assert!(rider(&flow, CONNECT).is_some_and(|r| r.on_top && !r.was_topmost));
+        // Tiling off: the rider leaves with the members.
+        flow.tiling_paused = true;
+        let summary = flow.sync_all_top_layer_with(&probe);
+        assert_eq!(summary.left, 3);
+        assert!(!probe.is_topmost(CONNECT) && !probe.is_topmost(F));
+        assert!(rider(&flow, CONNECT).is_some_and(|r| !r.on_top));
+        // Tiling on, rider back in; then the stop path.
+        flow.tiling_paused = false;
+        flow.sync_all_top_layer_with(&probe);
+        assert!(rider(&flow, CONNECT).is_some_and(|r| r.on_top) && probe.is_topmost(CONNECT));
+        assert_eq!(flow.release_top_layer_with(&probe), 3);
+        assert!(flow.riders.is_empty());
+        assert!(!probe.is_topmost(CONNECT), "the inherited flag is cleared");
+        assert!(!probe.is_topmost(F));
+        // A rider that was topmost on its own keeps the flag.
+        let mut flow = fixture();
+        let probe = owned_desktop();
+        probe.topmost.borrow_mut().insert(TILE_ERR);
+        flow.sync_all_top_layer_with(&probe);
+        activate(&mut flow, TILE_ERR, &probe);
+        assert!(rider(&flow, TILE_ERR).is_some_and(|r| r.was_topmost));
+        flow.release_top_layer_with(&probe);
+        assert!(probe.is_topmost(TILE_ERR));
+    }
+
+    #[test]
+    fn stale_riders_are_purged_hidden_and_destroyed_ones_forgotten() {
+        let mut flow = fixture();
+        let probe = owned_desktop();
+        flow.sync_all_top_layer_with(&probe);
+        for h in [CONNECT, ERROR, TILE_ERR] {
+            activate(&mut flow, h, &probe);
+        }
+        assert_eq!(flow.riders.len(), 3);
+        // ERROR dismissed (gone), CONNECT hidden: purged by the next pass,
+        // the hidden one lowered first.
+        probe.classes.borrow_mut().remove(&ERROR);
+        probe.hidden.borrow_mut().insert(CONNECT);
+        flow.reassert_top_layer_with(Some(A), &probe);
+        assert!(rider(&flow, ERROR).is_none() && rider(&flow, CONNECT).is_none());
+        assert!(!probe.is_topmost(CONNECT));
+        // The anchor goes away: its rider is purged.
+        flow.registry.remove_window(A);
+        flow.reassert_top_layer_with(Some(F), &probe);
+        assert!(flow.riders.is_empty());
+        assert!(!probe.is_topmost(TILE_ERR));
+        // Hide / destroy hooks.
+        let mut flow = fixture();
+        let probe = owned_desktop();
+        flow.sync_all_top_layer_with(&probe);
+        activate(&mut flow, CONNECT, &probe);
+        flow.forget_rider_with(CONNECT, false, &probe);
+        assert!(flow.riders.is_empty() && !probe.is_topmost(CONNECT));
+        flow.riders.insert(
+            ERROR,
+            Rider {
+                anchor: F,
+                on_top: true,
+                was_topmost: false,
+            },
+        );
+        flow.on_window_destroyed(ERROR);
+        assert!(flow.riders.is_empty());
+    }
+
+    #[test]
+    fn an_explicitly_ignored_shell_surface_is_never_a_member() {
+        let mut flow = fixture();
+        if let Some(w) = flow.registry.get_window_mut(HWND(I as *mut _)) {
+            w.class = "Windows.UI.Core.CoreWindow".into();
+        }
+        let probe = MockTopmost::default();
+        let summary = flow.sync_all_top_layer_with(&probe);
+        assert_eq!(summary.entered, 1);
+        assert!(!on_top(&flow, I) && !probe.is_topmost(I));
+        assert!(on_top(&flow, F));
     }
 
     #[test]

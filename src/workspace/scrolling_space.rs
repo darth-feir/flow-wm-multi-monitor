@@ -73,6 +73,7 @@ use crate::layout::types::{
 /// let (focused, _viewport_diff) = engine.focus(WindowId(3), Direction::Left).unwrap();
 /// assert_eq!(focused, WindowId(2));
 /// ```
+#[derive(Clone)]
 pub struct ScrollingSpace {
     /// Current virtual layout (the infinite horizontal canvas).
     virtual_layout: VirtualLayout,
@@ -836,6 +837,12 @@ impl ScrollingSpace {
         // column now at the left edge here, and a resize that slipped
         // through is undone on the spot.
         let _ = self.pin_to_slots(&mut new_layout, window);
+        // An empty strip has no view to keep: the camera goes home, so the
+        // next window starts at the left edge instead of where a centred
+        // canvas (`initialize_windows`, `center_canvas`) left the camera.
+        if new_layout.columns.is_empty() {
+            new_layout.viewport_offset = 0;
+        }
         let new_layout = mutations::normalize_row_viewports(&new_layout, window, &self.config);
         let new_actual = projection::project_with(
             &new_layout,
@@ -1155,6 +1162,21 @@ impl ScrollingSpace {
             virtual_layout: self.virtual_layout.clone(),
             actual_layout: self.actual.clone(),
         })
+    }
+
+    /// The visible rect a window would get if it were inserted now with
+    /// [`insert_window`](Self::insert_window): the insert is run on a copy
+    /// of this strip (same focus, widths, pattern, layout mode and camera)
+    /// and the placeholder's projected rect is read back; this strip is not
+    /// touched. `flow spawn` passes it as the new program's first window
+    /// rect (ADR-0023, *Appearing in place*).
+    #[must_use]
+    pub fn insert_preview_rect(&self) -> Option<crate::common::Rect> {
+        /// Never a real window handle.
+        const PLACEHOLDER: WindowId = WindowId(isize::MIN);
+        let mut dry = self.clone();
+        let _ = dry.insert_window(PLACEHOLDER);
+        dry.actual_layout().find(PLACEHOLDER).map(|e| e.rect)
     }
 
     /// Insert a new window as a column immediately after the focused window.
@@ -1639,6 +1661,39 @@ mod tests {
         engine
     }
 
+    /// Stage 30: a strip centred at startup (one window that fits) and then
+    /// emptied sends its camera home, so the next window opens in the left
+    /// slot in both layouts instead of in the middle of the screen.
+    #[test]
+    fn an_emptied_strip_resets_its_view_and_the_next_window_starts_at_the_left() {
+        for mode in [LayoutMode::Strip, LayoutMode::Book] {
+            let mut engine =
+                ScrollingSpace::new(test_monitor(), 640, 320, 100, 100, test_padding(), 4);
+            let _ = engine.set_layout_mode(mode, crate::layout::types::WrapAround::Off);
+            let _ = engine.initialize_windows(vec![WindowId(1)], Some(0), None);
+            assert!(
+                engine.virtual_layout().viewport_offset < 0,
+                "{mode:?}: centred"
+            );
+
+            let emptied = engine.remove_window(WindowId(1));
+            assert_eq!(emptied.virtual_layout.viewport_offset, 0, "{mode:?}");
+
+            let first = engine.insert_window(WindowId(2));
+            assert_eq!(
+                first.actual_layout.find(WindowId(2)).map(|e| e.rect.x),
+                Some(4),
+                "{mode:?}"
+            );
+            let second = engine.insert_window(WindowId(3));
+            assert_eq!(
+                second.actual_layout.find(WindowId(3)).map(|e| e.rect.x),
+                Some(4 + 640 + 4),
+                "{mode:?}"
+            );
+        }
+    }
+
     #[test]
     fn engine_add_windows_and_focus() {
         let engine = engine_with_three_columns();
@@ -1744,6 +1799,77 @@ mod tests {
         // Back to the pattern: the same column is anchored again.
         engine.apply_width_pattern(&[636, 1272]);
         assert_run(&engine, 1, &[1272, 636]);
+    }
+
+    // --- Insert preview (`flow spawn`'s first-window rect, ADR-0023) ---
+
+    /// The preview leaves `engine` untouched and equals the rect a real
+    /// insert gives; returns it.
+    fn preview_matches_insert(engine: &ScrollingSpace) -> crate::common::Rect {
+        let before = engine.actual_layout().clone();
+        let focus = engine.last_focused_window();
+        let preview = engine.insert_preview_rect().expect("a rect");
+        assert_eq!(engine.actual_layout(), &before, "the strip is untouched");
+        assert_eq!(engine.last_focused_window(), focus);
+        let mut real = engine.clone();
+        let _ = real.insert_window(WindowId(999));
+        let seated = real.actual_layout().find(WindowId(999)).expect("seated");
+        assert_eq!(preview, seated.rect);
+        assert_eq!(seated.pile, None, "the new column is in view");
+        preview
+    }
+
+    fn rect_on_screen(r: crate::common::Rect) -> bool {
+        let wa = test_monitor().work_area;
+        r.x >= wa.x && r.right() <= wa.right() && r.y >= wa.y && r.bottom() <= wa.bottom()
+    }
+
+    #[test]
+    fn the_insert_preview_of_an_empty_strip_is_its_first_column() {
+        let engine = ScrollingSpace::new(test_monitor(), 954, 320, 100, 100, test_padding(), 4);
+        let r = preview_matches_insert(&engine);
+        assert!(rect_on_screen(r), "{r:?}");
+        assert_eq!(r.width, 954);
+        assert_eq!(r.x, 4, "at the left edge plus the gap");
+    }
+
+    #[test]
+    fn the_insert_preview_in_a_strip_is_the_slot_after_the_focused_column() {
+        let mut engine = engine_with_three_columns();
+        engine.set_focus(WindowId(1));
+        let _ = engine.ensure_focused_visible();
+        let r = preview_matches_insert(&engine);
+        assert!(rect_on_screen(r), "{r:?}");
+        assert_eq!(r.width, 960);
+    }
+
+    #[test]
+    fn the_insert_preview_scrolls_when_the_new_column_does_not_fit() {
+        // Half-width columns, two in view, focus on the right one: the new
+        // column lands right of the screen until the strip scrolls.
+        let mut engine = ScrollingSpace::new(test_monitor(), 954, 320, 100, 100, test_padding(), 4);
+        engine.add_window(WindowId(1));
+        engine.add_window(WindowId(2));
+        engine.set_focus(WindowId(2));
+        let _ = engine.ensure_focused_visible();
+        let focused = engine.actual_layout().find(WindowId(2)).expect("2").rect;
+        assert!(focused.right() + 4 + 954 > 1920, "no room right of it");
+        let r = preview_matches_insert(&engine);
+        assert!(rect_on_screen(r), "scrolled into view: {r:?}");
+        assert_eq!(r.width, 954);
+        assert!(r.x >= 1920 / 2, "on the right half: {r:?}");
+    }
+
+    #[test]
+    fn the_insert_preview_in_book_mode_is_the_slot_the_new_column_surfaces_at() {
+        let engine = book_engine();
+        let r = preview_matches_insert(&engine);
+        assert!(rect_on_screen(r), "{r:?}");
+        // Focus on the right column of the run as well.
+        let mut engine = book_engine();
+        let _ = engine.focus(WindowId(1), Direction::Right);
+        let r = preview_matches_insert(&engine);
+        assert!(rect_on_screen(r), "{r:?}");
     }
 
     // --- Book mode (ADR-0022) ---

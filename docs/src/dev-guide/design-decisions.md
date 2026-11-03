@@ -349,6 +349,7 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
 - **ADR-0013 — The floating layer follows ADR-0003's invariant.** Floats
   are topmost only while flow owns the foreground; see the file for the two
   deviations (a config knob, and shell surfaces that leave the state alone).
+  Owned windows of flow windows are classed by their owner (ADR-0024).
   `docs/adr/0013-floating-layer-follows-adr-0003.md`
 - **ADR-0014 — Width patterns are assigned by column position and pin the
   strip.** A `[columns]` preset may be a `+` pattern (`1/3+2/3`); column `i`
@@ -440,3 +441,30 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   columns keep off-screen parking. Adds `[columns] wrap_around =
   "off" | "on" | "book"` for focus left/right at the strip ends.
   `docs/adr/0022-book-mode-piles.md`
+- **ADR-0023 — New windows open on the focused screen.** A window the user
+  just opened is seated on the active monitor (tile after its focused
+  column at that strip's width, float centred there), wherever Windows
+  placed it; windows found at startup, restored from minimize or first met
+  when they take the foreground keep their own screen. `[focus]
+  new_window_monitor = "placed"` keeps Windows' placement. Stage 30b moves
+  a window that is not shown yet onto the focused screen at
+  `EVENT_OBJECT_CREATE` (pre-placement), so it does not paint on the other
+  screen first. Stage 30c: programs the keymap (non-admin spawn binds),
+  `flow spawn` and `[startup] spawn` start are created by the daemon with
+  `STARTF_USEPOSITION` at a point on the focused screen, so their first
+  window is created there (for apps that do not pump messages before they
+  show, such as Alacritty). Stage 30d: the hint is the rect the new column
+  will get (a dry run of the seat, `STARTF_USEPOSITION | STARTF_USESIZE`),
+  and a window flow has never placed (no previous rect) is moved to its
+  slot instantly while the other columns tween, so new windows appear in
+  place instead of gliding there.
+  `docs/adr/0023-new-windows-open-on-the-focused-screen.md`
+- **ADR-0024 — Owned windows of flow windows ride the floating layer.** An
+  untracked window that takes the foreground and whose `GW_OWNER` chain
+  reaches a tracked window (a modal dialog, an error box) is a *rider*:
+  classed by that anchor instead of as a foreign app, held in the topmost
+  band with the layer after the members, demoted and released with it, and
+  never seated, bordered or learned. No window is seated under its own
+  popup. Explicitly ignored shell surfaces (Start, search) are no longer
+  layer members. Amends ADR-0013 (fixes the SSMS error box hidden behind its
+  own window). `docs/adr/0024-owned-windows-ride-the-floating-layer.md`

@@ -571,6 +571,8 @@ impl FlowWM {
                     // inserted into the layout.
                 } else if retries < MAX_PENDING_RETRIES {
                     still_pending.push((hwnd, retries + 1));
+                } else {
+                    self.pre_placed.remove(&hwnd);
                 }
                 // retries >= MAX_PENDING_RETRIES: give up silently.
                 // The window is likely a non-tiling helper window (tooltip,
@@ -588,11 +590,16 @@ impl FlowWM {
                     // early in the lifecycle — the window may not be visible
                     // or have its title set yet. If classification fails,
                     // defer to pending_creations for retry.
+                    // Not shown yet: a new window on another screen is
+                    // moved to the focused one before its first paint
+                    // (pre-placement, ADR-0023).
                     if !self.on_window_created(hwnd) {
+                        self.pre_place_created(hwnd);
                         self.pending_creations.push((hwnd, 0));
                     }
                 }
                 HookEvent::Destroyed { hwnd } => {
+                    self.pre_placed.remove(&hwnd);
                     self.on_window_destroyed(hwnd);
                 }
                 HookEvent::Foreground { hwnd } => {

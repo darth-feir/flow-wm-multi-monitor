@@ -549,6 +549,22 @@ impl WindowRegistry {
         self.pipeline.set_learned_rules(rules);
     }
 
+    /// Whether the rule layers (user → learned → default → fallback) would
+    /// `ignore` a window of `exe` / `class` / `process_path` that has no
+    /// title yet. Used before a window is classified (pre-placement,
+    /// ADR-0023): a rule that needs a title cannot match here, so this
+    /// answers only for exe / class / path rules.
+    #[must_use]
+    pub fn would_ignore_untitled(&self, exe: &str, class: &str, process_path: &str) -> bool {
+        let candidate = classification::WindowCandidate {
+            exe: exe.to_owned(),
+            title: String::new(),
+            class: class.to_owned(),
+            process_path: process_path.to_owned(),
+        };
+        self.pipeline.classify(&candidate) == crate::config::types::WindowAction::Ignore
+    }
+
     /// Replace the classification pipeline's user-rules layer.
     ///
     /// Used by hot-reload so edited `flow-rules.toml` rules take effect without
@@ -596,7 +612,8 @@ impl WindowRegistry {
                     window.last_virtual_slot = Some(slot);
                     WindowState::Tiling(TilingState::Minimized)
                 }
-                WindowState::Floating(FloatingState::Active { .. }) => {
+                WindowState::Floating(FloatingState::Active { rect }) => {
+                    window.last_float_rect = Some(*rect);
                     WindowState::Floating(FloatingState::Minimized)
                 }
                 _ => return, // Already minimized or ignored — no-op.
@@ -616,7 +633,8 @@ impl WindowRegistry {
     ///   the saved `last_virtual_slot`. If no slot was saved (edge case),
     ///   defaults to `(0, 0)`.
     /// - **Floating::Minimized** → restores to `Floating::Active { rect }` using
-    ///   the `pre_manage_rect` (the window's position before flow managed it).
+    ///   the rect it had when minimized (`last_float_rect`), else the
+    ///   `pre_manage_rect` (the window's position before flow managed it).
     /// - **Not minimized** → no-op (returns early).
     ///
     /// # Design: Why Default to (0, 0)?
@@ -659,7 +677,10 @@ impl WindowRegistry {
                     WindowState::Tiling(TilingState::Active { col, row })
                 }
                 WindowState::Floating(FloatingState::Minimized) => {
-                    let rect = window.pre_manage_rect;
+                    let rect = window
+                        .last_float_rect
+                        .take()
+                        .unwrap_or(window.pre_manage_rect);
                     WindowState::Floating(FloatingState::Active { rect })
                 }
                 _ => return, // Not minimized — no-op.
@@ -689,7 +710,8 @@ impl WindowRegistry {
     /// - `Tiling(Hidden)` + user-visible → restore slot from `last_virtual_slot`
     ///   (default `(0, 0)` if absent, mirroring `restore_window`), set
     ///   `Tiling(Active{col,row})`, return `Shown`.
-    /// - `Floating(Hidden)` + user-visible → restore `pre_manage_rect`, set
+    /// - `Floating(Hidden)` + user-visible → restore the rect it was hidden
+    ///   at (`last_float_rect`, else `pre_manage_rect`), set
     ///   `Floating(Active{rect})`, return `Shown`.
     /// - Untracked, `Ignored`, `Minimized`, or already-matching → `Unchanged`.
     ///
@@ -728,7 +750,8 @@ impl WindowRegistry {
                     window.last_virtual_slot = Some(slot);
                     WindowState::Tiling(TilingState::Hidden)
                 }
-                WindowState::Floating(FloatingState::Active { .. }) => {
+                WindowState::Floating(FloatingState::Active { rect }) => {
+                    window.last_float_rect = Some(*rect);
                     WindowState::Floating(FloatingState::Hidden)
                 }
                 _ => return VisibilityChange::Unchanged,
@@ -751,7 +774,10 @@ impl WindowRegistry {
                     WindowState::Tiling(TilingState::Active { col, row })
                 }
                 WindowState::Floating(FloatingState::Hidden) => {
-                    let rect = window.pre_manage_rect;
+                    let rect = window
+                        .last_float_rect
+                        .take()
+                        .unwrap_or(window.pre_manage_rect);
                     WindowState::Floating(FloatingState::Active { rect })
                 }
                 _ => return VisibilityChange::Unchanged,
@@ -2218,6 +2244,57 @@ mod tests {
         ));
     }
 
+    /// A float minimized and restored comes back at the rect it had, not at
+    /// the rect it had before flow managed it (stage 30: its border overlay
+    /// was seated at that stale rect).
+    #[test]
+    fn minimize_and_restore_float_keeps_its_rect() {
+        let (user, default) = default_rules();
+        let mut reg = WindowRegistry::new(&user, &default);
+        let hwnd_val = 99998isize;
+        let placed = crate::common::Rect {
+            x: 400,
+            y: 300,
+            width: 600,
+            height: 400,
+        };
+        let window = Window::new(
+            HWND(hwnd_val as *mut _),
+            "app.exe".into(),
+            "App".into(),
+            "AppClass".into(),
+            std::path::PathBuf::from("C:\\app.exe"),
+            crate::common::Rect {
+                x: 10,
+                y: 20,
+                width: 800,
+                height: 600,
+            },
+            WindowState::Floating(FloatingState::Active { rect: placed }),
+            crate::common::InvisibleBounds::zero(),
+        );
+        reg.windows.insert(hwnd_val, window);
+
+        reg.minimize_window(hwnd_val);
+        reg.restore_window(hwnd_val);
+        let w = reg.windows.get(&hwnd_val).unwrap();
+        assert!(matches!(
+            w.state,
+            WindowState::Floating(FloatingState::Active { rect }) if rect == placed
+        ));
+        assert_eq!(w.last_float_rect, None);
+
+        // Without a remembered rect the old fallback stands.
+        reg.windows.get_mut(&hwnd_val).unwrap().state =
+            WindowState::Floating(FloatingState::Minimized);
+        reg.restore_window(hwnd_val);
+        let w = reg.windows.get(&hwnd_val).unwrap();
+        assert!(matches!(
+            w.state,
+            WindowState::Floating(FloatingState::Active { rect }) if rect == w.pre_manage_rect
+        ));
+    }
+
     // ── Windows met minimized ─────────────────────────────────────────
 
     /// `WindowInfo` for a window met iconic: the rect is its restore rect.
@@ -2390,6 +2467,20 @@ mod tests {
         // Restoring again is a no-op.
         reg.restore_window(0x21);
         assert!(reg.is_tiling_active(0x21));
+    }
+
+    /// Pre-placement asks the rule layers before a window has a title: a
+    /// bundled exe / class `ignore` rule answers, an app with no rule does
+    /// not (the fallback action tiles it).
+    #[test]
+    fn would_ignore_untitled_answers_from_exe_and_class_rules() {
+        let user = WindowRulesConfig::default();
+        let default: WindowRulesConfig =
+            toml::from_str(crate::config::lifecycle::DEFAULT_RULES_TOML).expect("default rules");
+        let reg = WindowRegistry::new(&user, &default);
+        assert!(reg.would_ignore_untitled("explorer.exe", "Shell_TrayWnd", ""));
+        assert!(reg.would_ignore_untitled("StartMenuExperienceHost.exe", "X", ""));
+        assert!(!reg.would_ignore_untitled("alacritty.exe", "Window Class", ""));
     }
 
     /// The creation gates name the gate a window fails; a fake handle is

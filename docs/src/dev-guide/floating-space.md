@@ -554,7 +554,11 @@ flag, so a float that goes fullscreen leaves the layer first and re-enters
 through `register_float` when it comes back; a float and a fullscreen window
 are both topmost and stack by whichever was activated last. Minimized /
 hidden floats are out until restored / shown; `Ignored(Maximized|Fullscreen)`
-windows and untracked windows are never touched.
+windows are never touched, and neither is a tracked window whose class is a
+shell surface (`SHELL_CLASSES`: the Start menu and search `CoreWindow`s the
+default rules ignore explicitly would otherwise get `HWND_TOPMOST` on every
+raise, ADR-0024). Untracked windows are never members; the ones owned by a
+flow window ride with the layer instead (*Riders*, below).
 
 **The decision** (`classify_foreground`, pure; `FlowWM::decide_top_layer_with`
 over the daemon's view) looks at one window, the foreground, and yields one
@@ -563,7 +567,8 @@ of three owners:
 | Foreground | Owner | Layer |
 |------------|-------|-------|
 | A registry window whose state is `Tiling(Active)`, `Floating(Active)` or `Ignored(ExplicitRule)` — a tile or a layer member — **and** not fullscreen by the live check | `Flow` | raised: members `HWND_TOPMOST` |
-| Fullscreen by live geometry + style (tracked or not); an untracked window; a registry window in any other `Ignored` state (`Maximized`, `Fullscreen`, …) or a minimized / hidden state | `Foreign` | dropped: members seated directly under that window |
+| An untracked window owned by a flow window (its `GW_OWNER` chain reaches a tracked window, the *anchor*): classed by the anchor's state, and by the live fullscreen check on the window and the anchor | by its anchor | `Flow`: raised, and the window rides with the layer (*Riders*) |
+| Fullscreen by live geometry + style (tracked or not); an untracked window no tracked window owns; a registry window in any other `Ignored` state (`Maximized`, `Fullscreen`, …) or a minimized / hidden state | `Foreign` | dropped: members seated directly under that window |
 | A shell surface (class in `SHELL_CLASSES`), no foreground, or a handle already gone | `Shell` | kept: the last decision stands |
 
 *Fullscreen is read live, not from the stored state.* F11 in a browser, VS
@@ -616,11 +621,39 @@ click. These classes (`SHELL_CLASSES` in `top_layer.rs`: `Shell_TrayWnd`,
 `XamlExplorerHostIslandWindow`, `ForegroundStaging`, and the two above) leave
 the decision as it was, as does a null foreground. The keymap's OSD is shown
 `NoActivate` and never takes the foreground, so it needs no entry; any other
-AutoHotkey window is an ordinary app. A dialog owned by a
-tile (a Save-As box) is *not* on the list: it is a non-flow window and drops
-the layer, but it sits above its owner tile and the float lands right under
-the dialog, so nothing visible changes until its owner is activated again
-and raises.
+AutoHotkey window is an ordinary app. A dialog owned by a flow window (a
+Save-As box, a connect dialog, an error box) is not on the list either; it
+is classed by its owner (*Riders*).
+
+*Riders — owned windows of flow windows (ADR-0024,
+`docs/adr/0024-owned-windows-ride-the-floating-layer.md`).* Windows never
+reach the registry when they have an owner (`creation_gates`,
+`OwnedOrChild`), so a modal dialog or a message box of a flow window used to
+be a foreign foreground: it dropped the layer, the drop seated its own owner
+under it, and the next activation of any flow window raised every member
+above it again — the SSMS error box that could not be reached (2026-11-02).
+Now an untracked, visible foreground whose owner chain (at most eight
+`GW_OWNER` hops, a cycle ends the walk, `anchor_of`) reaches a tracked
+window is a *rider* of that *anchor*. It is classed by the anchor (shell
+classes still win first; the live fullscreen check runs on the rider and on
+the anchor), and while the layer is raised it is held in the topmost band
+like a member: an entering rider always gets `HWND_TOPMOST`, so it lands
+above the members raised before it; on a raise flip the members go first,
+then the riders, owner first and the foreground window (member or rider) last; the periodic
+pass re-asserts a demoted rider. A drop seats the riders under the
+foreground first, then the members, and no window is ever seated under a
+window on its own owner chain (`seat_below` falls back to
+`HWND_NOTOPMOST`). Riders get no registry record, seat, border or learned
+rule; they live in `FlowWM::riders` (`anchor`, `on_top`, `was_topmost`,
+where `was_topmost` ignores a flag inherited from an owner the layer holds).
+They leave with the layer (drop, `tiling off`, option off) and on `flow
+stop` / fail-back (`release_top_layer`, riders first), and are forgotten
+when hidden or destroyed or when every pass finds them gone, hidden or with
+an untracked anchor. A modeless owned window (a Find dialog) that once had
+the foreground therefore stays above flow windows until it closes or a
+foreign app takes the foreground; owned windows that never take the
+foreground are left to Windows' own topmost propagation. Logged as `top
+layer: rider 0x.. (anchor 0x..) entered|left|forgotten`.
 
 `flow ping` prints the state (`floating layer raised|dropped`) while the
 option and tiling are on; `flow query all` keeps reporting `on_top`, which is
@@ -654,10 +687,13 @@ ex-style only for a window that is wanted or held:
 | `tiling off`, config reload turning the option off | `sync_all_top_layer` | leave |
 | `flow stop`, fail-back, session end | `release_top_layer` in the shutdown rescue pass | leave, whatever the option says |
 | Destroyed | — | nothing (the record goes) |
+| An owned window of a flow window takes the foreground (rider) | `on_focus_changed` / `reassert_top_layer` → `decide_top_layer_with` notes it, `sync_top_layer` | enter (`HWND_TOPMOST`, after the members) |
+| A rider is hidden, destroyed, gone, or its anchor is no longer tracked | `on_window_hidden`, `on_window_destroyed`, the purge of every pass | leave (flag put back) and forgotten |
 | A member Windows demoted (an app clearing the flag on activation) | `on_focus_changed` for the activated window (when the decision stands); `reassert_top_layer` from the main loop once per `[focus] foreground_sync_interval_ms`, over the held windows only | re-assert |
 
 The Win32 side (`is_topmost` / `set_topmost` / `insert_below` /
-`is_fullscreen_live` / `class_name`) is behind `TopmostProbe`; the tiling
+`is_fullscreen_live` / `class_name` / `owner_of` / `is_visible`) is behind
+`TopmostProbe`; the tiling
 on/off probe extends it, so the pause (`released_on_top`) and the resume
 (`raised_on_top`) are covered by the mock desktop, and `top_layer.rs`'s own
 mock scripts the foreground (an untracked game window, a taskbar, a tile

@@ -313,6 +313,25 @@ columns. With the animator idle, a member whose target is the rect it was
 last sent to gets `Stay`, so a flip moves only the windows that change
 place. Workspace batches leave piles to travel with their workspace.
 
+### First placement
+
+A window with **no previous rect at all** (nothing in `submitted_rects`, no
+registry tiled or float rect) has never been placed by flow: it is new. A
+move that `plan_move` would tween becomes instant for it
+(`first_placement`, in `push_targets_as`, so every submit path applies it),
+and the other windows of the batch tween as usual. A new tile or float
+therefore appears in its slot instead of gliding there from wherever the app
+created it, whether flow spawned it or not. The registry's `tiled_rect` is
+only ever set by the layout, never cleared, so a seated window coming back
+from a minimize or a hide (its submitted rect dropped) still has a previous
+rect and still tweens. The creation pipeline's fresh-float branch builds its
+batch from a registry snapshot without the new float, because
+`register_float` writes the float's target into the registry first. The
+startup snap (`animate_layout_raw`) passes no previous rect either; it runs
+at zero duration, so nothing changes there. Logged at debug as `animate: new
+window 0x.. placed instantly at its slot (...)`. ADR-0023, *Appearing in
+place*.
+
 ## Cross-References
 
 - [Layout pipeline](./layout/pipeline.md) — how `AppliedLayout` is produced by

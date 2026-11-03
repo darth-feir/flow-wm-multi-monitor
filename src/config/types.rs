@@ -959,14 +959,34 @@ pub struct FocusConfig {
     /// that no-ops when the tracked focus already matches reality. Tunable at
     /// runtime via config hot-reload.
     pub foreground_sync_interval_ms: u64,
+
+    /// The screen a new window opens on: `"focused"` (the default, niri
+    /// behaviour) seats it on the screen that has the focus, `"placed"` on
+    /// the screen Windows put it on. Windows found at startup and windows
+    /// coming back from minimize or hide keep their own screen either way.
+    /// See ADR-0023.
+    pub new_window_monitor: NewWindowMonitor,
 }
 
 impl Default for FocusConfig {
     fn default() -> Self {
         Self {
             foreground_sync_interval_ms: 250,
+            new_window_monitor: NewWindowMonitor::Focused,
         }
     }
+}
+
+/// `[focus] new_window_monitor`: which screen a newly created window is
+/// seated on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NewWindowMonitor {
+    /// The screen that has the focus (the active monitor), like niri.
+    #[default]
+    Focused,
+    /// The screen Windows placed the window on.
+    Placed,
 }
 
 /// Floating window configuration (`[floating]`).
@@ -1285,6 +1305,20 @@ strategy = "original_slot"
         assert_eq!(FocusConfig::default().foreground_sync_interval_ms, 250);
     }
 
+    /// Positive: new windows open on the focused screen unless the user asks
+    /// for Windows' placement (ADR-0023); the key spells `focused` / `placed`.
+    #[test]
+    fn focus_config_new_window_monitor_defaults_to_focused() {
+        assert_eq!(
+            FocusConfig::default().new_window_monitor,
+            NewWindowMonitor::Focused
+        );
+        let parsed: FlowConfig =
+            toml::from_str("[focus]\nnew_window_monitor = \"placed\"\n").expect("parse");
+        assert_eq!(parsed.focus.new_window_monitor, NewWindowMonitor::Placed);
+        assert!(toml::from_str::<FlowConfig>("[focus]\nnew_window_monitor = \"left\"\n").is_err());
+    }
+
     /// Positive: `LoadoutConfig::default()` ships `default_path = "loadout.json"`
     /// — the canonical value the daemon resolves against when no `[loadout]`
     /// block is present in the user's `flow.toml`.
@@ -1352,6 +1386,7 @@ strategy = "original_slot"
             },
             focus: FocusConfig {
                 foreground_sync_interval_ms: 400,
+                new_window_monitor: NewWindowMonitor::Placed,
             },
             drag: DragConfig {
                 edge_scroll_width: 25,
@@ -1424,6 +1459,7 @@ default = \"1/2\"",
         assert_eq!(parsed.floating.default_width, Some(1200));
         assert_eq!(parsed.floating.default_height, Some(800));
         assert_eq!(parsed.focus.foreground_sync_interval_ms, 400);
+        assert_eq!(parsed.focus.new_window_monitor, NewWindowMonitor::Placed);
         assert_eq!(parsed.drag.edge_scroll_width, 25);
         assert_eq!(parsed.drag.col_edge_ratio, 0.3);
         assert_eq!(parsed.drag.col_edge_max_px, 50);

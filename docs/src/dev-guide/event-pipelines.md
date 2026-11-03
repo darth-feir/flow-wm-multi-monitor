@@ -61,7 +61,11 @@ The full pipeline for a created window:
    rule-classified float is indistinguishable from a toggled one. See
    [Floating Space](./floating-space.md).
 5. `animate_layout()` / `animate_workspaces()` convert the result into animation
-   targets and submit them to the `WindowAnimator`.
+   targets and submit them to the `WindowAnimator`. The new window has no
+   previous rect, so it is placed at its slot instantly while the other
+   columns tween (the first-placement rule, see
+   [Animation](./animation.md#first-placement); ADR-0023, *Appearing in
+   place*).
 6. `reconcile_new_window_focus()` pushes the OS foreground to the new window,
    syncs the registry focus, and refreshes borders (see *Foreground on
    creation* below).
@@ -69,6 +73,30 @@ The full pipeline for a created window:
 If classification fails (window not yet visible or titled), the hwnd is added to
 `pending_creations` and retried on subsequent loop iterations until it passes or
 the retry budget is exhausted.
+
+Before the hwnd goes to `pending_creations`, `pre_place_created()`
+(`daemon::pre_place`) may move it: a window that is not shown yet, a plausible
+top-level app window (root, unowned, not a child or tool window, with a caption
+or sizing frame) on a monitor other than the active one, that no rule would
+ignore without a title and whose thread answers a `WM_NULL` within 50 ms, is
+moved into the active monitor's work area (size kept, offset kept and clamped)
+before its first show. Only with `[focus] new_window_monitor = "focused"`,
+tiling on, more than one monitor, and once per window (`FlowWM::pre_placed`,
+cleared when the window is classified, destroyed or given up on). When it is
+classified later, its seat finds it on the focused monitor already, so it never
+paints on the other screen. A pre-placed window's `pre_manage_rect` is on the
+focused screen. Why and the limits: ADR-0023, *Pre-placement before the first
+paint*.
+
+A program the daemon starts itself (`Spawn` IPC command, the keymap's
+non-admin spawn binds, `[startup] spawn`) usually never reaches this step:
+`daemon::spawn` passes `STARTF_USEPOSITION | STARTF_USESIZE` with the rect
+the new column will get (a dry run of the seat on a clone of the active
+strip, `ScrollingSpace::insert_preview_rect`, inset by the border ring), so
+the window is created on the focused screen in its slot and the `Created`
+event finds it there (nothing to move across screens; at most the invisible
+border, or the app's own size, to correct). ADR-0023, *Spawning on the
+focused screen* and *Appearing in place*.
 
 ### Foreground on creation
 
@@ -248,6 +276,43 @@ monitor the user is not working on, or on the active monitor while the user
 is in a float or a window elsewhere, must not drag the foreground over
 (review finding B6); then only the strip's bookkeeping changes.
 
+### Windows hands the focus to the other screen (stage 30)
+
+When the foreground window closes, minimizes or hides, Windows activates the
+next window in z-order itself, wherever it is — typically a window on the
+other screen. The VM log of a Mod+Q on a DISPLAY2 tile shows the order:
+`Hidden` (flow removes the tile and pushes the successor, the push is often
+refused because the foreground is in transition), then `Foreground` for a
+DISPLAY1 window, then `Destroyed`. The daemon used to follow that foreground
+like any other: the active monitor flipped to DISPLAY1 and the next command
+acted there. Two pieces keep the focus on the screen the tile left:
+
+- **Focus held a moment ago.** `on_focus_changed` records the window that
+  lost the foreground and when (`FlowWM::last_focus_loss`). The removal
+  counts the removed window as the user's focus also when it lost the
+  foreground less than `FOCUS_HANDOFF_WINDOW` (500 ms) ago to a window on
+  *another* monitor — the order in which Windows' activation arrives before
+  the removal event. Only for a destroy or a minimize: a window that hides
+  may do so *because* it lost the foreground (hide on deactivation), and
+  then the user's click elsewhere must stand.
+- **The handoff.** When the removed window held the focus, its monitor stays
+  the active one and `FlowWM::focus_handoff` is armed for the same 500 ms:
+  the next foreground that lands on a managed window of *another* monitor is
+  sent back — to the strip's successor, or, when the strip is now empty, to
+  the desktop (`clear_foreground_window`, registry focus dropped), so no
+  window of the other screen keeps the keyboard and the next new window
+  opens on the emptied screen (ADR-0023). The redirect runs first in
+  `on_focus_changed`; when it succeeds the stray event is not processed at
+  all (a pile member of the other screen would otherwise flip its book), the
+  `Foreground` event of the window it went back to follows. The handoff
+  stays armed until it expires, because the drift poll
+  (`reconcile_foreground`) and the hook can both report the same stray
+  foreground; a report for a window that no longer has the foreground is
+  simply dropped. A foreground on the same monitor, on the successor, on the
+  desktop or on an unmanaged window passes; every IPC command but the
+  queries disarms it, so a deliberate `focus-monitor` right after a close is
+  never fought.
+
 ### Landing on a monitor's active workspace
 
 `focus_monitor` (the `focus-monitor` command, a `move-to-monitor`, and the
@@ -322,7 +387,7 @@ window belong to" question that must produce an answer, such as the
 
 | Condition | Action |
 |-----------|--------|
-| Not visible / no title / not Alt-Tab visible | Defer to `pending_creations`, retry later |
+| Not visible / no title / not Alt-Tab visible | Defer to `pending_creations`, retry later; a hidden top-level app window on another monitor is first pre-placed on the focused one (above) |
 | Owned by another window (tooltip, etc.) | Skip |
 | Already tracked (de-dup) | Skip |
 | Minimized (iconic) | Classify from the placement's restore rect; register as `Tiling::Minimized` / `Floating::Minimized` (or `Ignored`), owning monitor from that rect, no layout — the restore hook seats it |

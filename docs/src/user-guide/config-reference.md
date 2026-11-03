@@ -479,7 +479,7 @@ default_height = 800
 always_on_top = true
 ```
 
-### `[focus]` — foreground reconciliation
+### `[focus]` — foreground reconciliation and new windows
 
 `EVENT_SYSTEM_FOREGROUND` is a best-effort stream from Windows: under rapid
 window churn (e.g. a browser closing multiple tabs), the OS can settle the
@@ -491,13 +491,21 @@ query.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `foreground_sync_interval_ms` | `u32` | `250` | Interval (milliseconds) between reconciliation passes. The common in-sync pass is a single microsecond-scale read that no-ops. |
+| `new_window_monitor` | `"focused"` \| `"placed"` | `"focused"` | The screen a new window opens on. `"focused"` (niri behaviour) seats it on the screen that has the focus, at that screen's width preset, whatever screen Windows put it on; `"placed"` keeps the screen Windows chose. Windows found when the daemon starts and windows coming back from minimize or the tray keep their own screen either way. A window that first shows up by taking the foreground (one flow could not classify earlier, now clicked) also stays where it is. Why: `docs/adr/0023-new-windows-open-on-the-focused-screen.md`. |
 
 Example:
 
 ```toml
 [focus]
 foreground_sync_interval_ms = 250
+new_window_monitor = "focused"
 ```
+
+Closing or minimizing the focused tile hands the focus to its successor on
+the same screen, also when Windows has already given the foreground to a
+window on the other screen; when it was the last tile of that screen the
+screen stays the active one and the focus goes to the desktop, so the next
+new window opens there.
 
 ### `[loadout]` — save/restore file
 
@@ -656,6 +664,21 @@ path must be absolute. `admin = true` runs it elevated (UAC prompts as
 usual); `help` replaces the overlay's `run <program>` text. Programs start
 in your home folder.
 
+A spawn bind without `admin` is started by the daemon (`flow spawn`), which
+asks the program's first window to open on the focused screen, at the place
+and size its new column will get (`STARTF_USEPOSITION | STARTF_USESIZE`), so
+it does not appear on the other screen first. This works for programs that
+let Windows choose their first window's position (Alacritty, Windows Forms
+apps and most others); the size only for programs that also let Windows
+choose the size (Alacritty picks its own). A program that places itself
+(a remembered position, a single-instance app, a launcher stub such as the
+Store's `wt` alias) opens where it wants and is then moved to the focused
+screen. `admin = true` spawns go through the UAC path, which takes no position,
+so they can still show on the other screen for a moment. Only `.exe` programs
+get a position. When the daemon does not answer, the keymap starts the program
+itself. `flow spawn <program> [args...]` does the same from a shell. With
+`[focus] new_window_monitor = "placed"` or tiling off no position is passed.
+
 **Where to look.** `flow query binds` prints the resolved table as JSON
 (`flow query binds --plain` is the listing the keymap reads); the overlay
 (`show-hotkey-overlay`, Mod+Shift+/ by default) shows it on screen;
@@ -668,7 +691,8 @@ the same everywhere.
 Programs the daemon starts once it is ready, in order, each as the program
 and its arguments. A bare name is looked up like a `spawn` bind (above); a
 program that cannot be started is logged and the rest still run. They start
-in your home folder and are not tied to the daemon's lifetime.
+in your home folder, open on the focused screen like a spawn bind, and are not
+tied to the daemon's lifetime.
 
 ```toml
 [startup]

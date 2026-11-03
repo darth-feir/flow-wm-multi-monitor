@@ -166,8 +166,13 @@ always_on_top = false
 #
 # - foreground_sync_interval_ms: interval between reconciliation passes (ms).
 #   The common (in-sync) pass is a single microsecond-scale read that no-ops.
+# - new_window_monitor: the screen a new window opens on. "focused" (the
+#   default, niri behaviour) seats it on the screen that has the focus;
+#   "placed" keeps the screen Windows put it on. Windows found at startup and
+#   windows coming back from minimize keep their own screen either way.
 [focus]
 foreground_sync_interval_ms = 250
+new_window_monitor = "focused"
 
 # Tile-drag configuration.
 #

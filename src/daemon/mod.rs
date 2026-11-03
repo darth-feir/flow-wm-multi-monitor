@@ -76,6 +76,7 @@ mod hotplug;
 mod loadout;
 mod new;
 mod piles;
+mod pre_place;
 mod query;
 mod run;
 pub mod session;

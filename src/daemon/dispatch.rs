@@ -85,6 +85,21 @@ impl FlowWM {
     pub(super) fn dispatch(&mut self, msg: &SocketMessage) -> SocketResponse {
         log::debug!("ipc: dispatching {msg:?}");
 
+        // A command is the user acting: the removal pipeline's focus
+        // handoff (sending a stray foreground back) must not fight it.
+        if !matches!(
+            msg,
+            SocketMessage::Ping
+                | SocketMessage::QueryWindowsAll
+                | SocketMessage::QueryBinds
+                | SocketMessage::QueryLayoutVirtual
+                | SocketMessage::QueryLayoutActual
+                | SocketMessage::QueryState
+                | SocketMessage::CheckConfig
+        ) {
+            self.focus_handoff = None;
+        }
+
         // A keymap drag session is ended (committed) by the commands that
         // take the desktop away from it, before the busy gate below could
         // refuse them. See `daemon::drag_session`.
@@ -186,6 +201,9 @@ impl FlowWM {
                 self.dispatch_consume_or_expel(*direction)
             }
             SocketMessage::CloseWindow => self.dispatch_close_window(),
+
+            // --- Programs ---
+            SocketMessage::Spawn { argv } => self.dispatch_spawn(argv),
 
             // --- Queries ---
             SocketMessage::QueryWindowsAll => self.query_windows_all(),
@@ -1895,7 +1913,7 @@ impl FlowWM {
             let was_tracked = self.registry.is_tracked(fg);
             if !was_tracked {
                 log::debug!("set-window: foreground {fg:#x} not tracked — attempting creation");
-                self.on_window_created(fg);
+                self.on_window_created_as(fg, super::hooks::Arrival::Returning);
             }
             let outcome = if self.registry.is_tracked(fg) {
                 Ok(())
@@ -2064,7 +2082,13 @@ impl FlowWM {
     pub(super) fn centered_float_rect(&self, focused: WindowId) -> Rect {
         // Centre on the monitor the window is currently on, not blindly on
         // the active one.
-        let idx = self.monitor_index_for_hwnd(focused.0);
+        self.centered_float_rect_on(focused, self.monitor_index_for_hwnd(focused.0))
+    }
+
+    /// [`centered_float_rect`](Self::centered_float_rect) on monitor `idx`
+    /// (a new float opening on the focused screen, ADR-0023).
+    pub(super) fn centered_float_rect_on(&self, focused: WindowId, idx: usize) -> Rect {
+        let idx = idx.min(self.monitors.len().saturating_sub(1));
         let work_area = self.monitors[idx].active_scrolling().monitor().work_area;
         // Each dimension uses the user's explicit pixel value when set, else
         // the built-in fallback (fraction of work area, capped). The cap only

@@ -68,6 +68,11 @@ wrap_around = "off"
 [navigation]
 edge_hop = false
 
+# A new window opens on the screen that has the focus (niri); "placed" keeps the screen Windows
+# chose. Windows coming back from minimize keep their own screen.
+[focus]
+new_window_monitor = "focused"
+
 # Key bindings. Without this section the keymap uses its built-in table (binds.toml next to this
 # file: Mod+Arrows focus, Mod+Shift+Arrows move, Mod+1..9 workspaces, Mod+R widths, Mod+T Alacritty,
 # Mod+Space launcher, Mod+Shift+/ help, ...). Entries here are laid over it in niri's spelling: the

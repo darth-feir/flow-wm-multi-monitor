@@ -219,6 +219,11 @@ pub struct FlowWM {
     /// pending windows are retried even if no new hook events arrive.
     pub(super) pending_creations: Vec<(isize, u8)>,
 
+    /// Windows moved onto the focused screen before their first show
+    /// (pre-placement, ADR-0023): each is moved at most once. An entry
+    /// leaves when the window is classified, destroyed or given up on.
+    pub(super) pre_placed: std::collections::HashSet<isize>,
+
     /// Deadline at which float-location tracking resumes after flow suppresses
     /// it for a float animation.
     ///
@@ -277,6 +282,20 @@ pub struct FlowWM {
     /// repair of the same windows is logged once.
     pub(super) pile_drift: Vec<isize>,
 
+    /// The window that last lost the foreground to another one, and when:
+    /// lets the removal pipeline see that a tile that is closing or
+    /// minimizing held the focus a moment ago, when Windows already gave the
+    /// foreground away before the removal event arrived. See
+    /// `docs/src/dev-guide/event-pipelines.md`, *Focus after a removal or a
+    /// monitor switch*.
+    pub(super) last_focus_loss: Option<(isize, std::time::Instant)>,
+
+    /// Set by the removal pipeline when the focused tile left its strip:
+    /// for a short moment a foreground Windows hands to a window on another
+    /// screen is sent back to the successor (or to the desktop when the
+    /// strip is empty). See [`FocusHandoff`](super::hooks::FocusHandoff).
+    pub(super) focus_handoff: Option<super::hooks::FocusHandoff>,
+
     /// The floating layer's current decision: `true` while flow owns the
     /// foreground (members are kept topmost), `false` after the foreground
     /// moved to a fullscreen or non-flow window (members dropped under it).
@@ -296,6 +315,12 @@ pub struct FlowWM {
     /// the window the members are seated *under* when they leave. `None`
     /// while raised.
     pub(super) top_layer_below: Option<isize>,
+
+    /// The floating layer's riders: untracked windows owned by a flow
+    /// window (a modal dialog, an error box) that took the foreground, held
+    /// in the topmost band with the layer (ADR-0024,
+    /// [`Rider`](super::top_layer::Rider)). Keyed by the rider's handle.
+    pub(super) riders: std::collections::HashMap<isize, super::top_layer::Rider>,
 
     /// When the pending display-topology change settles and
     /// [`reconcile_monitors`](super::FlowWM::reconcile_monitors) runs.

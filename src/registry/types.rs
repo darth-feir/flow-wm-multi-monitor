@@ -161,6 +161,14 @@ pub struct Window {
     #[serde(skip)]
     pub minimized_at: Option<std::time::Instant>,
 
+    /// The visible rect an active float had when it was minimized or
+    /// hidden; the restore and re-show put it back into
+    /// `FloatingState::Active` (falling back to `pre_manage_rect`), so the
+    /// float — and its border overlay — come back where they were, not
+    /// where the window was before flow managed it. Process-local.
+    #[serde(skip)]
+    pub last_float_rect: Option<Rect>,
+
     /// Current tiled position computed by the layout engine's projection layer.
     ///
     /// Updated after every layout mutation. `None` if the window has never
@@ -311,6 +319,7 @@ impl Window {
             pre_manage_rect,
             last_natural_size,
             last_virtual_slot: None,
+            last_float_rect: None,
             minimized_at: None,
             tiled_rect: None,
             invisible_bounds,

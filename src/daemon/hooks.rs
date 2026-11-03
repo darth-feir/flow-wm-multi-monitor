@@ -35,6 +35,40 @@ use windows::Win32::Foundation::HWND;
 use super::animation::PrevRects;
 use super::types::FlowWM;
 
+/// How a window reached the creation pipeline: a window the user just
+/// opened, or one that was already on the desktop and comes back (restored
+/// from minimize while flow had never classified it, or classified only when
+/// it took the foreground). Only a new window is seated on the focused
+/// screen (`[focus] new_window_monitor`, ADR-0023).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Arrival {
+    /// A freshly created window.
+    New,
+    /// A window that keeps the screen it is on.
+    Returning,
+}
+
+/// How long after the focused tile left its strip a foreground Windows
+/// hands to a window on another screen is taken back.
+pub(super) const FOCUS_HANDOFF_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The removal pipeline's note that the focused tile just left the strip
+/// of monitor `monitor`: until `until`, a foreground that lands on a window
+/// of another screen is sent back to `successor`, or to the desktop when the
+/// strip has none. Windows activates the next window in z-order when the
+/// foreground window closes or minimizes, wherever that window is, and it
+/// does so after the hide / destroy event flow reacts to. See `docs/src/dev-guide/event-pipelines.md`, *Focus after a
+/// removal or a monitor switch*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FocusHandoff {
+    /// The monitor whose strip lost the focused tile.
+    pub(super) monitor: usize,
+    /// The strip's new focus, `None` when it is empty.
+    pub(super) successor: Option<WindowId>,
+    /// End of the redirect window.
+    pub(super) until: std::time::Instant,
+}
+
 impl FlowWM {
     /// Handle a window creation event.
     ///
@@ -82,6 +116,25 @@ impl FlowWM {
     /// [`ScrollingSpace::insert_window`](crate::workspace::ScrollingSpace::insert_window)
     /// for the full algorithm.
     pub(super) fn on_window_created(&mut self, hwnd: isize) -> bool {
+        self.on_window_created_as(hwnd, Arrival::New)
+    }
+
+    /// [`on_window_created`](Self::on_window_created) for a window that
+    /// arrives as `arrival`: a new window is seated on the screen
+    /// [`monitor_for_arrival`](Self::monitor_for_arrival) picks, a returning
+    /// one on its own.
+    pub(super) fn on_window_created_as(&mut self, hwnd: isize, arrival: Arrival) -> bool {
+        let tracked = self.classify_created(hwnd, arrival);
+        if tracked {
+            // Classified: its pre-placement (if any) is done with.
+            self.pre_placed.remove(&hwnd);
+        }
+        tracked
+    }
+
+    /// The body of [`on_window_created_as`](Self::on_window_created_as):
+    /// classify, register and seat; `true` when the window is tracked.
+    fn classify_created(&mut self, hwnd: isize, arrival: Arrival) -> bool {
         // Tiling off: classify and register only, so the window is known
         // when tiling resumes (`daemon::tiling` seats it then). No seat, no
         // move, no focus push, no border.
@@ -101,7 +154,7 @@ impl FlowWM {
         // Tiling: handle_created returns Some only for a freshly-registered
         // active tiling window.
         if let Some(window_id) = self.registry.handle_created(hwnd) {
-            self.seat_created_tile(hwnd, window_id);
+            self.seat_created_tile(hwnd, window_id, arrival);
             return true;
         }
 
@@ -126,7 +179,7 @@ impl FlowWM {
             && let ReclassifyResult::Recovered { now_tiling: true } =
                 self.registry.reclassify_os_state(hwnd)
         {
-            self.seat_created_tile(hwnd, WindowId(hwnd));
+            self.seat_created_tile(hwnd, WindowId(hwnd), arrival);
             return true;
         }
 
@@ -150,9 +203,20 @@ impl FlowWM {
                 .unwrap_or(false);
 
         if fresh_float {
-            let float_rect = self.centered_float_rect(WindowId(hwnd));
+            let idx = self.monitor_for_arrival(hwnd, arrival);
+            let float_rect = self.centered_float_rect_on(WindowId(hwnd), idx);
+            // The new float has no previous rect, so it appears at its
+            // place instead of gliding from where it was created
+            // (`animation::first_placement`); the registry already holds its
+            // target, so its entry is left out of the snapshot.
+            let mut prev = self.snapshot_prev_rects();
+            prev.remove(&hwnd);
             let float_actual = self.register_float(WindowId(hwnd), float_rect);
-            self.animate_workspaces(&[(float_actual, 0)]);
+            self.animate_workspaces_on(
+                self.active_monitor,
+                &[(float_actual, 0)],
+                PrevRects::Snapshot(&prev),
+            );
             self.reconcile_new_window_focus(hwnd);
         } else if !was_tracked {
             // A window freshly registered as ignored by an explicit rule (a
@@ -190,22 +254,43 @@ impl FlowWM {
     /// pipeline ([`on_window_created`](Self::on_window_created)) and returns
     /// whether the window is tracked afterwards. For a tracked window this
     /// is one `HashMap` hit; for the rest, the creation gates decide.
-    fn register_if_untracked(&mut self, hwnd: isize, event: &str) -> bool {
+    fn register_if_untracked(&mut self, hwnd: isize, event: &str, arrival: Arrival) -> bool {
         if self.registry.is_tracked(hwnd) {
             return true;
         }
         log::debug!("{event}: {hwnd:#x} not tracked — attempting creation");
-        self.on_window_created(hwnd);
+        self.on_window_created_as(hwnd, arrival);
         self.registry.is_tracked(hwnd)
     }
 
+    /// The monitor a window entering the creation pipeline is seated on: a
+    /// [`New`](Arrival::New) window on the active (focused) monitor while
+    /// `[focus] new_window_monitor = "focused"`, every other one on its home
+    /// monitor ([`home_monitor_for_hwnd`](Self::home_monitor_for_hwnd): a
+    /// fresh window has no owning-monitor memory, so the monitor Windows
+    /// placed it on). See ADR-0023.
+    pub(super) fn monitor_for_arrival(&self, hwnd: isize, arrival: Arrival) -> usize {
+        match (arrival, self.config.focus.new_window_monitor) {
+            (Arrival::New, crate::config::types::NewWindowMonitor::Focused) => self.active_monitor,
+            _ => self.home_monitor_for_hwnd(hwnd),
+        }
+    }
+
     /// Seat a freshly-classified (or freshly-adopted) tile the way a new
-    /// window is seated: on the monitor the OS placed it on — not blindly
-    /// on the active one (a fresh window has no owning-monitor memory, so
-    /// this resolves to MonitorFromWindow, then the rect) — next to that
-    /// strip's focused column, then push focus and attach the border.
-    fn seat_created_tile(&mut self, hwnd: isize, window_id: WindowId) {
-        let idx = self.home_monitor_for_hwnd(hwnd);
+    /// window is seated: on the monitor [`monitor_for_arrival`](Self::monitor_for_arrival)
+    /// picks — for a new window the focused one, at that strip's width —
+    /// next to that strip's focused column, then push focus and attach the
+    /// border. The window has no previous rect, so it is placed at its slot
+    /// instantly while the other columns tween
+    /// (`animation::first_placement`, ADR-0023 *Appearing in place*).
+    fn seat_created_tile(&mut self, hwnd: isize, window_id: WindowId, arrival: Arrival) {
+        let idx = self.monitor_for_arrival(hwnd, arrival);
+        if idx != self.home_monitor_for_hwnd(hwnd) {
+            log::debug!(
+                "new window {hwnd:#x} seated on the focused monitor {idx} (placed on {})",
+                self.home_monitor_for_hwnd(hwnd)
+            );
+        }
         let applied = self.monitors[idx]
             .active_scrolling_mut()
             .insert_window(window_id);
@@ -262,6 +347,8 @@ impl FlowWM {
     pub(super) fn on_window_destroyed(&mut self, hwnd: isize) {
         // A keymap drag session on this window ends with it.
         self.abandon_manual_drag_for(hwnd);
+        // A floating-layer rider (an owned dialog, ADR-0024) is forgotten.
+        self.forget_rider(hwnd, true);
 
         // Tiling off: bookkeeping only — out of every strip and floating
         // space (no animation, no successor focus) and out of the registry.
@@ -277,7 +364,7 @@ impl FlowWM {
         let was_tiling = self.registry.is_tiling(hwnd);
 
         if was_tiling {
-            self.remove_from_layout_and_refocus(WindowId(hwnd));
+            self.remove_from_layout_and_refocus(WindowId(hwnd), true);
         }
 
         // A destroyed float must leave the tracking set so the LOCATIONCHANGE
@@ -320,7 +407,7 @@ impl FlowWM {
         self.registry.minimize_window(hwnd);
 
         if was_tiling {
-            self.remove_from_layout_and_refocus(WindowId(hwnd));
+            self.remove_from_layout_and_refocus(WindowId(hwnd), true);
             self.forget_submitted(hwnd);
         }
         // A minimized float leaves the floating layer (back in on restore).
@@ -356,6 +443,8 @@ impl FlowWM {
     /// as `false` and is a no-op.
     pub(super) fn on_window_hidden(&mut self, hwnd: isize) {
         self.abandon_manual_drag_for(hwnd);
+        // A hidden rider leaves the band and is forgotten (ADR-0024).
+        self.forget_rider(hwnd, false);
 
         // Tiling off: registry only (see `on_window_minimized`).
         if self.tiling_paused {
@@ -366,7 +455,7 @@ impl FlowWM {
         let was_active_tiling = self.registry.is_tiling_active(hwnd);
         let change = self.registry.reconcile_visibility(hwnd);
         if change == VisibilityChange::Hidden && was_active_tiling {
-            self.remove_from_layout_and_refocus(WindowId(hwnd));
+            self.remove_from_layout_and_refocus(WindowId(hwnd), false);
             self.forget_submitted(hwnd);
         }
         // A hidden float leaves the floating layer (back in when shown).
@@ -409,8 +498,11 @@ impl FlowWM {
     /// workspace is parked leaves that parked strip, which is re-seated at
     /// its parking offset with no focus push. See
     /// `docs/src/dev-guide/event-pipelines.md`, *Focus after a removal or a
-    /// monitor switch*.
-    fn remove_from_layout_and_refocus(&mut self, window: WindowId) {
+    /// monitor switch*. `recent_loss_counts` (destroy, minimize; not a hide,
+    /// which an app may do *because* it lost the foreground) lets a window
+    /// that lost the foreground to another screen a moment ago count as the
+    /// user's focus.
+    fn remove_from_layout_and_refocus(&mut self, window: WindowId, recent_loss_counts: bool) {
         let idx = self.monitor_index_for_window(window);
         let active_id = self.monitors[idx].active_workspace_id();
         let home = self.monitors[idx]
@@ -441,16 +533,27 @@ impl FlowWM {
             .remove_window(window);
         let new_focus = self.monitors[idx].active_scrolling().last_focused_window();
 
+        // The removed window held the user's focus: by registry or OS, or a
+        // moment ago — Windows can give the foreground to a window on the
+        // other screen before the hide / destroy event reaches flow.
+        let focus_elsewhere = self
+            .registry
+            .focused()
+            .and_then(|f| self.monitor_index_containing(f))
+            .is_some_and(|m| m != idx);
         let held_focus = self.registry.focused() == Some(window)
-            || registry_win32::get_foreground_window() == Some(window.0);
-        if should_refocus_after_removal(
+            || registry_win32::get_foreground_window() == Some(window.0)
+            || (recent_loss_counts && focus_elsewhere && self.lost_focus_just_now(window));
+        // The user's focus left with the window: the strip's focus takes
+        // it, also when that was not the removed window.
+        let refocus = should_refocus_after_removal(
             prev_focus,
             new_focus,
             held_focus,
             idx == self.active_monitor,
             focus_on_strip,
-        ) && let Some(id) = new_focus
-        {
+        ) || (held_focus && new_focus.is_some());
+        if refocus && let Some(id) = new_focus {
             let target = id.0;
             if !registry_win32::set_foreground_window(target) {
                 log::warn!(
@@ -459,8 +562,94 @@ impl FlowWM {
             }
             self.registry.set_focused(target);
         }
+        if held_focus {
+            self.keep_focus_on_monitor(idx, new_focus);
+        }
 
         self.animate_layout_on(idx, &applied);
+    }
+
+    /// Whether `window` lost the foreground within
+    /// [`FOCUS_HANDOFF_WINDOW`].
+    fn lost_focus_just_now(&self, window: WindowId) -> bool {
+        self.last_focus_loss
+            .is_some_and(|(h, at)| h == window.0 && at.elapsed() < FOCUS_HANDOFF_WINDOW)
+    }
+
+    /// The focused tile just left monitor `idx`'s strip: that monitor stays
+    /// the active one, and a foreground Windows hands to another screen in
+    /// the next moment is sent back ([`FocusHandoff`]). With no `successor`
+    /// (the strip is empty) the focus goes to the desktop: no window keeps
+    /// it, and a window of another screen that already took it gives it up.
+    fn keep_focus_on_monitor(&mut self, idx: usize, successor: Option<WindowId>) {
+        self.set_active_monitor(idx);
+        self.focus_handoff = Some(FocusHandoff {
+            monitor: idx,
+            successor,
+            until: std::time::Instant::now() + FOCUS_HANDOFF_WINDOW,
+        });
+        if successor.is_some() {
+            return;
+        }
+        let foreground_elsewhere = registry_win32::get_foreground_window()
+            .and_then(|fg| self.monitor_index_containing(WindowId(fg)))
+            .is_some_and(|m| m != idx);
+        self.drop_tracked_focus();
+        if foreground_elsewhere && !registry_win32::clear_foreground_window() {
+            log::debug!("keep_focus_on_monitor: the desktop refused the foreground");
+        }
+        log::debug!(
+            "the last tile of monitor {idx} left: monitor {idx} stays active, focus on the desktop"
+        );
+    }
+
+    /// The [`FocusHandoff`] redirect, run first for every foreground event:
+    /// `true` when this foreground was Windows handing the focus of a closed
+    /// or minimized tile to a window on another screen and flow sent it back
+    /// (the event is then not processed; the one for the window it went
+    /// back to follows).
+    fn redirect_focus_handoff(&mut self, hwnd: isize) -> bool {
+        let Some(handoff) = self.focus_handoff else {
+            return false;
+        };
+        if std::time::Instant::now() >= handoff.until {
+            self.focus_handoff = None;
+            return false;
+        }
+        if handoff.successor == Some(WindowId(hwnd)) {
+            return false;
+        }
+        // A window of the same screen, the desktop or a window flow does
+        // not manage: nothing to undo.
+        if self
+            .monitor_index_containing(WindowId(hwnd))
+            .is_none_or(|m| m == handoff.monitor)
+        {
+            return false;
+        }
+        // Stays armed until it expires: the drift poll and the hook can both
+        // report the same stray foreground. An event for a window that no
+        // longer has the foreground (already sent back) is just dropped.
+        if registry_win32::get_foreground_window() != Some(hwnd) {
+            log::debug!("focus handoff: stale foreground {hwnd:#x} on another screen ignored");
+            return true;
+        }
+        let sent_back = match handoff.successor {
+            Some(s) => registry_win32::set_foreground_window(s.0),
+            None => {
+                let cleared = registry_win32::clear_foreground_window();
+                if cleared {
+                    self.drop_tracked_focus();
+                }
+                cleared
+            }
+        };
+        log::debug!(
+            "focus handoff: Windows gave the foreground to {hwnd:#x} on another screen; back to {:?} on monitor {}: {sent_back}",
+            handoff.successor,
+            handoff.monitor
+        );
+        sent_back
     }
 
     /// Remove `window` from the strip of parked workspace `ws_id` on monitor
@@ -536,7 +725,7 @@ impl FlowWM {
                 }
                 return;
             }
-            if !self.register_if_untracked(hwnd, "on_window_restored") {
+            if !self.register_if_untracked(hwnd, "on_window_restored", Arrival::Returning) {
                 return;
             }
         }
@@ -555,6 +744,7 @@ impl FlowWM {
             self.readd_tile_to_home_monitor(hwnd);
         } else {
             self.seat_float_if_unseated(hwnd);
+            self.resync_returning_float(hwnd);
         }
         // A restored float is back in the floating layer (a fullscreen
         // window, re-seated as a fullscreen column above, is not a member).
@@ -585,6 +775,21 @@ impl FlowWM {
         let float_actual = self.register_float(wid, rect);
         self.animate_workspaces(&[(float_actual, 0)]);
         log::debug!("float {hwnd:#x} registered minimized is now seated at {rect:?}");
+    }
+
+    /// Re-read the rect of a float that came back from minimize or hide
+    /// (the window is where Windows restored it, which is not always where
+    /// it was) into its floating space, the registry and its border overlay
+    /// ([`store_float_rect`](Self::store_float_rect)). Skipped while the
+    /// window still reports its minimized icon's frame: the registry then
+    /// keeps the rect it had before (`last_float_rect`). No-op for anything
+    /// but an active, seated float.
+    fn resync_returning_float(&mut self, hwnd: isize) {
+        if registry_win32::get_window_rect(HWND(hwnd as *mut _))
+            .is_ok_and(|r| !registry_win32::is_icon_rect(r))
+        {
+            self.store_float_rect(hwnd);
+        }
     }
 
     /// Handle `EVENT_OBJECT_SHOW`.
@@ -653,7 +858,7 @@ impl FlowWM {
         // de-duplicates by HWND. A window registered here is fully seated by
         // the creation pipeline, so nothing below applies to it.
         if !self.registry.is_tracked(hwnd) {
-            let _ = self.register_if_untracked(hwnd, "on_window_shown");
+            let _ = self.register_if_untracked(hwnd, "on_window_shown", Arrival::New);
             return;
         }
 
@@ -671,6 +876,8 @@ impl FlowWM {
         }
         if change == VisibilityChange::Shown && self.registry.is_tiling_active(hwnd) {
             self.readd_tile_to_home_monitor(hwnd);
+        } else if change == VisibilityChange::Shown {
+            self.resync_returning_float(hwnd);
         }
         // A re-shown float is back in the floating layer.
         self.sync_top_layer(hwnd);
@@ -696,7 +903,7 @@ impl FlowWM {
     /// `docs/src/dev-guide/event-pipelines.md`, *Cloaked / Uncloaked*.
     pub(super) fn on_window_uncloaked(&mut self, hwnd: isize) {
         if !self.registry.is_tracked(hwnd) {
-            let _ = self.register_if_untracked(hwnd, "on_window_uncloaked");
+            let _ = self.register_if_untracked(hwnd, "on_window_uncloaked", Arrival::New);
             return;
         }
         self.on_window_shown(hwnd);
@@ -709,6 +916,12 @@ impl FlowWM {
     /// natural no-op: the focused column is already visible, so
     /// `ensure_focused_visible` returns `None`.
     pub(super) fn on_focus_changed(&mut self, hwnd: isize) {
+        // Windows handing the focus of a tile that just closed to a window
+        // on another screen: sent back, nothing else to do for this event.
+        if self.redirect_focus_handoff(hwnd) {
+            return;
+        }
+
         // The floating layer re-decides against this window below and the
         // hook callback forwards its resizes from now on.
         self.note_foreground(hwnd);
@@ -716,7 +929,7 @@ impl FlowWM {
         // An untracked window taking the foreground is registered first so
         // the bookkeeping below finds it; one that fails a creation gate
         // (taskbar, menu, dialog) falls through and the rest no-ops.
-        let _ = self.register_if_untracked(hwnd, "on_focus_changed");
+        let _ = self.register_if_untracked(hwnd, "on_focus_changed", Arrival::Returning);
         // A `fullscreen = "app"` window is watched from its first
         // activation on (ADR-0020).
         self.update_app_fullscreen_watch(hwnd);
@@ -744,6 +957,11 @@ impl FlowWM {
         // every overlay. Combined with `Border::set_style`'s unchanged-style
         // short-circuit, this makes the focus path O(1) rather than O(N).
         let prev_focus = self.registry.focused().map(|id| id.0);
+        if let Some(prev) = prev_focus
+            && prev != hwnd
+        {
+            self.last_focus_loss = Some((prev, std::time::Instant::now()));
+        }
 
         self.registry.set_focused(hwnd);
 
@@ -1314,6 +1532,98 @@ mod readd_tests {
         flow.seat_recovered_float(A);
         assert_eq!(columns_holding(&flow, 1, A), 1);
         crate::registry::hooks::remove_float_hwnd(F);
+    }
+
+    /// [`flow`] plus a second monitor to the left (index 1), active.
+    fn two_monitors() -> FlowWM {
+        let mut flow = flow();
+        let screen = Rect {
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let info = MonitorInfo::single(screen);
+        let padding = Padding {
+            window_gap: 4,
+            up: 0,
+            down: 0,
+        };
+        let ws = Workspace::new(
+            WorkspaceId(1),
+            ScrollingSpace::new(info, 960, 320, 100, 100, padding, 4),
+        );
+        flow.monitors
+            .push(Monitor::new(screen, screen, vec![ws], 1));
+        flow.active_monitor = 1;
+        flow
+    }
+
+    /// ADR-0023: a new window goes to the focused monitor unless the config
+    /// says "placed"; a returning one keeps its own (here: the remembered
+    /// monitor 0) either way.
+    #[test]
+    fn a_new_window_is_seated_on_the_focused_monitor_a_returning_one_on_its_own() {
+        use crate::config::types::NewWindowMonitor;
+        let mut flow = two_monitors();
+        assert_eq!(flow.monitor_for_arrival(A, Arrival::New), 1);
+        assert_eq!(flow.monitor_for_arrival(A, Arrival::Returning), 0);
+        flow.config.focus.new_window_monitor = NewWindowMonitor::Placed;
+        assert_eq!(flow.monitor_for_arrival(A, Arrival::New), 0);
+        assert_eq!(flow.monitor_for_arrival(A, Arrival::Returning), 0);
+    }
+
+    /// The focus handoff only takes back a foreground that went to a window
+    /// on another screen, within its window; the successor itself,
+    /// a window of the same screen and untracked windows pass.
+    #[test]
+    fn a_focus_handoff_takes_back_only_a_foreground_on_another_screen() {
+        const C: isize = 0xC;
+        let mut flow = two_monitors();
+        flow.config.borders.enabled = false;
+        tiled(&mut flow.registry, C);
+        flow.monitors[1]
+            .active_scrolling_mut()
+            .add_window(WindowId(C));
+        flow.registry.set_monitor(C, 1);
+        let handoff = |until| FocusHandoff {
+            monitor: 1,
+            successor: Some(WindowId(C)),
+            until,
+        };
+        let soon = std::time::Instant::now() + std::time::Duration::from_secs(60);
+
+        flow.focus_handoff = Some(handoff(soon));
+        // The successor, an untracked window: not redirected, still armed.
+        assert!(!flow.redirect_focus_handoff(C));
+        assert!(!flow.redirect_focus_handoff(0x777));
+        assert!(flow.focus_handoff.is_some());
+        // A window on monitor 0 that no longer has the foreground (these
+        // fake handles never do): the stray event is dropped, no push, and
+        // the handoff stays armed for the next report of it.
+        assert!(flow.redirect_focus_handoff(A));
+        assert!(flow.focus_handoff.is_some());
+
+        // Expired: nothing happens and the handoff is dropped.
+        flow.focus_handoff = Some(handoff(std::time::Instant::now()));
+        assert!(!flow.redirect_focus_handoff(A));
+        assert!(flow.focus_handoff.is_none());
+    }
+
+    /// A tile that lost the foreground a moment ago still counts as the
+    /// user's focus for the removal pipeline; an old loss or another window
+    /// does not.
+    #[test]
+    fn a_focus_loss_counts_only_for_that_window_and_only_just_now() {
+        let mut flow = flow();
+        flow.last_focus_loss = Some((A, std::time::Instant::now()));
+        assert!(flow.lost_focus_just_now(WindowId(A)));
+        assert!(!flow.lost_focus_just_now(WindowId(B)));
+        flow.last_focus_loss = Some((
+            A,
+            std::time::Instant::now() - FOCUS_HANDOFF_WINDOW - std::time::Duration::from_millis(1),
+        ));
+        assert!(!flow.lost_focus_just_now(WindowId(A)));
     }
 }
 

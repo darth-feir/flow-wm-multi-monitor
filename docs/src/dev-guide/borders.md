@@ -160,6 +160,20 @@ active floats the stored `rect` is outset by `(thickness − overlap)` via
 `float_border_rect`, so a float border's ring sits in the surrounding gap like
 a tiled border's, even before the first drag.
 
+**A float back from minimize or the tray** gets a new overlay from that stored
+rect, so the rect must be where the float is. Until stage 30 the registry's
+restore (`restore_window`, and `reconcile_visibility` for a re-shown float)
+put the window's `pre_manage_rect` — where it was before flow managed it, a
+window rect, not a visible one — into `Floating(Active { rect })`, and the new
+ring was drawn there, off the window (host report: a UWP float, the VM case
+was 440 px off). The registry now keeps the rect a float had when it was
+minimized or hidden (`Window::last_float_rect`) and restores that, and the
+restore / show hooks re-read the live rect once the window no longer reports
+its icon frame (`resync_returning_float` → `store_float_rect`, which moves the
+overlay too), for an app that comes back somewhere else. Tiles were never
+affected: their overlay is seated from `tiled_rect` and moved by the animator
+with the window.
+
 ### Focus changes are O(1)
 
 A focus switch repaints **only the two affected overlays** — the window losing
