@@ -18,7 +18,7 @@ use crate::ipc::message::{LayerTarget, SocketMessage, SocketResponse, WindowMode
 use crate::layout::projection;
 use crate::layout::types::{ActualLayout, AppliedLayout};
 use crate::registry::hooks::{add_float_hwnd, remove_float_hwnd};
-use crate::registry::types::{FloatingState, TilingState, WindowState};
+use crate::registry::types::{FloatingState, IgnoredReason, TilingState, WindowState};
 use crate::registry::win32::{self as registry_win32, ForegroundPush};
 use crate::workspace::{FloatingSpace, WorkspaceId, WorkspaceParking};
 use windows::Win32::Foundation::HWND;
@@ -201,6 +201,7 @@ impl FlowWM {
                 self.dispatch_consume_or_expel(*direction)
             }
             SocketMessage::CloseWindow => self.dispatch_close_window(),
+            SocketMessage::MinimizeWindow => self.dispatch_minimize_window(),
 
             // --- Programs ---
             SocketMessage::Spawn { argv } => self.dispatch_spawn(argv),
@@ -373,6 +374,50 @@ impl FlowWM {
             log::warn!("dispatch_close_window: close_window failed for hwnd {target_hwnd}");
             SocketResponse::Error {
                 message: "failed to request window close".into(),
+            }
+        }
+    }
+
+    /// Minimize the focused window (`minimize-window`, Mod+M).
+    ///
+    /// The target is the registry's OS-focus, as for
+    /// [`dispatch_close_window`](Self::dispatch_close_window): an active
+    /// tile (a fullscreen one included) or an active float. Like closing it
+    /// is asynchronous: `ShowWindowAsync(SW_MINIMIZE)` only queues the
+    /// request, and the minimize hook (`on_window_minimized`) then takes the
+    /// window out of the layout and hands the focus to its successor on the
+    /// same screen (ADR-0023's focus handoff). A restore puts it back in
+    /// its slot. See `docs/src/dev-guide/floating-space.md`.
+    ///
+    /// # Errors
+    ///
+    /// Nothing focused, the focused window is not an active tile or float
+    /// ([`minimize_refusal`]), or the request could not be queued.
+    fn dispatch_minimize_window(&mut self) -> SocketResponse {
+        let focused = self.registry.focused();
+        let state = focused.and_then(|f| {
+            self.registry
+                .get_window(HWND(f.0 as *mut _))
+                .map(|w| &w.state)
+        });
+        if let Some(message) = minimize_refusal(focused.is_some(), state) {
+            return SocketResponse::Error { message };
+        }
+        let Some(target) = focused else {
+            return SocketResponse::Error {
+                message: "no focused window to minimize".into(),
+            };
+        };
+        if registry_win32::minimize_window(target.0) {
+            log::info!("minimize-window: minimizing {:#x}", target.0);
+            SocketResponse::Ok
+        } else {
+            log::warn!(
+                "dispatch_minimize_window: minimize request failed for {:#x}",
+                target.0
+            );
+            SocketResponse::Error {
+                message: "failed to request window minimize".into(),
             }
         }
     }
@@ -1838,6 +1883,16 @@ impl FlowWM {
         // daemon's map is what tells it apart.
         let currently_fullscreen = currently_tiling && self.is_fullscreen(focused.0);
         let currently_ignored = matches!(win.state, WindowState::Ignored(_));
+        // An elevated window cannot be moved at all (UIPI, ADR-0025): no
+        // adoption, and nothing to learn.
+        if matches!(win.state, WindowState::Ignored(IgnoredReason::Elevated)) {
+            return SocketResponse::Error {
+                message: format!(
+                    "window {:#x} ({}) is elevated; flow cannot move it (UIPI)",
+                    focused.0, win.exe
+                ),
+            };
+        }
 
         // Capture the window's identity for history recording before the
         // immutable borrow of `self.registry` (via `win`) ends — the
@@ -2709,6 +2764,30 @@ fn resolve_unknown_focus(
     }
 }
 
+/// Why `minimize-window` refuses, or `None` when it may minimize: something
+/// must be focused (`has_focus`) and its registry `state` must be an active
+/// tile or float. An ignored window is not flow's to minimize (an elevated
+/// one could not be, UIPI); a minimized or hidden one has nothing to do.
+#[must_use]
+pub(super) fn minimize_refusal(has_focus: bool, state: Option<&WindowState>) -> Option<String> {
+    if !has_focus {
+        return Some("no focused window to minimize".into());
+    }
+    match state {
+        None => Some("focused window not found in registry".into()),
+        Some(
+            WindowState::Tiling(TilingState::Active { .. })
+            | WindowState::Floating(FloatingState::Active { .. }),
+        ) => None,
+        Some(WindowState::Ignored(_)) => {
+            Some("focused window is not managed by flow (ignored); minimize it yourself".into())
+        }
+        Some(other) => Some(format!(
+            "focused window is in state {other:?}; only an active tile or float can be minimized"
+        )),
+    }
+}
+
 /// The learned rules handed to the classification pipeline: every rule of
 /// `history-flow-rules.toml` except one keyed on a shell-surface class
 /// ([`top_layer::is_shell_class`]), which an earlier build could learn when a
@@ -3157,7 +3236,6 @@ mod tests {
     use crate::config::types::WindowRulesConfig;
     use crate::layout::types::{MonitorInfo, Padding};
     use crate::registry::WindowRegistry;
-    use crate::registry::types::IgnoredReason;
     use crate::workspace::{Monitor, ScrollingSpace, Workspace};
 
     /// Fake HWND value used across all dispatch classification tests.
@@ -3168,6 +3246,72 @@ mod tests {
     /// to `state`, and set as the OS foreground. The window is also added to
     /// the scrolling space so positive-path tests (active tile) can exercise
     /// layout mutations.
+    #[test]
+    fn minimize_is_offered_for_active_tiles_and_floats_only() {
+        let tile = WindowState::Tiling(TilingState::Active { col: 0, row: 0 });
+        let float = WindowState::Floating(FloatingState::Active {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+        });
+        assert_eq!(minimize_refusal(true, Some(&tile)), None);
+        assert_eq!(minimize_refusal(true, Some(&float)), None);
+        assert_eq!(
+            minimize_refusal(false, None).as_deref(),
+            Some("no focused window to minimize")
+        );
+        for refused in [
+            WindowState::Tiling(TilingState::Minimized),
+            WindowState::Floating(FloatingState::Hidden),
+            WindowState::Ignored(IgnoredReason::ExplicitRule),
+            WindowState::Ignored(IgnoredReason::Elevated),
+        ] {
+            assert!(
+                minimize_refusal(true, Some(&refused)).is_some(),
+                "{refused:?}"
+            );
+        }
+        assert!(minimize_refusal(true, None).is_some());
+    }
+
+    #[test]
+    fn minimize_with_nothing_focused_or_an_ignored_focus_is_a_clean_error() {
+        let mut flow = flow_with_focused_state(WindowState::Ignored(IgnoredReason::Elevated));
+        assert!(matches!(
+            flow.dispatch_minimize_window(),
+            SocketResponse::Error { message } if message.contains("not managed")
+        ));
+        flow.registry.clear_focused();
+        assert!(matches!(
+            flow.dispatch_minimize_window(),
+            SocketResponse::Error { message } if message == "no focused window to minimize"
+        ));
+    }
+
+    /// ADR-0025: `set-window` never adopts an elevated window (it could not
+    /// be moved), so nothing is learned either.
+    #[test]
+    fn set_window_on_an_elevated_window_is_refused() {
+        for mode in [WindowMode::Tile, WindowMode::Float, WindowMode::Cycle] {
+            let mut flow = flow_with_focused_state(WindowState::Ignored(IgnoredReason::Elevated));
+            match flow.dispatch_set_window(mode) {
+                SocketResponse::Error { message } => {
+                    assert!(message.contains("elevated"), "{message}")
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+            assert!(matches!(
+                flow.registry
+                    .get_window(HWND(TEST_HWND as *mut _))
+                    .map(|w| &w.state),
+                Some(WindowState::Ignored(IgnoredReason::Elevated))
+            ));
+        }
+    }
+
     fn flow_with_focused_state(state: WindowState) -> FlowWM {
         let rules = WindowRulesConfig::default();
         let mut registry = WindowRegistry::new(&rules, &rules);
@@ -3188,6 +3332,7 @@ mod tests {
             is_maximized: false,
             is_fullscreen: false,
             is_iconic: false,
+            is_elevated: false,
         };
         registry.register_window_from_info(&info);
 
@@ -3560,6 +3705,7 @@ mod tests {
             is_maximized: false,
             is_fullscreen: false,
             is_iconic: false,
+            is_elevated: false,
         };
         registry.register_window_from_info(&info);
         if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {
@@ -3956,6 +4102,7 @@ mod tests {
                 is_maximized: false,
                 is_fullscreen: false,
                 is_iconic: false,
+                is_elevated: false,
             };
             flow.registry.register_window_from_info(&info);
         }
@@ -4064,6 +4211,7 @@ mod tests {
                 is_maximized: false,
                 is_fullscreen: false,
                 is_iconic: false,
+                is_elevated: false,
             };
             flow.registry.register_window_from_info(&info);
         }
@@ -4240,6 +4388,7 @@ mod tests {
             is_maximized: false,
             is_fullscreen: false,
             is_iconic: false,
+            is_elevated: false,
         };
         flow.registry.register_window_from_info(&info);
         if let Some(win) = flow.registry.get_window_mut(HWND(hwnd as *mut _)) {

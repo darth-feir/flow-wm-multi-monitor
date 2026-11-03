@@ -353,6 +353,9 @@ pub enum SocketMessage {
     },
     /// Close the focused window.
     CloseWindow,
+    /// Minimize the focused window (an active tile or float); the minimize
+    /// hook takes it out of the layout and moves the focus to its successor.
+    MinimizeWindow,
 
     // --- Workspace ---
     //
@@ -528,6 +531,7 @@ impl SocketMessage {
                 | Self::MoveWindowToMonitor { .. }
                 | Self::ReloadConfig
                 | Self::CloseWindow
+                | Self::MinimizeWindow
                 | Self::LoadoutLoad { .. }
                 | Self::SetTiling { .. }
                 | Self::ToggleTiling
@@ -865,6 +869,7 @@ mod tests {
                 direction: Direction::Left,
             },
             SocketMessage::CloseWindow,
+            SocketMessage::MinimizeWindow,
             SocketMessage::QueryWindowsAll,
             SocketMessage::QueryLayoutVirtual,
             SocketMessage::QueryLayoutActual,
@@ -1245,6 +1250,7 @@ mod tests {
                 direction: Direction::Right,
             },
             SocketMessage::CloseWindow,
+            SocketMessage::MinimizeWindow,
             SocketMessage::QueryWindowsAll,
             SocketMessage::QueryLayoutVirtual,
             SocketMessage::QueryLayoutActual,
@@ -1498,6 +1504,7 @@ mod tests {
             SocketMessage::ReloadConfig,
             // Close (async WM_CLOSE → destroy hook → layout reflow)
             SocketMessage::CloseWindow,
+            SocketMessage::MinimizeWindow,
             // Loadout restore re-seats every workspace
             SocketMessage::LoadoutLoad { path: None },
             // Tiling on/off moves every tiled window

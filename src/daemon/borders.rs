@@ -8,7 +8,7 @@
 
 use windows::Win32::Foundation::HWND;
 
-use crate::borders::{Border, BorderState, BorderStyle, style_for_state};
+use crate::borders::{Border, BorderState, BorderStyle, CornerPreference, style_for_state};
 use crate::common::Rect;
 use crate::registry::types::{FloatingState, TilingState, WindowState};
 
@@ -84,20 +84,14 @@ impl FlowWM {
             | WindowState::Ignored(_) => return None,
         };
         let mut style = style_for_state(&self.config.borders, state);
-        // Reuse the existing border's cached corner preference when one is
-        // already attached; only pay the DWM round-trip on the creation path
-        // (border == None). A window's corner rounding never changes at
-        // runtime, so this turns a per-focus-change `DwmGetWindowAttribute`
-        // into a cheap field read. See `Border::corner_preference`.
-        // See `docs/src/dev-guide/borders.md`.
-        style.corner_preference = window
-            .border
-            .as_ref()
-            .map(|b| b.corner_preference())
-            .unwrap_or_else(|| {
-                crate::registry::win32::get_window_corner_preference(HWND(hwnd as *mut _))
-                    .unwrap_or_default()
-            });
+        // The ring follows the target's real corners (`CornerPreference::
+        // resolve`: an explicit DWM preference, else square without caption
+        // and sizing frame). An attached border keeps what it resolved; only
+        // when the target's chrome bits changed since (an app toggling its
+        // decorations live) is the DWM preference read again, so a recolor
+        // costs one `GetWindowLongW`. See `docs/src/dev-guide/borders.md`,
+        // *Corner preference*.
+        style.corner_preference = corner_for(hwnd, window.border.as_ref());
         Some(style)
     }
 
@@ -152,6 +146,10 @@ impl FlowWM {
                     };
                     match Border::create(style, hwnd) {
                         Ok(b) => {
+                            b.note_corner(
+                                style.corner_preference,
+                                crate::registry::win32::chrome_bits(hwnd),
+                            );
                             if let Some(rect) = current_rect {
                                 b.set_geometry(rect);
                             }
@@ -163,6 +161,29 @@ impl FlowWM {
                     }
                 }
             }
+        }
+    }
+
+    /// Re-ring the focused window when its chrome bits changed since its
+    /// border resolved its corners (an app toggling its decorations while it
+    /// keeps the focus, which no focus event reports). Run by the periodic
+    /// foreground sync; costs one `GetWindowLongW`. See
+    /// `docs/src/dev-guide/borders.md`, *Corner preference*.
+    pub(super) fn recheck_focused_corners(&mut self) {
+        let Some(focused) = self.registry.focused() else {
+            return;
+        };
+        let stale = self
+            .registry
+            .get_window(HWND(focused.0 as *mut _))
+            .and_then(|w| w.border.as_ref())
+            .is_some_and(|b| {
+                let noted = b.corner().1;
+                let now = crate::registry::win32::chrome_bits(focused.0);
+                noted.is_some() && now.is_some() && noted != now
+            });
+        if stale {
+            self.refresh_border_for(focused.0);
         }
     }
 
@@ -182,4 +203,36 @@ impl FlowWM {
             self.refresh_border_for(raw);
         }
     }
+}
+
+/// The corners of `hwnd` for its ring: what `border` resolved when the
+/// target's chrome bits are unchanged, else resolved again (DWM preference
+/// + chrome, [`CornerPreference::resolve`]) and noted on `border`.
+fn corner_for(hwnd: isize, border: Option<&Border>) -> CornerPreference {
+    let chrome = crate::registry::win32::chrome_bits(hwnd);
+    if let Some(b) = border {
+        let (cached, noted) = b.corner();
+        match noted {
+            Some(bits) if Some(bits) == chrome => return cached,
+            // First refresh after creation: the creation resolved from the
+            // same styles a moment ago; just note them.
+            None => {
+                b.note_corner(cached, chrome);
+                return cached;
+            }
+            Some(_) if chrome.is_none() => return cached,
+            Some(_) => {}
+        }
+    }
+    let dwm = crate::registry::win32::get_window_corner_preference(HWND(hwnd as *mut _));
+    let pref = CornerPreference::resolve(dwm, chrome);
+    if let Some(b) = border {
+        log::debug!(
+            "border: window {hwnd:#x} chrome changed to {:#x}; corners now {}",
+            chrome.unwrap_or(0),
+            pref.name()
+        );
+        b.note_corner(pref, chrome);
+    }
+    pref
 }

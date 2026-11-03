@@ -98,6 +98,10 @@ pub struct WindowInfo {
     /// says whether it restores to maximized (`WPF_RESTORETOMAXIMIZED`);
     /// `is_fullscreen` is `false`. See [`restored_geometry`].
     pub is_iconic: bool,
+    /// Whether the window's process is out of flow's reach because of
+    /// UIPI: elevated (or its token unreadable) while flowd is not
+    /// ([`elevation_blocks`], ADR-0025).
+    pub is_elevated: bool,
 }
 
 // ── String conversion helpers ──────────────────────────────────────
@@ -737,10 +741,18 @@ fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> ForegroundPush {
     let attach_ok =
         unsafe { AttachThreadInput(our_thread_id, foreground_thread_id, true) }.as_bool();
     if !attach_ok {
-        report(format!(
-            "set_foreground_window: AttachThreadInput(true) failed for our_thread={our_thread_id} fg_thread={foreground_thread_id} fg_pid={foreground_pid} (Win32 error {:#x})",
-            unsafe { GetLastError() }.0
-        ));
+        let code = unsafe { GetLastError() }.0;
+        let line = format!(
+            "set_foreground_window: AttachThreadInput(true) failed for our_thread={our_thread_id} fg_thread={foreground_thread_id} fg_pid={foreground_pid} (Win32 error {code:#x})"
+        );
+        // ERROR_ACCESS_DENIED: the foreground belongs to an elevated
+        // process (UIPI, ADR-0025). Expected on every push while one is in
+        // front, so not a warning; the direct call below still runs.
+        if code == 5 {
+            log::debug!("{line} (foreground is elevated)");
+        } else {
+            report(line);
+        }
     }
 
     // Compute the outcome first, then detach in all paths.
@@ -927,6 +939,21 @@ pub fn close_window(hwnd_val: isize) -> bool {
     queued.is_ok()
 }
 
+/// Ask `hwnd_val` to minimize (`ShowWindowAsync(SW_MINIMIZE)`: Windows then
+/// activates the next window in z-order). Queued, not sent, for the same
+/// reason as [`close_window`]: a hung app must not stall the daemon. The
+/// minimize hook does the rest. `true` when queued.
+#[must_use]
+pub fn minimize_window(hwnd_val: isize) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{SW_MINIMIZE, ShowWindowAsync};
+    let hwnd = HWND(hwnd_val as *mut _);
+    // SAFETY: IsWindow accepts any value; ShowWindowAsync only posts.
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return false;
+    }
+    unsafe { ShowWindowAsync(hwnd, SW_MINIMIZE) }.as_bool()
+}
+
 /// Post `WM_SYSCOMMAND` `SC_MAXIMIZE` (`maximize`) or `SC_RESTORE` to
 /// `hwnd_val`: what the title-bar maximize / restore buttons send. An app
 /// with a full-screen mode of its own (Remote Desktop) switches to it on
@@ -956,13 +983,22 @@ pub fn post_syscommand(hwnd_val: isize, maximize: bool) -> bool {
 /// An app in its own full screen has none (ADR-0020).
 #[must_use]
 pub fn has_chrome(hwnd_val: isize) -> Option<bool> {
+    chrome_bits(hwnd_val).map(|bits| bits != 0)
+}
+
+/// The chrome bits of `hwnd_val`'s style right now (`WS_CAPTION | WS_THICKFRAME`
+/// masked out of `GWL_STYLE`, `0` for a window with neither); `None` for a
+/// handle that is gone. One `GetWindowLongW`: cheap enough for the border's
+/// corner check on every refresh (`docs/src/dev-guide/borders.md`).
+#[must_use]
+pub fn chrome_bits(hwnd_val: isize) -> Option<u32> {
     let hwnd = HWND(hwnd_val as *mut _);
     // SAFETY: IsWindow accepts any value; GetWindowLongW on a live handle.
     if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         return None;
     }
     let style = WINDOW_STYLE(unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32);
-    Some(style & (WS_CAPTION | WS_THICKFRAME) != WINDOW_STYLE(0))
+    Some((style & (WS_CAPTION | WS_THICKFRAME)).0)
 }
 
 /// The window facts that decide whether a window flow has not classified
@@ -1551,6 +1587,84 @@ pub fn get_process_exe_and_path(pid: u32) -> Result<(String, String), String> {
     result
 }
 
+/// Whether process `pid` runs elevated (`TokenElevation`): `Some(true)` /
+/// `Some(false)`, `None` when its token cannot be read. A medium-integrity
+/// process can open the token of an elevated process of the same user
+/// (`PROCESS_QUERY_LIMITED_INFORMATION` + `TOKEN_QUERY`, what Task
+/// Manager's *Elevated* column reads), so `None` means a process flow
+/// cannot inspect at all (another user, a protected or system process).
+#[must_use]
+pub fn process_elevation(pid: u32) -> Option<bool> {
+    use windows::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows::Win32::System::Threading::OpenProcessToken;
+    // SAFETY: OpenProcess with the least query right; the handle is closed
+    // below on every path.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut token = windows::Win32::Foundation::HANDLE::default();
+    // SAFETY: OpenProcessToken writes a token handle into a local; closed below.
+    let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
+    let _ = unsafe { CloseHandle(process) };
+    opened.ok()?;
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut returned = 0u32;
+    // SAFETY: TokenElevation fills a TOKEN_ELEVATION (one u32) into a local
+    // of the matching type and size.
+    let read = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut _ as *mut core::ffi::c_void),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    };
+    let _ = unsafe { CloseHandle(token) };
+    read.ok()?;
+    Some(elevation.TokenIsElevated != 0)
+}
+
+/// Whether flowd itself runs elevated (someone started it as admin), read
+/// once per process. An elevated daemon can move elevated windows, so the
+/// elevation gate is skipped ([`window_is_elevated`]).
+#[must_use]
+pub fn self_is_elevated() -> bool {
+    static SELF_ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SELF_ELEVATED.get_or_init(|| process_elevation(std::process::id()).unwrap_or(false))
+}
+
+/// The elevation gate's decision (ADR-0025): a window of an elevated
+/// process — or of one whose token cannot be read (`window == None`) — is
+/// out of flow's reach (UIPI refuses every move, z-order change and
+/// activation), unless the daemon is elevated too.
+#[must_use]
+pub const fn elevation_blocks(daemon_elevated: bool, window: Option<bool>) -> bool {
+    if daemon_elevated {
+        return false;
+    }
+    match window {
+        Some(elevated) => elevated,
+        None => true,
+    }
+}
+
+/// Whether `hwnd` belongs to a process flow cannot manage because of UIPI
+/// ([`elevation_blocks`]). A handle without a process (gone, or a test's
+/// fake handle) is not elevated: there is nothing to refuse. Elevation never
+/// changes during a process's life, so the registry asks once, at arrival.
+#[must_use]
+pub fn window_is_elevated(hwnd: HWND) -> bool {
+    let daemon = self_is_elevated();
+    if daemon {
+        return false;
+    }
+    let Ok(pid) = get_window_thread_process_id(hwnd) else {
+        return false;
+    };
+    elevation_blocks(daemon, process_elevation(pid))
+}
+
 /// Internal helper: queries the full image name from an open process handle.
 ///
 /// # Buffer Strategy
@@ -1680,12 +1794,14 @@ pub fn get_window_info(hwnd: HWND) -> Result<WindowInfo, String> {
                 is_maximized,
                 is_fullscreen,
                 is_iconic,
+                is_elevated: false,
             });
         }
     };
 
     let (exe, process_path) =
         get_process_exe_and_path(pid).unwrap_or(("unknown".to_owned(), String::new()));
+    let is_elevated = elevation_blocks(self_is_elevated(), process_elevation(pid));
 
     Ok(WindowInfo {
         hwnd,
@@ -1698,6 +1814,7 @@ pub fn get_window_info(hwnd: HWND) -> Result<WindowInfo, String> {
         is_maximized,
         is_fullscreen,
         is_iconic,
+        is_elevated,
     })
 }
 
@@ -2085,6 +2202,30 @@ mod tests {
     /// Helper to create an arbitrary invalid HWND (non-null but not a real window).
     fn invalid_hwnd() -> HWND {
         HWND(0xDEAD_BEEF as *mut _)
+    }
+
+    #[test]
+    fn the_elevation_gate_blocks_elevated_and_unreadable_windows() {
+        // flowd at medium integrity: an elevated or uninspectable process is
+        // out of reach, a normal one is managed.
+        assert!(elevation_blocks(false, Some(true)));
+        assert!(elevation_blocks(false, None));
+        assert!(!elevation_blocks(false, Some(false)));
+        // An elevated flowd can move everything: the gate is off.
+        assert!(!elevation_blocks(true, Some(true)));
+        assert!(!elevation_blocks(true, None));
+    }
+
+    #[test]
+    fn a_handle_without_a_process_is_not_elevated() {
+        assert!(!window_is_elevated(null_hwnd()));
+        assert!(!window_is_elevated(invalid_hwnd()));
+    }
+
+    #[test]
+    fn the_test_process_itself_reads_as_not_elevated_or_skips_the_gate() {
+        // Whatever the test runner's token says, reading it works.
+        assert!(process_elevation(std::process::id()).is_some());
     }
 
     #[test]

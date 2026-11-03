@@ -506,6 +506,9 @@ pub enum FloatingState {
 /// even if a config rule says to tile it. This is intentional — maximized and
 /// fullscreen windows have their own window management behavior that conflicts
 /// with tiling.
+///
+/// `Elevated` wins over everything: no rule, maximize or fullscreen state
+/// can make flow manage a window it is not allowed to move.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IgnoredReason {
     /// Window is maximized (`WS_MAXIMIZE` style).
@@ -514,6 +517,10 @@ pub enum IgnoredReason {
     Fullscreen,
     /// Window matched an explicit `ignore` rule in the config.
     ExplicitRule,
+    /// The window's process is elevated (or its token unreadable) and flowd
+    /// is not: UIPI refuses every move, so it is left unmanaged. Decided
+    /// once at arrival and never re-evaluated (ADR-0025).
+    Elevated,
 }
 
 // ── VirtualSlot ─────────────────────────────────────────────────────

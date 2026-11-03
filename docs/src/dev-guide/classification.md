@@ -209,6 +209,36 @@ To forget everything flow has learned:
 > programmatic way to clear learned state without touching the file by hand.
 > They are not yet implemented.
 
+## Elevated Windows Are Unmanaged
+
+A window whose process runs elevated (an Alacritty or PowerShell started as
+administrator, Task Manager on an admin account) cannot be managed by a flowd
+running at medium integrity: User Interface Privilege Isolation refuses every
+`SetWindowPos`, z-order change and activation flowd sends it. Before this rule
+such a window was seated as a column, each move failed (`apply_batch error for
+instant targets: backend error: Access is denied`), and the column stayed where
+it was, overlapping its neighbours.
+
+At arrival (`get_window_info`) flowd reads the process token
+(`OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `OpenProcessToken(TOKEN_QUERY)`
++ `GetTokenInformation(TokenElevation)`, which works across integrity levels for
+the same user). An elevated process, or one whose token cannot be read at all
+(another user, a protected or system process), makes the window
+`Ignored(Elevated)`: this outranks every rule and the maximized / fullscreen
+overrides. The registry logs one info line per window,
+`window 0x.. (exe) is elevated; left unmanaged (UIPI)`, and `flow query all`
+shows the state `Ignored::Elevated`. The window gets no seat, no border, no
+pre-placement and no learned rule; `set-window` on it is refused with a message.
+Elevation is fixed for a process's life, so it is never re-evaluated.
+
+Unlike an explicit-rule ignore it is **not** a floating-layer member and not a
+window flow owns in the foreground: the layer cannot lift it, so treating it as
+flow's would leave a float covering the focused elevated window. It is foreign
+to the layer instead: when it takes the foreground the layer drops under it,
+like under any other app, and its own dialogs never ride. If flowd itself runs
+elevated, the check is skipped and elevated windows are managed as usual. Why:
+ADR-0025 (`docs/adr/0025-elevated-windows-are-unmanaged.md`).
+
 ## Where the Code Lives
 
 | Concern | Location |
@@ -220,6 +250,7 @@ To forget everything flow has learned:
 | Runtime pipeline refresh | `set_learned_rules` on `ClassificationPipeline` and `WindowRegistry` |
 | Capture on `set-window` transition | `record_learned_transition` in [`src/daemon/dispatch.rs`](../../src/daemon/dispatch.rs) |
 | Daemon-owned history store | `history` field on `FlowWM`, loaded in `new()` |
+| Elevation gate (ADR-0025) | `process_elevation` / `elevation_blocks` in [`src/registry/win32.rs`](../../src/registry/win32.rs), `register_window_from_info` in [`src/registry/core.rs`](../../src/registry/core.rs) |
 
 ## Cross-References
 

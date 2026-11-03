@@ -54,6 +54,7 @@ classDiagram
         Maximized
         Fullscreen
         ExplicitRule
+        Elevated
     }
     class Window {
         +HWND hwnd
@@ -257,7 +258,9 @@ struct with no HWND) and returns a `WindowState`.
 
 ```mermaid
 flowchart TB
-    C["WindowCandidate<br/>(exe, title, class, process_path)"] --> MAX{"IsZoomed?<br/>(maximized)"}
+    C["WindowCandidate<br/>(exe, title, class, process_path)"] --> ELV{"Elevated process?<br/>(UIPI, flowd not elevated)"}
+    ELV -- Yes --> IGELV["Ignored(Elevated)<br/>ALWAYS wins"]
+    ELV -- No --> MAX{"IsZoomed?<br/>(maximized)"}
     MAX -- Yes --> IGMAX["Ignored(Maximized)<br/>ALWAYS wins"]
     MAX -- No --> FS{"Fullscreen?<br/>(rect == screen,<br/>no caption/thickframe)"}
     FS -- Yes --> IGFS["Ignored(Fullscreen)<br/>ALWAYS wins"]
@@ -277,6 +280,14 @@ flowchart TB
     PIPE --> FL["Floating(Active)"]
     PIPE --> IGX["Ignored(ExplicitRule)"]
 ```
+
+An elevated window comes first of all: when its process runs elevated (or its
+token cannot be read) and flowd does not, UIPI refuses every move, z-order change
+and activation flowd would send, so the registry records it `Ignored(Elevated)`
+at arrival and never looks again (elevation is fixed for a process's life). It
+gets no seat, no border, no learned rule and no floating-layer membership;
+`set-window` on it is refused. See ADR-0025 and
+[Classification](classification.md#elevated-windows-are-unmanaged).
 
 Maximized and fullscreen overrides always take precedence over rules. A window
 that is maximized will always be `Ignored(Maximized)` even if a config rule says

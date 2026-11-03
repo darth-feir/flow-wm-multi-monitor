@@ -1042,6 +1042,7 @@ impl FlowWM {
     /// microsecond-scale guard clause.
     pub(super) fn reconcile_foreground(&mut self) {
         self.last_foreground_sync = std::time::Instant::now();
+        self.recheck_focused_corners();
 
         let Some(true_fg) = registry_win32::get_foreground_window() else {
             return;
@@ -1333,6 +1334,7 @@ mod readd_tests {
             is_maximized: false,
             is_fullscreen: false,
             is_iconic: false,
+            is_elevated: false,
         };
         registry.register_window_from_info(&info);
         if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {

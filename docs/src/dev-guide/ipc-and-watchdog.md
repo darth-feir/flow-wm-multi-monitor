@@ -506,6 +506,7 @@ owning monitor the registry remembers for a minimized or hidden window), or
 | `flow dispatch width next/prev/cycle/<preset>` | `SetWidthPreset` — prints `flow: column width <preset>` |
 | `flow dispatch set-window float/tile/cycle/fullscreen` | `SetWindow { mode }` |
 | `flow dispatch close-window` | `CloseWindow` |
+| `flow dispatch minimize-window` | `MinimizeWindow` |
 | `flow dispatch switch-workspace <id>` | `SwitchWorkspace` |
 | `flow dispatch swap-workspace <id>` | `SwapWorkspace` (stub) |
 | `flow dispatch move-to-workspace <id>` | `MoveWindowToWorkspace` |

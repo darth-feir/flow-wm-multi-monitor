@@ -526,6 +526,12 @@ const FIXED_ACTIONS: &[(&str, &[&str], &str, &str)] = &[
         "close-window",
     ),
     (
+        "minimize-window",
+        &["minimize-window"],
+        "minimize window",
+        "minimize-window",
+    ),
+    (
         "center-column",
         &["center"],
         "center the focused column",
@@ -1091,6 +1097,7 @@ const GROUP_ORDER: &[&str] = &[
     "focus-workspace",
     "move-to-workspace",
     "close-window",
+    "minimize-window",
     "center-column",
     "toggle-window-floating",
     "move-window-to-floating",
@@ -1600,6 +1607,7 @@ mod tests {
             vec!["move-to-workspace", "9"]
         );
         assert_eq!(find("Mod+Q").action.argv, vec!["close-window"]);
+        assert_eq!(find("Mod+M").action.argv, vec!["minimize-window"]);
         assert_eq!(find("Mod+C").action.argv, vec!["center"]);
         assert_eq!(find("Mod+V").action.argv, vec!["set-window", "cycle"]);
         assert_eq!(
@@ -1631,8 +1639,8 @@ mod tests {
                 .iter()
                 .all(|b| !matches!(b.chord.canonical().as_str(), "Mod+Minus" | "Mod+Equal"))
         );
-        // focus 8, move 8, monitors 8, workspaces 20, q c v shift+v r f shift+b [ ] = 9, programs 6, help + quit.
-        assert_eq!(binds.len(), 8 + 8 + 8 + 20 + 9 + 6 + 2);
+        // focus 8, move 8, monitors 8, workspaces 20, q alt+m c v shift+v r f shift+b [ ] = 10, programs 6, help + quit.
+        assert_eq!(binds.len(), 8 + 8 + 8 + 20 + 10 + 6 + 2);
     }
 
     #[test]
@@ -1753,7 +1761,7 @@ mod tests {
                 "Mod+1..9, Mod+0",
                 "Mod+Ctrl+1..9, Mod+Ctrl+0",
                 "Mod+Q",
-                "Mod+C",
+                "Mod+M",
             ]
         );
         assert_eq!(rows[0].help, "focus the next window on this screen");
@@ -1765,8 +1773,8 @@ mod tests {
         assert!(chords.contains(&"Mod+Space, Mod+D"), "{chords:?}");
         assert!(chords.contains(&"Mod+Shift+Slash"));
         assert_eq!(*chords.last().unwrap(), "Mod+Shift+E");
-        // 2 focus + 2 move + monitors 2 + workspaces 2 + q c v shift+v r f shift+b + consume + launcher + 4 spawn + help + quit
-        assert_eq!(rows.len(), 2 + 2 + 2 + 2 + 7 + 1 + 1 + 4 + 1 + 1);
+        // 2 focus + 2 move + monitors 2 + workspaces 2 + q alt+m c v shift+v r f shift+b + consume + launcher + 4 spawn + help + quit
+        assert_eq!(rows.len(), 2 + 2 + 2 + 2 + 8 + 1 + 1 + 4 + 1 + 1);
     }
 
     #[test]

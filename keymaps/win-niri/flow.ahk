@@ -800,6 +800,7 @@ bind	#^8	tiling	dispatch	0	Mod+Ctrl+8	move the window to workspace 8	move-to-wor
 bind	#^9	tiling	dispatch	0	Mod+Ctrl+9	move the window to workspace 9	move-to-workspace<US>9
 bind	#^0	tiling	dispatch	0	Mod+Ctrl+0	move the window to workspace 10	move-to-workspace<US>10
 bind	#q	tiling	dispatch	0	Mod+Q	close window	close-window
+bind	#m	tiling	dispatch	0	Mod+M	minimize window	minimize-window
 bind	#c	tiling	dispatch	0	Mod+C	center the focused column	center
 bind	#v	tiling	dispatch	0	Mod+V	toggle floating	set-window<US>cycle
 bind	#+v	tiling	dispatch	0	Mod+Shift+V	switch focus between the floating and the tiled windows	switch-focus-between-floating-and-tiling
@@ -825,6 +826,7 @@ row	Mod+Alt+Left/Down/Up/Right	move the window to the other screen
 row	Mod+1..9, Mod+0	switch to that workspace
 row	Mod+Ctrl+1..9, Mod+Ctrl+0	move the window to that workspace
 row	Mod+Q	close window
+row	Mod+M	minimize window
 row	Mod+C	center the focused column
 row	Mod+V	toggle floating
 row	Mod+Shift+V	switch focus between the floating and the tiled windows

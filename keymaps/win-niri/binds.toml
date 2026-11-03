@@ -62,6 +62,7 @@
 
 # Columns and windows.
 "Mod+Q" = "close-window"
+"Mod+M" = "minimize-window"
 "Mod+C" = "center-column"
 "Mod+V" = "toggle-window-floating"
 "Mod+Shift+V" = "switch-focus-between-floating-and-tiling"

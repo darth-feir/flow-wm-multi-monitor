@@ -111,7 +111,10 @@ impl FlowWM {
     /// `"hidden"` or `"ignored"`. A
     /// `parked_row` field says whether a tile is hidden inside its column by
     /// the row viewport (`[columns] visible_rows`); `null` for a window in
-    /// no strip. Each monitor lists its active strip's `columns` with their
+    /// no strip. A `border_corner` field names the corners its border ring
+    /// follows (`"square"`, `"default"` = rounded, `"rounded"`,
+    /// `"rounded-small"`; `null` without a border).
+    /// Each monitor lists its active strip's `columns` with their
     /// `row_count`, `row_offset`, `visible_rows` and `fullscreen`.
     pub(super) fn query_windows_all(&self) -> SocketResponse {
         let viewport_offset = self.active_scrolling().virtual_layout().viewport_offset;
@@ -127,6 +130,14 @@ impl FlowWM {
         });
         annotate_windows_with(&mut payload, "pile", |hwnd| {
             serde_json::json!(self.pile_of(WindowId(hwnd)))
+        });
+        annotate_windows_with(&mut payload, "border_corner", |hwnd| {
+            serde_json::json!(
+                self.registry
+                    .get_window(windows::Win32::Foundation::HWND(hwnd as *mut _))
+                    .and_then(|w| w.border.as_ref())
+                    .map(|b| b.corner_preference().name())
+            )
         });
         if let serde_json::Value::Object(map) = &mut payload {
             let monitors: Vec<serde_json::Value> = self

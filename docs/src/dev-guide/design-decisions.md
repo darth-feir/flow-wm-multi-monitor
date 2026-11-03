@@ -468,3 +468,12 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   popup. Explicitly ignored shell surfaces (Start, search) are no longer
   layer members. Amends ADR-0013 (fixes the SSMS error box hidden behind its
   own window). `docs/adr/0024-owned-windows-ride-the-floating-layer.md`
+- **ADR-0025 — Elevated windows are unmanaged.** A window whose process runs
+  elevated (or whose token cannot be read) while flowd does not is out of
+  reach: UIPI refuses every move, z-order change and activation. It is
+  recorded `Ignored(Elevated)` at arrival, before any rule, logged once,
+  shown by `flow query all`, never seated, bordered, pre-placed or learned,
+  and `set-window` refuses it. It is foreign to the floating layer (the
+  layer drops under it), so no refused z-order call is ever sent. Skipped
+  when flowd itself is elevated.
+  `docs/adr/0025-elevated-windows-are-unmanaged.md`

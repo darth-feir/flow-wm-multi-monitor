@@ -974,6 +974,7 @@ mod tests {
             is_maximized: false,
             is_fullscreen: false,
             is_iconic: false,
+            is_elevated: false,
         };
         registry.register_window_from_info(&info);
         if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {
@@ -1159,6 +1160,20 @@ mod tests {
         assert!(!in_top_layer(&WindowState::Ignored(
             IgnoredReason::Fullscreen
         )));
+    }
+
+    /// An elevated window (ADR-0025) is neither a layer member nor a window
+    /// flow owns in the foreground: the layer cannot lift it (UIPI), so it
+    /// drops under it like under any other app, and its dialogs never ride.
+    #[test]
+    fn an_elevated_window_is_foreign_to_the_layer() {
+        let elevated = WindowState::Ignored(IgnoredReason::Elevated);
+        assert!(!in_top_layer(&elevated));
+        assert!(!owns_foreground(&elevated));
+        assert_eq!(
+            classify_foreground(Some("Window Class"), Some(&elevated), false),
+            ForegroundOwner::Foreign
+        );
     }
 
     #[test]

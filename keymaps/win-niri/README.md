@@ -127,7 +127,7 @@ polling has not noticed yet.
 
 `flow dispatch tiling toggle` pauses tiling inside the daemon without
 stopping it. While tiling is off every window-management chord (focus,
-move, monitors, workspaces, close, center, float, width, consume/expel —
+move, monitors, workspaces, close, minimize, center, float, width, consume/expel —
 the `tiling`-scoped binds) is released to Windows, so Win+Arrows snap,
 Win+1..9 launch from the taskbar, and so on. The toggle itself, the
 launcher, the help overlay, the program (`spawn`) chords and the stop

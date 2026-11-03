@@ -292,12 +292,13 @@ struct BorderInner {
     target: isize,
     /// Current style (color + thickness).
     style: Mutex<BorderStyle>,
-    /// Cached DWM corner preference resolved once from the target window at
-    /// creation. A window's corner rounding essentially never changes at
-    /// runtime, so [`Border::corner_preference`] lets the daemon avoid a
-    /// `DwmGetWindowAttribute` round-trip on every focus change (the recolor
-    /// path) — see `daemon::borders::border_style_for`.
-    corner_preference: CornerPreference,
+    /// The target's resolved corners and the chrome bits
+    /// (`WS_CAPTION | WS_THICKFRAME`) they were resolved from (`None`: not
+    /// read yet). The daemon re-resolves only when the chrome bits change
+    /// (an app toggling its decorations), so a recolor costs one
+    /// `GetWindowLongW`, not a `DwmGetWindowAttribute` — see
+    /// `daemon::borders::border_style_for` and `docs/src/dev-guide/borders.md`.
+    corner: Mutex<(CornerPreference, Option<u32>)>,
     /// Cached rendered ring surface (DIB + memory DC + shape signature).
     ///
     /// Lets [`Border::paint`] skip the expensive `CreateCompatibleDC` +
@@ -367,10 +368,9 @@ impl Border {
                 overlay: Mutex::new(hwnd.0 as isize),
                 target: target_hwnd,
                 style: Mutex::new(style),
-                // Cache the corner preference baked into the creation style so
-                // the daemon can reuse it on subsequent recolors without
-                // re-querying DWM.
-                corner_preference: style.corner_preference,
+                // The corners baked into the creation style; the daemon notes
+                // the chrome bits they came from right after (`note_corner`).
+                corner: Mutex::new((style.corner_preference, None)),
                 // No bitmap rendered yet — the first `paint` builds it.
                 surface: Mutex::new(None),
             }),
@@ -399,16 +399,27 @@ impl Border {
         *lock_tolerant(&self.inner.overlay)
     }
 
-    /// Returns the target window's corner-rounding preference, cached at
-    /// border creation.
+    /// The target window's resolved corners and the chrome bits they were
+    /// resolved from (`None`: not noted yet).
     ///
     /// The daemon uses this in `border_style_for` to build the recolor style
-    /// without re-issuing a `DwmGetWindowAttribute` call on every focus
-    /// change — the preference is frozen once per window because a window's
-    /// corner rounding never changes at runtime.
+    /// without a `DwmGetWindowAttribute` call on every focus change: it
+    /// re-resolves only when the target's chrome bits differ.
+    #[must_use]
+    pub(crate) fn corner(&self) -> (CornerPreference, Option<u32>) {
+        *lock_tolerant(&self.inner.corner)
+    }
+
+    /// The target's resolved corners, for `flow query all`.
     #[must_use]
     pub(crate) fn corner_preference(&self) -> CornerPreference {
-        self.inner.corner_preference
+        self.corner().0
+    }
+
+    /// Remember `pref` as the target's corners, resolved from chrome bits
+    /// `chrome`. The ring itself follows the next `set_style`.
+    pub(crate) fn note_corner(&self, pref: CornerPreference, chrome: Option<u32>) {
+        *lock_tolerant(&self.inner.corner) = (pref, chrome);
     }
 
     /// Re-assert the overlay's z-order so it sits just above its target
@@ -2238,7 +2249,7 @@ mod tests {
                 1,
                 CornerPreference::Square,
             )),
-            corner_preference: CornerPreference::Square,
+            corner: Mutex::new((CornerPreference::Square, None)),
             surface: Mutex::new(None),
         }
     }

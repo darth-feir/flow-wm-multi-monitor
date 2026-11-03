@@ -9,7 +9,7 @@
 //! | Loadout | `loadout save|load [path]` |
 //! | Config | `config init` / `reload` / `edit` / `path` / `check` |
 //! | Query | `query all` |
-//! | Dispatch | `dispatch focus\|swap-column\|move-window\|merge-column\|promote\|consume-or-expel\|expand-column\|shrink-column\|width\|center\|close-window\|set-window\|switch-workspace\|move-to-workspace`, plus stub `swap-workspace` |
+//! | Dispatch | `dispatch focus\|swap-column\|move-window\|merge-column\|promote\|consume-or-expel\|expand-column\|shrink-column\|width\|center\|close-window\|minimize-window\|set-window\|switch-workspace\|move-to-workspace`, plus stub `swap-workspace` |
 //!
 //! See the developer guide's *IPC & Watchdog* chapter
 //! (`docs/src/dev-guide/ipc-and-watchdog.md`) for the full command reference.
@@ -380,6 +380,13 @@ enum DispatchCommands {
     /// work, release resources, etc.). The window is removed from the layout
     /// automatically once Win32 reports its destruction.
     CloseWindow,
+    /// Minimize the currently focused window (an active tile or float).
+    ///
+    /// Sends [`SocketMessage::MinimizeWindow`]. The daemon asks Windows to
+    /// minimize it (`SW_MINIMIZE`); it leaves the layout like a window the
+    /// user minimized, the focus moves to its successor on the same screen,
+    /// and a restore puts it back in its slot.
+    MinimizeWindow,
     /// Set the focused window's tiling mode.
     ///
     /// Maps to [`SocketMessage::SetWindow`]. Sends
@@ -1438,6 +1445,9 @@ fn cmd_dispatch(command: DispatchCommands) -> Result<(), String> {
             cmd_dispatch_focus_layer(LayerTarget::Other)
         }
         DispatchCommands::CloseWindow => send_command(SocketMessage::CloseWindow, "window closed"),
+        DispatchCommands::MinimizeWindow => {
+            send_command(SocketMessage::MinimizeWindow, "window minimized")
+        }
         DispatchCommands::SetWindow { mode } => cmd_dispatch_set_window(mode),
         DispatchCommands::SwitchWorkspace { workspace_id } => send_command(
             SocketMessage::SwitchWorkspace { workspace_id },
@@ -3229,6 +3239,20 @@ mod tests {
             } => {}
             other => panic!("expected Dispatch::CloseWindow, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_dispatch_minimize_window() {
+        // Positive: `flow dispatch minimize-window` parses to MinimizeWindow.
+        let cli = Cli::try_parse_from(["flow", "dispatch", "minimize-window"]).unwrap();
+        match cli.command {
+            Commands::Dispatch {
+                command: DispatchCommands::MinimizeWindow,
+            } => {}
+            other => panic!("expected Dispatch::MinimizeWindow, got: {other:?}"),
+        }
+        // Negative: it takes no argument.
+        assert!(Cli::try_parse_from(["flow", "dispatch", "minimize-window", "now"]).is_err());
     }
 
     #[test]

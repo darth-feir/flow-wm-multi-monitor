@@ -305,12 +305,23 @@ impl WindowRegistry {
             process_path: info.process_path.clone(),
         };
 
-        let classified = classification::classify_with_state_pipeline(
-            &candidate,
-            info.is_maximized,
-            info.is_fullscreen,
-            &self.pipeline,
-        );
+        // An elevated window is out of reach (UIPI): no rule, seat or move
+        // applies to it (ADR-0025). Iconic or not, it stays ignored.
+        let classified = if info.is_elevated {
+            log::info!(
+                "window {:#x} ({}) is elevated; left unmanaged (UIPI)",
+                info.hwnd.0 as isize,
+                info.exe
+            );
+            WindowState::Ignored(IgnoredReason::Elevated)
+        } else {
+            classification::classify_with_state_pipeline(
+                &candidate,
+                info.is_maximized,
+                info.is_fullscreen,
+                &self.pipeline,
+            )
+        };
         let state = if info.is_iconic {
             minimized_state_for(classified)
         } else {
@@ -1757,6 +1768,9 @@ fn state_to_json(state: &WindowState) -> serde_json::Value {
         WindowState::Ignored(IgnoredReason::ExplicitRule) => {
             serde_json::json!("Ignored::ExplicitRule")
         }
+        WindowState::Ignored(IgnoredReason::Elevated) => {
+            serde_json::json!("Ignored::Elevated")
+        }
     }
 }
 
@@ -2151,6 +2165,7 @@ mod tests {
             is_maximized: false,
             is_fullscreen: false,
             is_iconic: false,
+            is_elevated: false,
         };
 
         reg.register_window_from_info(&info);
@@ -2315,6 +2330,7 @@ mod tests {
             is_maximized: restores_maximized,
             is_fullscreen: false,
             is_iconic: true,
+            is_elevated: false,
         }
     }
 
@@ -2780,6 +2796,48 @@ mod tests {
     }
     // ── register_window_from_info tests ──────────────────────────────
 
+    /// ADR-0025: an elevated window is registered `Ignored(Elevated)`
+    /// whatever its rules or OS state say, iconic or not.
+    #[test]
+    fn an_elevated_window_is_registered_ignored_elevated() {
+        let (user, default) = default_rules();
+        let mut reg = WindowRegistry::new(&user, &default);
+        for (hwnd_val, maximized, iconic) in [
+            (4101isize, false, false),
+            (4102, true, false),
+            (4103, false, true),
+        ] {
+            let info = win32::WindowInfo {
+                hwnd: HWND(hwnd_val as *mut _),
+                title: "Administrator: Alacritty".to_owned(),
+                class: "Window Class".to_owned(),
+                rect: crate::common::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 800,
+                    height: 600,
+                },
+                exe: "alacritty.exe".to_owned(),
+                process_path: r"C:\Tools\alacritty.exe".to_owned(),
+                is_visible: true,
+                is_maximized: maximized,
+                is_fullscreen: false,
+                is_iconic: iconic,
+                is_elevated: true,
+            };
+            reg.register_window_from_info(&info);
+            let w = reg.get_window(HWND(hwnd_val as *mut _)).unwrap();
+            assert!(
+                matches!(w.state, WindowState::Ignored(IgnoredReason::Elevated)),
+                "{hwnd_val:#x}: {:?}",
+                w.state
+            );
+            assert_eq!(
+                state_to_json(&w.state),
+                serde_json::json!("Ignored::Elevated")
+            );
+        }
+    }
     #[test]
     fn register_window_from_info_inserts_new_window() {
         let (user, default) = default_rules();
@@ -2802,6 +2860,7 @@ mod tests {
             is_maximized: false,
             is_fullscreen: false,
             is_iconic: false,
+            is_elevated: false,
         };
 
         assert!(reg.is_empty());
@@ -2835,6 +2894,7 @@ mod tests {
             is_maximized: false,
             is_fullscreen: false,
             is_iconic: false,
+            is_elevated: false,
         };
 
         reg.register_window_from_info(&info);
@@ -2878,6 +2938,7 @@ mod tests {
             is_maximized: true,
             is_fullscreen: false,
             is_iconic: false,
+            is_elevated: false,
         };
 
         reg.register_window_from_info(&info);

@@ -88,6 +88,11 @@ impl FlowWM {
             log::debug!("window {hwnd:#x} ({exe}) not pre-placed: a rule ignores it");
             return;
         }
+        // UIPI refuses the move of an elevated window (ADR-0025).
+        if registry_win32::window_is_elevated(handle) {
+            log::debug!("window {hwnd:#x} ({exe}) not pre-placed: it is elevated");
+            return;
+        }
         // The move is synchronous: a window whose thread is not pumping
         // (still initializing) would stall the daemon until it does.
         if !registry_win32::answers_within(hwnd, PRE_PLACE_PROBE_MS) {

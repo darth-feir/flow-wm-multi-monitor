@@ -905,6 +905,7 @@ mod tests {
             is_maximized: false,
             is_fullscreen: false,
             is_iconic: false,
+            is_elevated: false,
         }
     }
 

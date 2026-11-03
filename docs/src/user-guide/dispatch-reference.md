@@ -682,6 +682,24 @@ Default hotkey: `Alt + q`
 
 ---
 
+### `minimize-window`
+
+Minimize the focused window (an active tile or float, a fullscreen one
+included). It leaves the layout like a window you minimized yourself, and the
+focus moves to its successor on the same screen; restoring it (its taskbar
+button) puts it back in its slot. With nothing focused, or with a window flow
+does not manage in focus (an ignored or elevated one), the command fails with a
+message and changes nothing.
+
+```powershell
+flow dispatch minimize-window   # flow: window minimized
+```
+
+No default hotkey in the bundled `flow.ahk`; the win-niri keymap binds
+Mod+M.
+
+---
+
 ## Beyond `dispatch` — the rest of the CLI
 
 Everything above lives under `flow dispatch …` (the actions that change layout).

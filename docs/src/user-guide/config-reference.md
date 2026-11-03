@@ -630,6 +630,7 @@ same table are an error.
 | `focus-workspace N` | `switch-workspace N` | N from 1 |
 | `move-column-to-workspace N` (also `move-window-to-workspace N`) | `move-to-workspace N` | |
 | `close-window` | `close-window` | |
+| `minimize-window` | `minimize-window` | the focused tile or float leaves the layout, the focus moves to its successor on the same screen; a restore (taskbar) puts it back in its slot; Mod+M by default |
 | `center-column` | `center` | |
 | `toggle-window-floating`, `move-window-to-floating`, `move-window-to-tiling` | `set-window cycle` / `float` / `tile` | |
 | `switch-focus-between-floating-and-tiling` | `switch-focus-between-floating-and-tiling` | focus the other side: the float used last (else the top one), or the strip's last tile; Mod+Shift+V by default |
