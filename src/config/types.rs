@@ -169,6 +169,10 @@ pub struct FlowConfig {
     /// Daemon log retention and the keymap log switch (`[logging]`).
     pub logging: LoggingConfig,
 
+    /// Keymap options that are not bindings (`[keymap]`): the selection
+    /// buffer. See [`KeymapConfig`].
+    pub keymap: KeymapConfig,
+
     /// Key bindings (`[binds]`): niri's chord and action names, laid over
     /// the keymap's built-in table. The daemon validates them and the hotkey
     /// script registers them at runtime (`flow query binds`). See
@@ -272,6 +276,21 @@ pub struct LoggingConfig {
     pub keymap_log: bool,
 }
 
+/// Options of the hotkey script that are not key bindings (`[keymap]`).
+///
+/// The daemon only carries them to the keymap: `flow query binds` lists
+/// them (an `option` record in `--plain`), and the keymap re-reads that
+/// listing whenever `flow.toml` is saved, so they apply live.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct KeymapConfig {
+    /// The X11-style selection buffer (`selection.ahk`): text highlighted
+    /// with the mouse is remembered apart from the clipboard and a middle
+    /// click pastes it. Off by default. See
+    /// `docs/adr/0026-selection-buffer.md`.
+    pub selection_buffer: bool,
+}
+
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
@@ -348,6 +367,7 @@ impl Default for FlowConfig {
             loadout: LoadoutConfig::default(),
             navigation: NavigationConfig::default(),
             logging: LoggingConfig::default(),
+            keymap: KeymapConfig::default(),
             binds: crate::config::binds::BindsConfig::default(),
             startup: crate::config::startup::StartupConfig::default(),
             columns: None,
@@ -1345,6 +1365,10 @@ strategy = "original_slot"
         assert_eq!(parsed.logging.keep_days, 0);
         assert!(!parsed.logging.keymap_log);
         assert!(!FlowConfig::default().logging.keymap_log);
+        assert!(!parsed.keymap.selection_buffer);
+        assert!(!FlowConfig::default().keymap.selection_buffer);
+        let on: FlowConfig = toml::from_str("[keymap]\nselection_buffer = true\n").unwrap();
+        assert!(on.keymap.selection_buffer);
     }
 
     // --- Integration: Full field preservation through round-trip ---
@@ -1403,6 +1427,9 @@ strategy = "original_slot"
             logging: LoggingConfig {
                 keep_days: 3,
                 keymap_log: true,
+            },
+            keymap: KeymapConfig {
+                selection_buffer: true,
             },
             binds: crate::config::binds::BindsConfig {
                 defaults: false,
@@ -1469,6 +1496,7 @@ default = \"1/2\"",
         assert!(!parsed.navigation.edge_hop);
         assert_eq!(parsed.logging.keep_days, 3);
         assert!(parsed.logging.keymap_log);
+        assert!(parsed.keymap.selection_buffer);
         let columns = parsed.columns.as_ref().expect("columns round-trips");
         assert_eq!(columns.labels(), vec!["1/3", "1/2"]);
         assert_eq!(columns.default_index(), 1);

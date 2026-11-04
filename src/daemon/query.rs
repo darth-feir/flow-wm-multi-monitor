@@ -71,10 +71,10 @@ impl FlowWM {
             Ok(resolved) => {
                 let from_config = !binds.defaults || !binds.entries.is_empty();
                 SocketResponse::Data {
-                    payload: serde_json::json!(crate::config::binds::report(
-                        &resolved,
-                        from_config
-                    )),
+                    payload: serde_json::json!(
+                        crate::config::binds::report(&resolved, from_config)
+                            .with_selection_buffer(self.config.keymap.selection_buffer)
+                    ),
                 }
             }
             Err(problems) => SocketResponse::Error {

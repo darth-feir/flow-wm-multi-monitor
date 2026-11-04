@@ -94,6 +94,13 @@
         "new_window_monitor": "focused"
       }
     },
+    "keymap": {
+      "description": "Keymap options that are not bindings (`[keymap]`): the selection\nbuffer. See [`KeymapConfig`].",
+      "$ref": "#/$defs/KeymapConfig",
+      "default": {
+        "selection_buffer": false
+      }
+    },
     "loadout": {
       "description": "Loadout save/restore configuration.",
       "$ref": "#/$defs/LoadoutConfig",
@@ -583,6 +590,17 @@
           "description": "The screen a new window opens on: `\"focused\"` (the default, niri\nbehaviour) seats it on the screen that has the focus, `\"placed\"` on\nthe screen Windows put it on. Windows found at startup and windows\ncoming back from minimize or hide keep their own screen either way.\nSee ADR-0023.",
           "$ref": "#/$defs/NewWindowMonitor",
           "default": "focused"
+        }
+      }
+    },
+    "KeymapConfig": {
+      "description": "Options of the hotkey script that are not key bindings (`[keymap]`).\n\nThe daemon only carries them to the keymap: `flow query binds` lists\nthem (an `option` record in `--plain`), and the keymap re-reads that\nlisting whenever `flow.toml` is saved, so they apply live.",
+      "type": "object",
+      "properties": {
+        "selection_buffer": {
+          "description": "The X11-style selection buffer (`selection.ahk`): text highlighted\nwith the mouse is remembered apart from the clipboard and a middle\nclick pastes it. Off by default. See\n`docs/adr/0026-selection-buffer.md`.",
+          "type": "boolean",
+          "default": false
         }
       }
     },

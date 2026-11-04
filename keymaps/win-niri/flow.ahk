@@ -21,12 +21,16 @@
 ;   Mod+Ctrl+T                    stop FlowWM fully (daemon and this script); flow-resident.ahk,
 ;                                 if it runs, starts FlowWM again with the same chord
 ;   Mod+Ctrl+Shift+T              pause toggle: `flow dispatch tiling toggle` (daemon keeps running)
+;   middle click                  paste the selection buffer, only with `[keymap] selection_buffer = true`
+;                                 (selection.ahk; README.md *Selection buffer*)
 ;
 ; Every chord is bound only while the daemon's pipe answers; window-management
 ; chords only while tiling is on; Win+L stays Windows.
 ; ════════════════════════════════════════════════════════════════════════════
 
 #Include %A_ScriptDir%\flow-exe.ahk
+; Included before the binds are applied: ApplyBinds() switches it on or off.
+#Include %A_ScriptDir%\selection.ahk
 
 flowExe := ResolveFlowExe()   ; absolute path to flow.exe (see flow-exe.ahk); quote-safe below
 PipeName := EnvGet("FLOW_PIPE_NAME") || "\\.\pipe\flow"
@@ -358,6 +362,7 @@ Backslashes(n) {
 ;   bind <hotkey> <scope> <kind> <admin> <chord> <help> <argv items joined by Chr(31)>
 ;   row <chords> <help>            an overlay row for the table
 ;   hardwired <chords> <help>      an overlay row for the chords below
+;   option <name> 0|1              a keymap option ([keymap] in flow.toml): selection_buffer
 ;   source defaults|flow.toml
 ; The output goes through a file (UTF-8, no console window), never through
 ; WScript's Exec, which decodes with the OEM code page.
@@ -451,6 +456,7 @@ ApplyBinds(text) {
     }
     Registered := [], HelpRows := []
     n := 0, failed := 0
+    selection := false      ; an older daemon lists no option: off
     Loop Parse text, "`n", "`r" {
         f := StrSplit(A_LoopField, "`t")
         if (f.Length < 3)
@@ -487,9 +493,13 @@ ApplyBinds(text) {
                 }
             case "row", "hardwired":
                 HelpRows.Push([f[2], f[3]])
+            case "option":
+                if (f[2] = "selection_buffer")
+                    selection := f[3] = "1"
         }
     }
     HotIf()
+    SelectionApply(selection)
     BindsText := text
     BuildHelpGui()
     AhkLog("binds: " n " registered" (failed ? ", " failed " failed" : ""))
@@ -844,6 +854,7 @@ row	Mod+Shift+E	stop FlowWM
 hardwired	Mod + left-button drag	move a window grabbed anywhere (a tile drops into the zone under the cursor, a float moves; a click without moving only activates it)
 hardwired	Mod+Ctrl+T	FlowWM off (and on again, via flow-resident.ahk)
 hardwired	Mod+Ctrl+Shift+T	pause toggle (off: Windows manages windows, chords fall through)
+option	selection_buffer	0
 source	defaults
 )"
 ; END DEFAULT BINDS

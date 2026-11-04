@@ -12,19 +12,20 @@ setup.
 
 | File | Role |
 |------|------|
-| `flow.ahk` | The keymap: an interpreter that registers the chords `flow query binds --plain` lists (the daemon's view of `[binds]`), re-reads them when `flow.toml` is saved, and hardwires the Mod + left-button drag, Mod+Ctrl+T and Mod+Ctrl+Shift+T. `#Include`s the three files below. Started by the daemon (`flow start --ahk`) inside its kill-on-close job object. |
+| `flow.ahk` | The keymap: an interpreter that registers the chords `flow query binds --plain` lists (the daemon's view of `[binds]`), re-reads them when `flow.toml` is saved, and hardwires the Mod + left-button drag, Mod+Ctrl+T and Mod+Ctrl+Shift+T. `#Include`s the four files below. Started by the daemon (`flow start --ahk`) inside its kill-on-close job object. |
 | `binds.toml` | The default `[binds]` table, compiled into the daemon (`include_str!`). Paste a line into `flow.toml` to change it. Not read at runtime. |
 | `flow-exe.ahk` | `ResolveFlowExe()` — where `flow.exe` is. Shared by `flow.ahk` and `flow-resident.ahk`. |
 | `launcher.ahk` | Application launcher (the `launcher` action, Mod+Space / Mod+D by default): fuzzy-matches Start-menu shortcuts and a few built-ins; `window - x` and `file - x` search open windows or files instead. |
+| `selection.ahk` | The selection buffer (`[keymap] selection_buffer`, off by default): text highlighted with the mouse is kept apart from the clipboard and a middle click pastes it. See *Selection buffer* below. |
 | `help.ahk` | Key-binding overlay (the `show-hotkey-overlay` action, Mod+Shift+/ by default). Its rows come from the same `flow query binds` listing the hotkeys are registered from, so it cannot disagree with them. |
 | `flow-resident.ahk` | Optional resident starter: runs all the time (shortcut in `shell:startup`) and turns Mod+Ctrl+T into an on/off switch for the whole of FlowWM. |
 | `flow.toml.example` | The daemon side of the map: `[columns]` width presets (fractions and `2/3+1/3`-style slot patterns, per-screen `[[columns.screen]]` rules), `edge_hop = false`, and commented `[binds]` / `[startup]` examples. |
 
-Install: copy `flow.ahk`, `flow-exe.ahk`, `launcher.ahk` and `help.ahk` to
+Install: copy `flow.ahk`, `flow-exe.ahk`, `selection.ahk`, `launcher.ahk` and `help.ahk` to
 `%USERPROFILE%\.config\flow\` (the files must sit next to each other — the
 includes are `%A_ScriptDir%`-relative), merge `flow.toml.example` into
-`flow.toml`, and run `flow start --ahk`. `launcher.ahk` and `help.ahk` are
-includes and do not run on their own.
+`flow.toml`, and run `flow start --ahk`. `selection.ahk`, `launcher.ahk` and
+`help.ahk` are includes and do not run on their own.
 
 ## How flow.exe is found
 
@@ -362,6 +363,110 @@ refilters first if the list is stale, so it never acts on a stale row.
 interrupt a running one, and without it the first-character refilter of
 a pasted or fast-typed query could finish *after* the full-text one and
 overwrite the list with its stale rows (seen in the VM, 2026-10-26).
+
+## Selection buffer
+
+The X11 "primary selection": whatever you highlight with the mouse is
+remembered in a buffer of its own, and a middle click pastes it. The
+clipboard (Ctrl+C / Ctrl+V, Win+V history) is left as it was, and there is
+no history: the buffer holds one text. Off by default; to turn it on:
+
+```toml
+[keymap]
+selection_buffer = true
+```
+
+It applies when `flow.toml` is saved (the keymap re-reads the daemon's
+listing, which carries the option as an `option selection_buffer 0|1`
+record); turning it off forgets the buffer. With it off, `selection.ahk`
+registers no hotkey at all. It is part of `flow.ahk` (an `#Include`), so it
+starts and stops with the keymap.
+
+**Capture.** On a left-button release after a drag of more than 8 px, or
+after a double or triple click (Shift+click too), the script asks UI
+Automation for the selected text of the focused element, then of the
+element under the pointer, then of their ancestors (a web page keeps its
+selection on its Document; a chat-style page focuses a scroller that has no
+text). The first press in a browser window wakes its accessibility tree
+(Firefox builds it on the first request), and a capture right after that
+which finds nothing is read once more 400 ms later. A classic Edit control (Win32 dialogs, a WinForms `TextBox`)
+often answers UI Automation through its own MSAA object, which has no text
+pattern; for the focused one the script reads `EM_GETSEL` and `WM_GETTEXT`
+instead. It never uses the clipboard (Alacritty aside, below). An empty answer leaves the
+buffer as it was. Nothing is read from a password field (UIA `IsPassword`).
+A selection made with the keyboard is not captured.
+
+**Alacritty.** Alacritty draws its own text and gives UI Automation
+nothing to read, so the script uses Alacritty's copy-on-select instead.
+Turn that on in `%APPDATA%\alacritty\alacritty.toml`:
+
+```toml
+[selection]
+save_to_clipboard = true
+```
+
+Alacritty then writes the highlighted text to the clipboard when you
+release the button (drag, double click, triple click, Shift+click). On the
+first press in an Alacritty window the script saves the clipboard
+(`ClipboardAll`). After the release it waits up to 300 ms for Alacritty's
+write, takes that text into the buffer and puts the saved clipboard back,
+so the clipboard ends up as it was. If something else writes to the
+clipboard between the read and the restore (your own Ctrl+Shift+C, say),
+that write is kept and nothing is restored. Ctrl+Shift+C after a highlight
+still copies as usual.
+
+What you see:
+
+- For a moment (under 100 ms) the clipboard holds the highlighted
+  text. A clipboard manager or Win+V history may record it: that is
+  Alacritty's own write, which the script cannot mark. The restore is an
+  ordinary write too, so history may show the earlier entry again on top.
+- With `save_to_clipboard` off (Alacritty's default), Alacritty writes
+  nothing. The buffer stays as it was and the trace says `alacritty did not
+  copy within 300 ms; buffer kept`.
+- Every first left press in Alacritty saves the clipboard once. A large
+  clipboard (an image) makes that a copy of the image.
+
+**Paste.** A middle click with no modifier, with a non-empty buffer:
+
+| Under the pointer | What happens |
+|---|---|
+| A terminal (Windows Terminal, conhost, Alacritty, WezTerm, mintty, PuTTY, ConEmu) | The window is activated and the buffer pasted. |
+| A text field: UIA `Edit` that is not read-only, or a `Document` that says it is writable (ValuePattern), or (outside browsers) a focusable `Document` with a text pattern; up to three parents of the element hit are tried | A left click there (focus, caret under the pointer), then the buffer is pasted. |
+| A password field, a read-only field, anything else (a link, a button, a page in Edge / Chrome / Firefox / Brave / Vivaldi / Opera) | The middle click is passed on unchanged (replayed: press now, release with the button, so autoscroll still works). |
+| Remote Desktop (`mstsc.exe`, `msrdc.exe`), Hyper-V's `vmconnect.exe`, the taskbar, the desktop, the keymap's own windows | Not even looked at: the middle click is the app's. |
+
+With an empty buffer, or with Ctrl / Shift / Alt / Win held, the middle
+click is never touched. Pasting puts the buffer on the clipboard (marked
+`ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory = 0`,
+`CanUploadToCloudClipboard = 0`, so Win+V history and the cloud clipboard
+ignore it), sends the paste key (Shift+Insert; Ctrl+Shift+V for Alacritty),
+waits 300 ms and puts the saved clipboard back (`ClipboardAll`). The restore
+is an ordinary clipboard write: history may show the original entry again
+on top.
+
+**Limits.**
+
+- Apps that draw their own text and expose no UIA text pattern give
+  nothing: most games, some Electron / custom editors (VS Code's editor
+  surface). A highlight there is not captured. Alacritty is the exception, through its
+  copy-on-select (above). Its selection extended with the right button,
+  or made with the keyboard (vi mode), is not captured, and Alacritty's
+  write then stays on the clipboard.
+- A web page that turns text selection off (`user-select: none`, common
+  on app login screens) has nothing to capture. When a highlight is not
+  captured, the trace line names the element types that were asked
+  (`no selected text (focus ...; pointer ...)`).
+- An app whose text field is not an UIA `Edit` / `Document` under the
+  pointer gets its normal middle click instead of a paste.
+- An elevated window: UI Automation and the paste keys are refused (UIPI);
+  nothing is captured and nothing is pasted, silently.
+- A copy through Ctrl+C with the clipboard restored afterwards is not built
+  (a fallback for apps without a text pattern); ask if you want it.
+- The trace (`keymap_log`) records `selection:` lines with lengths and
+  executable names, never the text.
+
+Why it is built this way: `docs/adr/0026-selection-buffer.md`.
 
 ## Tracing
 

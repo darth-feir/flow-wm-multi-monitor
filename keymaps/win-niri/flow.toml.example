@@ -85,6 +85,13 @@ new_window_monitor = "focused"
 # "Mod+Return" = { spawn = ["alacritty"] }
 # "Mod+Shift+Return" = { spawn = ["wt", "-p", "PowerShell"], admin = true, help = "admin shell" }
 
+# The X11-style selection buffer: what you highlight with the mouse is kept apart from the clipboard
+# and a middle click on a text field or a terminal pastes it (the clipboard is put back). Off by
+# default; applies when this file is saved. Limits (Alacritty highlights are not seen, ...) are in
+# README.md next to this file, *Selection buffer*.
+# [keymap]
+# selection_buffer = true
+
 # Programs to run once FlowWM is up, each as ["program", "arg", ...] (looked up like a spawn bind).
 # [startup]
 # spawn = [["alacritty"]]

@@ -1188,6 +1188,26 @@ pub struct BindsReport {
     pub rows: Vec<HelpRow>,
     /// The chords the keymap hardwires, for the overlay.
     pub hardwired: Vec<HelpRow>,
+    /// `[keymap] selection_buffer`: the keymap runs its selection buffer
+    /// (`selection.ahk`). Absent from an older daemon's answer: off.
+    #[serde(default)]
+    pub selection_buffer: bool,
+}
+
+impl BindsReport {
+    /// Carry `[keymap] selection_buffer`; when on, the overlay also lists
+    /// the middle click.
+    #[must_use]
+    pub fn with_selection_buffer(mut self, on: bool) -> Self {
+        self.selection_buffer = on;
+        if on {
+            self.hardwired.push(HelpRow {
+                chords: "Middle click".into(),
+                help: "paste the text last highlighted with the mouse (selection buffer; the clipboard is kept)".into(),
+            });
+        }
+        self
+    }
 }
 
 /// The chords the keymap hardwires (see `flow.ahk`); listed so the overlay
@@ -1230,6 +1250,7 @@ pub fn report(binds: &[Bind], from_config: bool) -> BindsReport {
             .collect(),
         rows: help_rows(binds),
         hardwired: hardwired_rows(),
+        selection_buffer: false,
     }
 }
 
@@ -1317,7 +1338,8 @@ fn collapse_keys(prefix: &str, keys: &[&Key]) -> String {
 /// The `--plain` listing the hotkey script parses: one record per line,
 /// tab-separated. `bind` records carry the hotkey, scope, kind, admin flag,
 /// chord, help and the argv (items joined by [`PLAIN_ARGV_SEP`]); `row` and
-/// `hardwired` records carry the overlay text; `source` closes the list.
+/// `hardwired` records carry the overlay text; `option` records carry the
+/// keymap options (`option <name> 0|1`); `source` closes the list.
 #[must_use]
 pub fn plain_text(report: &BindsReport) -> String {
     let mut out = String::new();
@@ -1353,6 +1375,10 @@ pub fn plain_text(report: &BindsReport) -> String {
             out.push('\n');
         }
     }
+    out.push_str(&format!(
+        "option{PLAIN_SEP}selection_buffer{PLAIN_SEP}{}\n",
+        u8::from(report.selection_buffer)
+    ));
     out.push_str(&format!("source{PLAIN_SEP}{}\n", report.source));
     out
 }
@@ -1814,8 +1840,31 @@ mod tests {
                 .iter()
                 .any(|l| l.starts_with("hardwired\tMod+Ctrl+T\t"))
         );
+        assert!(lines.contains(&"option\tselection_buffer\t0"));
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("hardwired\tMiddle click\t"))
+        );
         assert_eq!(*lines.last().unwrap(), "source\tdefaults");
         assert_eq!(report(&binds, true).source, "flow.toml");
+
+        // [keymap] selection_buffer on: the option flips and the overlay
+        // lists the middle click; an older daemon's JSON (no field) is off.
+        let on = report(&binds, false).with_selection_buffer(true);
+        assert!(on.selection_buffer);
+        assert_eq!(on.hardwired.len(), 4);
+        let plain_on = plain_text(&on);
+        assert!(plain_on.lines().any(|l| l == "option\tselection_buffer\t1"));
+        assert!(
+            plain_on
+                .lines()
+                .any(|l| l.starts_with("hardwired\tMiddle click\t"))
+        );
+        let mut old = serde_json::to_value(&r).unwrap();
+        old.as_object_mut().unwrap().remove("selection_buffer");
+        let old: BindsReport = serde_json::from_value(old).unwrap();
+        assert!(!old.selection_buffer);
     }
 
     // ── the keymap's baked fallback ──

@@ -1175,6 +1175,16 @@ default = "1/2"
         assert!(report.binds.iter().all(|b| b.chord != "Mod+Q"));
         assert!(report.rows.iter().any(|r| r.chords == "Mod+R"));
         assert!(report.rows.iter().any(|r| r.chords == "Mod+Shift+R"));
+        assert!(!report.selection_buffer);
+
+        // [keymap] selection_buffer reaches the keymap through the listing.
+        flow.config.keymap.selection_buffer = true;
+        let SocketResponse::Data { payload } = flow.dispatch(&SocketMessage::QueryBinds) else {
+            panic!("expected Data");
+        };
+        let report: crate::config::BindsReport = serde_json::from_value(payload).unwrap();
+        assert!(report.selection_buffer);
+        assert!(report.hardwired.iter().any(|r| r.chords == "Middle click"));
     }
 
     #[test]

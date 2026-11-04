@@ -68,6 +68,7 @@ Not every field can change at runtime. Reload applies **live** fields in place;
 | `floating.always_on_top` | Immediate: turned on, every floating window and every rule-ignored window is raised above the tiles; turned off, they go back to the normal z-order (a window that was "always on top" by itself keeps that). |
 | `binds.*` | The daemon re-resolves the table; the hotkey script re-reads it a few seconds after the save and re-registers the chords (one-line message). A table with an error keeps the old chords. |
 | `startup.*` | Applies to the next daemon start only. |
+| `keymap.selection_buffer` | The hotkey script re-reads it with the bindings a few seconds after the save: the selection buffer starts or stops (stopping forgets the buffered text). |
 | **Workspace count (10), monitor geometry** | **Structural** — not reloadable. Restart the daemon. |
 
 What is preserved across reload: the user's arranged layout (columns, rows,
@@ -552,6 +553,24 @@ Example:
 ```toml
 [logging]
 keep_days = 14
+```
+
+### `[keymap]` — keymap options
+
+Options of the hotkey script (`keymaps/win-niri`) that are not key
+bindings. The daemon only carries them to the keymap, in the same
+`flow query binds` listing the chords come from (an `option` record in
+`--plain`), so a saved change applies within a few seconds.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `selection_buffer` | `bool` | `false` | The X11-style selection buffer (`selection.ahk`). Text highlighted with the mouse (a drag, a double or triple click) is read through UI Automation and kept apart from the clipboard; a middle click on a text field or a terminal pastes it, and the clipboard is put back afterwards. Elsewhere (a web page, a link, a button, a password field, Remote Desktop) the middle click is passed on unchanged. Apps that draw their own text give nothing to capture; Alacritty is captured through its copy-on-select and needs `[selection] save_to_clipboard = true` in its own `alacritty.toml` (the clipboard is put back after the read). The overlay (Mod+Shift+/) shows a *Middle click* row while it is on. Details and limits: the keymap README, *Selection buffer*. |
+
+Example:
+
+```toml
+[keymap]
+selection_buffer = true
 ```
 
 ### `[update]` — update checker

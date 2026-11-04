@@ -477,3 +477,13 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   layer drops under it), so no refused z-order call is ever sent. Skipped
   when flowd itself is elevated.
   `docs/adr/0025-elevated-windows-are-unmanaged.md`
+- **ADR-0026 — The selection buffer is a keymap option read through UI
+  Automation.** `[keymap] selection_buffer` (off by default) reaches the keymap
+  as an `option` record of the binds listing (live on save). `selection.ahk`,
+  an include of `flow.ahk`, reads the selected text of the focused element,
+  the element under the pointer or an ancestor of either (a web page keeps it
+  on its Document) through UIA after a drag or a double / triple click (never the clipboard,
+  never a password field; Alacritty, which has no text pattern, through its
+  copy-on-select write, read and then undone) and pastes it on a middle click over a writable
+  text field or a terminal, putting the clipboard back; every other middle
+  click is passed on unchanged. `docs/adr/0026-selection-buffer.md`

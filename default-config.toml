@@ -233,6 +233,20 @@ default_path = "loadout.json"
 keep_days = 14
 keymap_log = false
 
+# Keymap options that are not key bindings (keymaps/win-niri). Applied live:
+# the keymap re-reads them whenever this file is saved.
+#
+# - selection_buffer:  the X11-style selection buffer. Text highlighted with
+#                       the mouse (a drag, a double or triple click) is kept
+#                       apart from the clipboard, and a middle click on a text
+#                       field or a terminal pastes it; the clipboard is put
+#                       back afterwards. Read through UI Automation, so apps
+#                       that draw their own text (Alacritty) give nothing;
+#                       password fields are never read or pasted into.
+#                       Elsewhere the middle click is passed on unchanged.
+[keymap]
+selection_buffer = false
+
 # Update checker (`flow update`, and the start-time notice above). It asks
 # GitHub how this build relates to a branch or to the latest release and
 # prints the answer plus how to update; it NEVER downloads or replaces the
