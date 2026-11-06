@@ -78,6 +78,7 @@ mod new;
 mod piles;
 mod pre_place;
 mod query;
+mod restore_seat;
 mod run;
 pub mod session;
 pub(crate) mod shutdown;

@@ -29,7 +29,7 @@ pub(crate) mod border;
 pub(crate) mod style;
 
 pub use border::Border;
-pub use style::{BorderStyle, CornerPreference};
+pub use style::{BorderStyle, CornerFacts, CornerPreference};
 
 use crate::config::BorderConfig;
 

@@ -420,7 +420,7 @@ synced.
 | Condition | Action |
 |-----------|--------|
 | Not tracked | Skip |
-| Was `Tiling::Active` | Registry updates to `Tiling::Minimized`, `remove_from_layout_and_refocus()`, animate |
+| Was `Tiling::Active` | Its seat is recorded (`capture_restore_seat`: monitor, workspace, column, row, alone, width), registry updates to `Tiling::Minimized`, `remove_from_layout_and_refocus()`, animate |
 | Was `Tiling::Minimized` or not tiling | Registry state update only, no layout change |
 
 ### Restored (`EVENT_SYSTEM_MINIMIZEEND`)
@@ -428,15 +428,16 @@ synced.
 | Condition | Action |
 |-----------|--------|
 | Not tracked | Attempt the full creation pipeline first (`register_if_untracked`); a window that registers is seated by it and the rows below find it in place; one that fails a gate is skipped |
-| Now `Tiling::Active` | `add_window()` on the home monitor (appends at far right), animate; a window registered minimized has its geometry re-measured by `restore_window` first |
+| Now `Tiling::Active` | `readd_tile(hwnd, follow = true)` on the home monitor: back into its recorded seat (`plan_restore_seat`, `restore_window_at`; `[minimize_restore] strategy`), else appended; the view scrolls to it (`ensure_focused_visible`) and a foreground restore becomes the focus (`focus_restored_tile`); animate. A window registered minimized has its geometry re-measured by `restore_window` first |
 | Now `Floating::Active` with no float seat (registered minimized) | `register_float` at its current rect (centred if unreadable), animate |
 | Not tiling | Registry state update only |
 
-Restored windows are appended at the far right of the canvas rather than
-inserted at the old position. This avoids the complexity of tracking and
-restoring saved virtual slots for all cases (minimize + destroy interleaving).
-On a multi-monitor desktop the strip they are appended to is the home
-monitor's — see [Which monitor a returning window belongs to](#which-monitor-a-returning-window-belongs-to).
+Restored windows go back to the column they were minimized from (clamped to
+the column count; a seat on another workspace lands in the visible one, a seat
+on another monitor is appended), and the view follows them in strip and book
+layout alike (ADR-0027). Windows re-shown after a hide or recovered from
+maximized are still appended at the far right without a scroll. On a
+multi-monitor desktop the strip they return to is the home monitor's — see [Which monitor a returning window belongs to](#which-monitor-a-returning-window-belongs-to).
 
 With `[floating] always_on_top`, the minimize / hide handlers take a float out
 of the floating layer and the restore / show handlers put it back

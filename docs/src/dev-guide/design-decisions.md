@@ -487,3 +487,13 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   copy-on-select write, read and then undone) and pastes it on a middle click over a writable
   text field or a terminal, putting the clipboard back; every other middle
   click is passed on unchanged. `docs/adr/0026-selection-buffer.md`
+- **ADR-0027 — A restored tile returns to its seat, and a frameless window has
+  square corners.** The minimize hook records the tile's seat (monitor,
+  workspace, column, row, alone, width) next to the owning-monitor memory; the
+  restore puts it back there (index clamped to the column count; another
+  workspace lands in the active one; another monitor appends), the view
+  scrolls to it like a focus move (strip and book), and a foreground restore
+  becomes the focus. `[minimize_restore] strategy` now takes effect. The
+  border's corner rule also reads whether the client area covers the window
+  (Alacritty `decorations = "none"` keeps `WS_CAPTION | WS_THICKFRAME`):
+  square then. `docs/adr/0027-restore-seat-and-frameless-corners.md`

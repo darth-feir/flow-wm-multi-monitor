@@ -40,7 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::PCWSTR;
 use windows::core::w;
 
-use super::style::{BorderStyle, CornerPreference};
+use super::style::{BorderStyle, CornerFacts, CornerPreference};
 use crate::common::Rect;
 use crate::config::Color;
 
@@ -292,13 +292,13 @@ struct BorderInner {
     target: isize,
     /// Current style (color + thickness).
     style: Mutex<BorderStyle>,
-    /// The target's resolved corners and the chrome bits
-    /// (`WS_CAPTION | WS_THICKFRAME`) they were resolved from (`None`: not
-    /// read yet). The daemon re-resolves only when the chrome bits change
-    /// (an app toggling its decorations), so a recolor costs one
-    /// `GetWindowLongW`, not a `DwmGetWindowAttribute` — see
+    /// The target's resolved corners and the [`CornerFacts`] (chrome bits,
+    /// client covering the window) they were resolved from (`None`: not
+    /// read yet). The daemon re-resolves only when the facts change (an app
+    /// toggling its decorations), so a recolor costs one `GetWindowLongW`
+    /// and two rect reads, not a `DwmGetWindowAttribute` — see
     /// `daemon::borders::border_style_for` and `docs/src/dev-guide/borders.md`.
-    corner: Mutex<(CornerPreference, Option<u32>)>,
+    corner: Mutex<(CornerPreference, Option<CornerFacts>)>,
     /// Cached rendered ring surface (DIB + memory DC + shape signature).
     ///
     /// Lets [`Border::paint`] skip the expensive `CreateCompatibleDC` +
@@ -369,7 +369,7 @@ impl Border {
                 target: target_hwnd,
                 style: Mutex::new(style),
                 // The corners baked into the creation style; the daemon notes
-                // the chrome bits they came from right after (`note_corner`).
+                // the facts they came from right after (`note_corner`).
                 corner: Mutex::new((style.corner_preference, None)),
                 // No bitmap rendered yet — the first `paint` builds it.
                 surface: Mutex::new(None),
@@ -399,14 +399,14 @@ impl Border {
         *lock_tolerant(&self.inner.overlay)
     }
 
-    /// The target window's resolved corners and the chrome bits they were
+    /// The target window's resolved corners and the facts they were
     /// resolved from (`None`: not noted yet).
     ///
     /// The daemon uses this in `border_style_for` to build the recolor style
     /// without a `DwmGetWindowAttribute` call on every focus change: it
-    /// re-resolves only when the target's chrome bits differ.
+    /// re-resolves only when the target's [`CornerFacts`] differ.
     #[must_use]
-    pub(crate) fn corner(&self) -> (CornerPreference, Option<u32>) {
+    pub(crate) fn corner(&self) -> (CornerPreference, Option<CornerFacts>) {
         *lock_tolerant(&self.inner.corner)
     }
 
@@ -416,10 +416,10 @@ impl Border {
         self.corner().0
     }
 
-    /// Remember `pref` as the target's corners, resolved from chrome bits
-    /// `chrome`. The ring itself follows the next `set_style`.
-    pub(crate) fn note_corner(&self, pref: CornerPreference, chrome: Option<u32>) {
-        *lock_tolerant(&self.inner.corner) = (pref, chrome);
+    /// Remember `pref` as the target's corners, resolved from `facts`. The
+    /// ring itself follows the next `set_style`.
+    pub(crate) fn note_corner(&self, pref: CornerPreference, facts: Option<CornerFacts>) {
+        *lock_tolerant(&self.inner.corner) = (pref, facts);
     }
 
     /// Re-assert the overlay's z-order so it sits just above its target

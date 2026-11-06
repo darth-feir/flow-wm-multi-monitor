@@ -3,7 +3,11 @@
 **Status:** Accepted (stage 31b, 2026-11-03). Adds an ignore reason that outranks
 every classification rule and the maximized / fullscreen overrides, and
 keeps it out of the floating layer ([ADR-0013](0013-floating-layer-follows-adr-0003.md),
-[ADR-0024](0024-owned-windows-ride-the-floating-layer.md)).
+[ADR-0024](0024-owned-windows-ride-the-floating-layer.md)). The other stage 31b
+change, the square ring for a window without chrome
+(`docs/src/dev-guide/borders.md`, *Corner preference*), is amended by
+[ADR-0027](0027-restore-seat-and-frameless-corners.md): a window whose client
+area covers the whole window is square too.
 
 ## Context
 

@@ -26,6 +26,7 @@
 //! [`mutations::next_available_window`] (same-column sibling first, then left, then right).
 
 use crate::common::WindowId;
+use crate::config::types::MinimizeRestoreStrategy;
 use crate::registry::hooks::remove_float_hwnd;
 use crate::registry::types::{FloatingState, ReclassifyResult, VisibilityChange, WindowState};
 use crate::registry::win32 as registry_win32;
@@ -404,6 +405,11 @@ impl FlowWM {
         }
 
         let was_tiling = self.registry.is_tiling(hwnd);
+        // Its seat, read while it still has one: the restore puts it back
+        // there (ADR-0027).
+        if was_tiling {
+            self.capture_restore_seat(WindowId(hwnd));
+        }
         self.registry.minimize_window(hwnd);
 
         if was_tiling {
@@ -739,9 +745,10 @@ impl FlowWM {
 
         // After restore, check if the window is now tiling-active. It goes
         // back to the monitor it was minimized from (owning-monitor memory),
-        // not to wherever its parked rect happens to be nearest.
+        // not to wherever its parked rect happens to be nearest, into the
+        // column it left (restore seat), and the view follows it (ADR-0027).
         if self.registry.is_tiling(hwnd) {
-            self.readd_tile_to_home_monitor(hwnd);
+            self.readd_tile(hwnd, true);
         } else {
             self.seat_float_if_unseated(hwnd);
             self.resync_returning_float(hwnd);
@@ -1151,14 +1158,27 @@ impl FlowWM {
         log::info!("recovered float hwnd {hwnd} seated at {rect:?}");
     }
 
-    /// Append a returning tiled window (restored, re-shown, or recovered
-    /// from maximized) to the strip of its home monitor
-    /// ([`home_monitor_for_hwnd`](Self::home_monitor_for_hwnd)) and animate
-    /// it in. A window that is already seated somewhere (the hotplug
-    /// reconcile seats the windows it restores itself) is left where it is
-    /// and only its registry slot and rect are re-synced.
+    /// Append a returning tiled window (re-shown, or recovered from
+    /// maximized) to the strip of its home monitor; see
+    /// [`readd_tile`](Self::readd_tile) (no view follow).
     pub(super) fn readd_tile_to_home_monitor(&mut self, hwnd: isize) {
+        self.readd_tile(hwnd, false);
+    }
+
+    /// Seat a returning tiled window (restored, re-shown, or recovered from
+    /// maximized) in the strip of its home monitor
+    /// ([`home_monitor_for_hwnd`](Self::home_monitor_for_hwnd)) and animate
+    /// it in: back into the column it was minimized from when its restore
+    /// seat applies ([`plan_restore_seat`](super::restore_seat::plan_restore_seat)),
+    /// else appended at the far right. With `follow` (the restore hook) the
+    /// view scrolls to it like a focus move and, when Windows made it the
+    /// foreground, it becomes the focus. A window that is already seated
+    /// somewhere (the hotplug reconcile seats the windows it restores
+    /// itself) is left where it is and only its registry slot and rect are
+    /// re-synced. The restore seat is used up either way.
+    pub(super) fn readd_tile(&mut self, hwnd: isize, follow: bool) {
         let wid = WindowId(hwnd);
+        let seat = self.registry.take_restore_seat(hwnd);
         if let Some(idx) = self.monitor_index_containing(wid) {
             if let Some(ws_id) = self.monitors[idx].find_workspace_containing(wid)
                 && let Some(ws) = self.monitors[idx].workspace(ws_id)
@@ -1172,11 +1192,47 @@ impl FlowWM {
             return;
         }
         let idx = self.home_monitor_for_hwnd(hwnd);
-        let mut applied = self.monitors[idx].active_scrolling_mut().add_window(wid);
+        let ws_id = self.monitors[idx].active_workspace_id();
+        let columns = self.monitors[idx]
+            .active_scrolling()
+            .virtual_layout()
+            .columns
+            .len();
+        // `[minimize_restore] strategy` decides where a restore goes; a
+        // re-show or a maximize recovery is always appended.
+        let strategy = if follow {
+            self.config.minimize_restore.strategy
+        } else {
+            MinimizeRestoreStrategy::AppendRight
+        };
+        let plan = match strategy {
+            MinimizeRestoreStrategy::OriginalSlot => {
+                super::restore_seat::plan_restore_seat(seat, idx, ws_id.0, columns)
+            }
+            _ => None,
+        };
+        let strip = self.monitors[idx].active_scrolling_mut();
+        let mut applied = match (plan, strategy) {
+            (Some(p), _) => strip.restore_window_at(p.col, p.row, p.alone, wid, Some(p.width_px)),
+            (None, MinimizeRestoreStrategy::RightOfFocused) => strip.insert_window(wid),
+            (None, _) => strip.add_window(wid),
+        };
+        if follow && let Some(view) = strip.ensure_focused_visible() {
+            applied = view;
+        }
+        log::debug!(
+            "window {hwnd:#x} back on monitor {idx} at {}",
+            plan.map_or_else(
+                || "the end".to_owned(),
+                |p| format!("column {} row {}", p.col, p.row)
+            )
+        );
         self.remember_monitor(wid, idx);
+        if follow {
+            self.focus_restored_tile(hwnd, idx);
+        }
         // A fullscreen window comes back as a fullscreen column, in view
         // (ADR-0021), in the same batch.
-        let ws_id = self.monitors[idx].active_workspace_id();
         if let Some(fs) = self.reflag_fullscreen(wid, idx, ws_id, true) {
             applied = fs;
             // An app brings its own full screen back with it, in place.
@@ -1453,6 +1509,198 @@ mod readd_tests {
         flow.on_window_hidden(A);
         assert_eq!(columns_holding(&flow, 2, A), 0);
         assert_eq!(columns_holding(&flow, 1, A), 0);
+    }
+
+    /// The active strip's windows, column by column.
+    fn active_columns(flow: &FlowWM) -> Vec<Vec<isize>> {
+        flow.monitors[0]
+            .active_scrolling()
+            .virtual_layout()
+            .columns
+            .iter()
+            .map(|c| c.rows.iter().map(|r| r.window_id.0).collect())
+            .collect()
+    }
+
+    /// `flow()` plus tiles C and D after A in the active strip.
+    const C: isize = 0xC0;
+    const D: isize = 0xD0;
+    const E: isize = 0xE0;
+    fn flow_acd() -> FlowWM {
+        let mut flow = flow();
+        flow.config.borders.enabled = false;
+        for h in [C, D] {
+            tiled(&mut flow.registry, h);
+            let _ = flow.monitors[0]
+                .active_scrolling_mut()
+                .add_window(WindowId(h));
+            flow.registry.set_monitor(h, 0);
+        }
+        flow
+    }
+
+    fn minimize_and_restore(flow: &mut FlowWM, h: isize) {
+        flow.on_window_minimized(h);
+        assert!(!active_columns(flow).iter().flatten().any(|w| *w == h));
+        flow.registry.restore_window(h);
+        flow.readd_tile(h, true);
+    }
+
+    #[test]
+    fn a_restored_tile_goes_back_into_its_column_and_is_the_strip_focus() {
+        let mut flow = flow_acd();
+        minimize_and_restore(&mut flow, C);
+        assert_eq!(active_columns(&flow), vec![vec![A], vec![C], vec![D]]);
+        assert_eq!(
+            flow.monitors[0].active_scrolling().last_focused_window(),
+            Some(WindowId(C))
+        );
+        // The seat is used up: a later re-show appends.
+        assert!(flow.registry.take_restore_seat(C).is_none());
+    }
+
+    #[test]
+    fn two_minimized_tiles_restored_in_reverse_order_each_find_their_column() {
+        let mut flow = flow_acd();
+        flow.on_window_minimized(A);
+        flow.on_window_minimized(D);
+        assert_eq!(active_columns(&flow), vec![vec![C]]);
+        flow.registry.restore_window(D);
+        flow.readd_tile(D, true);
+        flow.registry.restore_window(A);
+        flow.readd_tile(A, true);
+        assert_eq!(active_columns(&flow), vec![vec![A], vec![C], vec![D]]);
+    }
+
+    #[test]
+    fn a_seat_past_the_end_is_clamped_and_a_stacked_tile_rejoins_its_column() {
+        let mut flow = flow_acd();
+        flow.on_window_minimized(D);
+        let _ = flow.monitors[0]
+            .active_scrolling_mut()
+            .remove_window(WindowId(C));
+        flow.registry.restore_window(D);
+        flow.readd_tile(D, true);
+        assert_eq!(active_columns(&flow), vec![vec![A], vec![D]]);
+        // D stacked under A: minimized from row 1 of column 0, it rejoins.
+        let mut flow = flow_acd();
+        let _ = flow.monitors[0]
+            .active_scrolling_mut()
+            .remove_window(WindowId(D));
+        let _ = flow.monitors[0].active_scrolling_mut().restore_window_at(
+            0,
+            1,
+            false,
+            WindowId(D),
+            None,
+        );
+        assert_eq!(active_columns(&flow), vec![vec![A, D], vec![C]]);
+        minimize_and_restore(&mut flow, D);
+        assert_eq!(active_columns(&flow), vec![vec![A, D], vec![C]]);
+    }
+
+    #[test]
+    fn a_seat_on_a_gone_workspace_lands_in_the_active_one() {
+        let mut flow = flow_acd();
+        flow.on_window_minimized(C);
+        let mut seat = flow.registry.take_restore_seat(C).expect("seat");
+        seat.workspace = 9;
+        flow.registry.set_restore_seat(C, Some(seat));
+        flow.registry.restore_window(C);
+        flow.readd_tile(C, true);
+        assert_eq!(active_columns(&flow), vec![vec![A], vec![C], vec![D]]);
+    }
+
+    #[test]
+    fn the_view_follows_a_tile_restored_out_of_view() {
+        // Four 960 px columns on 1920: the view at the right end shows D, E.
+        let mut flow = flow_acd();
+        tiled(&mut flow.registry, E);
+        let _ = flow.monitors[0]
+            .active_scrolling_mut()
+            .add_window(WindowId(E));
+        flow.registry.set_monitor(E, 0);
+        let strip = flow.monitors[0].active_scrolling_mut();
+        strip.set_focus(WindowId(E));
+        let _ = strip.ensure_focused_visible();
+        assert!(strip.virtual_layout().viewport_offset > 0);
+        // A is minimized out of view, then restored: back at column 0, and
+        // the camera moved to show it.
+        minimize_and_restore(&mut flow, A);
+        assert_eq!(active_columns(&flow)[0], vec![A]);
+        let strip = flow.monitors[0].active_scrolling();
+        let rect = strip
+            .actual_layout()
+            .find(WindowId(A))
+            .expect("projected")
+            .rect;
+        assert!(
+            rect.x >= 0 && rect.x + rect.width <= 1920,
+            "{rect:?} on screen"
+        );
+    }
+
+    #[test]
+    fn in_book_mode_a_restored_tile_is_in_the_open_run_not_a_pile() {
+        use crate::layout::types::{LayoutMode, WrapAround};
+        let mut flow = flow_acd();
+        tiled(&mut flow.registry, E);
+        let _ = flow.monitors[0]
+            .active_scrolling_mut()
+            .add_window(WindowId(E));
+        flow.registry.set_monitor(E, 0);
+        let strip = flow.monitors[0].active_scrolling_mut();
+        let _ = strip.set_layout_mode(LayoutMode::Book, WrapAround::Off);
+        strip.set_focus(WindowId(E));
+        let _ = strip.ensure_focused_visible();
+        let pile = |flow: &FlowWM, h: isize| {
+            flow.monitors[0]
+                .active_scrolling()
+                .actual_layout()
+                .find(WindowId(h))
+                .expect("projected")
+                .pile
+        };
+        assert!(pile(&flow, A).is_some(), "A starts in the left pile");
+        minimize_and_restore(&mut flow, A);
+        assert_eq!(active_columns(&flow)[0], vec![A]);
+        assert_eq!(pile(&flow, A), None, "A is open after the restore");
+    }
+
+    #[test]
+    fn the_minimize_restore_strategy_picks_the_seat() {
+        let mut flow = flow_acd();
+        flow.config.minimize_restore.strategy = MinimizeRestoreStrategy::AppendRight;
+        minimize_and_restore(&mut flow, A);
+        assert_eq!(active_columns(&flow), vec![vec![C], vec![D], vec![A]]);
+        let mut flow = flow_acd();
+        flow.config.minimize_restore.strategy = MinimizeRestoreStrategy::RightOfFocused;
+        flow.on_window_minimized(D);
+        flow.monitors[0]
+            .active_scrolling_mut()
+            .set_focus(WindowId(A));
+        flow.registry.restore_window(D);
+        flow.readd_tile(D, true);
+        assert_eq!(active_columns(&flow), vec![vec![A], vec![D], vec![C]]);
+    }
+
+    #[test]
+    fn a_tile_without_a_seat_is_appended_and_followed() {
+        let mut flow = flow_acd();
+        tiled(&mut flow.registry, E);
+        flow.registry.set_monitor(E, 0);
+        flow.readd_tile(E, true);
+        assert_eq!(active_columns(&flow).last(), Some(&vec![E]));
+        let strip = flow.monitors[0].active_scrolling();
+        let rect = strip
+            .actual_layout()
+            .find(WindowId(E))
+            .expect("projected")
+            .rect;
+        assert!(
+            rect.x >= 0 && rect.x + rect.width <= 1920,
+            "{rect:?} on screen"
+        );
     }
 
     #[test]

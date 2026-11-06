@@ -216,6 +216,14 @@ pub struct Window {
     #[serde(default)]
     pub monitor: Option<usize>,
 
+    /// Where this tile sat when it was **minimized** — the *restore seat*,
+    /// kept next to the owning monitor memory: the restore hook puts the
+    /// window back there instead of appending it (ADR-0027). Set by the
+    /// minimize hook for a seated tile, taken (cleared) by the next re-add.
+    /// Process-local, so never serialised; dropped with the record.
+    #[serde(skip)]
+    pub restore_seat: Option<RestoreSeat>,
+
     /// The window rect (full `GetWindowRect` space, like `pre_manage_rect`)
     /// the window had the **first time it entered a tiled layout** this
     /// run; `None` until then. Recorded once (from `pre_manage_rect` or, for
@@ -325,6 +333,7 @@ impl Window {
             invisible_bounds,
             border: None,
             monitor: None,
+            restore_seat: None,
             pre_tiling_rect: None,
             adopted_from_maximized: false,
             geometry_from_placement: false,
@@ -521,6 +530,28 @@ pub enum IgnoredReason {
     /// is not: UIPI refuses every move, so it is left unmanaged. Decided
     /// once at arrival and never re-evaluated (ADR-0025).
     Elevated,
+}
+
+// ── RestoreSeat ─────────────────────────────────────────────────────
+
+/// The seat a tile left when it was minimized ([`Window::restore_seat`]):
+/// the monitor and workspace of its strip, its column and row there,
+/// whether it had the column to itself, and the column's width. Read by
+/// the daemon's restore hook (ADR-0027).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreSeat {
+    /// Index of the monitor whose strip held the tile.
+    pub monitor: usize,
+    /// Id of the workspace whose strip held the tile.
+    pub workspace: u32,
+    /// Column index in that strip.
+    pub col: usize,
+    /// Row index within the column.
+    pub row: usize,
+    /// The tile was the only row of its column.
+    pub alone: bool,
+    /// The column's width in pixels.
+    pub width_px: i32,
 }
 
 // ── VirtualSlot ─────────────────────────────────────────────────────

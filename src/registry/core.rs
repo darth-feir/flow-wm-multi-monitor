@@ -519,6 +519,22 @@ impl WindowRegistry {
         }
     }
 
+    /// Record (or clear, `None`) the seat tracked `hwnd_val` left when it was
+    /// minimized. See [`Window::restore_seat`].
+    pub fn set_restore_seat(&mut self, hwnd_val: isize, seat: Option<super::types::RestoreSeat>) {
+        if let Some(window) = self.windows.get_mut(&hwnd_val) {
+            window.restore_seat = seat;
+        }
+    }
+
+    /// Take (and clear) the seat `hwnd_val` left when it was minimized.
+    /// See [`Window::restore_seat`].
+    pub fn take_restore_seat(&mut self, hwnd_val: isize) -> Option<super::types::RestoreSeat> {
+        self.windows
+            .get_mut(&hwnd_val)
+            .and_then(|w| w.restore_seat.take())
+    }
+
     /// The remembered owning monitor of `hwnd_val`, if the window is tracked
     /// and has been seated on a monitor before. See [`Window::monitor`].
     #[must_use]

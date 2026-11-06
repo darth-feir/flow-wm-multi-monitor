@@ -51,7 +51,9 @@ pub mod desktop;
 pub use classification::{ClassificationPipeline, WindowCandidate, matches_rule};
 pub use core::WindowRegistry;
 pub use hooks::HookEvent;
-pub use types::{FloatingState, IgnoredReason, TilingState, VirtualSlot, Window, WindowState};
+pub use types::{
+    FloatingState, IgnoredReason, RestoreSeat, TilingState, VirtualSlot, Window, WindowState,
+};
 pub use win32::WindowInfo;
 
 // `desktop` is not re-exported — it's used internally by `main.rs` and the hook

@@ -43,14 +43,14 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetCursorPos, GetDesktopWindow,
-    GetForegroundWindow, GetShellWindow, GetSystemMetrics, GetWindowLongW, GetWindowPlacement,
-    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HWND_NOTOPMOST,
-    HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SM_CXSCREEN,
-    SM_CYSCREEN, SW_MAXIMIZE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOSIZE, SetForegroundWindow, SetWindowPlacement, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WINDOWPLACEMENT, WM_CLOSE, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_THICKFRAME,
+    BringWindowToTop, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetClientRect, GetCursorPos,
+    GetDesktopWindow, GetForegroundWindow, GetShellWindow, GetSystemMetrics, GetWindowLongW,
+    GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible,
+    IsZoomed, PostMessageW, SM_CXSCREEN, SM_CYSCREEN, SW_MAXIMIZE, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SetForegroundWindow,
+    SetWindowPlacement, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT,
+    WM_CLOSE, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_THICKFRAME,
 };
 use windows::core::PWSTR;
 
@@ -999,6 +999,54 @@ pub fn chrome_bits(hwnd_val: isize) -> Option<u32> {
     }
     let style = WINDOW_STYLE(unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32);
     Some((style & (WS_CAPTION | WS_THICKFRAME)).0)
+}
+
+/// Whether a client area of `client_w` x `client_h` covers a window rect of
+/// `window_w` x `window_h` within 1 px: the window has no non-client frame.
+/// The client area always lies inside the window rect, so equal sizes mean
+/// equal rects; comparing sizes only keeps the answer stable while the
+/// window moves (no `ClientToScreen` racing a `SetWindowPos`). Pure half of
+/// [`corner_facts`].
+#[must_use]
+pub const fn client_covers_window(
+    window_w: i32,
+    window_h: i32,
+    client_w: i32,
+    client_h: i32,
+) -> bool {
+    const TOLERANCE: i32 = 1;
+    window_w > 0
+        && window_h > 0
+        && (window_w - client_w).abs() <= TOLERANCE
+        && (window_h - client_h).abs() <= TOLERANCE
+}
+
+/// The facts the border's corner rule reads ([`CornerPreference::resolve`]):
+/// [`chrome_bits`] plus whether the client area covers the window
+/// (`GetClientRect` against `GetWindowRect`, [`client_covers_window`]);
+/// `None` for a handle that is gone. A rect that cannot be read counts as
+/// not covering. See ADR-0027.
+#[must_use]
+pub fn corner_facts(hwnd_val: isize) -> Option<crate::borders::CornerFacts> {
+    let chrome = chrome_bits(hwnd_val)?;
+    let hwnd = HWND(hwnd_val as *mut _);
+    let mut client = RECT::default();
+    // SAFETY: a plain read on a handle IsWindow accepted in `chrome_bits`; a
+    // handle that died since makes it fail, which counts as "frame".
+    let client_ok = unsafe { GetClientRect(hwnd, &mut client) }.is_ok();
+    let client_covers = client_ok
+        && get_window_rect(hwnd).is_ok_and(|w| {
+            client_covers_window(
+                w.width,
+                w.height,
+                client.right - client.left,
+                client.bottom - client.top,
+            )
+        });
+    Some(crate::borders::CornerFacts {
+        chrome,
+        client_covers,
+    })
 }
 
 /// The window facts that decide whether a window flow has not classified
@@ -2202,6 +2250,26 @@ mod tests {
     /// Helper to create an arbitrary invalid HWND (non-null but not a real window).
     fn invalid_hwnd() -> HWND {
         HWND(0xDEAD_BEEF as *mut _)
+    }
+
+    #[test]
+    fn a_client_covers_the_window_only_without_a_frame() {
+        // Alacritty `decorations = "none"` (host, 2026-11-06): 908x1044 both.
+        assert!(client_covers_window(908, 1044, 908, 1044));
+        // Within the 1 px tolerance.
+        assert!(client_covers_window(908, 1044, 907, 1043));
+        // Firefox's custom title bar keeps its invisible resize borders:
+        // window 922x1051, client 906x1043.
+        assert!(!client_covers_window(922, 1051, 906, 1043));
+        // A normal WinForms window: caption and frame.
+        assert!(!client_covers_window(360, 300, 344, 261));
+        // An empty rect (gone, iconic) is no answer.
+        assert!(!client_covers_window(0, 0, 0, 0));
+    }
+
+    #[test]
+    fn corner_facts_of_a_dead_handle_are_none() {
+        assert_eq!(corner_facts(0xDEAD_BEEF), None);
     }
 
     #[test]

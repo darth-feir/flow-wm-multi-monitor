@@ -402,24 +402,29 @@ corner preference (`DwmGetWindowAttribute` with
 "rendering-only" (Option A): the border *matches* whatever corner shape the
 window already has; it never forces a window square or rounded.
 
-**The default resolves from the styles.** A window that never set a preference
-reads `DWMWCP_DEFAULT`, and Windows 11 rounds such a window only when it has a
-caption or a sizing frame (`WS_CAPTION` / `WS_THICKFRAME`). A window with neither
-(Alacritty with `window.decorations = "none"`, a borderless popup, a WinForms
-`FormBorderStyle = None`) is drawn square, so `CornerPreference::resolve` turns
-`Default` into `Square` when the chrome bits are `0`; an explicit preference
-(`Square` / `Rounded` / `RoundedSmall`) is kept as it is. Maximized and fullscreen
-windows are square too, but they have no ring.
+**The default resolves from the window's frame.** A window that never set a
+preference reads `DWMWCP_DEFAULT`, and Windows 11 rounds such a window only when
+it has a non-client frame. `CornerPreference::resolve` reads `CornerFacts`
+(`registry::win32::corner_facts`): the chrome bits (`WS_CAPTION` /
+`WS_THICKFRAME`) and whether the client area covers the whole window (client
+size = window size within 1 px). A window with neither bit (a borderless popup,
+a WinForms `FormBorderStyle = None`) or whose client covers the window
+(Alacritty with `window.decorations = "none"`, which keeps both bits and removes
+its frame in `WM_NCCALCSIZE`) is drawn square, so `Default` turns into `Square`;
+an explicit preference (`Square` / `Rounded` / `RoundedSmall`) is kept as it is.
+Maximized and fullscreen windows are square too, but they have no ring. The
+measurement behind this is in ADR-0027.
 
-**The cache follows the chrome.** Each `Border` keeps the corners it resolved and
-the chrome bits (`GWL_STYLE & (WS_CAPTION | WS_THICKFRAME)`) they came from. A
-refresh (focus change, recolor) reads the style again (one `GetWindowLongW`, no
-cross-process message) and re-reads the DWM preference only when the bits differ,
+**The cache follows the facts.** Each `Border` keeps the corners it resolved and
+the `CornerFacts` they came from. A refresh (focus change, recolor) reads them
+again (one `GetWindowLongW` and two rect reads, no cross-process message) and
+re-reads the DWM preference only when they differ,
 so an app that toggles its decorations live gets the right ring on its next
 refresh. Because an app can toggle while it keeps the focus (no focus event), the
 periodic foreground sync (`[focus] foreground_sync_interval_ms`, 250 ms) also
-checks the focused window's bits (`recheck_focused_corners`). A change is logged
-at debug (`border: window 0x.. chrome changed to 0x..; corners now square`), and
+checks the focused window's facts (`recheck_focused_corners`). A change is logged
+at debug (`border: window 0x.. chrome changed to 0x.. (client covers: true);
+corners now square`), and
 `flow query all` reports each window's `border_corner` (`square`, `default`,
 `rounded`, `rounded-small`; `null` without a ring). An app that changes its DWM
 preference at runtime without touching its styles is not noticed (none known).

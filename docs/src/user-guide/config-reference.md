@@ -406,9 +406,11 @@ easing = "ease-out-expo"
 
 Accepted `strategy` values:
 
-- `"original_slot"` — Restore to the exact column/row it was minimized from.
+- `"original_slot"` — Restore to the exact column/row it was minimized from. The column index is clamped to the strip's current column count (columns closed meanwhile move it towards the end); it rejoins a shared column at its row when that column still has room, else it gets a column of its own at its old width. A window minimized on a workspace that is no longer the visible one (or is gone) comes back in the visible workspace at that index; one whose monitor is gone is appended on its home monitor.
 - `"right_of_focused"` — Restore into a new slot immediately to the right of the currently focused window.
 - `"append_right"` — Append to the rightmost column.
+
+With every strategy the view scrolls to the restored window (strip and book layout), and when Windows gives it the foreground (taskbar click, Alt+Tab) it is the focused window. A window that is re-shown after hiding itself, or recovered from maximized, is appended without a scroll. Why: `docs/adr/0027-restore-seat-and-frameless-corners.md`.
 
 Example:
 
@@ -444,6 +446,15 @@ komorebi/Hyprland-style borders that the default Windows drop-shadow cannot.
 | `focused_color` | `String` | `"#00AAFF"` | Border color for the focused/active window. Hex `#RRGGBB`. |
 | `unfocused_color` | `String` | `"#555555"` | Border color for tiled-but-not-focused windows. Hex `#RRGGBB`. |
 | `floating_color` | `String` | `"#AA00FF"` | Border color for floating windows. Hex `#RRGGBB`. |
+
+The ring's corners are not configured: they follow the window. An app's own
+corner preference (`DWMWA_WINDOW_CORNER_PREFERENCE`) is used as it is; a
+window without one gets a rounded ring, or a square ring when it has no
+caption and no sizing frame, or when its client area covers the whole window
+(it draws its own frame, as Alacritty with `window.decorations = "none"`
+does). `flow query all` reports the result per window as `border_corner`
+(`default` = rounded, `square`, `rounded`, `rounded-small`; `null` without a
+ring). Why: `docs/adr/0027-restore-seat-and-frameless-corners.md`.
 
 Example:
 
@@ -649,7 +660,7 @@ same table are an error.
 | `focus-workspace N` | `switch-workspace N` | N from 1 |
 | `move-column-to-workspace N` (also `move-window-to-workspace N`) | `move-to-workspace N` | |
 | `close-window` | `close-window` | |
-| `minimize-window` | `minimize-window` | the focused tile or float leaves the layout, the focus moves to its successor on the same screen; a restore (taskbar) puts it back in its slot; Mod+M by default |
+| `minimize-window` | `minimize-window` | the focused tile or float leaves the layout, the focus moves to its successor on the same screen; a restore (taskbar, Alt+Tab) puts it back in its slot and scrolls it into view (`[minimize_restore]`); Mod+M by default |
 | `center-column` | `center` | |
 | `toggle-window-floating`, `move-window-to-floating`, `move-window-to-tiling` | `set-window cycle` / `float` / `tile` | |
 | `switch-focus-between-floating-and-tiling` | `switch-focus-between-floating-and-tiling` | focus the other side: the float used last (else the top one), or the strip's last tile; Mod+Shift+V by default |

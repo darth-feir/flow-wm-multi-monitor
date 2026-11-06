@@ -148,7 +148,7 @@ impl FlowWM {
                         Ok(b) => {
                             b.note_corner(
                                 style.corner_preference,
-                                crate::registry::win32::chrome_bits(hwnd),
+                                crate::registry::win32::corner_facts(hwnd),
                             );
                             if let Some(rect) = current_rect {
                                 b.set_geometry(rect);
@@ -164,10 +164,11 @@ impl FlowWM {
         }
     }
 
-    /// Re-ring the focused window when its chrome bits changed since its
-    /// border resolved its corners (an app toggling its decorations while it
-    /// keeps the focus, which no focus event reports). Run by the periodic
-    /// foreground sync; costs one `GetWindowLongW`. See
+    /// Re-ring the focused window when its corner facts (chrome bits, client
+    /// covering the window) changed since its border resolved its corners
+    /// (an app toggling its decorations while it keeps the focus, which no
+    /// focus event reports). Run by the periodic foreground sync; costs one
+    /// `GetWindowLongW` and two rect reads. See
     /// `docs/src/dev-guide/borders.md`, *Corner preference*.
     pub(super) fn recheck_focused_corners(&mut self) {
         let Some(focused) = self.registry.focused() else {
@@ -179,7 +180,7 @@ impl FlowWM {
             .and_then(|w| w.border.as_ref())
             .is_some_and(|b| {
                 let noted = b.corner().1;
-                let now = crate::registry::win32::chrome_bits(focused.0);
+                let now = crate::registry::win32::corner_facts(focused.0);
                 noted.is_some() && now.is_some() && noted != now
             });
         if stale {
@@ -206,10 +207,10 @@ impl FlowWM {
 }
 
 /// The corners of `hwnd` for its ring: what `border` resolved when the
-/// target's chrome bits are unchanged, else resolved again (DWM preference
-/// + chrome, [`CornerPreference::resolve`]) and noted on `border`.
+/// target's corner facts are unchanged, else resolved again (DWM preference
+/// + facts, [`CornerPreference::resolve`]) and noted on `border`.
 fn corner_for(hwnd: isize, border: Option<&Border>) -> CornerPreference {
-    let chrome = crate::registry::win32::chrome_bits(hwnd);
+    let chrome = crate::registry::win32::corner_facts(hwnd);
     if let Some(b) = border {
         let (cached, noted) = b.corner();
         match noted {
@@ -228,8 +229,9 @@ fn corner_for(hwnd: isize, border: Option<&Border>) -> CornerPreference {
     let pref = CornerPreference::resolve(dwm, chrome);
     if let Some(b) = border {
         log::debug!(
-            "border: window {hwnd:#x} chrome changed to {:#x}; corners now {}",
-            chrome.unwrap_or(0),
+            "border: window {hwnd:#x} chrome changed to {:#x} (client covers: {}); corners now {}",
+            chrome.map_or(0, |f| f.chrome),
+            chrome.is_some_and(|f| f.client_covers),
             pref.name()
         );
         b.note_corner(pref, chrome);
