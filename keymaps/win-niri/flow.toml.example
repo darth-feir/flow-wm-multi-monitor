@@ -74,14 +74,15 @@ edge_hop = false
 new_window_monitor = "focused"
 
 # Key bindings. Without this section the keymap uses its built-in table (binds.toml next to this
-# file: Mod+Arrows focus, Mod+Shift+Arrows move, Mod+1..9 workspaces, Mod+R widths, Mod+T Alacritty,
-# Mod+Space launcher, Mod+Shift+/ help, ...). Entries here are laid over it in niri's spelling: the
+# file: Mod+Arrows focus, Mod+Shift+Arrows move, Mod+wheel like Mod+Left/Right, Mod+1..9 workspaces,
+# Mod+R widths, Mod+T Alacritty, Mod+Space launcher, Mod+Shift+/ help, ...). Entries here are laid over it in niri's spelling: the
 # same chord replaces the default, a new chord is added, "none" unbinds one. Saved changes apply
 # within a few seconds; `flow query binds` shows the result, `flow config check` names mistakes.
 # The full grammar and action table are in the user guide (Config Reference, [binds]).
 [binds]
 # "Mod+Shift+R" = "switch-preset-column-width-back"
 # "Mod+Q" = "none"
+# "Mod+Ctrl+WheelUp" = "none"   # a wheel chord set to none reaches the app again (WheelUp/Down/Left/Right)
 # "Mod+Return" = { spawn = ["alacritty"] }
 # "Mod+Shift+Return" = { spawn = ["wt", "-p", "PowerShell"], admin = true, help = "admin shell" }
 

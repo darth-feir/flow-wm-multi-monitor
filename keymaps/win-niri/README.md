@@ -174,7 +174,9 @@ amendment):
   in the session (masked), which got it from mstsc before the chord was
   known. A Win key seen down for more than 5 s
   counts as released (a release mstsc swallows cannot leave the twins armed).
-  The hardwired chords (Mod+Ctrl+T, Mod+drag) have no twins.
+  The hardwired chords (Mod+Ctrl+T, Mod+drag) and the wheel chords have no
+  twins (a wheel twin would be a bare wheel hotkey), so Mod+wheel there goes
+  to the session.
 
 Win+L (lock) is handled by Windows below the hook layer and is untouched;
 the only ways around that are a keyboard-firmware or registry remap of the
@@ -188,6 +190,14 @@ Alt+H/J/K/L and Alt+Shift+H/J/K/L duplicate Mod+Arrows and Mod+Shift+Arrows
 (upstream's vim-style defaults). While tiling is on they shadow any app menu
 accelerator on those letters (Alt+H opens Help in some apps); tiling off
 releases them like every other window-management chord.
+
+Mod + mouse wheel mirrors the Left / Right arrow chords (wheel up or tilt
+left = Left, wheel down or tilt right = Right) with no modifier, Shift
+(move), Ctrl (screen) and Alt (move to screen); ADR-0029. Each wheel chord
+steps at most once every 150 ms (`WheelCooldownMs` in `flow.ahk`), so one
+flick is one step, and the ticks in between are swallowed. The plain wheel
+is never bound; a wheel chord set to `"none"` in `[binds]` is not registered
+and reaches the app again (Win+Ctrl+wheel zoom, for instance).
 
 Shadowed while the daemon runs: Win+1..9/0 (taskbar launch), Win+C, Win+Q,
 Win+M (minimize all),

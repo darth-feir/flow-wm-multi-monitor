@@ -99,11 +99,21 @@ paste when the defaults change.
 case). The AutoHotkey string is the modifiers' prefixes (`#`, `^`, `!`,
 `+`) and the key's AutoHotkey name. Letters, digits and `F1`..`F24` map to
 themselves; the named keys are a table in `binds.rs` (`BracketLeft` → `[`,
-`Page_Up` → `PgUp`, `WheelScrollDown` → `WheelDown`, ...); `vkXX` / `scXXX`
+`Page_Up` → `PgUp`, `WheelDown` → `WheelDown`, ...), and `KEY_ALIASES`
+maps other spellings onto them (niri's `WheelScrollDown` is `WheelDown`, so
+the two are one chord); `vkXX` / `scXXX`
 pass through for anything else. `Slash` maps to `vkBF`, not `/`, because
 `#+/` never fires in AutoHotkey v2 (the keymap README, *AutoHotkey
 lessons*). A bare key needs a modifier unless it is `Print` or `Pause`, and
 mouse buttons are not accepted at all.
+
+The wheel keys (`Key::is_wheel`) are ordinary keys to the daemon. Two
+places treat them apart: `help_rows` starts a new overlay row when the key
+family changes (arrows, wheel, the rest), so `Mod+WheelUp/WheelDown/...`
+does not swallow `Mod+Left/Down/Up/Right`; and `flow.ahk`'s `ApplyBinds`
+wraps every `...Wheel(Up|Down|Left|Right)` hotkey in `WheelBind` (menu-mask
+key, per-chord 150 ms cooldown) and registers no Remote Desktop twin for it
+([ADR-0029](../../adr/0029-mod-wheel-chords.md)).
 
 ## Actions
 

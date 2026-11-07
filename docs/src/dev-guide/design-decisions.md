@@ -508,3 +508,11 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   keeps the stored value); the 250 ms foreground sync re-measures the focused
   window and moves it into its slot on a change. No per-app rule.
   `docs/adr/0028-late-chrome-invisible-bounds.md`
+- **ADR-0029 — Mod + mouse wheel chords are binds, with a cooldown in the
+  keymap.** The default `[binds]` table maps Mod / Mod+Shift / Mod+Ctrl /
+  Mod+Alt + wheel up or tilt left to the matching Left arrow action and wheel
+  down or tilt right to the Right one (`WheelUp` .. `WheelRight`, niri's
+  `WheelScroll*` as an alias). `flow.ahk` masks the Win release and lets each
+  wheel chord step at most once per 150 ms, swallowing the ticks between; the
+  plain wheel and unbound chords are never registered, and wheel chords get
+  no Remote Desktop twin. `docs/adr/0029-mod-wheel-chords.md`

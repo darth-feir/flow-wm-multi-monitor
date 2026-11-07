@@ -47,6 +47,9 @@ Registered := []        ; [hotkey, scope] of every chord registered from it
 HelpRows := []          ; [chords, help] rows for help.ahk
 HelpGui := 0            ; the overlay panel, built by help.ahk's BuildHelpGui() from HelpRows (declared here:
                         ; ApplyBinds() runs before the include's own auto-execute lines)
+WheelCooldownMs := 150  ; a Mod+wheel chord steps at most once in this many ms: one flick, one step (ADR-0029)
+WheelLast := Map()      ; chord -> A_TickCount of its last step
+A_MaxHotkeysPerInterval := 400  ; a fast wheel would otherwise trip AutoHotkey's runaway-hotkey dialog
 
 Flow(cmd) {
     global flowExe
@@ -445,6 +448,20 @@ BindCallback(kind, argvText, admin) {
     return 0
 }
 
+; A wheel chord (Mod+WheelUp ...): the Win release is masked as in ModDrag,
+; and the chord steps at most once per WheelCooldownMs; the ticks in between
+; are swallowed too, so the window under the cursor does not scroll.
+; docs/adr/0029-mod-wheel-chords.md
+WheelBind(chord, cb, *) {
+    global WheelLast, WheelCooldownMs
+    Send "{Blind}{vkE8}"
+    now := A_TickCount
+    if (WheelLast.Has(chord) && now - WheelLast[chord] < WheelCooldownMs)
+        return
+    WheelLast[chord] := now
+    cb()
+}
+
 ; Register the listing: the previous set is turned off first (under the
 ; criterion each chord was registered with), then every `bind` record is
 ; registered under its scope's gate and the overlay rows are collected.
@@ -471,6 +488,9 @@ ApplyBinds(text) {
                     failed++
                     continue
                 }
+                wheel := RegExMatch(f[2], "i)Wheel(Up|Down|Left|Right)$")
+                if wheel
+                    cb := WheelBind.Bind(f[6], cb)
                 HotIf(BindGate(f[3]))
                 try {
                     Hotkey(f[2], cb, "On")
@@ -482,7 +502,9 @@ ApplyBinds(text) {
                     continue
                 }
                 ; The Remote Desktop twin of a Win chord (see CheckRdpFullscreen).
-                if RegExMatch(f[2], "^([#^!+<>*~$]*)(.+)$", &m) && InStr(m[1], "#") {
+                ; None for a wheel chord: its twin would be a bare wheel hotkey,
+                ; and the plain wheel is never routed through this script.
+                if !wheel && RegExMatch(f[2], "^([#^!+<>*~$]*)(.+)$", &m) && InStr(m[1], "#") {
                     twin := StrReplace(m[1], "#") m[2]
                     HotIf(BindGate("rdp-" f[3]))
                     try {
@@ -769,6 +791,10 @@ bind	#Left	tiling	dispatch	0	Mod+Left	focus the next window on this screen	focus
 bind	#Down	tiling	dispatch	0	Mod+Down	focus the next window on this screen	focus<US>down
 bind	#Up	tiling	dispatch	0	Mod+Up	focus the next window on this screen	focus<US>up
 bind	#Right	tiling	dispatch	0	Mod+Right	focus the next window on this screen	focus<US>right
+bind	#WheelUp	tiling	dispatch	0	Mod+WheelUp	focus the next window on this screen	focus<US>left
+bind	#WheelDown	tiling	dispatch	0	Mod+WheelDown	focus the next window on this screen	focus<US>right
+bind	#WheelLeft	tiling	dispatch	0	Mod+WheelLeft	focus the next window on this screen	focus<US>left
+bind	#WheelRight	tiling	dispatch	0	Mod+WheelRight	focus the next window on this screen	focus<US>right
 bind	!h	tiling	dispatch	0	Alt+H	focus the next window on this screen	focus<US>left
 bind	!j	tiling	dispatch	0	Alt+J	focus the next window on this screen	focus<US>down
 bind	!k	tiling	dispatch	0	Alt+K	focus the next window on this screen	focus<US>up
@@ -777,6 +803,10 @@ bind	#+Left	tiling	dispatch	0	Mod+Shift+Left	move the window along the strip (up
 bind	#+Down	tiling	dispatch	0	Mod+Shift+Down	move the window along the strip (up/down inside a stacked column)	move-window<US>down
 bind	#+Up	tiling	dispatch	0	Mod+Shift+Up	move the window along the strip (up/down inside a stacked column)	move-window<US>up
 bind	#+Right	tiling	dispatch	0	Mod+Shift+Right	move the window along the strip (up/down inside a stacked column)	move-window<US>right
+bind	#+WheelUp	tiling	dispatch	0	Mod+Shift+WheelUp	move the window along the strip (up/down inside a stacked column)	move-window<US>left
+bind	#+WheelDown	tiling	dispatch	0	Mod+Shift+WheelDown	move the window along the strip (up/down inside a stacked column)	move-window<US>right
+bind	#+WheelLeft	tiling	dispatch	0	Mod+Shift+WheelLeft	move the window along the strip (up/down inside a stacked column)	move-window<US>left
+bind	#+WheelRight	tiling	dispatch	0	Mod+Shift+WheelRight	move the window along the strip (up/down inside a stacked column)	move-window<US>right
 bind	!+h	tiling	dispatch	0	Alt+Shift+H	move the window along the strip (up/down inside a stacked column)	move-window<US>left
 bind	!+j	tiling	dispatch	0	Alt+Shift+J	move the window along the strip (up/down inside a stacked column)	move-window<US>down
 bind	!+k	tiling	dispatch	0	Alt+Shift+K	move the window along the strip (up/down inside a stacked column)	move-window<US>up
@@ -785,10 +815,18 @@ bind	#^Left	tiling	dispatch	0	Mod+Ctrl+Left	focus the other screen	focus-monitor
 bind	#^Down	tiling	dispatch	0	Mod+Ctrl+Down	focus the other screen	focus-monitor<US>down
 bind	#^Up	tiling	dispatch	0	Mod+Ctrl+Up	focus the other screen	focus-monitor<US>up
 bind	#^Right	tiling	dispatch	0	Mod+Ctrl+Right	focus the other screen	focus-monitor<US>right
+bind	#^WheelUp	tiling	dispatch	0	Mod+Ctrl+WheelUp	focus the other screen	focus-monitor<US>left
+bind	#^WheelDown	tiling	dispatch	0	Mod+Ctrl+WheelDown	focus the other screen	focus-monitor<US>right
+bind	#^WheelLeft	tiling	dispatch	0	Mod+Ctrl+WheelLeft	focus the other screen	focus-monitor<US>left
+bind	#^WheelRight	tiling	dispatch	0	Mod+Ctrl+WheelRight	focus the other screen	focus-monitor<US>right
 bind	#!Left	tiling	dispatch	0	Mod+Alt+Left	move the window to the other screen	move-to-monitor<US>left
 bind	#!Down	tiling	dispatch	0	Mod+Alt+Down	move the window to the other screen	move-to-monitor<US>down
 bind	#!Up	tiling	dispatch	0	Mod+Alt+Up	move the window to the other screen	move-to-monitor<US>up
 bind	#!Right	tiling	dispatch	0	Mod+Alt+Right	move the window to the other screen	move-to-monitor<US>right
+bind	#!WheelUp	tiling	dispatch	0	Mod+Alt+WheelUp	move the window to the other screen	move-to-monitor<US>left
+bind	#!WheelDown	tiling	dispatch	0	Mod+Alt+WheelDown	move the window to the other screen	move-to-monitor<US>right
+bind	#!WheelLeft	tiling	dispatch	0	Mod+Alt+WheelLeft	move the window to the other screen	move-to-monitor<US>left
+bind	#!WheelRight	tiling	dispatch	0	Mod+Alt+WheelRight	move the window to the other screen	move-to-monitor<US>right
 bind	#1	tiling	dispatch	0	Mod+1	switch to workspace 1	switch-workspace<US>1
 bind	#2	tiling	dispatch	0	Mod+2	switch to workspace 2	switch-workspace<US>2
 bind	#3	tiling	dispatch	0	Mod+3	switch to workspace 3	switch-workspace<US>3
@@ -828,11 +866,15 @@ bind	#!+t	always	spawn	1	Mod+Alt+Shift+T	run wt as admin	wt
 bind	#+vkBF	always	help	0	Mod+Shift+Slash	this help (Esc hides it)	
 bind	#+e	always	quit	0	Mod+Shift+E	stop FlowWM	
 row	Mod+Left/Down/Up/Right	focus the next window on this screen
+row	Mod+WheelUp/WheelDown/WheelLeft/WheelRight	focus the next window on this screen
 row	Alt+H/J/K/L	focus the next window on this screen
 row	Mod+Shift+Left/Down/Up/Right	move the window along the strip (up/down inside a stacked column)
+row	Mod+Shift+WheelUp/WheelDown/WheelLeft/WheelRight	move the window along the strip (up/down inside a stacked column)
 row	Alt+Shift+H/J/K/L	move the window along the strip (up/down inside a stacked column)
 row	Mod+Ctrl+Left/Down/Up/Right	focus the other screen
+row	Mod+Ctrl+WheelUp/WheelDown/WheelLeft/WheelRight	focus the other screen
 row	Mod+Alt+Left/Down/Up/Right	move the window to the other screen
+row	Mod+Alt+WheelUp/WheelDown/WheelLeft/WheelRight	move the window to the other screen
 row	Mod+1..9, Mod+0	switch to that workspace
 row	Mod+Ctrl+1..9, Mod+Ctrl+0	move the window to that workspace
 row	Mod+Q	close window

@@ -117,11 +117,25 @@ const NAMED_KEYS: &[(&str, &str)] = &[
     ("Comma", ","),
     ("Period", "."),
     ("Slash", "vkBF"),
+    ("WheelUp", "WheelUp"),
+    ("WheelDown", "WheelDown"),
+    ("WheelLeft", "WheelLeft"),
+    ("WheelRight", "WheelRight"),
+];
+
+/// Other spellings of a named key: the alias on the left, the canonical
+/// name in [`NAMED_KEYS`] on the right. niri spells the wheel
+/// `WheelScrollDown`; both parse to one chord.
+const KEY_ALIASES: &[(&str, &str)] = &[
     ("WheelScrollUp", "WheelUp"),
     ("WheelScrollDown", "WheelDown"),
     ("WheelScrollLeft", "WheelLeft"),
     ("WheelScrollRight", "WheelRight"),
 ];
+
+/// The mouse-wheel keys (canonical names). The keymap gives their chords a
+/// per-chord cooldown so one flick is one step (ADR-0029).
+const WHEEL_KEYS: &[&str] = &["WheelUp", "WheelDown", "WheelLeft", "WheelRight"];
 
 /// Keys that may be bound without a modifier (a bare letter or digit would
 /// swallow typing).
@@ -161,6 +175,10 @@ impl Key {
                 });
             }
         }
+        let word = KEY_ALIASES
+            .iter()
+            .find(|(alias, _)| alias.eq_ignore_ascii_case(word))
+            .map_or(word, |(_, name)| *name);
         if let Some((name, ahk)) = NAMED_KEYS
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(word))
@@ -214,6 +232,21 @@ impl Key {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Whether this is a mouse-wheel key (`WheelUp` .. `WheelRight`).
+    #[must_use]
+    pub fn is_wheel(&self) -> bool {
+        WHEEL_KEYS.contains(&self.name.as_str())
+    }
+
+    /// The overlay groups keys of one family on a row: arrows, wheel, the rest.
+    fn family(&self) -> u8 {
+        match self.name.as_str() {
+            "Left" | "Right" | "Up" | "Down" => 0,
+            _ if self.is_wheel() => 1,
+            _ => 2,
+        }
     }
 
     /// Whether this is a digit key.
@@ -1255,8 +1288,10 @@ pub fn report(binds: &[Bind], from_config: bool) -> BindsReport {
 }
 
 /// Collapse the binds into overlay rows: consecutive binds of the same
-/// group with the same modifiers share a row (`Mod+Left/Down/Up/Right`,
-/// `Mod+1..9, Mod+0`, `Alt+H/J/K/L`); everything else is one row each.
+/// group with the same modifiers and the same key family (arrows, wheel,
+/// other) share a row (`Mod+Left/Down/Up/Right`,
+/// `Mod+WheelUp/WheelDown/WheelLeft/WheelRight`, `Mod+1..9, Mod+0`,
+/// `Alt+H/J/K/L`); everything else is one row each.
 #[must_use]
 pub fn help_rows(binds: &[Bind]) -> Vec<HelpRow> {
     let mut rows: Vec<HelpRow> = Vec::new();
@@ -1269,6 +1304,7 @@ pub fn help_rows(binds: &[Bind]) -> Vec<HelpRow> {
         while j < binds.len()
             && binds[j].action.group == first.action.group
             && binds[j].chord.mod_prefix() == prefix
+            && binds[j].chord.key().family() == first.chord.key().family()
         {
             keys.push(binds[j].chord.key());
             j += 1;
@@ -1297,7 +1333,7 @@ fn group_help(action: &Action) -> String {
     }
 }
 
-/// `prefix` + the keys: `/`-joined for arrows and letters, `a..b` runs for
+/// `prefix` + the keys: `/`-joined for arrows, wheel keys and letters, `a..b` runs for
 /// consecutive digits, otherwise each chord in full, comma-separated.
 fn collapse_keys(prefix: &str, keys: &[&Key]) -> String {
     if keys.len() == 1 {
@@ -1305,6 +1341,7 @@ fn collapse_keys(prefix: &str, keys: &[&Key]) -> String {
     }
     let simple = keys.iter().all(|k| {
         matches!(k.name(), "Left" | "Right" | "Up" | "Down")
+            || k.is_wheel()
             || k.name().len() == 1 && k.digit().is_none()
     });
     if simple {
@@ -1460,6 +1497,85 @@ mod tests {
         assert!(err("Mod+F25").contains("unknown key"));
         assert!(err("Mod+MouseLeft").contains("mouse buttons"));
         assert!(err("Mod+LButton").contains("mouse buttons"));
+    }
+
+    #[test]
+    fn wheel_keys_parse_in_both_spellings_and_never_bare() {
+        for (text, canonical, ahk) in [
+            ("Mod+WheelUp", "Mod+WheelUp", "#WheelUp"),
+            ("mod+wheeldown", "Mod+WheelDown", "#WheelDown"),
+            ("Shift+Mod+WheelLeft", "Mod+Shift+WheelLeft", "#+WheelLeft"),
+            ("Alt+Win+WheelRight", "Mod+Alt+WheelRight", "#!WheelRight"),
+            ("Mod+Ctrl+WheelScrollUp", "Mod+Ctrl+WheelUp", "#^WheelUp"),
+            ("Mod+WheelScrollRight", "Mod+WheelRight", "#WheelRight"),
+        ] {
+            let c = Chord::parse(text).expect(text);
+            assert_eq!(c.canonical(), canonical, "{text}");
+            assert_eq!(c.ahk(), ahk, "{text}");
+            assert!(c.key().is_wheel(), "{text}");
+        }
+        assert!(!Chord::parse("Mod+Left").unwrap().key().is_wheel());
+        // niri's spelling and ours are one chord.
+        assert_eq!(
+            Chord::parse("Mod+WheelScrollDown").unwrap(),
+            Chord::parse("Mod+WheelDown").unwrap()
+        );
+        // The plain wheel is never bound: apps keep scrolling.
+        for bare in [
+            "WheelUp",
+            "WheelDown",
+            "WheelLeft",
+            "WheelRight",
+            "WheelScrollUp",
+        ] {
+            assert!(
+                Chord::parse(bare).expect_err(bare).contains("no modifier"),
+                "{bare}"
+            );
+        }
+        let err = Chord::parse("Mod+WheelSideways").expect_err("bogus wheel");
+        assert!(err.contains("unknown key \"WheelSideways\""), "{err}");
+        assert!(
+            err.contains("WheelUp, WheelDown, WheelLeft, WheelRight"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn two_spellings_of_one_wheel_chord_are_refused() {
+        let p = parse_binds(
+            "[binds]
+\"Mod+WheelUp\" = \"focus-column-left\"
+\"Mod+WheelScrollUp\" = \"focus-column-right\"
+",
+        )
+        .resolve()
+        .expect_err("same chord twice");
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("the same chord as"), "{p:?}");
+    }
+
+    #[test]
+    fn a_user_table_remaps_and_clears_wheel_chords() {
+        let binds = parse_binds(
+            "[binds]
+\"Mod+WheelDown\" = \"focus-monitor-right\"
+\"Mod+WheelUp\" = \"none\"
+",
+        )
+        .resolve()
+        .unwrap();
+        let find = |c: &str| binds.iter().find(|b| b.chord.canonical() == c);
+        assert_eq!(
+            find("Mod+WheelDown").unwrap().action.argv,
+            vec!["focus-monitor", "right"]
+        );
+        assert!(find("Mod+WheelUp").is_none());
+        assert_eq!(
+            find("Mod+WheelLeft").unwrap().action.argv,
+            vec!["focus", "left"]
+        );
+        assert_eq!(binds.len(), default_binds().len() - 1);
     }
 
     #[test]
@@ -1659,14 +1775,44 @@ mod tests {
         assert_eq!(find("Mod+Shift+Slash").action.kind, ActionKind::Help);
         assert_eq!(find("Mod+Shift+Slash").chord.ahk(), "#+vkBF");
         assert_eq!(find("Mod+Shift+E").action.kind, ActionKind::Quit);
+        // The wheel mirrors the Left / Right arrows (tilt = the same as up / down).
+        for (mods, left, right) in [
+            ("Mod+", vec!["focus", "left"], vec!["focus", "right"]),
+            (
+                "Mod+Shift+",
+                vec!["move-window", "left"],
+                vec!["move-window", "right"],
+            ),
+            (
+                "Mod+Ctrl+",
+                vec!["focus-monitor", "left"],
+                vec!["focus-monitor", "right"],
+            ),
+            (
+                "Mod+Alt+",
+                vec!["move-to-monitor", "left"],
+                vec!["move-to-monitor", "right"],
+            ),
+        ] {
+            for key in ["WheelUp", "WheelLeft"] {
+                let b = find(&format!("{mods}{key}"));
+                assert_eq!(b.action.argv, left, "{mods}{key}");
+                assert_eq!(b.action.argv, find(&format!("{mods}Left")).action.argv);
+            }
+            for key in ["WheelDown", "WheelRight"] {
+                let b = find(&format!("{mods}{key}"));
+                assert_eq!(b.action.argv, right, "{mods}{key}");
+                assert_eq!(b.action.argv, find(&format!("{mods}Right")).action.argv);
+            }
+        }
         // Mod+Minus / Mod+Equal left the defaults in stage 20.
         assert!(
             binds
                 .iter()
                 .all(|b| !matches!(b.chord.canonical().as_str(), "Mod+Minus" | "Mod+Equal"))
         );
-        // focus 8, move 8, monitors 8, workspaces 20, q alt+m c v shift+v r f shift+b [ ] = 10, programs 6, help + quit.
-        assert_eq!(binds.len(), 8 + 8 + 8 + 20 + 10 + 6 + 2);
+        // focus 8, move 8, monitors 8, wheel 16, workspaces 20, q alt+m c v shift+v r f shift+b [ ] = 10, programs 6, help + quit.
+        assert_eq!(binds.len(), 8 + 8 + 8 + 16 + 20 + 10 + 6 + 2);
     }
 
     #[test]
@@ -1776,14 +1922,18 @@ mod tests {
         let rows = help_rows(&default_binds());
         let chords: Vec<&str> = rows.iter().map(|r| r.chords.as_str()).collect();
         assert_eq!(
-            &chords[..10],
+            &chords[..14],
             &[
                 "Mod+Left/Down/Up/Right",
+                "Mod+WheelUp/WheelDown/WheelLeft/WheelRight",
                 "Alt+H/J/K/L",
                 "Mod+Shift+Left/Down/Up/Right",
+                "Mod+Shift+WheelUp/WheelDown/WheelLeft/WheelRight",
                 "Alt+Shift+H/J/K/L",
                 "Mod+Ctrl+Left/Down/Up/Right",
+                "Mod+Ctrl+WheelUp/WheelDown/WheelLeft/WheelRight",
                 "Mod+Alt+Left/Down/Up/Right",
+                "Mod+Alt+WheelUp/WheelDown/WheelLeft/WheelRight",
                 "Mod+1..9, Mod+0",
                 "Mod+Ctrl+1..9, Mod+Ctrl+0",
                 "Mod+Q",
@@ -1791,7 +1941,9 @@ mod tests {
             ]
         );
         assert_eq!(rows[0].help, "focus the next window on this screen");
-        assert_eq!(rows[6].help, "switch to that workspace");
+        assert_eq!(rows[1].help, "focus the next window on this screen");
+        assert_eq!(rows[9].help, "move the window to the other screen");
+        assert_eq!(rows[10].help, "switch to that workspace");
         assert!(
             chords.contains(&"Mod+BracketLeft, Mod+BracketRight"),
             "{chords:?}"
@@ -1799,8 +1951,8 @@ mod tests {
         assert!(chords.contains(&"Mod+Space, Mod+D"), "{chords:?}");
         assert!(chords.contains(&"Mod+Shift+Slash"));
         assert_eq!(*chords.last().unwrap(), "Mod+Shift+E");
-        // 2 focus + 2 move + monitors 2 + workspaces 2 + q alt+m c v shift+v r f shift+b + consume + launcher + 4 spawn + help + quit
-        assert_eq!(rows.len(), 2 + 2 + 2 + 2 + 8 + 1 + 1 + 4 + 1 + 1);
+        // 2 focus + 2 move + monitors 2 + wheel 4 + workspaces 2 + q alt+m c v shift+v r f shift+b + consume + launcher + 4 spawn + help + quit
+        assert_eq!(rows.len(), 2 + 2 + 2 + 4 + 2 + 8 + 1 + 1 + 4 + 1 + 1);
     }
 
     #[test]

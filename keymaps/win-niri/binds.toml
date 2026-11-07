@@ -38,6 +38,26 @@
 "Mod+Alt+Up" = "move-column-to-monitor-up"
 "Mod+Alt+Right" = "move-column-to-monitor-right"
 
+# The mouse wheel with Mod mirrors the Left / Right arrow chords: wheel up or tilt left = Left,
+# wheel down or tilt right = Right. One flick is one step (the keymap's cooldown); the plain
+# wheel is never bound, so apps scroll as usual.
+"Mod+WheelUp" = "focus-column-left"
+"Mod+WheelDown" = "focus-column-right"
+"Mod+WheelLeft" = "focus-column-left"
+"Mod+WheelRight" = "focus-column-right"
+"Mod+Shift+WheelUp" = "move-column-left"
+"Mod+Shift+WheelDown" = "move-column-right"
+"Mod+Shift+WheelLeft" = "move-column-left"
+"Mod+Shift+WheelRight" = "move-column-right"
+"Mod+Ctrl+WheelUp" = "focus-monitor-left"
+"Mod+Ctrl+WheelDown" = "focus-monitor-right"
+"Mod+Ctrl+WheelLeft" = "focus-monitor-left"
+"Mod+Ctrl+WheelRight" = "focus-monitor-right"
+"Mod+Alt+WheelUp" = "move-column-to-monitor-left"
+"Mod+Alt+WheelDown" = "move-column-to-monitor-right"
+"Mod+Alt+WheelLeft" = "move-column-to-monitor-left"
+"Mod+Alt+WheelRight" = "move-column-to-monitor-right"
+
 # Workspaces 1..10 (Mod+0 is the tenth).
 "Mod+1" = "focus-workspace 1"
 "Mod+2" = "focus-workspace 2"

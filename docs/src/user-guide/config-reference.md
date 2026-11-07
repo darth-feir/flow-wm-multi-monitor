@@ -667,7 +667,7 @@ shows what is bound. See `flow query binds` for the resolved list.
 "Mod+Shift+Q" = "close-window"             # ... and put it elsewhere
 "Mod+Return" = { spawn = ["alacritty"] }   # run a program
 "Mod+Shift+Return" = { spawn = ["wt", "-p", "PowerShell"], admin = true, help = "admin shell" }
-"Mod+Shift+WheelScrollDown" = "focus-column-right"
+"Mod+Ctrl+WheelUp" = "none"               # give Ctrl+wheel (zoom) back to apps while Win is held
 "Mod+X" = "dispatch width 1/2"             # anything `flow dispatch` accepts
 ```
 
@@ -676,10 +676,12 @@ key. Modifiers: `Mod` (also `Super`, `Win` — the Windows key), `Ctrl`
 (`Control`), `Alt`, `Shift`. Keys: a letter, a digit, `F1`..`F24`, one of
 `Left Right Up Down Home End Page_Up Page_Down Insert Delete BackSpace
 Return Tab Escape Space Print Pause Minus Equal BracketLeft BracketRight
-Semicolon Apostrophe Grave Backslash Comma Period Slash WheelScrollUp
-WheelScrollDown WheelScrollLeft WheelScrollRight`, or a raw AutoHotkey
-`vkXX` / `scXXX` code. A bare key needs a modifier (`Print` and `Pause`
-excepted); mouse buttons are not configurable. `Mod+Ctrl+T` and
+Semicolon Apostrophe Grave Backslash Comma Period Slash WheelUp
+WheelDown WheelLeft WheelRight` (niri's `WheelScrollUp` .. `WheelScrollRight`
+are the same keys; `WheelLeft` / `WheelRight` are the tilt), or a raw
+AutoHotkey `vkXX` / `scXXX` code. A bare key needs a modifier (`Print` and
+`Pause` excepted), so the plain wheel is never bound; mouse buttons are not
+configurable. `Mod+Ctrl+T` and
 `Mod+Ctrl+Shift+T` are reserved by the keymap (FlowWM off/on, tiling
 pause), as is Mod + left-button drag. Two spellings of one chord in the
 same table are an error.
@@ -714,6 +716,16 @@ same table are an error.
 | `quit` | `flow stop` and the keymap exits | |
 | `none` | unbinds the chord | |
 | `{ spawn = ["prog", "arg", ...], admin = false, help = "..." }` | runs the program | see below |
+
+**The mouse wheel.** The built-in table binds Mod, Mod+Shift, Mod+Ctrl and
+Mod+Alt with the wheel like the Left / Right arrow chords: wheel up or tilt
+left runs `focus-column-left`, `move-column-left`, `focus-monitor-left`,
+`move-column-to-monitor-left`; wheel down or tilt right the `-right`
+action. A wheel chord steps at most once every 150 ms (one flick, one
+step); the ticks in between are swallowed. A chord set to `"none"` is not
+registered at all, so the wheel reaches the app under the cursor again
+with the modifiers held. Inside a Remote Desktop full screen Mod+wheel goes
+to the remote session.
 
 Window-management actions are live while the daemon runs *and tiling is
 on*; `launcher`, `show-hotkey-overlay`, `toggle-tiling`, `quit` and `spawn`
