@@ -358,7 +358,8 @@ requested mode is then applied: `tile`, `float` and `fullscreen` do what
 they say, and `cycle` means `tile` here (the window had no float/tile state
 to flip a moment ago). A window that fails one of FlowWM's gates — a tool
 window, an untitled window, a hidden or cloaked one, a dialog owned by
-another window — is refused with an error that names the gate, e.g.
+another window, a window running elevated (as administrator) while
+FlowWM is not — is refused with an error that names the gate, e.g.
 `focused window is not managed and cannot be registered: not Alt+Tab visible
 (tool window or DWM-cloaked)`. Windows that are minimized when FlowWM starts
 are registered as minimized and tiled (or floated) the moment you restore
@@ -687,7 +688,7 @@ Default hotkey: `Alt + q`
 Minimize the focused window (an active tile or float, a fullscreen one
 included). It leaves the layout like a window you minimized yourself, and the
 focus moves to its successor on the same screen; restoring it (its taskbar
-button) puts it back in its slot. With nothing focused, or with a window flow
+button) puts it back in its slot and scrolls the view to it. With nothing focused, or with a window flow
 does not manage in focus (an ignored or elevated one), the command fails with a
 message and changes nothing.
 
@@ -718,7 +719,8 @@ A few other top-level commands are worth knowing:
 | `flow config check` | List every problem in `flow.toml` (each `[binds]` entry on its own line, preset lists against the attached screens) and `flow-rules.toml` without applying anything — through the running daemon, or locally when none runs. |
 | `flow loadout save [path]` / `flow loadout load [path]` | Save / restore the window arrangement. Without a path the config's `[loadout] default_path` (a plain file name in the config dir) is used. A given path must be a `.json` file with no `..` in it; relative paths are resolved against the config directory, absolute ones used as given. Anything else is refused — by the CLI before sending, and by the daemon for whatever arrives over the pipe. |
 | `flow query binds [--plain]` | The key bindings the daemon resolved from `[binds]` (or the keymap's built-in table) as JSON: chord, AutoHotkey hotkey, action, what it runs, scope, help text, plus the overlay rows. `--plain` prints the tab-separated listing `flow.ahk` registers its hotkeys from. |
-| `flow query all` | Dump every tracked window (state, `mode` — `tiled` / `floating` / `fullscreen` / `minimized` / `hidden` / `ignored` —, `on_top` — whether FlowWM currently keeps it above the tiles (`[floating] always_on_top`) —, rect, column/row, `pile` — `"left"` / `"right"` for a window piled in book layout, else `null` —, …) as JSON, plus the monitors (each with its `width_preset`, `layout` and `wrap_around`) and whether tiling is on (`tiling_enabled`). |
+| `flow query all` | Dump every tracked window (state, `mode` — `tiled` / `floating` / `fullscreen` / `minimized` / `hidden` / `ignored` —, `on_top` — whether FlowWM currently keeps it above the tiles (`[floating] always_on_top`) —, rect, column/row, `pile` — `"left"` / `"right"` for a window piled in book layout, else `null` —, `border_corner` — `"square"` / `"default"` / `"rounded"` / `"rounded-small"`, `null` without a border —, …; a window running elevated while FlowWM is not has the state `Ignored::Elevated`) as JSON, plus the monitors (each with its `width_preset`, `layout` and `wrap_around`) and whether tiling is on (`tiling_enabled`). |
+| `flow spawn <program> [args…]` | Ask the daemon to start a program so that its first window opens on the focused screen, at the slot its new column will get. `<program>` is resolved like a `[startup] spawn` entry (Program Files, `%LOCALAPPDATA%\Programs`, the Store's execution aliases, PATH; a path must be absolute) and started from the home folder. Put `--` before the program when an argument starts with `-`. Exits non-zero when the daemon does not answer or cannot start it. The win-niri keymap's non-admin spawn binds use it. |
 | `flow enable-autostart [--ahk]` | Create the login shortcut in `shell:startup` (idempotent). |
 | `flow disable-autostart` | Remove the login shortcut (idempotent). |
 | `flow update` | Ask GitHub whether something newer than this build exists and print how to update — **it never downloads or installs anything**. Compares the commit the binary was built from with the `[update]` branch (by default the build's own branch of the repository its `origin` pointed at), or the crate version with the latest release when `[update] branch = ""`. Exit code `0` = up to date, `10` = something newer, `2` = api.github.com unreachable, `3` = repository / branch / release not found, `4` = other GitHub error, `5` = no commit embedded in the build. `--check` is accepted and changes nothing. |

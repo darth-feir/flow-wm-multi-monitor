@@ -128,7 +128,8 @@ strategy = "original_slot"
 # - unfocused_color: border color for tiled-but-not-focused windows
 # - floating_color: border color for floating windows
 #
-# Colors are hex strings of the form "#RRGGBB".
+# Colors are hex strings of the form "#RRGGBB". The ring's corners are not
+# configured: they follow the window (square for a frameless window).
 [borders]
 enabled = true
 thickness = 3
@@ -241,7 +242,9 @@ keymap_log = false
 #                       apart from the clipboard, and a middle click on a text
 #                       field or a terminal pastes it; the clipboard is put
 #                       back afterwards. Read through UI Automation, so apps
-#                       that draw their own text (Alacritty) give nothing;
+#                       that draw their own text give nothing (Alacritty is
+#                       read through its copy-on-select instead, which needs
+#                       [selection] save_to_clipboard = true in alacritty.toml);
 #                       password fields are never read or pasted into.
 #                       Elsewhere the middle click is passed on unchanged.
 [keymap]

@@ -7,6 +7,15 @@ config, and start.
 > Already installed and just want the command list? Jump to the
 > [Command Reference](./dispatch-reference.md).
 
+> **This fork.** The steps below are upstream's ([CCpcalvin/flow-wm](https://github.com/CCpcalvin/flow-wm)):
+> `cargo install flow-wm` and the upstream clone install upstream FlowWM, and
+> `flow config init --ahk` writes upstream's `Alt`-based `flow.ahk` (the
+> repository's root `flow.ahk`). The fork (darth-feir/flow-wm-fork, branch
+> `feat/multi-monitor`) is built from its own clone, and its Windows-key
+> keymap is the set of `.ahk` files in `keymaps/win-niri/`, copied by hand
+> next to `flow.toml` together with `flow.toml.example` merged into it; see
+> the repository README, *Using the fork*, and `keymaps/win-niri/README.md`.
+
 ## Prerequisites
 
 FlowWM is a native Windows application and links against Win32, so you need:

@@ -87,8 +87,9 @@ new_window_monitor = "focused"
 
 # The X11-style selection buffer: what you highlight with the mouse is kept apart from the clipboard
 # and a middle click on a text field or a terminal pastes it (the clipboard is put back). Off by
-# default; applies when this file is saved. Limits (Alacritty highlights are not seen, ...) are in
-# README.md next to this file, *Selection buffer*.
+# default; applies when this file is saved. Limits (apps that draw their own text give nothing;
+# Alacritty needs `[selection] save_to_clipboard = true`, ...) are in README.md next to this
+# file, *Selection buffer*.
 # [keymap]
 # selection_buffer = true
 
@@ -98,7 +99,7 @@ new_window_monitor = "focused"
 
 # The floating layer, as in niri: floating windows (Mod+V) and windows your rules ignore (dialogs,
 # popups) always sit above the tiled windows, even when a tile has the focus, so a dialog is never
-# hidden behind the strip. They go back to the normal z-order when tiled, on `tiling off`
-# (Mod+Ctrl+T) and when the daemon stops; a window that was "always on top" by itself keeps that.
+# hidden behind the strip; a dialog owned by a flow window rides along with them. They go back to
+# the normal z-order when tiled, on `tiling off` (Mod+Ctrl+Shift+T) and when the daemon stops; a window that was "always on top" by itself keeps that.
 [floating]
 always_on_top = true

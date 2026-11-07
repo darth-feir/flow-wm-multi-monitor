@@ -19,7 +19,7 @@ setup.
 | `selection.ahk` | The selection buffer (`[keymap] selection_buffer`, off by default): text highlighted with the mouse is kept apart from the clipboard and a middle click pastes it. See *Selection buffer* below. |
 | `help.ahk` | Key-binding overlay (the `show-hotkey-overlay` action, Mod+Shift+/ by default). Its rows come from the same `flow query binds` listing the hotkeys are registered from, so it cannot disagree with them. |
 | `flow-resident.ahk` | Optional resident starter: runs all the time (shortcut in `shell:startup`) and turns Mod+Ctrl+T into an on/off switch for the whole of FlowWM. |
-| `flow.toml.example` | The daemon side of the map: `[columns]` width presets (fractions and `2/3+1/3`-style slot patterns, per-screen `[[columns.screen]]` rules), `edge_hop = false`, and commented `[binds]` / `[startup]` examples. |
+| `flow.toml.example` | The daemon side of the map: `[columns]` width presets (fractions and `2/3+1/3`-style slot patterns, per-screen `[[columns.screen]]` rules), `edge_hop = false`, `[focus] new_window_monitor`, and commented `[binds]` / `[keymap]` / `[startup]` examples. |
 
 Install: copy `flow.ahk`, `flow-exe.ahk`, `selection.ahk`, `launcher.ahk` and `help.ahk` to
 `%USERPROFILE%\.config\flow\` (the files must sit next to each other — the
@@ -190,6 +190,7 @@ accelerator on those letters (Alt+H opens Help in some apps); tiling off
 releases them like every other window-management chord.
 
 Shadowed while the daemon runs: Win+1..9/0 (taskbar launch), Win+C, Win+Q,
+Win+M (minimize all),
 Win+V (clipboard history), Win+R (Run: use the right Win key or the
 launcher), Win+F (Feedback Hub), Win+D (show desktop), Win+T (taskbar
 cycle), Win+Arrows (Snap), Win+Ctrl+Left/Right
@@ -225,6 +226,9 @@ follow the `[binds]` table; the list above is the default one.
   `%LOCALAPPDATA%\Programs\<name>\<name>.exe`, the Store's execution alias
   `%LOCALAPPDATA%\Microsoft\WindowsApps\<name>.exe`, then each `PATH`
   entry — never the working directory; a path is taken only when absolute.
+  A non-admin `.exe` is then started through the daemon (`flow spawn`), so
+  its first window opens on the focused screen; when `flow spawn` cannot be
+  run or exits non-zero the script starts it itself.
   Admin launches use the shell's `RunAs` verb, so UAC prompts as usual; a
   declined prompt is not reported. Programs start in the home folder.
 - **Exit codes without blocking a hotkey:** `DispatchDone` opens the
@@ -286,8 +290,8 @@ Lessons:
   relative to the focused window and lands in the wrong window (it
   happened to work only when the active window sat near the screen origin).
 - **Elevated windows** (UIPI) cannot be moved by this script unless it runs
-  elevated too; the daemon still answers `drag begin`, the window stays put
-  and `drag end` snaps the tile back.
+  elevated too. The daemon leaves them unmanaged (`Ignored(Elevated)`,
+  ADR-0025), so `drag begin` refuses them and the click is swallowed.
 - **The dead zone belongs in the script.** Before it, every Mod+click opened
   and closed a `drag` session, and on a tile the daemon re-committed the
   layout for a gesture that never moved. The threshold is where the cursor

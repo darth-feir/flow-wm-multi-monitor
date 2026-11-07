@@ -68,6 +68,7 @@ classDiagram
         +Option~VirtualSlot~ last_virtual_slot
         +Option~Rect~ tiled_rect
         +InvisibleBounds invisible_bounds
+        +Option~RestoreSeat~ restore_seat
     }
     class VirtualSlot {
         +usize col
@@ -83,8 +84,11 @@ classDiagram
 The `Window` struct ([`src/registry/types.rs`](../../src/registry/types.rs)) is the
 single record for every tracked window. Its `state` field determines how the
 layout engine and animation layer interact with it. `VirtualSlot` bridges the
-registry to the layout engine — when a tiled window is minimized, its column/row
-position is saved here and restored on un-minimize.
+registry to the layout engine — when a tiled window is minimized or hidden, its
+column/row position is saved here. A minimized tile also records its full seat
+in `restore_seat` (`RestoreSeat`: monitor, workspace, column, row, alone, width), which the
+restore hook takes to put it back there (ADR-0027); a float minimized or hidden
+keeps its rect in `last_float_rect`. The diagram shows the core fields only.
 
 ### State Transitions
 

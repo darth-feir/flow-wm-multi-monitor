@@ -23,9 +23,15 @@ features.
 | Remaining IPC stubs | 🜂 Near-term | `PlaceAbove`, `QueryState`, `SetConfigValue`, `ForgetApp`/`ForgetAllApps` (`CheckConfig` done in the fork: ADR-0015) |
 | Floating enhancements | 🜂 Near-term | smart placement, size memory, z-order, gap mgmt |
 | Real cross-column `MoveWindow` | 🜂 Near-term | Left/Right aliased to swap-column; row-preserving move + floating nudge pending |
-| Multi-monitor support | ✅ Done | one `Monitor` + scrolling space per display; windows tile on the monitor they appear on; parked columns and parked workspaces stay off every monitor (neighbours modelled on all four sides); cross-monitor focus/move commands (`focus-monitor`, `move-to-monitor`, edge hops) — see [Command Reference › Monitors](../user-guide/dispatch-reference.md#monitors) |
-| Tiling on/off toggle | ✅ Done | `flow dispatch tiling on\|off\|toggle` (`Alt + Shift + t`): a pause inside the daemon — every tile back on-screen (pre-tiling rect where known, parked workspaces included), borders dropped, hooks registry-only, layout commands refused — and a resume that rebuilds from the live desktop with remembered seats; reported by `flow ping`, `flow query all` and the status file — see [IPC › Tiling on/off](./ipc-and-watchdog.md#tiling-onoff-pause-and-resume) |
+| Multi-monitor support | ✅ Done | one `Monitor` + scrolling space per display; new windows open on the focused monitor (ADR-0023, `[focus] new_window_monitor = "placed"` keeps the one they appear on); parked columns and parked workspaces stay off every monitor (neighbours modelled on all four sides); cross-monitor focus/move commands (`focus-monitor`, `move-to-monitor`, edge hops) — see [Command Reference › Monitors](../user-guide/dispatch-reference.md#monitors) |
+| Tiling on/off toggle | ✅ Done | `flow dispatch tiling on\|off\|toggle` (`Alt + Shift + t` in upstream's `flow.ahk`, Mod+Ctrl+Shift+T in win-niri): a pause inside the daemon — every tile back on-screen (pre-tiling rect where known, parked workspaces included), borders dropped, hooks registry-only, layout commands refused — and a resume that rebuilds from the live desktop with remembered seats; reported by `flow ping`, `flow query all` and the status file — see [IPC › Tiling on/off](./ipc-and-watchdog.md#tiling-onoff-pause-and-resume) |
 | Monitor hotplug | ✅ Done | `WM_DISPLAYCHANGE` / `SPI_SETWORKAREA` debounced into one reconcile: monitors matched by handle → rect → primary, survivors re-projected in place, windows of a vanished display migrated to the monitor Windows reports for them (else the primary), owner memory remapped, everything re-seated instantly — see [IPC & fail-back](./ipc-and-watchdog.md#monitor-hotplug) |
+| Key bindings as config (fork) | ✅ Done | `[binds]` in `flow.toml`, validated by the daemon and registered by the win-niri keymap at runtime; `flow query binds`, `flow config check` (ADR-0015) |
+| Fullscreen and book layout (fork) | ✅ Done | fullscreen is a column of the strip (ADR-0021, ADR-0020 for an app's own full screen); `[columns] layout = "book"` piles the columns out of view (ADR-0022) |
+| New windows on the focused screen (fork) | ✅ Done | `[focus] new_window_monitor`, pre-placement at create, `flow spawn` with a position hint for the keymap's spawn binds and `[startup] spawn` (ADR-0023) |
+| Owned dialogs and elevated windows (fork) | ✅ Done | owned windows of flow windows ride the floating layer (ADR-0024); elevated windows are `Ignored(Elevated)` and never moved (ADR-0025) |
+| Minimize and restore (fork) | ✅ Done | `minimize-window` (Mod+M); a restore returns to the remembered seat per `[minimize_restore] strategy` and scrolls it into view (ADR-0027) |
+| Selection buffer (fork) | ✅ Done | `[keymap] selection_buffer`, highlight then middle-click to paste, in the keymap through UI Automation (ADR-0026) |
 | Cloak parked windows (`DWMWA_CLOAK`) | ◷ Mid-term | read side exists; write side missing |
 | Watchdog + recovery snapshot | ◷ Mid-term | not started; gated on `flow`/`flowd` being complete |
 | Input hooks (DragSession etc.) | ◷ Aspirational | `src/input/` does not exist; drag is covered from the keymap (ADR-0011), resize is not |
@@ -236,6 +242,11 @@ into IPC commands than a re-implemented keyboard hook. `flow`'s role is the
 layout engine and window manager — not the input layer. See
 [Design Decisions](./design-decisions.md) for more on this separation of
 concerns.
+
+The fork keeps the daemon out of the input layer but makes the chords
+configuration: a `[binds]` table in `flow.toml` that the daemon validates and
+lists (`flow query binds`) and the AutoHotkey keymap registers (ADR-0015, see
+[Key Bindings](./keybinds.md)). The daemon still installs no keyboard hook.
 
 Users map their preferred hotkeys to `flow dispatch` CLI calls via their
 chosen keybinding tool. This keeps `flow`'s attack surface small and avoids

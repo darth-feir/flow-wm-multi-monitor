@@ -24,12 +24,16 @@ What the fork adds, each with a page in the Developer Guide (`docs/src/dev-guide
 | **Column widths** | `[columns] presets = ["1/3", "1/2", "1/1"]`: `width cycle` switches every column on the focused screen; a window moved to another screen takes that screen's width. |
 | **Stacked columns** | `[columns] visible_rows` / `max_rows`: a column shows two rows at a time and scrolls through up to four; merging into a full column moves the window past it. `consume-or-expel` merges into, or pops out of, the neighbouring column. |
 | **Book layout** | `[columns] layout = "book"` (per screen too, or `set-layout toggle` / `Mod+Shift+B` at runtime) piles the columns out of view behind the leftmost and rightmost visible columns instead of parking them off-screen, so every window stays on screen and a one-column scroll flips the next card to the top. `wrap_around` lets focus wrap round the strip. |
-| **Fullscreen** | `set-window fullscreen` toggles a real fullscreen (over the taskbar) and puts the window back where it was. |
-| **Floating layer** | `[floating] always_on_top`: floating windows and rule-ignored dialogs stay above the tiled strip, niri style, so nothing hides behind the tiles. |
+| **Fullscreen** | `set-window fullscreen` (`Mod+F`) makes the window's column fullscreen, as in niri: it covers the whole screen (over the taskbar) while the view starts at it, focus moves through it like any column, and toggling again puts it back where it was. Remote Desktop is asked for its own full screen. |
+| **Floating layer** | `[floating] always_on_top`: floating windows and rule-ignored dialogs stay above the tiled strip, niri style, so nothing hides behind the tiles. A dialog owned by a flow window (an error box, a modal) rides along with that layer. |
+| **New windows** | A new window opens on the focused screen (`[focus] new_window_monitor`), already in its slot: programs started from the keymap, by `flow spawn` or by `[startup] spawn` are asked to create their first window there. |
+| **Minimize and restore** | `minimize-window` (`Mod+M`); a restored tile goes back to the column and row it left (`[minimize_restore] strategy`) and the view scrolls to it. |
+| **Elevated windows** | A window running as administrator while FlowWM is not is left unmanaged (Windows refuses to let FlowWM move it) instead of half-managed. |
+| **Borders** | The ring follows the window's own corners; frameless windows (Alacritty without decorations) get a square ring. |
 | **Windows that were already open** | Maximized windows are adopted (`adopt_maximized`), minimized windows are registered from their restore position, Store apps (created cloaked) are picked up when uncloaked, and `set-window` registers an unknown window before acting on it. No more reopening apps so the tiler sees them. |
 | **Update checker** | `flow update` only reports whether the remote branch or release is newer than the commit the binaries were built from (`flow --version` shows it). The self-installer is gone. |
 | **Hardening** | Apps launched from the keymap survive the daemon stopping; the IPC pipe has a real ACL, rejects remote clients and caps message size; loadout paths are validated; window titles are logged only at debug level and logs are pruned (`[logging] keep_days`); dependencies audited clean. |
-| **Keymap** | `keymaps/win-niri/`: the Windows key as Mod with arrow keys, matching niri's defaults, plus a fuzzy launcher (`Mod+Space`), a key-binding overlay (`Mod+Shift+/`), terminal chords, a tiling pause (`Mod+Ctrl+Shift+T`) and an on/off switch (`Mod+Ctrl+T`, via a small resident starter). |
+| **Keymap** | `keymaps/win-niri/`: the Windows key as Mod with arrow keys, matching niri's defaults, plus a fuzzy launcher (`Mod+Space`), a key-binding overlay (`Mod+Shift+/`), terminal chords, a tiling pause (`Mod+Ctrl+Shift+T`), an on/off switch (`Mod+Ctrl+T`, via a small resident starter) and an opt-in X11-style selection buffer (`[keymap] selection_buffer`: highlight, then middle-click to paste). Chords are configuration: a `[binds]` table in `flow.toml`, in niri's spelling. |
 
 ### Using the fork
 
@@ -42,7 +46,7 @@ cargo build --release
 flow config init                 # writes %USERPROFILE%\.config\flow\flow.toml
 ```
 
-Copy `flow.exe` and `flowd.exe` somewhere permanent (for example `%LOCALAPPDATA%\Programs\flow`), copy every `.ahk` file from `keymaps\win-niri\` into `%USERPROFILE%\.config\flow\`, and merge `keymaps\win-niri\flow.toml.example` into your `flow.toml`: it carries the presets, the stack rows, the width floor for 1920-px screens, `adopt_maximized`, `always_on_top` and `edge_hop = false`. Then `flow start --ahk`, or put a shortcut to `flow-resident.ahk` in your Startup folder and press `Mod+Ctrl+T`. The keymap's header lists every chord; `Mod+Shift+/` shows them on screen.
+Copy `flow.exe` and `flowd.exe` somewhere permanent (for example `%LOCALAPPDATA%\Programs\flow`), copy every `.ahk` file from `keymaps\win-niri\` into `%USERPROFILE%\.config\flow\`, and merge `keymaps\win-niri\flow.toml.example` into your `flow.toml`: it carries the presets, the stack rows, the width floor for 1920-px screens, `adopt_maximized`, `always_on_top`, `edge_hop = false`, `new_window_monitor`, and commented `[binds]`, `[keymap]` and `[startup]` examples. Then `flow start --ahk`, or put a shortcut to `flow-resident.ahk` in your Startup folder and press `Mod+Ctrl+T`. The keymap's header lists every chord; `Mod+Shift+/` shows them on screen.
 
 The keymap uses the Windows key directly, so the few chords Windows reserves below the hook layer stay with Windows: `Win+L` always locks. Upstream's firmware-remap advice under [Can I use the Win key?](#can-i-use-the-win-key) still applies if you want those too.
 
@@ -67,6 +71,8 @@ FlowWM exists because the existing Windows tiling managers didn't scroll the way
 ### Install
 
 FlowWM is Windows-only and compiles locally, so you need the **Rust MSVC toolchain** ([rustup](https://rustup.rs/)) plus the **Visual Studio "Desktop development with C++"** workload — it links against Win32, so MinGW/GNU won't work.
+
+(These two paths install upstream FlowWM. For this fork, see [Using the fork](#using-the-fork).)
 
 **From crates.io (recommended):**
 

@@ -51,7 +51,9 @@ flowchart LR
    kind, argv, admin flag, scope, help line), the overlay rows with
    consecutive binds of one group and modifier set collapsed
    (`Mod+Left/Down/Up/Right`, `Mod+1..9, Mod+0`, `Alt+H/J/K/L`), the
-   hardwired chords, and the source (`defaults` or `flow.toml`). `--plain`
+   hardwired chords, the keymap options (`[keymap] selection_buffer`, carried
+   to the script as an `option selection_buffer 0|1` record in `--plain`,
+   ADR-0026), and the source (`defaults` or `flow.toml`). `--plain`
    turns the JSON into the tab-separated listing the script parses
    (`config::binds::plain_text`); the conversion runs in the CLI, which the
    keymap always runs from the daemon's own directory (`FLOW_BIN`), so the
@@ -64,7 +66,9 @@ flowchart LR
    window-management chords, `AlwaysGate` (daemon up) for the launcher, the
    overlay, programs, the pause and quit actions. The callback is built from
    the record's kind: `dispatch` runs `flow dispatch <argv>` through the
-   script's non-blocking `D()`, `spawn` resolves and starts the program,
+   script's non-blocking `D()`, `spawn` resolves the program and starts it
+   through `flow spawn` (non-admin `.exe`, so it opens on the focused screen,
+   ADR-0023) or itself (admin, or no daemon),
    `launcher` / `help` / `quit` / `toggle-tiling` call the script's own
    functions. The gates are named functions so a chord registered under one
    can be found again: a reload turns every registered chord off under the

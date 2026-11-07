@@ -9,7 +9,7 @@
 ; built-in table (binds.toml next to this file), and registers every chord
 ; with Hotkey(). The help overlay (help.ahk) is built from the same listing.
 ; Install at %USERPROFILE%\.config\flow\flow.ahk (together with flow-exe.ahk,
-; launcher.ahk and help.ahk, which it #Includes) and start with
+; selection.ahk, launcher.ahk and help.ahk, which it #Includes) and start with
 ; `flow start --ahk`. Design notes, the daemon-liveness gate, the tiling
 ; toggle, which Windows keys are shadowed and the AutoHotkey lessons are in
 ; README.md next to this file; the bind grammar and the action table are in

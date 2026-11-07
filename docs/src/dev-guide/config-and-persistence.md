@@ -121,7 +121,7 @@ flowchart TD
     AUTH -->|"flow.toml Err in race window"| DIE["exit 1: pipe never created"]
 ```
 
-`flow config reload` reuses these same loaders to hot-reload a running daemon (see [Hot-reload](#hot-reload--flow-config-reload) below).
+`flow config reload` reuses these same loaders to hot-reload a running daemon (see [Hot-reload](#hot-reload----flow-config-reload) below).
 
 After loading `flow.toml`, the daemon calls `FlowConfig::validate()` to catch semantically invalid values (negative padding, `min_column_width_px` exceeding `column_width`). Validation failures produce warnings but do not prevent the daemon from running.
 
@@ -160,6 +160,8 @@ Not every field can change at runtime. Reload applies **live** fields in place; 
 | `column_width` (base), `min_column_width_px`, `min_window_height_px` | update cached bounds; existing per-column widths preserved |
 | `animation.*` | `WindowAnimator::update_config` for the new duration/easing/enabled |
 | **Workspace count (10), monitor geometry** | **structural** -- not reloadable |
+
+The table lists upstream's fields. The new config replaces `FlowWM::config` whole, so a field read where it is used (`[focus] new_window_monitor`, `[minimize_restore] strategy`, `[navigation]`, ...) applies from its next use; the per-field effects, the fork's sections included, are in the user guide's [Config Reference](../user-guide/config-reference.md#live-reloadable-vs-structural-fields).
 
 ### What is preserved
 
@@ -217,7 +219,7 @@ no daemon running the CLI falls back to the local `check_config`.
 
 ## Application Config Fields
 
-All defaults are from `FlowConfig::default()` in `src/config/types.rs`:
+All defaults are from `FlowConfig::default()` in `src/config/types.rs`. The table lists the core fields; every field and section, the fork's included, is in the user guide's [Config Reference](../user-guide/config-reference.md):
 
 | Field / Group | Type | Default | Description |
 |---------------|------|---------|-------------|
@@ -225,18 +227,18 @@ All defaults are from `FlowConfig::default()` in `src/config/types.rs`:
 | `column_width` | `Option<u32>` | `None` | Fixed pixel-width override; skips auto-computation when set |
 | `min_column_width_px` | `u32` | `640` | Minimum allowed column width |
 | `padding.window_gap` | `i32` | `16` | Uniform gap between all elements |
-| `padding.up` | `i32` | `16` | Top screen margin |
-| `padding.down` | `i32` | `16` | Bottom screen margin |
+| `padding.up` | `i32` | `0` | Top screen margin |
+| `padding.down` | `i32` | `0` | Bottom screen margin |
 | `animation.enabled` | `bool` | `true` | Enable layout transition animations |
 | `animation.duration_ms` | `u32` | `240` | Animation duration in milliseconds |
 | `animation.easing` | `ConfigEasing` | `ease-out-expo` | Easing curve (31 named variants) |
-| `minimize_restore.strategy` | `enum` | `original_slot` | Where restored windows are placed |
+| `minimize_restore.strategy` | `enum` | `original_slot` | Where restored and re-shown tiles are placed |
 
 ### Column Sizing Model
 
 The primary sizing mode uses `columns_per_screen`: the daemon computes the actual pixel width at startup as `base_content_width = (monitor_width - (N+1) * window_gap) / N` where `N = columns_per_screen`. Setting `column_width` to a fixed pixel value overrides this computation entirely.
 
-A `[columns]` section (`src/config/width_preset.rs`) replaces both with an ordered list of presets. Each `Monitor` carries its current preset index (`Monitor::width_preset`) into **its** list — the first `[[columns.screen]]` rule matching its `ScreenFacts` (work-area size, orientation, `Monitor::device_name` from `MONITORINFOEXW::szDevice`), else the top-level list (`ColumnsConfig::list_for`). The daemon derives the strip's base `column_width` and width pattern from that preset and the monitor's own work area (`FlowWM::layout_config_for` in `src/daemon/width_preset.rs`; `resolve_for_screen` is the one function startup, hotplug and reload use to pick the index, carrying the previous preset over by width when the list still has it), and `flow dispatch width` (`SetWidthPreset`) re-bases every workspace of the focused monitor and sets every column to the new preset (`ScrollingSpace::apply_width_pattern`). A preset with two or more terms pins every column to `terms[i % n]` by position inside `ScrollingSpace` (see [Width patterns](./layout/mutations.md#width-patterns-pin-columns-by-position)). `check_screens` validates every list against the attached screens at startup (stage `monitors`) and before a reload is applied. The per-monitor preset is saved in the loadout (`LoadoutFile::monitors`) and reported by `flow query all`.
+A `[columns]` section (`src/config/width_preset.rs`) replaces both with an ordered list of presets. Each `Monitor` carries its current preset index (`Monitor::width_preset`) into **its** list — the first `[[columns.screen]]` rule matching its `ScreenFacts` (work-area size, orientation, `Monitor::device_name` from `MONITORINFOEXW::szDevice`), else the top-level list (`ColumnsConfig::list_for`). The daemon derives the strip's base `column_width` and width pattern from that preset and the monitor's own work area (`FlowWM::layout_config_for` in `src/daemon/width_preset.rs`; `resolve_for_screen` is the one function startup, hotplug and reload use to pick the index, carrying the previous preset over by width when the list still has it), and `flow dispatch width` (`SetWidthPreset`) re-bases every workspace of the focused monitor and sets every column to the new preset (`ScrollingSpace::apply_width_pattern`). A preset with two or more terms is a set of screen slots: applying it resizes the columns on screen in place, the focused column taking the first term, and the slots stay put while the strip scrolls (ADR-0017; see [Width patterns](./layout/mutations.md#width-patterns-pin-columns-to-screen-slots)). `check_screens` validates every list against the attached screens at startup (stage `monitors`) and before a reload is applied. The per-monitor preset is saved in the loadout (`LoadoutFile::monitors`) and reported by `flow query all`.
 
 ## Window Classification Rules
 

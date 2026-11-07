@@ -106,6 +106,7 @@ in the repo root — `flow config init` copies it verbatim.
 | `column_width` | `Option<u32>` | `None` | Optional fixed pixel width per column. When set, ignores `columns_per_screen`. Useful on ultrawide monitors where you want consistent column sizes regardless of monitor count. Both are ignored when a [`[columns]`](#columns--column-width-presets) section is present. |
 | `min_column_width_px` | `u32` | `640` | Floor for column width in pixels. Columns cannot be resized below this. |
 | `min_window_height_px` | `u32` | `100` | Minimum row height in pixels — the floor for any single window's allocated height inside a column. Bounds the maximum number of rows that can stack inside one column. |
+| `min_row_height_px` | `u32` | `100` | Floor for one row while a row boundary is dragged: neither row shrinks below it (the edge pins and snaps back on release). Independent of `min_window_height_px`. |
 | `check_for_updates` | `bool` | `false` | Whether `flow start` runs the update checker (the same one behind `flow update`, configured by [`[update]`](#update--update-checker)) and prints a one-line notice when something newer exists on GitHub. **Off by default in this fork** — nothing is contacted at start unless you opt in with `true`. When on it runs after the daemon is ready, is bounded by a 5 s timeout, stays silent on any failure, never blocks startup and never downloads anything. The explicit `flow update` command is unaffected by this flag. |
 | `adopt_maximized` | `bool` | `false` | Whether a window that is **maximized** when FlowWM meets it — in the startup scan, when it opens, when tiling is turned back on — is un-maximized and classified through your rules (tiled or floated like any other window) instead of being left alone as "ignored: maximized" until you restore it. Fullscreen windows (video, games) are never adopted, nor is a window your rules ignore. An adopted window is maximized again when FlowWM hands the desktop back: `flow dispatch tiling off`, `flow stop`, a fail-back. With `false` (the stock behaviour) a maximized window stays ignored until you restore it or run [`set-window`](./dispatch-reference.md#set-window-mode) on it, which adopts it either way. |
 
@@ -116,6 +117,7 @@ columns_per_screen = 4
 # column_width = 1280          # optional fixed width; ignores columns_per_screen
 min_column_width_px = 640
 min_window_height_px = 100
+min_row_height_px = 100
 check_for_updates = false      # the fork's default; true opts in to the start-time GitHub check (a notice only)
 adopt_maximized = false        # true: un-maximize and tile/float windows found maximized
 ```
@@ -359,9 +361,9 @@ layout = "book"           # this screen only, with the list above
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `window_gap` | `u32` | `16` | Uniform gap (pixels) between all elements: window-to-window, window-to-screen-edge. |
-| `up` | `u32` | `0` | Reserved space (pixels) above the tiling area. |
-| `down` | `u32` | `0` | Reserved space (pixels) below the tiling area — e.g. for taskbar clearance. |
+| `window_gap` | `i32` | `16` | Uniform gap (pixels) between all elements: window-to-window, window-to-screen-edge. |
+| `up` | `i32` | `0` | Reserved space (pixels) above the tiling area. |
+| `down` | `i32` | `0` | Reserved space (pixels) below the tiling area — e.g. for taskbar clearance. |
 
 Example:
 
@@ -430,6 +432,33 @@ Example:
 ```toml
 [navigation]
 edge_hop = true
+```
+
+### `[drag]` — tile drag zones
+
+How a tile dragged by its title bar or by Mod + left-button drag picks its
+drop zone and scrolls the strip (see
+[`drag begin` / `drag end`](./dispatch-reference.md#drag-begin--drag-end)).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `edge_scroll_width` | `i32` | `30` | Minimum band (pixels) at a screen edge that scrolls the strip; the whole band on an edge shared with another monitor. |
+| `edge_scroll_ratio` | `f32` | `0.0833` | The screen-edge band as a fraction of the work-area width; also the height of the top / bottom row-scroll bands of a stacked column with off-screen rows. `0` = pixels only. |
+| `col_edge_ratio` | `f32` | `0.33` | Fraction of a column's width, on each side, that drops the window as a new column beside it. |
+| `col_edge_max_px` | `i32` | `0` | Pixel cap on that band; `0` = no cap. |
+| `edge_scroll_initial_delay_ms` | `u32` | `500` | Gap from the first edge scroll to the first repeat; clamped up to the repeat interval. |
+| `edge_scroll_repeat_interval_ms` | `u32` | `240` | Gap between column scrolls while the cursor stays in the band; clamped up to the animation duration. |
+
+Example:
+
+```toml
+[drag]
+edge_scroll_width = 30
+edge_scroll_ratio = 0.0833
+col_edge_ratio = 0.33
+col_edge_max_px = 0
+edge_scroll_initial_delay_ms = 500
+edge_scroll_repeat_interval_ms = 240
 ```
 
 ### `[borders]` — window border overlays
@@ -781,8 +810,14 @@ with AND logic — all must match.
 | Field | Type | Description |
 |-------|------|-------------|
 | `exe` | `String` | Executable name to match (e.g. `"chrome.exe"`). Case-insensitive on the filename. |
-| `title` | `String` | Window title substring to match. |
-| `class` | `String` | Win32 window class name to match. Often the most reliable identifier — see note below. |
+| `exe_regex` | `String` | Regex on the executable name. Case-insensitive unless it starts with `(?-i)`. |
+| `process_path` | `String` | Exact full executable path. Case-insensitive. |
+| `process_path_regex` | `String` | Regex on the full executable path. Case-insensitive unless it starts with `(?-i)`. |
+| `title` | `String` | Exact window title. Case-sensitive. |
+| `title_contains` | `String` | Substring of the window title. Case-sensitive. |
+| `title_regex` | `String` | Regex on the window title. Case-sensitive unless it uses `(?i)`. |
+| `class` | `String` | Exact Win32 window class name. Case-sensitive. Often the most reliable identifier — see note below. |
+| `class_regex` | `String` | Regex on the window class name. Case-sensitive unless it uses `(?i)`. |
 
 > **Prefer `class` over `exe` + `title` for system helpers.** The class is
 > assigned at window creation, while the title may be set a few milliseconds
@@ -860,7 +895,8 @@ When a new window appears, FlowWM checks, in order:
 
 1. **User rules** — your `flow-rules.toml`, top-to-bottom, first match wins.
 2. **Learned rules** — machine-written to `history-flow-rules.toml`. Whenever
-   you press `Alt + T` on a floating window (or float a tiled one),
+   you tile a floating window (or float a tiled one) with `set-window` —
+   `Alt + T` in upstream's `flow.ahk`, Mod+V in the win-niri keymap —
    FlowWM records your choice and applies it automatically next time you open
    that app.
 3. **Bundled defaults** — `default-flow-rules.toml`, embedded in the binary.
