@@ -203,7 +203,9 @@ responsibilities:
    (which include invisible borders). The bridge looks up each window's
    `InvisibleBounds` from the registry and calls `visible_to_window()` to
    translate. Without this, windows would appear with gaps larger than
-   configured.
+   configured. The batch re-measures those borders first (late chrome,
+   ADR-0028, `docs/adr/0028-late-chrome-invisible-bounds.md`), so a window
+   whose frame changed since registration is placed with the fresh value.
 
 3. **Type conversion**: maps flow's `WindowId(isize)` to `WindowRef(isize)`,
    and the visible rect's `{width, height}` to `IVec2::new(width, height)`.

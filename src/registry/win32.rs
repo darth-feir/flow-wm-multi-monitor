@@ -388,6 +388,45 @@ pub fn get_invisible_bounds(hwnd: HWND) -> InvisibleBounds {
     }
 }
 
+/// The largest invisible border a re-measurement accepts per edge: a
+/// reading beyond it is taken as a window caught mid-move or mid-state
+/// change, not a frame (ADR-0028).
+pub const MAX_PLAUSIBLE_INVISIBLE_BORDER: i32 = 32;
+
+/// [`get_invisible_bounds`] for a re-measurement of a window that is
+/// already placed (ADR-0028): `None` instead of zero when a read fails,
+/// when the window rect changed between the two reads around the DWM
+/// query (it moved mid-measurement), or when an edge exceeds
+/// [`MAX_PLAUSIBLE_INVISIBLE_BORDER`], so the caller keeps the stored
+/// value. Negative edges clamp to zero as in [`get_invisible_bounds`].
+#[must_use]
+pub fn measure_invisible_bounds(hwnd: HWND) -> Option<InvisibleBounds> {
+    let before = get_window_rect(hwnd).ok()?;
+    let visible = get_extended_frame_bounds(hwnd).ok()?;
+    let after = get_window_rect(hwnd).ok()?;
+    if before != after || visible.width <= 0 || visible.height <= 0 {
+        return None;
+    }
+    let bounds = InvisibleBounds {
+        left: (visible.x - before.x).max(0),
+        top: (visible.y - before.y).max(0),
+        right: (before.right() - visible.right()).max(0),
+        bottom: (before.bottom() - visible.bottom()).max(0),
+    };
+    let max = MAX_PLAUSIBLE_INVISIBLE_BORDER;
+    (bounds.left <= max && bounds.top <= max && bounds.right <= max && bounds.bottom <= max)
+        .then_some(bounds)
+}
+
+/// Whether DWM can be asked for `hwnd`'s frame now: visible, not
+/// minimized, not maximized and not cloaked. An iconic window reports its
+/// icon rect and a maximized one its monitor overhang, neither a frame
+/// worth storing (ADR-0028).
+#[must_use]
+pub fn frame_measurable(hwnd: HWND) -> bool {
+    is_window_visible(hwnd) && !is_iconic(hwnd) && !is_zoomed(hwnd) && !is_cloaked(hwnd)
+}
+
 /// Returns `true` if the window has the `WS_VISIBLE` style.
 ///
 /// # Arguments
@@ -2319,6 +2358,17 @@ mod tests {
             result.is_err(),
             "get_extended_frame_bounds should return Err for invalid HWND"
         );
+    }
+
+    #[test]
+    fn a_re_measurement_that_cannot_read_the_frame_keeps_the_stored_value() {
+        // Unlike the registration measurement (zero on failure), a failed
+        // re-measurement is `None`, so the caller keeps what it stored, and
+        // a window that cannot be read is never measurable (ADR-0028).
+        assert_eq!(measure_invisible_bounds(null_hwnd()), None);
+        assert_eq!(measure_invisible_bounds(invalid_hwnd()), None);
+        assert!(!frame_measurable(null_hwnd()));
+        assert!(!frame_measurable(invalid_hwnd()));
     }
 
     #[test]

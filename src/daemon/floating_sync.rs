@@ -97,6 +97,9 @@ impl FlowWM {
             return;
         };
 
+        // Late chrome (ADR-0028): read the rect back through fresh borders.
+        let _ = self.remeasure_frame_with(&super::frame_bounds::Win32Frame, hwnd, "rect re-read");
+
         // Bounds + state come from the registry. A non-Active float (minimized
         // or hidden) is skipped so its stored rect isn't clobbered by a stale
         // GetWindowRect reading.

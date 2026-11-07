@@ -302,6 +302,8 @@ impl FlowWM {
         if self.tiling_paused {
             return;
         }
+        // Late chrome (ADR-0028): the drag converts rects with these borders.
+        let _ = self.remeasure_frame_with(&super::frame_bounds::Win32Frame, hwnd, "drag start");
         let hwnd_handle = HWND(hwnd as *mut _);
         let Some(window) = self.registry.get_window(hwnd_handle) else {
             return;

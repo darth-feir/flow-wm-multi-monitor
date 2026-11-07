@@ -356,13 +356,31 @@ includes invisible borders — typically ~7px on the left, right, and bottom
 edges — used for drop shadows and resize hit-testing. This means `GetWindowRect`
 is **not** the visual rect of the window.
 
-The registry measures each window's invisible borders once at registration time
+The registry measures each window's invisible borders at registration time
 by comparing `GetWindowRect` against `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)`,
 which returns the rect that the user actually sees. The difference is stored as an
 `InvisibleBounds` struct (`{left, top, right, bottom}`) in the `Window`. If either
 query fails (DWM unavailable, window destroyed mid-query), the bounds default to
 zero (fail-open — the window may have slightly larger gaps, but this is preferable
 to crashing).
+
+### Re-measured at placement (late chrome)
+
+Some apps apply their chrome after the window exists (WPF / VS-shell windows:
+SSMS, Visual Studio), so the registration measurement sees frame == window rect
+and stores zero. The daemon therefore re-measures (`daemon/frame_bounds.rs`,
+`registry::win32::measure_invisible_bounds`) before every layout batch for the
+windows it moves, at drag start for the dragged window, and when a float's rect
+is read back; the foreground sync (250 ms) re-measures the focused window and
+moves it into its slot (tile) or onto its stored visible rect (float) when the
+value changed. Only an active tile or float that is visible, not iconic, not
+maximized, not cloaked and not in the app's own full screen is measured, only
+while the animator is idle and never the window a drag owns. A reading whose
+window rect moved between the two reads, or with an edge over 32 px, is dropped;
+a failed or dropped reading keeps the stored value. A change logs at debug
+(`window 0x.. (exe) invisible bounds changed L.. T.. R.. B.. -> ...; re-placed`)
+and `flow query all` shows the stored value. See
+ADR-0028, `docs/adr/0028-late-chrome-invisible-bounds.md`.
 
 The animation bridge later uses `InvisibleBounds` to translate between the
 layout engine's visible-rect coordinates (what the user sees) and Win32's

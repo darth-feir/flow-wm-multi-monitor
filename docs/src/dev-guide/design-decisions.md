@@ -499,3 +499,12 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   border's corner rule also reads whether the client area covers the window
   (Alacritty `decorations = "none"` keeps `WS_CAPTION | WS_THICKFRAME`):
   square then. `docs/adr/0027-restore-seat-and-frameless-corners.md`
+- **ADR-0028 — Invisible frame borders are re-measured when a window is
+  placed.** WPF / VS-shell windows (SSMS, Visual Studio) apply their chrome
+  after registration, so the borders measured then were 0 and the content sat
+  5-6 px inside the ring. Every layout batch, a drag start and a float's rect
+  read-back re-measure the windows they touch (visible, not iconic, maximized,
+  cloaked or in the app's own full screen; animator idle; a failed reading
+  keeps the stored value); the 250 ms foreground sync re-measures the focused
+  window and moves it into its slot on a change. No per-app rule.
+  `docs/adr/0028-late-chrome-invisible-bounds.md`

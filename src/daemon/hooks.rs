@@ -1054,6 +1054,7 @@ impl FlowWM {
     pub(super) fn reconcile_foreground(&mut self) {
         self.last_foreground_sync = std::time::Instant::now();
         self.recheck_focused_corners();
+        self.recheck_focused_frame();
 
         let Some(true_fg) = registry_win32::get_foreground_window() else {
             return;

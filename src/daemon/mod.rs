@@ -70,6 +70,7 @@ mod drag;
 mod drag_session;
 mod edge_scroll;
 mod floating_sync;
+mod frame_bounds;
 mod fullscreen;
 mod hooks;
 mod hotplug;

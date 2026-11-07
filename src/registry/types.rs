@@ -180,8 +180,10 @@ pub struct Window {
 
     /// Invisible border sizes for this window.
     ///
-    /// Measured once at registration time by comparing `GetWindowRect`
-    /// (full rect) against DWM extended frame bounds (visible rect).
+    /// Measured at registration time by comparing `GetWindowRect`
+    /// (full rect) against DWM extended frame bounds (visible rect), and
+    /// re-measured whenever the daemon places the window (late chrome,
+    /// ADR-0028).
     /// Used by the daemon to translate between the layout engine's visible-rect
     /// coordinates and Win32's window-rect coordinates for `SetWindowPos`.
     ///

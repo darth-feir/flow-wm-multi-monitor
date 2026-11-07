@@ -153,6 +153,8 @@ impl FlowWM {
     /// between them) must be submitted together or the first monitor's
     /// windows stop wherever the second submission caught them.
     pub(super) fn animate_layouts_on(&mut self, layouts: &[(usize, &AppliedLayout)]) {
+        // Late chrome (ADR-0028): fresh invisible borders for this placement.
+        self.remeasure_frames(entry_hwnds(layouts));
         let mut targets: Vec<WindowTarget> = Vec::new();
         let mut submitted: Vec<(isize, Rect)> = Vec::new();
         for (idx, layout) in layouts {
@@ -192,6 +194,7 @@ impl FlowWM {
     /// filter does not trigger — the dragged window animates to its final
     /// position as intended.
     fn submit_animation(&mut self, layouts: &[(usize, &AppliedLayout)]) {
+        self.remeasure_frames(entry_hwnds(layouts));
         let mut targets: Vec<WindowTarget> = Vec::new();
         let mut submitted: Vec<(isize, Rect)> = Vec::new();
         for (monitor_idx, layout) in layouts {
@@ -492,6 +495,7 @@ impl FlowWM {
         if batches.is_empty() {
             return;
         }
+        self.remeasure_frames(batch_hwnds(batches));
 
         let WorkspaceTargets {
             targets,
@@ -681,6 +685,7 @@ impl FlowWM {
     /// is **not** recorded as the window's last submitted rect, so the next
     /// batch still moves it from where it really is.
     pub(super) fn teleport_workspaces(&mut self, batches: &[(ActualLayout, i32)]) {
+        self.remeasure_frames(batch_hwnds(batches));
         let border_thickness = self.config.borders.thickness as i32;
         let border_overlap = self.config.borders.overlap as i32;
         let excluded_float = self.drag_state.as_ref().map(|d| d.dragged_hwnd());
@@ -760,6 +765,7 @@ impl FlowWM {
     /// filter — the resize analog of [`animate_preview_on`](Self::animate_preview_on),
     /// except it bypasses the animator (Teleport, not animation) per ADR-0004.
     pub(super) fn teleport_preview(&mut self, preview: &AppliedLayout) {
+        self.remeasure_frames(entry_hwnds(&[(0, preview)]));
         let border_thickness = self.config.borders.thickness as i32;
         let border_overlap = self.config.borders.overlap as i32;
         let mut submitted: Vec<(isize, Rect)> = Vec::new();
@@ -1165,6 +1171,20 @@ fn push_targets_as(
     decision
 }
 
+/// Every window `layouts` place, for [`FlowWM::remeasure_frames`].
+fn entry_hwnds<'a>(layouts: &'a [(usize, &AppliedLayout)]) -> impl Iterator<Item = isize> + 'a {
+    layouts
+        .iter()
+        .flat_map(|(_, l)| l.actual_layout.entries.iter().map(|e| e.window_id.0))
+}
+
+/// Every window a workspace batch places, for [`FlowWM::remeasure_frames`].
+fn batch_hwnds(batches: &[(ActualLayout, i32)]) -> impl Iterator<Item = isize> + '_ {
+    batches
+        .iter()
+        .flat_map(|(l, _)| l.entries.iter().map(|e| e.window_id.0))
+}
+
 /// The first-placement rule (ADR-0023, *Appearing in place*): a window
 /// with no previous rect, neither a submitted one
 /// ([`FlowWM::last_submitted_rect`]) nor a registry tiled or float rect,
@@ -1215,7 +1235,7 @@ fn float_geometry(
 /// translated for its invisible borders and inset by `thickness - overlap`
 /// for its ring, except a fullscreen column, which has no ring and covers
 /// its rect exactly (ADR-0021).
-fn tile_geometry(
+pub(super) fn tile_geometry(
     fullscreen: bool,
     bounds: crate::common::InvisibleBounds,
     visible: Rect,
