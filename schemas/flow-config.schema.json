@@ -649,7 +649,7 @@
       }
     },
     "MinimizeRestore": {
-      "description": "Strategy for restoring minimized tiling windows.\n\n- `OriginalSlot` — put the window back where it was before minimize\n- `RightOfFocused` — insert as a new column to the right of focused\n- `AppendRight` — append as the rightmost column on the canvas",
+      "description": "Strategy for bringing back a tiling window that was minimized, or that\nhid itself (tray) and is shown again.\n\n- `OriginalSlot` — put the window back where it was before minimize or hide\n- `RightOfFocused` — insert as a new column to the right of focused\n- `AppendRight` — append as the rightmost column on the canvas",
       "type": "object",
       "properties": {
         "strategy": {
@@ -663,7 +663,7 @@
       "description": "Available minimize restore strategies.\n\nSee [`MinimizeRestore`] for the semantics of each variant.",
       "oneOf": [
         {
-          "description": "Put the window back where it was before minimize.",
+          "description": "Put the window back where it was before minimize or hide.",
           "type": "string",
           "const": "original_slot"
         },

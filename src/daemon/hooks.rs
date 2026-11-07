@@ -406,9 +406,10 @@ impl FlowWM {
 
         let was_tiling = self.registry.is_tiling(hwnd);
         // Its seat, read while it still has one: the restore puts it back
-        // there (ADR-0027).
-        if was_tiling {
-            self.capture_restore_seat(WindowId(hwnd));
+        // there (ADR-0027). Only from a seated tile: a repeated minimize, or
+        // one of a hidden tile, keeps the seat recorded earlier.
+        if self.registry.is_tiling_active(hwnd) {
+            self.capture_restore_seat(WindowId(hwnd), "minimized");
         }
         self.registry.minimize_window(hwnd);
 
@@ -429,12 +430,12 @@ impl FlowWM {
     /// Pipeline:
     /// 1. Capture active-tiling status **before** reconcile mutates state.
     /// 2. `registry.reconcile_visibility(hwnd)` — state-based idempotent
-    ///    transition (`Active → Hidden`, preserving the layout slot in
-    ///    `last_virtual_slot`). Returns [`VisibilityChange::Unchanged`] if the
-    ///    window was already hidden/minimized (this event also fires on ordinary
-    ///    minimize — the state check prevents double-removal).
+    ///    transition (`Active → Hidden`). Returns [`VisibilityChange::Unchanged`]
+    ///    if the window was already hidden/minimized (this event also fires on
+    ///    ordinary minimize — the state check prevents double-removal).
     /// 3. If the window was an **active** tiling window immediately before the
-    ///    transition and the state actually changed to `Hidden`:
+    ///    transition and the state actually changed to `Hidden`: its restore
+    ///    seat is recorded, as on minimize (ADR-0027, *Hidden windows*), then
     ///    [`remove_from_layout_and_refocus`] — removes from layout, pushes focus
     ///    to the successor, and animates.
     ///
@@ -461,6 +462,8 @@ impl FlowWM {
         let was_active_tiling = self.registry.is_tiling_active(hwnd);
         let change = self.registry.reconcile_visibility(hwnd);
         if change == VisibilityChange::Hidden && was_active_tiling {
+            // The re-show puts it back here, like a restore (ADR-0027).
+            self.capture_restore_seat(WindowId(hwnd), "hidden");
             self.remove_from_layout_and_refocus(WindowId(hwnd), false);
             self.forget_submitted(hwnd);
         }
@@ -834,13 +837,13 @@ impl FlowWM {
     /// [`on_window_restored`](Self::on_window_restored)) transitions
     /// `Hidden → Active`:
     /// 1. `registry.reconcile_visibility(hwnd)` — state-based idempotent
-    ///    transition (`Hidden → Active`, restoring the saved slot from
-    ///    `last_virtual_slot`). Returns [`VisibilityChange::Unchanged`] if the
-    ///    window was already active.
+    ///    transition (`Hidden → Active`). Returns [`VisibilityChange::Unchanged`]
+    ///    if the window was already active.
     /// 2. If the state actually changed to `Shown` and the window is now an
-    ///    **active** tiling window:
-    ///    - `layout.add_window(id)` — re-adds to layout.
-    ///    - `animate_layout(applied)` — animates the window reappearing.
+    ///    **active** tiling window: [`readd_tile`](Self::readd_tile) with the
+    ///    view following, exactly as a restore from minimize — back into the
+    ///    seat it was hidden from, scrolled into view, focused when Windows
+    ///    made it the foreground (ADR-0027, *Hidden windows*).
     ///
     /// # Why this is safe to fire on every `SHOW`
     ///
@@ -882,7 +885,8 @@ impl FlowWM {
             return;
         }
         if change == VisibilityChange::Shown && self.registry.is_tiling_active(hwnd) {
-            self.readd_tile_to_home_monitor(hwnd);
+            // Back into the seat it was hidden from, in view (ADR-0027).
+            self.readd_tile(hwnd, true);
         } else if change == VisibilityChange::Shown {
             self.resync_returning_float(hwnd);
         }
@@ -1158,9 +1162,8 @@ impl FlowWM {
         log::info!("recovered float hwnd {hwnd} seated at {rect:?}");
     }
 
-    /// Append a returning tiled window (re-shown, or recovered from
-    /// maximized) to the strip of its home monitor; see
-    /// [`readd_tile`](Self::readd_tile) (no view follow).
+    /// Append a tiled window recovered from maximized to the strip of its
+    /// home monitor; see [`readd_tile`](Self::readd_tile) (no view follow).
     pub(super) fn readd_tile_to_home_monitor(&mut self, hwnd: isize) {
         self.readd_tile(hwnd, false);
     }
@@ -1168,9 +1171,9 @@ impl FlowWM {
     /// Seat a returning tiled window (restored, re-shown, or recovered from
     /// maximized) in the strip of its home monitor
     /// ([`home_monitor_for_hwnd`](Self::home_monitor_for_hwnd)) and animate
-    /// it in: back into the column it was minimized from when its restore
-    /// seat applies ([`plan_restore_seat`](super::restore_seat::plan_restore_seat)),
-    /// else appended at the far right. With `follow` (the restore hook) the
+    /// it in: back into the column it was minimized or hidden from when its
+    /// restore seat applies ([`plan_restore_seat`](super::restore_seat::plan_restore_seat)),
+    /// else appended at the far right. With `follow` (restore and re-show) the
     /// view scrolls to it like a focus move and, when Windows made it the
     /// foreground, it becomes the focus. A window that is already seated
     /// somewhere (the hotplug reconcile seats the windows it restores
@@ -1198,8 +1201,8 @@ impl FlowWM {
             .virtual_layout()
             .columns
             .len();
-        // `[minimize_restore] strategy` decides where a restore goes; a
-        // re-show or a maximize recovery is always appended.
+        // `[minimize_restore] strategy` decides where a restore or a
+        // re-show goes; a maximize recovery is always appended.
         let strategy = if follow {
             self.config.minimize_restore.strategy
         } else {
@@ -1701,6 +1704,85 @@ mod readd_tests {
             rect.x >= 0 && rect.x + rect.width <= 1920,
             "{rect:?} on screen"
         );
+    }
+
+    /// The show hook's layout half after the registry's `Hidden → Active`
+    /// (a test hwnd is never visible, so `reconcile_visibility` cannot).
+    fn show_hidden(flow: &mut FlowWM, h: isize) {
+        if let Some(w) = flow.registry.get_window_mut(HWND(h as *mut _)) {
+            assert!(matches!(w.state, WindowState::Tiling(TilingState::Hidden)));
+            w.state = WindowState::Tiling(TilingState::Active { col: 0, row: 0 });
+        }
+        flow.readd_tile(h, true);
+    }
+
+    #[test]
+    fn a_hidden_tile_is_shown_back_in_its_column_in_view() {
+        let mut flow = flow_acd();
+        tiled(&mut flow.registry, E);
+        let _ = flow.monitors[0]
+            .active_scrolling_mut()
+            .add_window(WindowId(E));
+        flow.registry.set_monitor(E, 0);
+        let strip = flow.monitors[0].active_scrolling_mut();
+        strip.set_focus(WindowId(E));
+        let _ = strip.ensure_focused_visible();
+        assert!(strip.virtual_layout().viewport_offset > 0);
+        flow.on_window_hidden(C);
+        assert_eq!(active_columns(&flow), vec![vec![A], vec![D], vec![E]]);
+        show_hidden(&mut flow, C);
+        assert_eq!(
+            active_columns(&flow),
+            vec![vec![A], vec![C], vec![D], vec![E]]
+        );
+        let strip = flow.monitors[0].active_scrolling();
+        assert_eq!(strip.last_focused_window(), Some(WindowId(C)));
+        let rect = strip
+            .actual_layout()
+            .find(WindowId(C))
+            .expect("projected")
+            .rect;
+        assert!(
+            rect.x >= 0 && rect.x + rect.width <= 1920,
+            "{rect:?} on screen"
+        );
+        assert!(flow.registry.take_restore_seat(C).is_none(), "used up");
+    }
+
+    #[test]
+    fn a_hidden_tile_whose_columns_closed_is_clamped_to_the_end() {
+        let mut flow = flow_acd();
+        flow.on_window_hidden(D);
+        let _ = flow.monitors[0]
+            .active_scrolling_mut()
+            .remove_window(WindowId(C));
+        show_hidden(&mut flow, D);
+        assert_eq!(active_columns(&flow), vec![vec![A], vec![D]]);
+    }
+
+    #[test]
+    fn a_hidden_tile_that_is_destroyed_leaves_no_seat() {
+        let mut flow = flow_acd();
+        flow.on_window_hidden(C);
+        assert!(
+            flow.registry
+                .get_window(HWND(C as *mut _))
+                .is_some_and(|w| w.restore_seat.is_some()),
+            "the hide recorded a seat"
+        );
+        flow.on_window_destroyed(C);
+        assert!(flow.registry.get_window(HWND(C as *mut _)).is_none());
+        assert!(flow.registry.take_restore_seat(C).is_none());
+        assert_eq!(active_columns(&flow), vec![vec![A], vec![D]]);
+    }
+
+    #[test]
+    fn a_minimize_of_a_hidden_tile_keeps_the_seat_of_the_hide() {
+        let mut flow = flow_acd();
+        flow.on_window_hidden(C);
+        flow.on_window_minimized(C);
+        let seat = flow.registry.take_restore_seat(C).expect("seat kept");
+        assert_eq!((seat.col, seat.row), (1, 0));
     }
 
     #[test]

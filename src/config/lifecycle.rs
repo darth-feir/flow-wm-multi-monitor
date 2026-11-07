@@ -236,6 +236,11 @@ pub fn load_rules_config(path: &Path) -> FlowResult<WindowRulesConfig> {
     match load_toml::<WindowRulesConfig>(path) {
         Ok(config) => {
             log::info!("loaded window rules from {:?}", path);
+            // Info, not warn: the file is valid; `flow config check` is
+            // where the user is told.
+            for warning in config.inert_field_warnings() {
+                log::info!("flow-rules.toml: {warning}");
+            }
             Ok(config)
         }
         Err(ConfigLoadError::Missing) => {
@@ -511,7 +516,9 @@ pub fn write_ahk_template(dir: &Path) -> Result<bool, String> {
 ///
 /// # Returns
 ///
-/// `Ok(())` if all present files are valid (or no files exist).
+/// `Ok(warnings)` if all present files are valid (or no files exist):
+/// one line per accepted-but-inert setting
+/// ([`WindowRulesConfig::inert_field_warnings`]), empty when there is none.
 /// `Err(message)` describing the first validation/parse failure found.
 ///
 /// # Example
@@ -525,7 +532,7 @@ pub fn write_ahk_template(dir: &Path) -> Result<bool, String> {
 /// }
 /// ```
 #[must_use = "validation errors must be handled"]
-pub fn check_config(dir: &Path) -> Result<(), String> {
+pub fn check_config(dir: &Path) -> Result<Vec<String>, String> {
     let flow_path = dir.join("flow.toml");
 
     // Only validate flow.toml if it exists — missing is not an error.
@@ -547,11 +554,33 @@ pub fn check_config(dir: &Path) -> Result<(), String> {
     if rules_path.exists() {
         let contents = std::fs::read_to_string(&rules_path)
             .map_err(|e| format!("failed to read {:?}: {e}", rules_path))?;
-        let _: WindowRulesConfig =
+        let rules: WindowRulesConfig =
             toml::from_str(&contents).map_err(|e| format!("flow-rules.toml parse error: {e}"))?;
+        return Ok(rules_warning_lines(&rules));
     }
 
-    Ok(())
+    Ok(Vec::new())
+}
+
+/// The `flow config check` warnings for the rules file at `path`: one
+/// `flow-rules.toml: ...` line per inert setting. Empty when the file is
+/// missing or does not parse (that is a problem, reported elsewhere).
+/// Logs nothing.
+#[must_use]
+pub fn rules_file_warnings(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| toml::from_str::<WindowRulesConfig>(&contents).ok())
+        .map(|rules| rules_warning_lines(&rules))
+        .unwrap_or_default()
+}
+
+fn rules_warning_lines(rules: &WindowRulesConfig) -> Vec<String> {
+    rules
+        .inert_field_warnings()
+        .into_iter()
+        .map(|w| format!("flow-rules.toml: {w}"))
+        .collect()
 }
 
 // ── Private helper ─────────────────────────────────────────────────────
@@ -999,6 +1028,33 @@ strategy = "original_slot"
         assert!(
             result.is_ok(),
             "partial flow.toml should pass check_config (merged with defaults): {result:?}"
+        );
+    }
+
+    /// Positive: rule fields that do nothing still pass, with a warning each.
+    #[test]
+    fn check_config_warns_about_inert_rule_fields() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join("flow-rules.toml"),
+            "default_action = \"float\"
+
+[[rules]]
+match = { exe = \"Discord.exe\" }
+action = \"tile\"
+initial_width_px = 960
+override_persist = true
+",
+        )
+        .unwrap();
+        let warnings = check_config(dir).expect("still valid");
+        assert_eq!(
+            warnings,
+            vec![
+                "flow-rules.toml: rule 1 (exe = \"Discord.exe\"): initial_width_px has no effect in this version",
+                "flow-rules.toml: rule 1 (exe = \"Discord.exe\"): override_persist has no effect: an explicit rule already wins over learned rules",
+            ]
         );
     }
 

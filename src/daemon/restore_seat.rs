@@ -1,5 +1,5 @@
-//! The restore seat: a tile minimized from its strip comes back into the
-//! column it left, and the view follows it. ADR-0027;
+//! The restore seat: a tile minimized or hidden from its strip comes back
+//! into the column it left, and the view follows it. ADR-0027;
 //! `docs/src/dev-guide/event-pipelines.md`, *Minimize / Restore*.
 
 use crate::common::WindowId;
@@ -55,9 +55,10 @@ pub(super) fn plan_restore_seat(
 impl FlowWM {
     /// Record the seat `window` has in its strip right now (monitor,
     /// workspace, column, row, alone, width) as its restore seat; cleared
-    /// when it is not a seated tile. Called by the minimize hook before the
-    /// window leaves the strip.
-    pub(super) fn capture_restore_seat(&mut self, window: WindowId) {
+    /// when it is not a seated tile. Called by the minimize and hide hooks
+    /// before the window leaves the strip.
+    /// `how` ("minimized", "hidden") only words the log line.
+    pub(super) fn capture_restore_seat(&mut self, window: WindowId, how: &str) {
         let seat = self.monitor_index_containing(window).and_then(|idx| {
             let ws_id = self.monitors[idx].find_workspace_containing(window)?;
             let layout = self.monitors[idx]
@@ -77,7 +78,7 @@ impl FlowWM {
         });
         if let Some(s) = seat {
             log::debug!(
-                "window {:#x} minimized from monitor {} workspace {} column {} row {}",
+                "window {:#x} {how} from monitor {} workspace {} column {} row {}",
                 window.0,
                 s.monitor,
                 s.workspace,

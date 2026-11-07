@@ -541,16 +541,44 @@ pub struct WindowRule {
     /// sets it) does not hide it. See ADR-0020.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fullscreen: Option<FullscreenStyle>,
-    /// Optional initial column width in pixels.
-    ///
-    /// When set, a window matching this rule is created at this width instead
-    /// of the default `column_width`. The value must fall within the engine's
-    /// current bounds (`[min_column_width_px, abs_max_width]`) at apply time.
+    /// Accepted but has no effect in this version: a new tile's width comes
+    /// from the `[columns]` width patterns (ADR-0017). `flow config check`
+    /// warns when it is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initial_width_px: Option<u32>,
-    /// If true, this rule overrides per-app learned state.
+    /// Accepted but has no effect: an explicit rule already wins over
+    /// learned rules (user rules, then learned, then defaults; first match
+    /// wins). `flow config check` warns when it is set.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub override_persist: bool,
+}
+
+impl MatchRule {
+    /// The criteria a rule sets, as `key = "value"` pairs in declaration
+    /// order (`any window` when none is set), for messages naming a rule.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let fields = [
+            ("exe", &self.exe),
+            ("title", &self.title),
+            ("title_contains", &self.title_contains),
+            ("title_regex", &self.title_regex),
+            ("class", &self.class),
+            ("process_path", &self.process_path),
+            ("exe_regex", &self.exe_regex),
+            ("class_regex", &self.class_regex),
+            ("process_path_regex", &self.process_path_regex),
+        ];
+        let set: Vec<String> = fields
+            .iter()
+            .filter_map(|(key, value)| value.as_ref().map(|v| format!("{key} = {v:?}")))
+            .collect();
+        if set.is_empty() {
+            "any window".to_owned()
+        } else {
+            set.join(", ")
+        }
+    }
 }
 
 /// Match criteria for a window rule.
@@ -688,7 +716,6 @@ pub enum FullscreenStyle {
 /// [[rules]]
 /// match = { class = "Chrome_WidgetWin_1" }
 /// action = "tile"
-/// initial_width_px = 960
 ///
 /// [[rules]]
 /// match = { exe = "mstsc.exe", class = "TscShellContainerClass" }
@@ -702,6 +729,30 @@ pub struct WindowRulesConfig {
     /// Window classification rules (first match wins).
     #[serde(default)]
     pub rules: Vec<WindowRule>,
+}
+
+impl WindowRulesConfig {
+    /// One line per rule field that is accepted but does nothing
+    /// (`initial_width_px`, `override_persist`), for `flow config check`
+    /// and the daemon's load log. Rules are numbered from 1.
+    #[must_use]
+    pub fn inert_field_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, rule) in self.rules.iter().enumerate() {
+            let who = format!("rule {} ({})", i + 1, rule.match_.summary());
+            if rule.initial_width_px.is_some() {
+                out.push(format!(
+                    "{who}: initial_width_px has no effect in this version"
+                ));
+            }
+            if rule.override_persist {
+                out.push(format!(
+                    "{who}: override_persist has no effect: an explicit rule already wins over learned rules"
+                ));
+            }
+        }
+        out
+    }
 }
 
 impl Default for WindowRulesConfig {
@@ -835,9 +886,10 @@ impl Default for AnimationConfig {
     }
 }
 
-/// Strategy for restoring minimized tiling windows.
+/// Strategy for bringing back a tiling window that was minimized, or that
+/// hid itself (tray) and is shown again.
 ///
-/// - `OriginalSlot` — put the window back where it was before minimize
+/// - `OriginalSlot` — put the window back where it was before minimize or hide
 /// - `RightOfFocused` — insert as a new column to the right of focused
 /// - `AppendRight` — append as the rightmost column on the canvas
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -861,7 +913,7 @@ impl Default for MinimizeRestore {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MinimizeRestoreStrategy {
-    /// Put the window back where it was before minimize.
+    /// Put the window back where it was before minimize or hide.
     OriginalSlot,
     /// Insert as a new column to the right of focused.
     RightOfFocused,
@@ -1940,6 +1992,44 @@ branch = \"main\"
     }
 
     #[test]
+    fn inert_rule_fields_are_warned_per_rule() {
+        let config: WindowRulesConfig = toml::from_str(
+            r#"
+default_action = "float"
+
+[[rules]]
+match = { exe = "code.exe" }
+action = "tile"
+
+[[rules]]
+match = { exe = "Discord.exe", class_regex = "Chrome.*" }
+action = "tile"
+initial_width_px = 800
+override_persist = true
+
+[[rules]]
+match = {}
+action = "float"
+override_persist = true
+"#,
+        )
+        .expect("both fields still parse");
+        assert_eq!(
+            config.inert_field_warnings(),
+            vec![
+                "rule 2 (exe = \"Discord.exe\", class_regex = \"Chrome.*\"): initial_width_px has no effect in this version",
+                "rule 2 (exe = \"Discord.exe\", class_regex = \"Chrome.*\"): override_persist has no effect: an explicit rule already wins over learned rules",
+                "rule 3 (any window): override_persist has no effect: an explicit rule already wins over learned rules",
+            ]
+        );
+        assert!(
+            WindowRulesConfig::default()
+                .inert_field_warnings()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn window_rules_config_from_toml() {
         let toml_str = r#"
 default_action = "float"
@@ -1958,6 +2048,13 @@ initial_width_px = 960
         assert_eq!(config.rules.len(), 2);
         assert_eq!(config.rules[0].action, Some(WindowAction::Ignore));
         assert_eq!(config.rules[1].initial_width_px, Some(960));
+        assert_eq!(
+            config.inert_field_warnings(),
+            vec![
+                "rule 2 (class = \"Chrome_WidgetWin_1\"): initial_width_px has no effect in this version"
+                    .to_owned()
+            ]
+        );
         assert_eq!(config.rules[1].fullscreen, None);
     }
 

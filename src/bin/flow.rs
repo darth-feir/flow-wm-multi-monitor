@@ -449,7 +449,7 @@ enum DispatchCommands {
     #[command(name = "focus-monitor")]
     FocusMonitor {
         #[command(subcommand)]
-        direction: FocusDirection,
+        direction: MonitorDirection,
     },
     /// Move the focused window to the monitor in the given direction. A
     /// tiled window joins that monitor's strip at the near edge; a float
@@ -459,7 +459,7 @@ enum DispatchCommands {
     #[command(name = "move-to-monitor")]
     MoveWindowToMonitor {
         #[command(subcommand)]
-        direction: FocusDirection,
+        direction: MonitorDirection,
     },
     /// Turn tiling off (hand the desktop back to Windows, every window
     /// moved back on-screen), on again, or toggle it — without stopping
@@ -522,6 +522,19 @@ enum FocusDirection {
     /// Focus the window above.
     Up,
     /// Focus the window below.
+    Down,
+}
+
+/// Direction of the target screen for `flow dispatch focus-monitor|move-to-monitor <dir>`.
+#[derive(Debug, Subcommand)]
+enum MonitorDirection {
+    /// The monitor to the left.
+    Left,
+    /// The monitor to the right.
+    Right,
+    /// The monitor above.
+    Up,
+    /// The monitor below.
     Down,
 }
 
@@ -1292,7 +1305,9 @@ fn cmd_config_path() -> Result<(), String> {
 /// parse errors, validation, each bad `[binds]` entry, preset lists that do
 /// not fit the attached screens — and the rules file. Without a daemon the
 /// files are checked locally ([`config::check_config`]), which cannot see
-/// the screens. Missing files are not errors: defaults apply.
+/// the screens. Missing files are not errors: defaults apply. Settings
+/// that are accepted but have no effect are printed as `flow: warning:`
+/// lines and leave the configuration valid.
 ///
 /// # Errors
 ///
@@ -1304,6 +1319,13 @@ fn cmd_config_check() -> Result<(), String> {
                 .get("problems")
                 .and_then(|p| serde_json::from_value(p.clone()).ok())
                 .unwrap_or_default();
+            let warnings: Vec<String> = payload
+                .get("warnings")
+                .and_then(|w| serde_json::from_value(w.clone()).ok())
+                .unwrap_or_default();
+            for w in &warnings {
+                eprintln!("flow: warning: {w}");
+            }
             let screens = payload.get("screens").and_then(serde_json::Value::as_u64);
             if problems.is_empty() {
                 println!(
@@ -1321,7 +1343,9 @@ fn cmd_config_check() -> Result<(), String> {
         Ok(other) => Err(format!("unexpected reply to check: {other:?}")),
         Err(_) => {
             let dir = config::dirs::config_dir();
-            config::check_config(&dir)?;
+            for w in config::check_config(&dir)? {
+                eprintln!("flow: warning: {w}");
+            }
             println!("flow: configuration is valid (no daemon running; checked locally)");
             Ok(())
         }
@@ -1459,13 +1483,13 @@ fn cmd_dispatch(command: DispatchCommands) -> Result<(), String> {
         ),
         DispatchCommands::FocusMonitor { direction } => send_command(
             SocketMessage::FocusMonitor {
-                direction: focus_direction_to_direction(direction),
+                direction: monitor_direction_to_direction(direction),
             },
             "monitor focused",
         ),
         DispatchCommands::MoveWindowToMonitor { direction } => send_command(
             SocketMessage::MoveWindowToMonitor {
-                direction: focus_direction_to_direction(direction),
+                direction: monitor_direction_to_direction(direction),
             },
             "window moved to monitor",
         ),
@@ -1669,13 +1693,13 @@ fn horizontal_to_direction(direction: HorizontalDirection) -> Direction {
     }
 }
 
-/// Map the CLI's `FocusDirection` subcommand onto the IPC [`Direction`].
-fn focus_direction_to_direction(direction: FocusDirection) -> Direction {
+/// Map the CLI's `MonitorDirection` subcommand onto the IPC [`Direction`].
+fn monitor_direction_to_direction(direction: MonitorDirection) -> Direction {
     match direction {
-        FocusDirection::Left => Direction::Left,
-        FocusDirection::Right => Direction::Right,
-        FocusDirection::Up => Direction::Up,
-        FocusDirection::Down => Direction::Down,
+        MonitorDirection::Left => Direction::Left,
+        MonitorDirection::Right => Direction::Right,
+        MonitorDirection::Up => Direction::Up,
+        MonitorDirection::Down => Direction::Down,
     }
 }
 
@@ -2852,6 +2876,27 @@ mod tests {
             describe_drag_reply(DragAction::End, &none),
             "no drag session to end"
         );
+    }
+
+    /// The help of a subcommand path, as `flow <path> --help` prints it.
+    fn help_of(path: &[&str]) -> String {
+        let mut cmd = <Cli as clap::CommandFactory>::command();
+        let mut sub = &mut cmd;
+        for name in path {
+            sub = sub.find_subcommand_mut(name).expect("subcommand");
+        }
+        sub.render_long_help().to_string()
+    }
+
+    #[test]
+    fn monitor_direction_help_does_not_talk_about_focusing_a_window() {
+        for cmd in ["move-to-monitor", "focus-monitor"] {
+            let help = help_of(&["dispatch", cmd]);
+            assert!(!help.contains("Focus the window"), "{cmd}: {help}");
+            assert!(help.contains("The monitor to the left"), "{cmd}: {help}");
+        }
+        let help = help_of(&["dispatch", "focus"]);
+        assert!(help.contains("Focus the window to the left"), "{help}");
     }
 
     #[test]

@@ -493,7 +493,9 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   restore puts it back there (index clamped to the column count; another
   workspace lands in the active one; another monitor appends), the view
   scrolls to it like a focus move (strip and book), and a foreground restore
-  becomes the focus. `[minimize_restore] strategy` now takes effect. The
+  becomes the focus. `[minimize_restore] strategy` now takes effect. A tile
+  hidden to the tray and shown again takes the same path (addendum, stage
+  33b). The
   border's corner rule also reads whether the client area covers the window
   (Alacritty `decorations = "none"` keeps `WS_CAPTION | WS_THICKFRAME`):
   square then. `docs/adr/0027-restore-seat-and-frameless-corners.md`

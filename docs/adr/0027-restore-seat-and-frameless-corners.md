@@ -67,9 +67,10 @@ the user asked for, so that is what the user expects to see.
   user has now moved on purpose.
 - **Strategy.** `[minimize_restore] strategy`: `original_slot` (default)
   as above, `right_of_focused` inserts after the strip's focused column,
-  `append_right` appends; all three follow the view. A window re-shown
-  after a hide or recovered from maximized is still appended without a
-  scroll (an app re-showing itself is not the user's request).
+  `append_right` appends; all three follow the view. A window recovered
+  from maximized is still appended without a scroll. (Stage 33 also
+  appended a window re-shown after a hide; stage 33b changed that, see
+  *Hidden windows* below.)
 - **Floats** keep their stage 30 behaviour (rect restored).
 
 ### Consequences
@@ -137,6 +138,50 @@ matched: winit keeps `WS_CAPTION` for undecorated windows.
   would be square; there is no API to read those margins. None seen yet. An
   app that sets `DWMWA_WINDOW_CORNER_PREFERENCE` is followed.
 - There is still no config key for the corner shape; it is detected.
+
+## Addendum (stage 33b, 2026-11-06): hidden windows
+
+### Context
+
+An app that hides to the tray and is reopened (Discord, Teams, Steam,
+Spotify, Electron apps) came back at the far right of the strip with no
+scroll: the hide hook took the tile out of the strip without recording a
+seat, and the show hook appended it. The registry's `last_virtual_slot`,
+saved on hide as well, never placed anything.
+
+### Decision
+
+- The hide hook (`on_window_hidden`, also the DWM-cloak hook) records the
+  restore seat of an active tile before removing it, exactly as the
+  minimize hook does: same `RestoreSeat`, same lifetime (dropped with the
+  record on destroy or purge, used up by the next re-add).
+- The show hook (`on_window_shown`, also uncloak) re-adds the tile through
+  `readd_tile(hwnd, follow = true)`, the restore path: seat applied
+  (clamp, shared-column rejoin, workspace fallback), view scrolled to it,
+  focus taken when Windows made it the foreground. `[minimize_restore]
+  strategy` applies to both. The view follows any re-add on this path,
+  with or without a seat (as for a restore).
+- The minimize hook now records a seat only from an active tile, so a
+  minimize that reaches a tile already hidden (or a repeated minimize)
+  keeps the seat recorded first instead of clearing it.
+- A maximize recovery is unchanged: appended, no scroll.
+
+Rejected: keep re-shows as they were because "an app re-showing itself is
+not the user's request". In practice the re-show is the answer to a tray
+click; the user looks for the window where it was.
+
+### Consequences
+
+- A tile cloaked and uncloaked by DWM (a suspended UWP app, a Windows
+  virtual-desktop switch) also returns to its seat; when several come back
+  at once the view ends on the last one shown.
+- `last_virtual_slot` stays: it is the placeholder slot of the registry's
+  `Active` state on restore/show (re-synced from the layout once seated)
+  and the hotplug reconcile's casualty order. It is not where a tile goes
+  back.
+- Unit tests: hide then show back in its column and in view, clamp after
+  columns closed, destroy while hidden leaves no seat, minimize of a
+  hidden tile keeps the hide's seat. VM driver `test-stage33b.ps1`, H1-H7.
 
 ## Tests
 

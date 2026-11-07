@@ -2397,13 +2397,17 @@ impl FlowWM {
     /// `flow config check` against the running daemon: every problem in
     /// `flow.toml` (parse, validation, `[binds]` entry by entry, preset
     /// lists against the attached screens) and `flow-rules.toml`, without
-    /// applying anything. Answers `Data { "ok", "problems": [...] }`.
+    /// applying anything. Answers `Data { "ok", "problems": [...],
+    /// "warnings": [...] }`; warnings (settings accepted but inert) do not
+    /// make it invalid.
     fn dispatch_check_config(&self) -> SocketResponse {
         let problems = self.config_problems();
+        let warnings = self.config_warnings();
         SocketResponse::Data {
             payload: serde_json::json!({
                 "ok": problems.is_empty(),
                 "problems": problems,
+                "warnings": warnings,
                 "screens": self.monitors.len(),
             }),
         }
@@ -2441,6 +2445,12 @@ impl FlowWM {
             problems.push(format!("{error}"));
         }
         problems
+    }
+
+    /// The warnings `dispatch_check_config` reports: `flow-rules.toml`
+    /// settings that are accepted but have no effect, one line each.
+    pub(super) fn config_warnings(&self) -> Vec<String> {
+        crate::config::rules_file_warnings(&user_rules_path_in(&self.config_dir))
     }
 }
 /// Pure candidate rule behind [`FlowWM::resolve_focus_target_with`]: the

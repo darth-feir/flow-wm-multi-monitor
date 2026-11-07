@@ -362,8 +362,8 @@ nothing left to change.
 ### Which monitor a returning window belongs to
 
 A window coming back into a layout (restored, re-shown, recovered from
-maximized) is appended to its *home* monitor (`home_monitor_for_hwnd`,
-`readd_tile_to_home_monitor`), resolved in this order of trust:
+maximized) is seated on its *home* monitor (`home_monitor_for_hwnd`,
+`readd_tile`), resolved in this order of trust:
 
 1. the **owning-monitor memory** (`Window::owner_monitor`), recorded whenever
    the daemon seats the window and surviving minimize / hide;
@@ -422,7 +422,7 @@ synced.
 |-----------|--------|
 | Not tracked | Skip |
 | Was `Tiling::Active` | Its seat is recorded (`capture_restore_seat`: monitor, workspace, column, row, alone, width), registry updates to `Tiling::Minimized`, `remove_from_layout_and_refocus()`, animate |
-| Was `Tiling::Minimized` or not tiling | Registry state update only, no layout change |
+| Was `Tiling::Minimized`, `Tiling::Hidden` or not tiling | Registry state update only, no layout change; a seat recorded by an earlier hide is kept |
 
 ### Restored (`EVENT_SYSTEM_MINIMIZEEND`)
 
@@ -436,14 +436,16 @@ synced.
 Restored windows go back to the column they were minimized from (clamped to
 the column count; a seat on another workspace lands in the visible one, a seat
 on another monitor is appended), and the view follows them in strip and book
-layout alike (ADR-0027). Windows re-shown after a hide or recovered from
-maximized are still appended at the far right without a scroll. On a
+layout alike (ADR-0027). A tile re-shown after a hide takes the same path
+(its seat is recorded on hide; see [Hidden / Shown](#hidden--shown-event_object_hide--event_object_show)),
+and `[minimize_restore] strategy` applies to both. A window recovered from
+maximized is still appended at the far right without a scroll. On a
 multi-monitor desktop the strip they return to is the home monitor's — see [Which monitor a returning window belongs to](#which-monitor-a-returning-window-belongs-to).
 
 With `[floating] always_on_top`, the minimize / hide handlers take a float out
 of the floating layer and the restore / show handlers put it back
 (`FlowWM::sync_top_layer`; a fullscreen window, re-seated as a fullscreen
-column by `readd_tile_to_home_monitor`, is left to the fullscreen code); the created and state-change handlers
+column by `readd_tile`, is left to the fullscreen code); the created and state-change handlers
 put a window registered or recovered as a float or an explicit-rule ignore in,
 and the foreground handler raises an activated member again if its app
 demoted it. See [Floating Space](./floating-space.md#the-floating-layer-floating-always_on_top).
@@ -471,8 +473,9 @@ These events handle tray-hide ("close to system tray") and DWM-cloak behaviors
 that `EVENT_SYSTEM_MINIMIZESTART/END` do not cover.
 
 **Hidden:** If the window was `Tiling::Active` and the state actually changed
-to `Hidden` (via `reconcile_visibility`), the window is removed from layout
-with focus successor resolution — identical to the minimize path. The
+to `Hidden` (via `reconcile_visibility`), its restore seat is recorded
+(`capture_restore_seat`) and the window is removed from layout with focus
+successor resolution — identical to the minimize path. The
 `is_tiling_active` check (not `is_tiling`) prevents double-removal since Win32
 fires both `MINIMIZESTART` and `HIDE` for ordinary minimizes.
 
@@ -483,7 +486,12 @@ fires both `MINIMIZESTART` and `HIDE` for ordinary minimizes.
 2. **OS-ignored** — a tracked `Ignored(Maximized|Fullscreen)` window gets the
    [State Change](#state-change-event_object_statechange) recovery.
 3. **Re-show** — if the window was `Hidden` and now transitions to `Shown`,
-   re-add to layout via `add_window()`.
+   `readd_tile(hwnd, follow = true)`, exactly as a restore from minimize:
+   back into the seat it was hidden from (clamped; shared column rejoined;
+   another workspace lands in the visible one), the view scrolls to it, and
+   it becomes the focus when Windows made it the foreground. An app hiding
+   to the tray and coming back (Discord, Teams, Steam) returns where it
+   was (ADR-0027, *Hidden windows*).
 
 ### Cloaked / Uncloaked (`EVENT_OBJECT_CLOAKED` / `EVENT_OBJECT_UNCLOAKED`)
 

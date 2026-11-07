@@ -45,6 +45,9 @@ flow config check
 With a daemon running the check is done by the daemon, so it also knows the
 attached screens (preset lists are checked per screen) and reports each bad
 `[binds]` entry on its own line; without one, the files are checked locally.
+Settings that are accepted but do nothing are printed as `flow: warning:`
+lines and leave the configuration valid (see
+[Accepted fields with no effect](#accepted-fields-with-no-effect)).
 
 ### Live-reloadable vs. structural fields
 
@@ -67,6 +70,9 @@ Not every field can change at runtime. Reload applies **live** fields in place;
 | `adopt_maximized` | Applies to the next maximized window the daemon meets (a window already parked as ignored is adopted when it is next focused, shown or moved). |
 | `floating.always_on_top` | Immediate: turned on, every floating window and every rule-ignored window is raised above the tiles; turned off, they go back to the normal z-order (a window that was "always on top" by itself keeps that). |
 | `binds.*` | The daemon re-resolves the table; the hotkey script re-reads it a few seconds after the save and re-registers the chords (one-line message). A table with an error keeps the old chords. |
+| `focus.new_window_monitor` | Applies to the next window that opens. |
+| `minimize_restore.strategy` | Applies to the next restore from minimize or re-show after a hide. |
+| `logging.keymap_log` | Applies the next time the daemon launches the keymap (`flow start --ahk`). |
 | `startup.*` | Applies to the next daemon start only. |
 | `keymap.selection_buffer` | The hotkey script re-reads it with the bindings a few seconds after the save: the selection buffer starts or stops (stopping forgets the buffered text). |
 | **Workspace count (10), monitor geometry** | **Structural** — not reloadable. Restart the daemon. |
@@ -400,19 +406,19 @@ duration_ms = 240
 easing = "ease-out-expo"
 ```
 
-### `[minimize_restore]` — bringing minimized windows back
+### `[minimize_restore]` — bringing minimized and hidden windows back
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `strategy` | `MinimizeRestoreStrategy` | `"original_slot"` | Where a minimized tiling window goes when restored. See below. |
+| `strategy` | `MinimizeRestoreStrategy` | `"original_slot"` | Where a tiling window goes when it is restored from minimize, or shown again after hiding itself (an app closed to the tray and reopened). See below. |
 
 Accepted `strategy` values:
 
-- `"original_slot"` — Restore to the exact column/row it was minimized from. The column index is clamped to the strip's current column count (columns closed meanwhile move it towards the end); it rejoins a shared column at its row when that column still has room, else it gets a column of its own at its old width. A window minimized on a workspace that is no longer the visible one (or is gone) comes back in the visible workspace at that index; one whose monitor is gone is appended on its home monitor.
+- `"original_slot"` — Restore to the exact column/row it was minimized or hidden from. The column index is clamped to the strip's current column count (columns closed meanwhile move it towards the end); it rejoins a shared column at its row when that column still has room, else it gets a column of its own at its old width. A window minimized on a workspace that is no longer the visible one (or is gone) comes back in the visible workspace at that index; one whose monitor is gone is appended on its home monitor.
 - `"right_of_focused"` — Restore into a new slot immediately to the right of the currently focused window.
 - `"append_right"` — Append to the rightmost column.
 
-With every strategy the view scrolls to the restored window (strip and book layout), and when Windows gives it the foreground (taskbar click, Alt+Tab) it is the focused window. A window that is re-shown after hiding itself, or recovered from maximized, is appended without a scroll. Why: `docs/adr/0027-restore-seat-and-frameless-corners.md`.
+With every strategy the view scrolls to the restored window (strip and book layout), and when Windows gives it the foreground (taskbar click, Alt+Tab, reopening from the tray) it is the focused window. A window that hid itself (Discord, Teams, Steam, Spotify "close to tray") and is shown again is treated exactly like a restore from minimize. A window recovered from maximized is appended without a scroll. Why: `docs/adr/0027-restore-seat-and-frameless-corners.md`.
 
 Example:
 
@@ -861,6 +867,20 @@ Desktop sends the Windows key combinations to the remote session (the
 (`flow.ahk`) puts its keyboard hook back in front whenever a Remote Desktop
 full screen becomes active, so the FlowWM chords keep working there and
 every other Windows key combination still reaches the session.
+
+#### Accepted fields with no effect
+
+Two rule fields from upstream still parse, so a file that sets them keeps
+loading, but they do nothing; `flow config check` prints a warning for
+each rule that sets one (the daemon's log notes the same lines at `info`
+level when it loads the file):
+
+- `initial_width_px` — `rule N (<match>): initial_width_px has no effect in
+  this version`. A new tile's width comes from the `[columns]` width
+  patterns, per screen slot (ADR-0017).
+- `override_persist` — `rule N (<match>): override_persist has no effect: an
+  explicit rule already wins over learned rules`. Your rules are checked
+  before the learned ones, and the first match wins.
 
 ### Example
 

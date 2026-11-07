@@ -98,10 +98,10 @@ mod hwnd_serde {
 ///   explicit user resize. Used when the layout engine needs to determine
 ///   a window's natural proportions.
 ///
-/// - **`last_virtual_slot`** — The window's last known column/row position
-///   in the layout grid. Saved when a tiled window is minimized and
-///   restored when it's un-minimized. This prevents the window from losing
-///   its place in the layout.
+/// - **`last_virtual_slot`** — The registry's column/row of the tile when
+///   it was last minimized or hidden. Not where it goes back (that is
+///   `restore_seat`); read as the placeholder slot of the `Active` state on
+///   restore/show and by the hotplug reconcile to order its casualties.
 ///
 /// - **`tiled_rect`** — The window's current tiled position as computed by
 ///   the layout engine's projection layer. Updated after every mutation.
@@ -150,7 +150,8 @@ pub struct Window {
     /// Preferred unmanaged size, updated on explicit user resize.
     pub last_natural_size: Size,
 
-    /// Remembered virtual-slot position for minimize/restore cycles.
+    /// The registry slot at the last minimize or hide (see the struct
+    /// docs: placeholder on restore, hotplug casualty order).
     pub last_virtual_slot: Option<VirtualSlot>,
 
     /// When the minimize hook last moved this window to a `Minimized`
@@ -216,10 +217,11 @@ pub struct Window {
     #[serde(default)]
     pub monitor: Option<usize>,
 
-    /// Where this tile sat when it was **minimized** — the *restore seat*,
-    /// kept next to the owning monitor memory: the restore hook puts the
-    /// window back there instead of appending it (ADR-0027). Set by the
-    /// minimize hook for a seated tile, taken (cleared) by the next re-add.
+    /// Where this tile sat when it was **minimized or hidden** — the
+    /// *restore seat*, kept next to the owning monitor memory: the restore
+    /// and re-show hooks put the window back there instead of appending it
+    /// (ADR-0027). Set by the minimize and hide hooks for a seated tile,
+    /// taken (cleared) by the next re-add.
     /// Process-local, so never serialised; dropped with the record.
     #[serde(skip)]
     pub restore_seat: Option<RestoreSeat>,
@@ -408,14 +410,19 @@ impl std::fmt::Display for CreationSkip {
 /// |------|-------|----|
 /// | (new) | classification | `Tiling(Active)` / `Floating(Active)` / `Ignored(...)` |
 /// | `Tiling(Active)` | `MinimizeStart` | `Tiling(Minimized)` |
-/// | `Tiling(Minimized)` | `MinimizeEnd` | `Tiling(Active)` with restored slot |
-/// | `Tiling(Active)` | `EVENT_OBJECT_HIDE` | `Tiling(Hidden)` (slot saved to `last_virtual_slot`) |
-/// | `Tiling(Hidden)` | `EVENT_OBJECT_SHOW` | `Tiling(Active)` with restored slot |
+/// | `Tiling(Minimized)` | `MinimizeEnd` | `Tiling(Active)`; the daemon re-seats it from its restore seat |
+/// | `Tiling(Active)` | `EVENT_OBJECT_HIDE` | `Tiling(Hidden)`; the daemon records its restore seat |
+/// | `Tiling(Hidden)` | `EVENT_OBJECT_SHOW` | `Tiling(Active)`; the daemon re-seats it from its restore seat |
 /// | `Tiling(Hidden)` | Destroyed | removed from registry |
 /// | `Floating(Active)` | `MinimizeStart` | `Floating(Minimized)` |
 /// | `Floating(Minimized)` | `MinimizeEnd` | `Floating(Active)` with original rect |
 /// | `Floating(Active)` | `EVENT_OBJECT_HIDE` | `Floating(Hidden)` |
-/// | `Floating(Hidden)` | `EVENT_OBJECT_SHOW` | `Floating(Active)` with `pre_manage_rect` |
+/// | `Floating(Hidden)` | `EVENT_OBJECT_SHOW` | `Floating(Active)` with the rect it was hidden at |
+///
+/// The column a tile goes back to is the daemon's
+/// [`Window::restore_seat`] (ADR-0027), not `last_virtual_slot`: the
+/// `col`/`row` the registry writes on `MinimizeEnd`/`SHOW` are a
+/// placeholder until the daemon re-syncs the slots from the layout.
 ///
 /// Note: tile ↔ float transitions are implemented via `flow dispatch set-window`
 /// (see `docs/src/dev-guide/floating-space.md`). An `Ignored` window leaves
@@ -437,10 +444,9 @@ pub enum WindowState {
 
 /// Sub-state for windows participating in the tiling layout.
 ///
-/// Tiled windows can be either actively positioned at a grid slot or minimized.
-/// When minimized, the window's grid position is preserved in
-/// [`Window::last_virtual_slot`](Window::last_virtual_slot) so it can be
-/// restored to its original position.
+/// Tiled windows can be actively positioned at a grid slot, minimized or
+/// hidden. A minimized or hidden tile is out of the layout; the daemon's
+/// [`Window::restore_seat`] says where it goes back (ADR-0027).
 ///
 /// # Relationship to Layout Engine
 ///
@@ -459,8 +465,8 @@ pub enum TilingState {
     /// Window is minimized (preserving its virtual-slot assignment).
     Minimized,
     /// Window is hidden from the user (tray-hidden / cloaked / `SW_HIDE`) but
-    /// still tracked. The original tiling slot is preserved in
-    /// [`Window::last_virtual_slot`] so it can be restored on re-show.
+    /// still tracked. The daemon records its restore seat on hide and puts
+    /// it back there on re-show, as for a minimize (ADR-0027).
     ///
     /// Distinct from [`Minimized`](Self::Minimized): a minimize is an
     /// explicit user action via the taskbar/minimize button, whereas
@@ -534,10 +540,10 @@ pub enum IgnoredReason {
 
 // ── RestoreSeat ─────────────────────────────────────────────────────
 
-/// The seat a tile left when it was minimized ([`Window::restore_seat`]):
+/// The seat a tile left when it was minimized or hidden ([`Window::restore_seat`]):
 /// the monitor and workspace of its strip, its column and row there,
 /// whether it had the column to itself, and the column's width. Read by
-/// the daemon's restore hook (ADR-0027).
+/// the daemon's restore and re-show hooks (ADR-0027).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RestoreSeat {
     /// Index of the monitor whose strip held the tile.
@@ -556,18 +562,14 @@ pub struct RestoreSeat {
 
 // ── VirtualSlot ─────────────────────────────────────────────────────
 
-/// Virtual layout position remembered for minimize/restore cycles.
+/// The registry's column/row of a tile when it was last minimized or
+/// hidden ([`Window::last_virtual_slot`]).
 ///
-/// When a tiled window is minimized, its column/row position is saved here
-/// so it can be restored to the same slot when un-minimized. Without this,
-/// a restored window would lose its place in the layout grid.
-///
-/// # Bridge Between Registry and Layout Engine
-///
-/// `VirtualSlot` is the data bridge between the registry (which tracks window
-/// state) and the layout engine (which manages grid positions). The registry
-/// saves the slot on minimize and reads it on restore. The layout engine
-/// assigns new slots when windows are added or moved.
+/// Where the tile goes back is the daemon's [`RestoreSeat`], not this: the
+/// registry reads the slot as the placeholder `Active { col, row }` on
+/// restore/show (re-synced from the layout once the daemon seats it), and
+/// the hotplug reconcile orders the tiles Windows minimized with a display
+/// change by it.
 ///
 /// # Default on Restore
 ///

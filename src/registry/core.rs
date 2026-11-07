@@ -617,9 +617,10 @@ impl WindowRegistry {
     /// # Design: Why Save the Virtual Slot?
     ///
     /// When a tiled window is minimized, its position in the layout grid
-    /// (`col`, `row`) is saved into [`last_virtual_slot`](super::types::Window::last_virtual_slot).
-    /// When the window is restored, this slot is used to place it back at
-    /// its original position — the user doesn't lose their window arrangement.
+    /// (`col`, `row`) is saved into [`last_virtual_slot`](super::types::Window::last_virtual_slot):
+    /// the placeholder slot of the restored `Active` state and the hotplug
+    /// reconcile's casualty order. Where the layout puts it back is the
+    /// daemon's restore seat (ADR-0027).
     ///
     /// # Borrow Checker Workaround
     ///

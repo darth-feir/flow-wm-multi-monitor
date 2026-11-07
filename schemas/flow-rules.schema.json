@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "WindowRulesConfig",
-  "description": "Window classification configuration, loaded from `flow-rules.toml`.\n\nThis is the user-facing window rules file. Rules are evaluated top-to-bottom,\nfirst match wins. If no rule matches, `default_action` is used.\n\nLoaded from `%USERPROFILE%\\.config\\flow\\flow-rules.toml` (see [`config::dirs`](crate::config::dirs)\nfor overrides). If the file doesn't exist,\ndefaults to an empty rule list with `default_action: float`.\n\n# Example\n\n```toml\ndefault_action = \"float\"\n\n[[rules]]\nmatch = { exe = \"explorer.exe\", title_contains = \"Open\" }\naction = \"ignore\"\n\n[[rules]]\nmatch = { class = \"Chrome_WidgetWin_1\" }\naction = \"tile\"\ninitial_width_px = 960\n\n[[rules]]\nmatch = { exe = \"mstsc.exe\", class = \"TscShellContainerClass\" }\nfullscreen = \"app\"\n```",
+  "description": "Window classification configuration, loaded from `flow-rules.toml`.\n\nThis is the user-facing window rules file. Rules are evaluated top-to-bottom,\nfirst match wins. If no rule matches, `default_action` is used.\n\nLoaded from `%USERPROFILE%\\.config\\flow\\flow-rules.toml` (see [`config::dirs`](crate::config::dirs)\nfor overrides). If the file doesn't exist,\ndefaults to an empty rule list with `default_action: float`.\n\n# Example\n\n```toml\ndefault_action = \"float\"\n\n[[rules]]\nmatch = { exe = \"explorer.exe\", title_contains = \"Open\" }\naction = \"ignore\"\n\n[[rules]]\nmatch = { class = \"Chrome_WidgetWin_1\" }\naction = \"tile\"\n\n[[rules]]\nmatch = { exe = \"mstsc.exe\", class = \"TscShellContainerClass\" }\nfullscreen = \"app\"\n```",
   "type": "object",
   "properties": {
     "default_action": {
@@ -152,7 +152,7 @@
           ]
         },
         "initial_width_px": {
-          "description": "Optional initial column width in pixels.\n\nWhen set, a window matching this rule is created at this width instead\nof the default `column_width`. The value must fall within the engine's\ncurrent bounds (`[min_column_width_px, abs_max_width]`) at apply time.",
+          "description": "Accepted but has no effect in this version: a new tile's width comes\nfrom the `[columns]` width patterns (ADR-0017). `flow config check`\nwarns when it is set.",
           "type": [
             "integer",
             "null"
@@ -165,7 +165,7 @@
           "$ref": "#/$defs/MatchRule"
         },
         "override_persist": {
-          "description": "If true, this rule overrides per-app learned state.",
+          "description": "Accepted but has no effect: an explicit rule already wins over\nlearned rules (user rules, then learned, then defaults; first match\nwins). `flow config check` warns when it is set.",
           "type": "boolean"
         }
       },
