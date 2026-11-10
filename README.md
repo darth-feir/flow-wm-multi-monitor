@@ -11,17 +11,17 @@ FlowWM is written by [CCpcalvin](https://github.com/CCpcalvin/flow-wm) (MIT). Up
 | Area | What changed |
 |---|---|
 | **Multiple monitors** | Every monitor has its own scrolling strip and its own workspaces. `focus-monitor` and `move-column-to-monitor` cross screens; columns scrolled out of view park beyond the virtual screen, never on the neighbour. Each screen's work area is measured on its own, so a vertical taskbar on one screen is respected. Monitors can be plugged and unplugged while the daemon runs. |
-| **Column widths** | `[columns] presets = ["1/3", "1/2", "1/1"]` and slot patterns such as `"2/3+1/3"`: `Mod+R` cycles the width of every column on the focused screen, each screen can have its own list, and a column moved to another screen takes that screen's width. |
-| **Stacked columns** | `[columns] visible_rows` / `max_rows`: a column shows two rows at a time and scrolls through up to four. `Mod+[` and `Mod+]` merge the window into the neighbouring column or pop it out again. |
-| **Book layout** | `[columns] layout = "book"` (per screen too, or `Mod+Shift+B` at runtime) piles the columns out of view behind the leftmost and rightmost visible ones, so every window stays on screen and one scroll flips the next card to the top. `wrap_around` lets focus wrap round the strip. |
-| **Fullscreen** | `Mod+F` makes the window's column fullscreen as niri does: it covers the whole screen including the taskbar, focus moves through it like any other column, and `Mod+F` again puts it back. Apps with a full screen of their own (Remote Desktop) are asked for it instead. |
-| **Floating layer** | `[floating] always_on_top`: floating windows, and dialogs owned by a managed window, stay above the tiled strip so nothing hides behind the tiles. `Mod+V` floats or tiles the focused window, `Mod+Shift+V` switches focus between the two layers. |
+| **Column widths** | `[columns] presets = ["1/3", "1/2", "1/1"]` and slot patterns such as `"2/3+1/3"`: `Win+R` cycles the width of every column on the focused screen, each screen can have its own list, and a column moved to another screen takes that screen's width. |
+| **Stacked columns** | `[columns] visible_rows` / `max_rows`: a column shows two rows at a time and scrolls through up to four. `Win+[` and `Win+]` merge the window into the neighbouring column or pop it out again. |
+| **Book layout** | `[columns] layout = "book"` (per screen too, or `Win+Shift+B` at runtime) piles the columns out of view behind the leftmost and rightmost visible ones, so every window stays on screen and one scroll flips the next card to the top. `wrap_around` lets focus wrap round the strip. |
+| **Fullscreen** | `Win+F` makes the window's column fullscreen as niri does: it covers the whole screen including the taskbar, focus moves through it like any other column, and `Win+F` again puts it back. Apps with a full screen of their own (Remote Desktop) are asked for it instead. |
+| **Floating layer** | `[floating] always_on_top`: floating windows, and dialogs owned by a managed window, stay above the tiled strip so nothing hides behind the tiles. `Win+V` floats or tiles the focused window, `Win+Shift+V` switches focus between the two layers. |
 | **New windows** | A new window opens on the focused screen, already in its slot: programs started from the keymap, by `flow spawn` or by `[startup] spawn` are asked to put their first window there, so nothing flashes on the other screen first. |
-| **Minimize and restore** | `Mod+M` minimizes. A restored tile goes back to the column and row it left, the view scrolls to it, and a window that hid itself to the tray comes back the same way. |
+| **Minimize and restore** | `Win+M` minimizes. A restored tile goes back to the column and row it left, the view scrolls to it, and a window that hid itself to the tray comes back the same way. |
 | **Windows that were already open** | Windows that exist before the daemon starts are adopted, maximized ones included; Store apps are picked up once they are uncloaked. No reopening apps so the tiler sees them. |
 | **Elevated windows** | A window running as administrator while FlowWM is not is left alone, since Windows refuses to let FlowWM move it. |
 | **Borders** | The ring follows the window's own shape: a frameless window such as Alacritty without decorations gets a square ring. Windows that grow their frame late (SSMS, Visual Studio) are re-measured when placed, so there is no gap between app and ring. |
-| **Mouse** | Mod + left-button drag moves a tile to a new slot, on any screen, with a drop preview. Mod + mouse wheel mirrors the arrow chords: wheel alone moves focus, with Shift moves the column, with Ctrl changes screen, with Alt moves the column to the other screen. |
+| **Mouse** | Win + left-button drag moves a tile to a new slot, on any screen, with a drop preview. Win + mouse wheel mirrors the arrow chords: wheel alone moves focus, with Shift moves the column, with Ctrl changes screen, with Alt moves the column to the other screen. |
 | **Selection buffer** | An opt-in X11-style buffer (`[keymap] selection_buffer`): highlight text with the mouse, then middle-click to paste it, without touching the clipboard. Works in terminals, editors and browsers through UI Automation; Alacritty needs its copy-on-select option. |
 | **Key bindings are configuration** | Chords live in a `[binds]` table in `flow.toml`, in niri's spelling, laid over a built-in default table. The keymap registers whatever the daemon lists and re-reads it when the file is saved. |
 | **Fail-safe exit** | Every way the daemon can stop, including a crash, puts the desktop back the way Windows had it: borders gone, windows restored, nothing left parked off-screen. Tiling can be paused without stopping. |
@@ -31,31 +31,32 @@ Each row has a design record in `docs/adr` (ADR-0007 onwards) and a page in the 
 
 ## The keymap
 
-`keymaps/win-niri/` is an AutoHotkey v2 keymap with the Windows key as Mod and the arrow keys instead of hjkl, following niri's defaults. The chords Windows reserves below the hook layer stay with Windows: `Win+L` always locks.
+`keymaps/win-niri/` is an AutoHotkey v2 keymap with the Windows key as the modifier and the arrow keys instead of hjkl, following niri's defaults. niri writes the modifier as `Mod` because it may be Super or Alt depending on where niri runs; here it is always the Windows key, in a virtual machine too, so this table says `Win`. In the `[binds]` table it is still spelled `Mod`, niri's spelling. The chords Windows reserves below the hook layer stay with Windows: `Win+L` always locks.
 
 | Chord | What it does |
 |---|---|
-| `Mod+Arrows` | Focus the column to the left or right, the window above or below |
-| `Mod+Shift+Arrows` | Move the column or window that way |
-| `Mod+Ctrl+Left/Right` | Focus the other screen |
-| `Mod+Alt+Left/Right` | Move the column to the other screen |
-| `Mod+Wheel` and the same modifiers | The same as the Left and Right arrow chords |
-| `Mod+1..9`, `Mod+0` | Workspace 1 to 10 on the focused screen; with `Ctrl`, move the column there |
-| `Mod+R` | Cycle the column width presets |
-| `Mod+F` | Fullscreen the column |
-| `Mod+V`, `Mod+Shift+V` | Float or tile the window; switch focus between the layers |
-| `Mod+[`, `Mod+]` | Merge into, or pop out of, the neighbouring column |
-| `Mod+C` | Center the column |
-| `Mod+M`, `Mod+Q` | Minimize, close |
-| `Mod+Shift+B` | Toggle the book layout on this screen |
-| `Mod+T`, `Mod+Shift+T` | Alacritty, Alacritty as administrator (`Mod+Alt+T` for Windows Terminal) |
-| `Mod+Space` | Fuzzy launcher over the Start menu, open windows and files |
-| `Mod+Shift+/` | Key-binding overlay, built from the same list the hotkeys come from |
-| `Mod+Ctrl+Shift+T` | Pause tiling; the daemon keeps running |
-| `Mod+Ctrl+T` | FlowWM off and on again (through the resident starter) |
-| `Mod+Shift+E` | Quit |
+| `Win+Arrows` | Focus the column to the left or right, the window above or below |
+| `Win+Shift+Arrows` | Move the column or window that way |
+| `Win+Ctrl+Left/Right` | Focus the other screen |
+| `Win+Alt+Left/Right` | Move the column to the other screen |
+| `Win+Wheel` and the same modifiers | The same as the Left and Right arrow chords |
+| `Win` + left-button drag | Move the tile to a new slot, on either screen, with a drop preview (hardwired, not in `[binds]`) |
+| `Win+1..9`, `Win+0` | Workspace 1 to 10 on the focused screen; with `Ctrl`, move the column there |
+| `Win+R` | Cycle the column width presets |
+| `Win+F` | Fullscreen the column |
+| `Win+V`, `Win+Shift+V` | Float or tile the window; switch focus between the layers |
+| `Win+[`, `Win+]` | Merge into, or pop out of, the neighbouring column |
+| `Win+C` | Center the column |
+| `Win+M`, `Win+Q` | Minimize, close |
+| `Win+Shift+B` | Toggle the book layout on this screen |
+| `Win+T`, `Win+Shift+T` | Alacritty, Alacritty as administrator (`Win+Alt+T` for Windows Terminal) |
+| `Win+Space` | Fuzzy launcher over the Start menu, open windows and files |
+| `Win+Shift+/` | Key-binding overlay, built from the same list the hotkeys come from |
+| `Win+Ctrl+Shift+T` | Pause tiling; the daemon keeps running |
+| `Win+Ctrl+T` | FlowWM off and on again (through the resident starter) |
+| `Win+Shift+E` | Quit |
 
-`Alt+hjkl` and `Alt+Shift+hjkl` are bound too, for upstream's muscle memory. Any chord can be changed, added or set to `"none"` in `[binds]`; the full grammar and action list are in the user guide's config reference.
+`Alt+hjkl` and `Alt+Shift+hjkl` are bound too, for upstream's muscle memory. Any chord can be changed, added or set to `"none"` in `[binds]`, except the drag and the two `Win+Ctrl` switches, which are hardwired; the full grammar and action list are in the user guide's config reference.
 
 ## Install
 
@@ -71,7 +72,7 @@ target\release\flow.exe config init   # writes %USERPROFILE%\.config\flow\flow.t
 1. Copy `flow.exe` and `flowd.exe` from `target\release\` together into one folder, for example `%LOCALAPPDATA%\Programs\flow`. `flow start` looks for `flowd.exe` next to `flow.exe`, and the keymap looks for `flow.exe` in that folder.
 2. Copy every `.ahk` file from `keymaps\win-niri\` into `%USERPROFILE%\.config\flow\`. They include each other, so they must sit together.
 3. Merge `keymaps\win-niri\flow.toml.example` into your `flow.toml`. It carries the width presets, the stack rows, `layout` and `wrap_around`, `adopt_maximized`, `always_on_top`, `new_window_monitor`, and commented `[binds]`, `[keymap]` and `[startup]` examples.
-4. Install [AutoHotkey v2](https://www.autohotkey.com/), then `flow start --ahk`. For every login, `flow enable-autostart --ahk` writes one shortcut into your Startup folder. A shortcut to `flow-resident.ahk` in the Startup folder instead gives you `Mod+Ctrl+T` as an on/off switch for the whole thing.
+4. Install [AutoHotkey v2](https://www.autohotkey.com/), then `flow start --ahk`. For every login, `flow enable-autostart --ahk` writes one shortcut into your Startup folder. A shortcut to `flow-resident.ahk` in the Startup folder instead gives you `Win+Ctrl+T` as an on/off switch for the whole thing.
 
 `flow config check` reports every problem in both config files without applying anything; `flow query binds` shows the resolved chord table; `flow query all` shows what the daemon sees.
 
