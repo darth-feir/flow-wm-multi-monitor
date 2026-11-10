@@ -16,7 +16,7 @@ in `flow-rules.toml` or by running `flow dispatch set-window tile` on it once.
 
 This whitelist model is encoded in a single value: the `default_action` field
 of `WindowRulesConfig` defaults to `Float` (see
-[`src/config/types.rs`](../../src/config/types.rs)). When no rule at any layer
+`src/config/types.rs`). When no rule at any layer
 matches a window, the pipeline returns `Float` rather than `Tile`. The bundled
 `default-flow-rules.toml` carries `default_action = "float"` to match.
 
@@ -53,13 +53,26 @@ The four layers, from highest to lowest priority:
 2. **Learned rules** — machine-written to `history-flow-rules.toml`. See
    [Learned Rules](#learned-rules) below.
 3. **Default rules** — embedded into the binary at compile time from
-   [`default-flow-rules.toml`](../../default-flow-rules.toml). Catch well-known
+   `default-flow-rules.toml`. Catch well-known
    system windows (taskbar, Chromium helper windows, dialogs).
 4. **`default_action`** — the unconditional fallback, now `Float`.
 
 User rules outrank learned rules deliberately: if flow's learned behavior
 conflicts with the user's intent, the user's `flow-rules.toml` entry wins and
 the learned rule is never consulted for that app.
+
+### Rule Fields That Have No Effect
+
+Two rule fields still parse but do nothing (stage 33b): `initial_width_px` (a
+new tile's width comes from the `[columns]` width patterns, ADR-0017) and
+`override_persist` (an explicit rule already wins over learned rules, by the
+order above). `WindowRulesConfig::inert_field_warnings` names each one per rule
+(`rule N (exe = "…"): initial_width_px has no effect in this version`);
+`flow config check` prints those lines for `flow-rules.toml` as
+`flow: warning:` lines and still reports the configuration valid (through the
+daemon's `CheckConfig`, or locally without a daemon), and the daemon logs them
+at info when it loads the file
+(`load_rules_config` in `src/config/lifecycle.rs`).
 
 ## Learned Rules
 
@@ -181,9 +194,12 @@ An explicit rule in `flow-rules.toml` can still tile or float a shell surface;
 only the learned layer is filtered.
 
 At registration a shell surface gets nothing beyond what every ignored window
-gets: it is tracked for the foreground decisions and never moved. A shell
+gets: it is tracked for the foreground decisions and never moved. It is not a
+floating-layer member either, even when an explicit default rule ignores it
+(it would get `HWND_TOPMOST` on every raise; ADR-0024, see
+[Floating Space](./floating-space.md#the-floating-layer-floating-always_on_top)). A shell
 surface an older build tiled and left at a slot (it was hidden when that
-daemon stopped; see `ipc-and-watchdog.md`, *Hidden tiles go home*) keeps that
+daemon stopped; see [IPC & Watchdog](./ipc-and-watchdog.md#hidden-tiles-go-home)) keeps that
 position until its process restarts: end `SearchHost.exe` once (Task Manager
 or a sign-out); Windows starts it again on the next Win key. flowd never kills
 a shell process itself.
@@ -205,7 +221,7 @@ To forget everything flow has learned:
   always wins regardless of what the history file says.
 
 > The `ForgetApp` / `ForgetAllApps` IPC commands (declared in
-> [`src/ipc/message.rs`](../../src/ipc/message.rs)) are intended as a
+> `src/ipc/message.rs`) are intended as a
 > programmatic way to clear learned state without touching the file by hand.
 > They are not yet implemented.
 
@@ -243,14 +259,14 @@ ADR-0025 (`docs/adr/0025-elevated-windows-are-unmanaged.md`).
 
 | Concern | Location |
 |---------|----------|
-| History store (load, record, dedup, save) | [`src/config/history.rs`](../../src/config/history.rs) |
-| History file path resolution | `history_rules_path[_in]` in [`src/config/dirs.rs`](../../src/config/dirs.rs) |
-| `default_action = Float` default | `Default` impl for `WindowRulesConfig` in [`src/config/types.rs`](../../src/config/types.rs) |
-| Four-layer pipeline evaluation | `ClassificationPipeline::classify` in [`src/registry/classification.rs`](../../src/registry/classification.rs) |
+| History store (load, record, dedup, save) | `src/config/history.rs` |
+| History file path resolution | `history_rules_path[_in]` in `src/config/dirs.rs` |
+| `default_action = Float` default | `Default` impl for `WindowRulesConfig` in `src/config/types.rs` |
+| Four-layer pipeline evaluation | `ClassificationPipeline::classify` in `src/registry/classification.rs` |
 | Runtime pipeline refresh | `set_learned_rules` on `ClassificationPipeline` and `WindowRegistry` |
-| Capture on `set-window` transition | `record_learned_transition` in [`src/daemon/dispatch.rs`](../../src/daemon/dispatch.rs) |
+| Capture on `set-window` transition | `record_learned_transition` in `src/daemon/dispatch.rs` |
 | Daemon-owned history store | `history` field on `FlowWM`, loaded in `new()` |
-| Elevation gate (ADR-0025) | `process_elevation` / `elevation_blocks` in [`src/registry/win32.rs`](../../src/registry/win32.rs), `register_window_from_info` in [`src/registry/core.rs`](../../src/registry/core.rs) |
+| Elevation gate (ADR-0025) | `process_elevation` / `elevation_blocks` in `src/registry/win32.rs`, `register_window_from_info` in `src/registry/core.rs` |
 
 ## Cross-References
 

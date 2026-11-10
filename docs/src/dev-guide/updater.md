@@ -19,7 +19,7 @@ dependencies it needed.)
 
 `build.rs` runs `git` in the checkout being built and hands the result to the
 crate as `FLOW_BUILD_*` environment variables, which
-[`src/build_info.rs`](../../src/build_info.rs) exposes as constants:
+`src/build_info.rs` exposes as constants:
 
 | Constant | Source | Example |
 |----------|--------|---------|
@@ -28,7 +28,7 @@ crate as `FLOW_BUILD_*` environment variables, which
 | `BRANCH` | `git rev-parse --abbrev-ref HEAD` (empty for a detached `HEAD`) | `feat/multi-monitor` |
 | `DIRTY` | `git status --porcelain --untracked-files=no` non-empty | `false` |
 | `COMMIT_DATE` | `git log -1 --format=%cs` (committer date) | `2026-10-22` |
-| `ORIGIN_URL` | `git config --get remote.origin.url` | `https://github.com/CCpcalvin/flow-wm` |
+| `ORIGIN_URL` | `git config --get remote.origin.url` | `https://github.com/darth-feir/flow-wm.git` |
 
 Every variable is always set — to the empty string when `git` is not
 installed or the source is not a checkout (a crates.io tarball) — so the crate
@@ -68,6 +68,17 @@ check_for_updates = false   # true: `flow start` runs the checker and prints a o
 `repo` is validated to be `owner/name` (letters, digits, `-`, `_`, `.`);
 anything else is reported as a config error (exit code 3) rather than sent to
 GitHub.
+
+Which repository a build checks is therefore decided by the checkout it was
+built from, not by `Cargo.toml` (whose `repository` field still names
+upstream and is not read by the checker). A build from a clone of the fork
+(`origin` = `https://github.com/darth-feir/flow-wm`, branch
+`feat/multi-monitor`) checks `darth-feir/flow-wm` `feat/multi-monitor`; a
+clone of upstream checks `CCpcalvin/flow-wm`. `UPSTREAM_REPO`
+(`CCpcalvin/flow-wm`) is used only when neither `[update] repo` nor a
+github.com `origin` names a repository. A checkout whose `origin` is a private
+repository gets `repository … not found on GitHub (or private)` (exit 3),
+because the checker sends no token; set `[update] repo` to a public one.
 
 ## The check
 
@@ -168,11 +179,11 @@ to contact the network at every start.
 
 | Step | Location |
 |------|----------|
-| Git metadata at build time | [`build.rs`](../../build.rs) |
-| Constants, `version_line`, `github_repo_from_url` | [`src/build_info.rs`](../../src/build_info.rs) |
-| `[update]` table | `UpdateConfig` in [`src/config/types.rs`](../../src/config/types.rs) |
-| Target resolution, requests, JSON → `Report`, exit codes | [`src/updater/mod.rs`](../../src/updater/mod.rs) (`resolve_target`, `check_target`, `compare_report`, `head_report`, `release_report`, `how_to_update`) |
-| CLI wiring | `cmd_update` and `maybe_notify_update` in [`src/bin/flow.rs`](../../src/bin/flow.rs) |
+| Git metadata at build time | `build.rs` |
+| Constants, `version_line`, `github_repo_from_url` | `src/build_info.rs` |
+| `[update]` table | `UpdateConfig` in `src/config/types.rs` |
+| Target resolution, requests, JSON → `Report`, exit codes | `src/updater/mod.rs` (`resolve_target`, `check_target`, `compare_report`, `head_report`, `release_report`, `how_to_update`) |
+| CLI wiring | `cmd_update` and `maybe_notify_update` in `src/bin/flow.rs` |
 
 Everything that interprets GitHub's answers is a pure function over the JSON
 text and a `LocalBuild` value, so the unit tests feed canned responses and

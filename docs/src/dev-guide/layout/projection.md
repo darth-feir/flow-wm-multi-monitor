@@ -1,6 +1,6 @@
 # Projection
 
-The projection function converts the abstract virtual canvas into concrete pixel rectangles that Windows OS can render. Given a `VirtualLayout`, a `MonitorInfo`, and a `Padding`, the [`project`](../../src/layout/projection.rs) function computes an `ActualLayout` containing one entry per window with an exact screen-coordinate `Rect`. This is the only place in the layout module where pixel coordinates materialize — and the only place where padding is applied.
+The projection function converts the abstract virtual canvas into concrete pixel rectangles that Windows OS can render. Given a `VirtualLayout`, a `MonitorInfo`, a `Padding` and the `visible_rows` row-viewport size, the `project` (`src/layout/projection.rs`) function computes an `ActualLayout` containing one entry per window with an exact screen-coordinate `Rect`. This is the only place in the layout module where pixel coordinates materialize — and the only place where padding is applied.
 
 ## The slot model
 
@@ -46,11 +46,11 @@ A column is visible when its canvas range partially overlaps the viewport:
 visible = (canvas_col_right > viewport_left) && (canvas_col_left < viewport_right)
 ```
 
-This is a standard interval overlap test. Columns that overlap even by one pixel are projected at their real screen coordinates; columns with no overlap are parked.
+This is a standard interval overlap test. Columns that overlap even by one pixel are projected at their real screen coordinates; columns with no overlap are parked. Two rules override it: a visible column that would overhang a work-area edge with a neighbouring monitor beyond it is parked on that side (see the multi-monitor note below), and a fullscreen column decides the view on its own (see [Fullscreen columns](#fullscreen-columns)). The viewport width is the work area's width, and `monitor_left` above is the work area's `x`.
 
 ## Row rects: source-of-truth heights
 
-Each `Row` in a column carries its own `height: i32` field, and projection consumes that value **verbatim** as the window's pixel height. There is no equal-division step here, no recomputation, no rescaling, no inset — projection simply stacks the rows. Equal-height distribution is performed exactly once, at mutation time, by [`distribute_heights`](../../src/layout/mutations.rs) (see [Mutations](./mutations.md)). Between mutations, row heights are intentionally stable so that future drag-resize or IPC-driven continuous-height adjustment can preserve user-customized heights.
+Each `Row` in a column carries its own `height: i32` field, and projection consumes that value **verbatim** as the window's pixel height. There is no equal-division step here, no recomputation, no rescaling, no inset — projection simply stacks the rows. Equal-height distribution is performed exactly once, at mutation time, by `distribute_heights` (`src/layout/mutations.rs`) (see [Mutations](./mutations.md)). Between mutations, row heights are intentionally stable so that future drag-resize or IPC-driven continuous-height adjustment can preserve user-customized heights.
 
 The vertical stacking model: starting at `y = monitor_y + padding.up + window_gap`, each row occupies `row.height` pixels, and a single `window_gap` separates consecutive rows:
 
@@ -103,8 +103,8 @@ graph LR
         VP["Viewport"]
     end
 
-    PL["Left Parking\nx = monitor_left - col_width"]
-    PR["Right Parking\nx = monitor_right"]
+    PL["Left Parking\nx = virtual_left - col_width - PARK_MARGIN"]
+    PR["Right Parking\nx = virtual_right + PARK_MARGIN"]
 
     PL -.->|"parked left"| Monitor
     Monitor -.->|"parked right"| PR
@@ -116,8 +116,10 @@ graph LR
 
 There are two parking zones:
 
-- **Left parking**: `monitor_left - col_width`. For columns whose canvas right edge is at or before the viewport left edge.
-- **Right parking**: `monitor_right`. For columns whose canvas left edge is at or beyond the viewport right edge.
+- **Left parking** (`park_left_x`): `virtual_screen.x - col_width - PARK_MARGIN`. For columns whose canvas right edge is at or before the viewport left edge.
+- **Right parking** (`park_right_x`): `virtual_screen.right() + PARK_MARGIN`. For columns whose canvas left edge is at or beyond the viewport right edge.
+
+`PARK_MARGIN` is 16 px, small so scroll-in/out animations on a free edge stay short. The zones are measured from the virtual screen (the bounding box of every monitor), not from this monitor's edge; on a single monitor the two are the same (see the multi-monitor note below).
 
 Parked windows use the same `row.height`-stacking logic as visible windows, so when a column scrolls from parked to visible (or vice versa), its windows animate smoothly with consistent dimensions — there is no sudden resize or padding change at the boundary.
 
@@ -250,8 +252,11 @@ only, the external `neighbour_down` only, and neither has a left/right
 neighbour — so column parking on a stacked pair is exactly the single-monitor
 rule, measured from the virtual screen.
 
-The vertical flags are not read by `project` at all: columns only ever park
-horizontally. They drive **workspace parking**, which lives in the daemon
+The vertical flags never affect column parking: columns only ever park
+horizontally. Inside `project` they only place the rows a row viewport parks
+above or below (`park_above_bottom` / `park_below_top`, see
+[Row viewports](#row-viewports-stacked-columns)). Their main job is
+**workspace parking**, which lives in the daemon
 (`workspace::y_offset::WorkspaceParking`) because projection is
 workspace-local. The rule mirrors the horizontal one:
 

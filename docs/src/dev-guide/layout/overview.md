@@ -1,6 +1,6 @@
 # Layout Overview
 
-The layout engine models a tiling window manager as an **infinite horizontal canvas** that the user scrolls through. Columns of stacked windows extend left and right without bound; a sliding camera determines which slice of that canvas is visible on screen. The entire layout module ([`src/layout/`](../../src/layout/mod.rs)) is pure Rust with zero Win32 dependencies, making every operation fully unit-testable on any platform.
+The layout engine models a tiling window manager as an **infinite horizontal canvas** that the user scrolls through. Columns of stacked windows extend left and right without bound; a sliding camera determines which slice of that canvas is visible on screen. The entire layout module (`src/layout/`) is pure Rust with zero Win32 dependencies, making every operation fully unit-testable on any platform.
 
 ## Two-layer model
 
@@ -21,9 +21,12 @@ classDiagram
         +usize row_offset
         +bool fullscreen
         +with_row(width_px, row) Column
+        +with_rows(width_px, rows) Column
         +canvas_width(monitor_width, gap) i32
         +slots(visible_rows) usize
+        +max_row_offset(visible_rows) usize
         +row_visible(row, visible_rows) bool
+        +reveal_row(row, visible_rows) bool
         +is_valid_width() bool
     }
 
@@ -35,6 +38,7 @@ classDiagram
     class ActualEntry {
         +WindowId window_id
         +Rect rect
+        +Option~PileSide~ pile
     }
 
     class AppliedLayout {
@@ -44,6 +48,13 @@ classDiagram
 
     class MonitorInfo {
         +Rect work_area
+        +Rect screen_rect
+        +Rect virtual_screen
+        +bool neighbour_left
+        +bool neighbour_right
+        +bool neighbour_up
+        +bool neighbour_down
+        +is_parked(rect) bool
     }
 
     class Padding {
@@ -59,7 +70,7 @@ classDiagram
     AppliedLayout --> ActualLayout : wraps
 ```
 
-[`VirtualLayout`](../../src/layout/types.rs) holds the ordered `columns` vector and a `viewport_offset` — the camera position measured in pixels from the canvas origin. [`Column`](../../src/layout/types.rs) stores only a `width_px`, a `rows` list, a `row_offset` — the first row of its **row viewport** when the column holds more rows than `[columns] visible_rows` shows (see [Projection](./projection.md#row-viewports-stacked-columns)) — and a `fullscreen` flag (one window over the whole screen while it starts the view, one screen wide on the canvas; see [Projection](./projection.md#fullscreen-columns)); it carries no x-position. [`ActualLayout`](../../src/layout/types.rs) is produced by the projection step and contains one [`ActualEntry`](../../src/layout/types.rs) per window, each with a concrete `Rect` in screen coordinates. [`AppliedLayout`](../../src/layout/types.rs) bundles both the new virtual and actual layouts together — the animation layer diffs every window's target rect against its real on-screen position to decide what needs tweening.
+`VirtualLayout` holds the ordered `columns` vector and a `viewport_offset` — the camera position measured in pixels from the canvas origin. `Column` stores only a `width_px`, a `rows` list, a `row_offset` — the first row of its **row viewport** when the column holds more rows than `[columns] visible_rows` shows (see [Projection](./projection.md#row-viewports-stacked-columns)) — and a `fullscreen` flag (one window over the whole screen while it starts the view, one screen wide on the canvas; see [Projection](./projection.md#fullscreen-columns)); it carries no x-position. `ActualLayout` is produced by the projection step and contains one `ActualEntry` per window, each with a concrete `Rect` in screen coordinates (and, in book mode, the `pile` side it lies in; see [Projection](./projection.md#book-mode-piles)). `AppliedLayout` bundles both the new virtual and actual layouts together — the animation layer diffs every window's target rect against its real on-screen position to decide what needs tweening. All five types live in `src/layout/types.rs`.
 
 ## The camera model
 
@@ -92,7 +103,7 @@ graph LR
     style Viewport fill:#bbf,stroke:#333,stroke-width:2px
 ```
 
-Columns outside the viewport are **parked** at deterministic off-screen positions — one column-width beyond the nearest viewport edge. Windows OS does not gracefully ignore windows placed at extreme off-screen coordinates, so parking them nearby keeps the window manager well-behaved and enables smooth scroll-in/out animations. See [Projection](./projection.md) for the full parking algorithm.
+Columns outside the viewport are **parked** at deterministic off-screen positions — just beyond the left or right edge of the *virtual screen* (the bounding box of every monitor), `PARK_MARGIN` (16 px) out, so a parked column never lands on a neighbouring monitor. Windows OS does not gracefully ignore windows placed at extreme off-screen coordinates, so parking them nearby keeps the window manager well-behaved and enables smooth scroll-in/out animations. In book mode (`[columns] layout = "book"`, ADR-0022) the columns out of view pile behind the edge columns instead of parking. See [Projection](./projection.md) for the full parking algorithm.
 
 ## Why position is implicit
 
@@ -108,6 +119,6 @@ Padding — the uniform `window_gap` between windows and screen edges, plus opti
 
 ## What lives where
 
-The `src/layout/` module contains only the pure math: type definitions, mutation functions, and the projection function. There is no orchestrator here. [`ScrollingSpace`](../workspace.md) (in `src/workspace/scrolling_space.rs`) owns the current `VirtualLayout`, calls mutation functions to produce new virtual layouts, passes them through projection, and wraps the result in an `AppliedLayout` for the animation layer. This separation means the layout math can be tested in isolation from any workspace or Win32 state.
+The `src/layout/` module contains only the pure math: type definitions (`types.rs`), mutation functions (`mutations.rs`), the projection functions (`projection.rs`), the drag-resize classifier and boundary-move resizes (`resize.rs`, contract in ADR-0004) and the drop-zone previews (`preview.rs`, see [Tile Drag](../tile-drag.md)). There is no orchestrator here. [`ScrollingSpace`](../workspace.md) (in `src/workspace/scrolling_space.rs`) owns the current `VirtualLayout`, calls mutation functions to produce new virtual layouts, applies the rules that sit one layer up (width-pattern slot pinning, row-viewport normalization), passes the result through projection, and wraps it in an `AppliedLayout` for the animation layer. Each monitor's active workspace has its own `ScrollingSpace` (ADR-0007), so every projection is local to one monitor. This separation means the layout math can be tested in isolation from any workspace or Win32 state.
 
 The full data-flow pipeline — mutation, projection, animation — is described in [Pipeline](./pipeline.md). The mutation catalog and their algorithms are covered in [Mutations](./mutations.md).

@@ -11,7 +11,7 @@ features.
 | Area | Status | Note |
 |---|---|---|
 | Tiling engine + scrolling canvas | ✅ Done | `mutate → project → animate` pipeline |
-| Window lifecycle hooks | ✅ Done | create/destroy/minimize/restore/show-hide/foreground + `STATECHANGE`/`NAMECHANGE` |
+| Window lifecycle hooks | ✅ Done | create/destroy/minimize/restore/show-hide/foreground/move-size + `STATECHANGE`/`NAMECHANGE`/`CLOAKED`-`UNCLOAKED` |
 | Dispatch surface | ✅ Mostly | focus, swap, scroll, widths, center, monocle, close — see [Remaining IPC stubs](#remaining-ipc-stubs) for the gaps |
 | Floating space | ✅ Done | tile↔float, centered placement, merged scroll+float batches |
 | Workspaces | ✅ Done | 10 per monitor; switch + move-to animate; `SwapWorkspace` pending |
@@ -30,8 +30,10 @@ features.
 | Fullscreen and book layout (fork) | ✅ Done | fullscreen is a column of the strip (ADR-0021, ADR-0020 for an app's own full screen); `[columns] layout = "book"` piles the columns out of view (ADR-0022) |
 | New windows on the focused screen (fork) | ✅ Done | `[focus] new_window_monitor`, pre-placement at create, `flow spawn` with a position hint for the keymap's spawn binds and `[startup] spawn` (ADR-0023) |
 | Owned dialogs and elevated windows (fork) | ✅ Done | owned windows of flow windows ride the floating layer (ADR-0024); elevated windows are `Ignored(Elevated)` and never moved (ADR-0025) |
-| Minimize and restore (fork) | ✅ Done | `minimize-window` (Mod+M); a restore returns to the remembered seat per `[minimize_restore] strategy` and scrolls it into view (ADR-0027) |
+| Minimize and restore (fork) | ✅ Done | `minimize-window` (Mod+M); a restore, and a tile shown again after hiding itself (tray apps), returns to the remembered seat per `[minimize_restore] strategy` and scrolls it into view (ADR-0027 and its stage 33b addendum) |
 | Selection buffer (fork) | ✅ Done | `[keymap] selection_buffer`, highlight then middle-click to paste, in the keymap through UI Automation (ADR-0026) |
+| Late-chrome invisible borders (fork) | ✅ Done | invisible frame borders re-measured before each layout batch, at drag start, on a float rect read-back and for the focused window on the foreground sync, so WPF / VS-shell windows (SSMS) fill their slot (ADR-0028) |
+| Mod + mouse wheel chords (fork) | ✅ Done | `Mod[+Shift\|Ctrl\|Alt]+WheelUp/Down/Left/Right` in the default `[binds]` mirror the arrow chords; one step per 150 ms per chord in the keymap (ADR-0029) |
 | Cloak parked windows (`DWMWA_CLOAK`) | ◷ Mid-term | read side exists; write side missing |
 | Watchdog + recovery snapshot | ◷ Mid-term | not started; gated on `flow`/`flowd` being complete |
 | Input hooks (DragSession etc.) | ◷ Aspirational | `src/input/` does not exist; drag is covered from the keymap (ADR-0011), resize is not |
@@ -43,8 +45,9 @@ The `mutate → project → animate` pipeline, the window registry, and the
 Win32 hook thread are all in place and driving real window management:
 
 - **Window lifecycle**: create, destroy, minimize, restore, show/hide,
-  foreground, plus the `STATECHANGE` (maximize/fullscreen recovery) and
-  `NAMECHANGE` (late-title recovery) hooks. See
+  foreground, move/size (drag), plus the `STATECHANGE` (maximize/fullscreen
+  recovery), `NAMECHANGE` (late-title recovery) and `CLOAKED`/`UNCLOAKED`
+  (UWP frames) hooks. See
   [Event Pipelines](./event-pipelines.md).
 - **Dispatch surface**: focus, per-window swap, column swap, semantic move,
   scroll, expand/shrink/set column width, center, monocle toggle, close
@@ -161,7 +164,7 @@ indistinguishable), and a reconcile that lands mid-drag is simply postponed.
 The workspace hierarchy models `Vec<Monitor>` with `active_monitor: usize`,
 and every IPC command routes through `active_scrolling()`; the constructor
 builds one `Monitor` per display from `EnumDisplayMonitors` + `GetMonitorInfoW`
-([`src/daemon/new.rs`](../../src/daemon/new.rs)).
+(`src/daemon/new.rs`).
 
 ### Performance: Cloaking Off-Screen Windows
 
@@ -271,7 +274,9 @@ logs a warning but does not block the remaining windows. See
 
 `GetWindowRect` returns a rect that includes a hidden ~7px border on the
 left, right, and bottom edges. This is not the visual rect of the window.
-`flow` works around this via the `InvisibleBounds` tracking in the registry.
+`flow` works around this via the `InvisibleBounds` tracking in the registry,
+measured at registration and again when a window is placed (some apps apply
+their chrome late, ADR-0028).
 See the [Window Registry](./window-registry.md) chapter for how invisible
 bounds are measured and how `visible_to_window()` compensates.
 

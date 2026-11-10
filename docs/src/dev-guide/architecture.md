@@ -8,9 +8,9 @@ one library crate, coordinated by a top-level orchestrator struct called
 `FlowWM`.
 
 The two binaries — `flowd` (the background daemon that owns all state) and `flow`
-(the CLI client) — share the library crate rooted at [`src/lib.rs`](../../src/lib.rs).
-The daemon entry point is [`src/main.rs`](../../src/main.rs); the CLI lives in
-[`src/bin/flow.rs`](../../src/bin/flow.rs).
+(the CLI client) — share the library crate rooted at `src/lib.rs`.
+The daemon entry point is `src/main.rs`; the CLI lives in
+`src/bin/flow.rs`.
 
 ## Subsystem Map
 
@@ -59,8 +59,9 @@ the resulting `AppliedLayout` becomes the animator's move targets.
   named pipe, parses each `SocketMessage` frame, and hands it to the orchestrator's
   `dispatch()`.
 - **Win32 Hook Thread** (`src/registry/hooks.rs`) — a background thread that
-  subscribes to `SetWinEventHook` for window create / destroy / focus / minimize /
-  show / location events. It **never touches daemon state**: it only pushes
+  subscribes to `SetWinEventHook` for window create / destroy / foreground /
+  move-size / minimize / show / hide / state / name / cloak / location events
+  (nine hooks; location events are filtered in the callback). It **never touches daemon state**: it only pushes
   lightweight `HookEvent` structs through an `mpsc` channel that the main loop
   drains. See [Threading Model](./threading-model.md).
 
@@ -72,12 +73,15 @@ the resulting `AppliedLayout` becomes the animator's move targets.
   update this first; the resulting `WindowId` is what every other subsystem refers
   to. See [Window Registry](./window-registry.md).
 - **Workspace Hierarchy** (`src/workspace`) — the nested layout state:
-  `Vec<Monitor>` → `Vec<Workspace>` → one `ScrollingSpace` + one `FloatingSpace` per
+  `Vec<Monitor>` (one per display, each with ten workspaces) → `Vec<Workspace>` →
+  one `ScrollingSpace` + one `FloatingSpace` per
   workspace. `ScrollingSpace` is the tiled half — the same thing that used to be
   called the `LayoutEngine`; it owns the list of columns and delegates the actual
   math to `src/layout`. `FloatingSpace` keeps non-tiled windows at literal pixel
-  coordinates. The orchestrator always operates on the **active** monitor's
-  **active** workspace. See [Workspace Hierarchy](./workspace.md).
+  coordinates. Keyboard commands act on the **active** monitor (the one that owns
+  focus) and its **active** workspace; hook events for a window act on the monitor
+  that holds it (`monitor_index_for_window` / `home_monitor_for_hwnd`), so every
+  screen is its own scrolling space (ADR-0007). See [Workspace Hierarchy](./workspace.md).
 - **Layout Math** (`src/layout`) — pure mutation and projection functions with **zero
   Win32 dependencies**. `ScrollingSpace` calls these to mutate the virtual layout and
   project it into concrete pixel rects (`AppliedLayout`). Being pure means it is fully
@@ -88,19 +92,28 @@ the resulting `AppliedLayout` becomes the animator's move targets.
 
 ### Supporting subsystems
 
-- **Config** (`src/config`) — loads `flow.toml` into [`FlowConfig`](../../src/config/types.rs),
-  applies defaults (code is the single source of truth), and derives layout
-  parameters at startup. See [Config & Persistence](./config-and-persistence.md).
+- **Config** (`src/config`) — loads `flow.toml` into `FlowConfig` (`src/config/types.rs`),
+  applies defaults (code is the single source of truth), and derives per-monitor
+  layout parameters at startup and again on every reload (`flow.toml` and
+  `flow-rules.toml` are watched once a second, `src/daemon/config_watch.rs`). See [Config & Persistence](./config-and-persistence.md).
 - **HistoryStore** (`src/config/history.rs`) — persists the user's explicit
   `set-window` decisions (learned rules) to `history-flow-rules.toml` so the next
   window of the same app is classified automatically. See
   [Classification & Learned Rules](./classification.md). (A separate recovery-snapshot
   `persist` module is planned but not yet implemented — see the
   [Roadmap](./roadmap.md).)
+- **Borders** (`src/borders`, bridged by `src/daemon/borders.rs`) — one click-through
+  overlay window per managed window that draws its colored ring. The overlays are
+  owned by the daemon's main thread, which is why the main loop pumps window
+  messages. See [Borders](./borders.md).
+- **Loadout** (`src/loadout`, file I/O in `src/daemon/loadout.rs`) — pure serde types
+  for saving and restoring workspace layouts. See [Loadout](./loadout.md).
+- **Updater** (`src/updater`) — the release check behind `flow update`; it never
+  installs. See [Updater](./updater.md).
 
 ## Ownership Model
 
-[FlowWM](../../src/daemon/types.rs) owns every subsystem and routes
+`FlowWM` (`src/daemon/types.rs`) owns every subsystem and routes
 events between them. This is the most important structural invariant in the codebase:
 **no subsystem knows about any other subsystem**. They only expose methods that take
 inputs and return outputs. The daemon is the glue.
@@ -114,17 +127,24 @@ classDiagram
         +animator: WindowAnimator
         +server: PipeServer
         +config: FlowConfig
+        +history: HistoryStore
         +hook_receiver: Receiver~HookEvent~
         +shutting_down: bool
+        +active_monitor() Monitor
         +active_scrolling() ScrollingSpace
         +active_scrolling_mut() ScrollingSpace
-        +active_workspace() Workspace
-        +animate_layout()
+        +monitor_index_for_window(id) usize
+        +animate_layout(layout)
+        +animate_layout_on(monitor, layout)
     }
 
     class Monitor {
-        +workspaces: Vec~Workspace~
-        +active_workspace_index: usize
+        -screen_rect: Rect
+        -work_area: Rect
+        -hmonitor: isize
+        -workspaces: Vec~Workspace~
+        -active_workspace: usize
+        +active_workspace_index() usize
         +active_workspace() Workspace
         +active_scrolling() ScrollingSpace
     }
@@ -133,16 +153,17 @@ classDiagram
         +id: WorkspaceId
         +scrolling: ScrollingSpace
         +floating: FloatingSpace
+        +last_focused_float: Option~WindowId~
     }
 
     class WindowRegistry {
-        +windows: HashMap~HWND, Window~
+        +windows: HashMap~isize, Window~
         +handle_created(hwnd) Option~WindowId~
-        +handle_destroyed(hwnd)
+        +remove_window(hwnd)
     }
 
     class WindowAnimator {
-        +animate(layout)
+        +animate(targets) AnimationHandle
     }
 
     FlowWM "1" --> "1..*" Monitor
@@ -155,10 +176,13 @@ classDiagram
 
 The daemon accesses the active scrolling space through accessor chains:
 `self.active_scrolling()` delegates to `self.monitors[active_monitor]
-.active_workspace().scrolling`. This indirection exists so that multi-monitor
-and multi-workspace support can be added later without changing the call sites
-in hook handlers and IPC dispatch — they always operate on "the active" scrolling
-space.
+.active_workspace().scrolling`. Multi-monitor and multi-workspace support use the
+same chain with an explicit index: `active_monitor` follows focus, and handlers
+that act on a particular window look its monitor up first
+(`monitor_index_for_window`, `home_monitor_for_hwnd`) and reach that monitor's
+spaces through `self.monitors[idx]`. Animation has per-monitor entry points too
+(`animate_layout_on`, `animate_layouts_on`), because each monitor projects its own
+strip.
 
 ## The Layout Pipeline
 
@@ -172,12 +196,15 @@ flowchart LR
 ```
 
 1. **Mutate** — a method on `ScrollingSpace` mutates the virtual layout (add a
-   window, swap columns, scroll the viewport, resize a column). This produces a
-   `LayoutDiff` describing what changed.
+   window, swap columns, scroll the viewport, resize a column) by calling a pure
+   function in `src/layout/mutations.rs` that returns a new `VirtualLayout`. There
+   is no diff type: the full new layout is the output.
 2. **Project** — a pure function in `src/layout/projection.rs` converts the full
    `VirtualLayout` into an `ActualLayout` with concrete pixel coordinates. Padding
-   is applied here. Off-screen windows are "parked" at large negative/positive X
-   offsets.
+   is applied here. Off-screen columns are "parked" just beyond the left or right
+   edge of the virtual screen (the bounding box of all monitors, `PARK_MARGIN` =
+   16 px out); in book mode they pile behind the edge columns instead.
+   `ScrollingSpace` returns both layouts as an `AppliedLayout`.
 3. **Animate** — the `WindowAnimator` compares each window's target rect (from
    projection) against its current on-screen rect and issues smooth
    `SetWindowPos` transitions.
@@ -191,7 +218,7 @@ For the full explanation, see [Layout Overview](./layout/overview.md) and
 
 ## Repository Layout
 
-The repository layout is covered in the [Developer Guide introduction](./index.md).
+The repository layout is covered in the [Developer Guide introduction](./README.md).
 The two big ideas to internalise before reading any source file:
 
 1. **The layout pipeline is pure.** `src/layout/` has zero Win32 dependencies and is

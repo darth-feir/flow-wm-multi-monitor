@@ -40,17 +40,19 @@ What the fork adds, each with a page in the Developer Guide (`docs/src/dev-guide
 Clone the fork and build it (same toolchain as upstream, below):
 
 ```powershell
-git clone -b feat/multi-monitor https://github.com/darth-feir/flow-wm-fork.git
-cd flow-wm-fork
-cargo build --release
-flow config init                 # writes %USERPROFILE%\.config\flow\flow.toml
+git clone -b feat/multi-monitor https://github.com/darth-feir/flow-wm.git
+cd flow-wm
+cargo build --release --locked
+target\release\flow.exe config init   # writes %USERPROFILE%\.config\flow\flow.toml and flow-rules.toml
 ```
 
-Copy `flow.exe` and `flowd.exe` somewhere permanent (for example `%LOCALAPPDATA%\Programs\flow`), copy every `.ahk` file from `keymaps\win-niri\` into `%USERPROFILE%\.config\flow\`, and merge `keymaps\win-niri\flow.toml.example` into your `flow.toml`: it carries the presets, the stack rows, the width floor for 1920-px screens, `adopt_maximized`, `always_on_top`, `edge_hop = false`, `new_window_monitor`, and commented `[binds]`, `[keymap]` and `[startup]` examples. Then `flow start --ahk`, or put a shortcut to `flow-resident.ahk` in your Startup folder and press `Mod+Ctrl+T`. The keymap's header lists every chord; `Mod+Shift+/` shows them on screen.
+Copy `flow.exe` and `flowd.exe` from `target\release\` together into one folder (`flow start` looks for `flowd.exe` next to `flow.exe`), somewhere permanent such as `%LOCALAPPDATA%\Programs\flow` (the keymap looks there for `flow.exe`), copy every `.ahk` file from `keymaps\win-niri\` into `%USERPROFILE%\.config\flow\`, and merge `keymaps\win-niri\flow.toml.example` into your `flow.toml`: it carries the presets, the stack rows, `layout` / `wrap_around`, the width floor for 1920-px screens, `adopt_maximized`, `always_on_top`, `edge_hop = false`, `new_window_monitor`, and commented `[binds]`, `[keymap]` and `[startup]` examples. Then `flow start --ahk`, or put a shortcut to `flow-resident.ahk` in your Startup folder and press `Mod+Ctrl+T`. The keymap's header lists every chord; `Mod+Shift+/` shows them on screen.
 
 The keymap uses the Windows key directly, so the few chords Windows reserves below the hook layer stay with Windows: `Win+L` always locks. Upstream's firmware-remap advice under [Can I use the Win key?](#can-i-use-the-win-key) still applies if you want those too.
 
 Every stage of the fork was developed and tested in a Hyper-V guest with two virtual 1920×1080 displays before touching a real desktop; the daemon never needs to run on a developer's own machine to be verified.
+
+The fork's guides live in `docs/src/` (build them with `mdbook build docs`); the published book linked in the upstream sections below is upstream's and does not cover the fork's pages. Issues and pull requests for the fork go to [darth-feir/flow-wm](https://github.com/darth-feir/flow-wm) (branch `feat/multi-monitor`); see [Contributing](docs/src/user-guide/contributing.md) for the workflow.
 
 ## How it compares
 

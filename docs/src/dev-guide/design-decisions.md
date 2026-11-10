@@ -76,7 +76,7 @@ empty, or nested-partial — serde fills the gaps from the `Default` impl.
 ## Config Defaults: Code Is the Single Source of Truth
 
 Default values for every config field live in the `Default` impls of each config
-struct in [`src/config/types.rs`](../../src/config/types.rs). Each struct carries
+struct in `src/config/types.rs`. Each struct carries
 `#[serde(default)]` at the container level, so a user's `flow.toml` may be partial
 or empty.
 
@@ -122,6 +122,15 @@ positioning), and each application owns its own rendering pipeline. `SetWindowPo
 applies the position change immediately, which is what the animation system
 expects when tweening individual window rects frame by frame.
 
+The deciding reason, recorded in `src/animation/backend/win32.rs`, is UIPI:
+the deferred batch is atomic, so a single window of a higher-integrity
+process (an elevated app, a UAC prompt) makes `EndDeferWindowPos` fail with
+`ERROR_ACCESS_DENIED` and nothing moves. Per-window calls fail one window at
+a time. Since ADR-0019 every call on a managed window goes through
+`place_window` in that file, which picks the `SetWindowPos` flags (pure move,
+silent parked resize, plain resize); since ADR-0025 elevated windows are not
+managed at all, so the refused calls are not sent in the first place.
+
 ## `WindowId` as the Platform-Independent Bridge Type
 
 `WindowId` (currently `pub struct WindowId(pub isize)`, wrapping the raw HWND
@@ -133,7 +142,8 @@ only component that holds the HWND-to-`WindowId` mapping and performs Win32 call
 
 The `isize` wrapping exists because `HWND` is `!Send` in windows-rs (it wraps a
 raw pointer), but `WindowId` must be `Send` to cross thread boundaries (e.g. the
-hook callback sends `HookEvent { hwnd: isize }` through the `mpsc` channel). The
+hook callback sends `HookEvent` variants such as `HookEvent::Created { hwnd: isize }`
+through the `mpsc` channel). The
 raw integer value is just a kernel handle — it is safe to share across threads.
 
 ## Keybindings Removed, Delegated to External Tools
@@ -153,6 +163,12 @@ configurable hotkey bindings. This was removed because:
 
 The IPC protocol surface (focus, swap, scroll, resize, etc.) is fully defined and
 stable — any external tool that can write JSON to a named pipe can drive `flow`.
+
+The fork keeps the daemon out of global input but moves the binding *table*
+back into configuration: ADR-0015 adds a `[binds]` table to `flow.toml` that
+the daemon parses, validates and lists (`flow query binds`), and the
+AutoHotkey keymap (`keymaps/win-niri`) registers the hotkeys from that list.
+The daemon still intercepts no input; see [Key Bindings](./keybinds.md).
 
 ## Loadout Window Identity: HWND-Exact (Not Fuzzy Matching)
 
@@ -241,6 +257,10 @@ workspace visible at vertical offset `0`, every other non-empty workspace
 parked one monitor-height (plus a `window_gap`) above or below it. They reach
 that picture through **different animation policies**, and the two paths
 deliberately do not share a code path beyond the pure merge+offset math.
+(On a monitor with another display directly above or below, the fork parks
+that side's workspaces beyond the Win32 virtual screen instead and moves them
+there instantly, ADR-0007; see
+[Neighbours on four sides](./layout/projection.md#neighbours-on-four-sides).)
 
 - **Switch** (`switch_workspace_layout`) animates only the two *participants*
   (the source and destination workspaces, whose offset genuinely changes) and

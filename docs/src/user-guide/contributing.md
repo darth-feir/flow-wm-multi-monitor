@@ -2,7 +2,7 @@
 
 Contributions are welcome — bug reports, feature ideas, and pull requests all
 help. This page is the user-facing short version. The canonical contributor
-reference is the repo's [`CONTRIBUTING.md`](https://github.com/CCpcalvin/flow-wm/blob/master/CONTRIBUTING.md),
+reference is the repo's [`CONTRIBUTING.md`](https://github.com/darth-feir/flow-wm/blob/feat/multi-monitor/CONTRIBUTING.md),
 and the architecture is documented in the
 [Developer Guide](../dev-guide/index.md).
 
@@ -80,6 +80,8 @@ override it, the `logs/` folder moves with it — mention your config dir in the
 report.
 
 > **Where to file:** open an issue at
+> <https://github.com/darth-feir/flow-wm/issues>. A bug that also happens
+> with upstream FlowWM (without the fork's changes) belongs upstream, at
 > <https://github.com/CCpcalvin/flow-wm/issues>.
 
 ## Requesting features
@@ -91,6 +93,19 @@ and describe the workflow you're trying to enable, not just the implementation
 you imagine. "Here's the friction I hit" is more useful than "add this flag".
 
 ## Pull requests
+
+This fork's work happens on the branch `feat/multi-monitor`, which is based
+on upstream's `master` ([CCpcalvin/flow-wm](https://github.com/CCpcalvin/flow-wm));
+the fork's own `master` tracks upstream. Branch off `feat/multi-monitor` and
+open pull requests against it at
+[darth-feir/flow-wm](https://github.com/darth-feir/flow-wm).
+
+A change of behaviour or design comes with its rationale written down rather
+than left in code comments: the fork's decisions are ADRs in `docs/adr/`
+(the fork's are 0007 onwards, in the shape of ADR-0006: summary, context,
+options considered, consequences), indexed in
+[Design Decisions](../dev-guide/design-decisions.md#decisions-made-in-the-multi-monitor-fork);
+how things work is written up in the Developer Guide (`docs/src/dev-guide/`).
 
 Before opening a PR, make sure the basics are green:
 
@@ -114,8 +129,8 @@ A few project-wide conventions:
 
 For the full conventions (including the 3-layer documentation model and
 contributor gates), see
-[`CONTRIBUTING.md`](https://github.com/CCpcalvin/flow-wm/blob/master/CONTRIBUTING.md)
-in the repo root.
+[`CONTRIBUTING.md`](https://github.com/darth-feir/flow-wm/blob/feat/multi-monitor/CONTRIBUTING.md)
+in the repo root (upstream's text, which applies to the fork too).
 
 ## Understanding the codebase
 

@@ -55,7 +55,8 @@ versioned JSON document:
   "version": 3,
   "workspaces": [
     {
-      "workspace_id": 0,
+      "monitor": 0,
+      "workspace_id": 1,
       "active": true,
       "scrolling": {
         "viewport_offset": 0,
@@ -69,6 +70,9 @@ versioned JSON document:
       },
       "floating": []
     }
+  ],
+  "monitors": [
+    { "index": 0, "width_preset": "1/2" }
   ]
 }
 ```
@@ -78,9 +82,17 @@ versioned JSON document:
   earlier v2 that carried a `saved_at` timestamp) cannot be migrated (`HWND`
   cannot be synthesized), so it is skipped with a logged reason rather than
   silently misread.
-- `workspaces` — one snapshot per workspace: its tiling columns/rows (each row
-  a `WindowRef` + height), the viewport scroll offset, the focused window, and
-  any floating windows with their screen rectangles.
+- `workspaces` — one snapshot per workspace of every monitor: the monitor
+  index (primary = 0; absent in single-monitor files, read as 0), the
+  workspace id (`1..=10`, repeating per monitor), whether it was the
+  monitor's active one, its tiling columns/rows (each row a `WindowRef` +
+  height), the viewport scroll offset, the focused window, and any floating
+  windows with their screen rectangles.
+- `monitors` — one entry per monitor (`index`) with the label of the column
+  width preset it was on; `width_preset` is left out when no presets are
+  configured. A load puts each monitor back on its saved preset when that
+  label is still configured (a stale label is logged and skipped). Files
+  older than presets have no `monitors` key, read as an empty list.
 
 `exe` appears in every `WindowRef` purely so the file is human-readable when
 a restore fails; a `title` key is accepted (older files) but not written.
@@ -117,7 +129,7 @@ sequenceDiagram
 every monitor → workspace, joins the virtual layout (columns, rows, viewport
 offset, focus) with per-window registry metadata, swaps `WindowId` for
 `WindowRef`, and writes pretty-printed JSON. Ignored windows (maximized,
-fullscreen, or rule-ignored) are excluded from both save and restore. A
+app-fullscreen, rule-ignored, or elevated) are excluded from both save and restore. A
 minimized window is in no strip or floating space, so it is never saved
 either — including one the startup scan registered minimized. A fullscreen
 window (`set-window fullscreen`) is a column of its strip (ADR-0021) and is
@@ -145,17 +157,31 @@ The load path (`FlowWM::apply_loadout`) is shared by auto-restore and manual
 4. **Apply** per-workspace: `set_layout` replaces the tiling canvas (a saved
    column with no rows builds no column — and the writer never emits one),
    floating windows are placed at their saved rectangles, and registry state
-   is synced. Focus is restored by its saved `HWND` directly. A snapshot whose
-   workspace id exists on no monitor is not applied; its tiles and floats are
-   handed to the leftover pass instead of being seated nowhere (every
-   referenced window was purged from its old seat before this phase).
+   is synced. Focus is restored by its saved `HWND` directly. Before this
+   phase each monitor goes back to its saved width preset, and every window
+   the file references is purged from every workspace on every monitor.
+   Workspace ids repeat per monitor, so a snapshot is applied to the
+   workspace with its id on the monitor with its `monitor` index; a
+   snapshot from a monitor that is not attached is **merged** into the
+   first monitor that has that workspace id (its columns take that
+   monitor's preset width when presets are configured) rather than
+   overwriting it. A snapshot whose workspace id exists on no monitor is
+   not applied; its tiles and floats are handed to the leftover pass
+   instead of being seated nowhere.
 5. **Leftover** windows — open now but not referenced by the loadout, plus
    the tiles and floats of an unknown-workspace snapshot — are appended as
    new columns on the active workspace (floats clamped into its work area),
-   so no open window disappears. Only **active** tiles qualify: a tile the
+   so no open window disappears. A leftover still seated in a workspace the
+   file did not touch (e.g. monitor 1 when a one-monitor file is restored)
+   stays where it is. Only **active** tiles qualify: a tile the
    registry holds `Minimized` or `Hidden` (registered minimized at startup,
    or minimized since the save) has no seat to take until its restore /
    show hook gives it one, and must not be appended as an iconic column.
+6. **Seat** every monitor: its active workspace becomes the one holding the
+   OS foreground window if that lives on it (read with
+   `GetForegroundWindow`, never set), else the one the file marks `active`
+   for that monitor (workspace 1 as the last fallback); the other
+   workspaces park vertically, and the book-mode piles are seated.
 
 There is no staleness check: a loadout is restored whenever every saved `HWND`
 is live, and the no-partial abort handles the rest. See the Design Decisions

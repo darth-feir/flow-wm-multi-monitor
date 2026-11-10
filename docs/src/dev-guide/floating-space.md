@@ -40,7 +40,7 @@ graph TB
 
 ## Data Model
 
-`FloatingSpace` ([`src/workspace/floating_space.rs`](../../src/workspace/floating_space.rs))
+`FloatingSpace` (`src/workspace/floating_space.rs`)
 holds an ordered `Vec<ActualEntry>`. Later entries render on top (z-order). The
 struct is pure data and math — no Win32, no side effects.
 
@@ -55,6 +55,7 @@ classDiagram
         +is_empty() bool
         +len() usize
         +windows() &[ActualEntry]
+        +replace_all(entries)
         +to_actual_layout() ActualLayout
         +centered_rect(preferred, work_area) Rect$
     }
@@ -93,8 +94,9 @@ are clamped rather than scaled — their dimensions are simply capped.
 
 The *preferred* size comes from the window's `last_natural_size` (the visible
 content rect measured at registration time). If that's unavailable or zero, the
-config fraction fallback (`FloatingConfig.default_width/height` × work area
-dimensions) is used. See [Configuration](#configuration) for the defaults.
+explicit `[floating] default_width` / `default_height` pixel sizes are used,
+and for an axis left unset the built-in fraction-of-work-area fallback
+(`fallback_float_size`). See [Configuration](#configuration) for the defaults.
 
 ## Tile ↔ Float Transitions
 
@@ -106,16 +108,24 @@ transition changes the window's *space*, not its *focus*.
 ### Three entry points share one float-placement primitive
 
 The float-placement core (`register_float` in
-[`src/daemon/dispatch.rs`](../../src/daemon/dispatch.rs)) — add to
+`src/daemon/dispatch.rs`) — add to
 `FloatingSpace`, mirror the rect into `FloatingState::Active`, and arm
-`add_float_hwnd` tracking — is reached from three call sites, so a float always
-ends up identically wired regardless of how it became a float:
+`add_float_hwnd` tracking, and enter the floating layer (`sync_top_layer`) — is
+reached from three primary call sites, so a float always ends up identically
+wired regardless of how it became a float:
 
 | Entry point | Trigger | Float rect |
 |-------------|---------|------------|
-| **`set-window float` / `cycle`** | explicit user toggle of a tiled window | centered (`centered_float_rect`) |
-| **`on_window_created` (runtime)** | a new window the rule pipeline classifies as `Float` | centered (`centered_float_rect`) — identical to a toggle |
-| **startup scan** | a `Float`-classified window already open when the daemon launched | its **current on-screen position** (adopted in place, not re-centred) |
+| **`set-window float` / `cycle`** | explicit user toggle of a tiled window | centered on the monitor the window is on (`centered_float_rect`) |
+| **`on_window_created` (runtime)** | a new window the rule pipeline classifies as `Float` | centered on the monitor the arrival is seated on — the focused screen by default, ADR-0023 (`centered_float_rect_on`); it appears there without a glide from where it was created |
+| **startup scan** | a `Float`-classified window already open when the daemon launched | its **current on-screen position** (adopted in place, not re-centred; `populate_existing_floats`) |
+
+The same primitive also seats a float adopted from an ignored window
+(`adopt_ignored_as_float`, at its current rect), a float moved to another
+monitor (its rect translated into the target work area), a float-origin
+window leaving fullscreen, a float registered while minimized and then
+restored (`seat_float_if_unseated`) and a float recovered from
+`Ignored(Maximized|Fullscreen)` (`seat_recovered_float`, centred).
 
 The runtime path exists because classification runs at creation time: without
 it, a rule-classified float would land in the registry yet stay absent from
@@ -241,7 +251,12 @@ floats, every re-animation of a floating space (a float appearing, a
 workspace switch, `set-window float`) lost `2·(thickness − overlap)` px —
 4 px with the default ring — and a float dragged a few times visibly shrank.
 `float_geometry` (`src/daemon/animation.rs`) is the single rule, covered by
-`float_geometry_tests` and the drag-session round-trip test.
+`float_geometry_tests` and the drag-session round-trip test. The round trip
+is only exact when the invisible-frame bounds are current, so
+`store_float_rect` re-measures them before it converts the rect
+(`remeasure_frame_with`, ADR-0028, `docs/adr/0028-late-chrome-invisible-bounds.md`):
+an app whose chrome lands after registration (WPF, the Visual Studio shell)
+would otherwise be read back through zero bounds.
 
 During a keymap drag session on a float (`flow dispatch drag begin`, see
 [Tile Drag](./tile-drag.md), *Keymap-driven sessions*) `store_float_rect`
@@ -250,9 +265,40 @@ written once, by `drag end`, and the bridge leaves the window out of every
 batch meanwhile, so a float appearing mid-drag cannot snap the dragged one
 back to a stale rect.
 
+## Minimize, hide and restore
+
+`minimize-window` (Mod+M in the win-niri keymap; `dispatch_minimize_window`)
+acts on the registry's focus. Only an active tile (a fullscreen one included)
+or an active float is accepted (`minimize_refusal`); an ignored window is
+refused with "minimize it yourself". The command only queues
+`ShowWindowAsync(SW_MINIMIZE)`; the minimize hook does the rest, exactly as
+for a minimize the user does from the title bar.
+
+- **A float keeps its seat.** `on_window_minimized` does not take a float out
+  of its `FloatingSpace`; the registry moves it to `Floating(Minimized)` and
+  keeps the rect it had (`Window::last_float_rect`). It leaves the floating
+  layer and its border overlay is dropped. A hidden float (tray) is handled
+  the same way by `on_window_hidden`.
+- **A float comes back where it was.** `restore_window` puts
+  `last_float_rect` (else `pre_manage_rect`) back into `Floating(Active {
+  rect })`; the restore / show hooks then re-read the live rect once the
+  window no longer reports its icon frame (`resync_returning_float` →
+  `store_float_rect`), re-enter the layer and recreate the border. A float
+  registered while minimized has no seat yet and is placed into the space of
+  the monitor it is on (`seat_float_if_unseated`).
+- **A tile returns to its seat.** A tile minimized or hidden from its strip
+  records a restore seat (monitor, workspace, column, row, column width) and
+  is taken out of the layout with the focus handed to its successor on the
+  same screen; the restore or re-show puts it back into that column, clamped
+  to the current columns, and scrolls the view to it (`src/daemon/restore_seat.rs`,
+  `[minimize_restore] strategy`, ADR-0027,
+  `docs/adr/0027-restore-seat-and-frameless-corners.md`). See
+  [Event Pipelines](./event-pipelines.md).
+
 ## Workspace Switching with Floats
 
-`dispatch_switch_workspace` extends naturally: for each workspace on the active
+`dispatch_switch_workspace` (the batches are built in
+`switch_workspace_layout`) extends naturally: for each workspace on the active
 monitor, the daemon merges the scrolling `ActualLayout` and the floating
 `ActualLayout` into one combined layout before partitioning into the
 animate/teleport/skip buckets.
@@ -335,13 +381,16 @@ slot in alongside the tiling arm.
 ## Configuration
 
 The `[floating]` section in `flow.toml` controls default floating window
-dimensions:
+dimensions and the floating layer:
 
 ```toml
 [floating]
 # default_width = 1200    # explicit pixel width (optional)
 # default_height = 800    # explicit pixel height (optional)
+# always_on_top = false   # the floating layer (default off; see below)
 ```
+
+`always_on_top` is described in [The floating layer](#the-floating-layer-floating-always_on_top).
 
 Both fields are optional explicit pixel sizes (`Option<i32>`). When omitted
 (the default), the daemon uses a built-in fallback: 60% × 80% of the monitor's
@@ -349,7 +398,7 @@ work area, capped at approximately 1536 × 1152 pixels (derived from a QHD
 2560×1440 reference). The cap ensures ultrawide and 4K monitors don't produce
 absurdly large popups. An explicit pixel value is always respected as-is — the
 cap applies only to the fallback. The fallback constants live in
-[`src/daemon/dispatch.rs`](../../src/daemon/dispatch.rs).
+`src/daemon/dispatch.rs`.
 
 These defaults are used as a **fallback** when a window has no
 `last_natural_size`. Most windows *do* have a natural size (measured from their
@@ -359,7 +408,7 @@ edge cases where the natural size is zero or unavailable.
 ### Config-defaults rule
 
 Code is the single source of truth. The `Default` impl in
-[`src/config/types.rs`](../../src/config/types.rs) defines the actual runtime
+`src/config/types.rs` defines the actual runtime
 defaults; `default-config.toml` is a hand-written example synced by a
 compile-time test. See [config and persistence](./config-and-persistence.md)
 for the full design rationale.
@@ -428,6 +477,11 @@ Full decision table:
 | Float | false | false | false | true | AdoptFloating |
 | Fullscreen | false | false | false | true | AdoptFullscreen |
 | *any* | false | false | false | false | Err (minimized / hidden) |
+
+One ignored state is refused before the table is consulted: an
+`Ignored(Elevated)` window cannot be moved at all (UIPI, ADR-0025), so
+`set-window` on it answers an error naming the window and nothing is adopted
+or learned.
 
 A fullscreen window is a tile of the strip (ADR-0021), so "fullscreen"
 implies "currently tiling" and is checked first. `cycle` keeps its float/tile
@@ -554,7 +608,8 @@ flag, so a float that goes fullscreen leaves the layer first and re-enters
 through `register_float` when it comes back; a float and a fullscreen window
 are both topmost and stack by whichever was activated last. Minimized /
 hidden floats are out until restored / shown; `Ignored(Maximized|Fullscreen)`
-windows are never touched, and neither is a tracked window whose class is a
+windows are never touched, nor is an `Ignored(Elevated)` window (UIPI refuses
+the daemon's z-order changes; it is foreign to the layer, ADR-0025), and neither is a tracked window whose class is a
 shell surface (`SHELL_CLASSES`: the Start menu and search `CoreWindow`s the
 default rules ignore explicitly would otherwise get `HWND_TOPMOST` on every
 raise, ADR-0024). Untracked windows are never members; the ones owned by a
@@ -568,7 +623,7 @@ of three owners:
 |------------|-------|-------|
 | A registry window whose state is `Tiling(Active)`, `Floating(Active)` or `Ignored(ExplicitRule)` — a tile or a layer member — **and** not fullscreen by the live check | `Flow` | raised: members `HWND_TOPMOST` |
 | An untracked window owned by a flow window (its `GW_OWNER` chain reaches a tracked window, the *anchor*): classed by the anchor's state, and by the live fullscreen check on the window and the anchor | by its anchor | `Flow`: raised, and the window rides with the layer (*Riders*) |
-| Fullscreen by live geometry + style (tracked or not); an untracked window no tracked window owns; a registry window in any other `Ignored` state (`Maximized`, `Fullscreen`, …) or a minimized / hidden state | `Foreign` | dropped: members seated directly under that window |
+| Fullscreen by live geometry + style (tracked or not); an untracked window no tracked window owns; a registry window in any other `Ignored` state (`Maximized`, `Fullscreen`, `Elevated`) or a minimized / hidden state, and a rider whose anchor is in one of those states | `Foreign` | dropped: members seated directly under that window |
 | A shell surface (class in `SHELL_CLASSES`), no foreground, or a handle already gone | `Shell` | kept: the last decision stands |
 
 *Fullscreen is read live, not from the stored state.* F11 in a browser, VS

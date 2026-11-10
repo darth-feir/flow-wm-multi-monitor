@@ -93,9 +93,9 @@ existing layout is never disrupted.
 ## `flow.toml`
 
 The application config. Schema:
-[`schemas/flow-config.schema.json`](https://github.com/CCpcalvin/flow-wm/blob/master/schemas/flow-config.schema.json).
+[`schemas/flow-config.schema.json`](https://github.com/darth-feir/flow-wm/blob/feat/multi-monitor/schemas/flow-config.schema.json).
 A hand-written, fully-commented example lives at
-[`default-config.toml`](https://github.com/CCpcalvin/flow-wm/blob/master/default-config.toml)
+[`default-config.toml`](https://github.com/darth-feir/flow-wm/blob/feat/multi-monitor/default-config.toml)
 in the repo root — `flow config init` copies it verbatim.
 
 > **Single source of truth.** Default values live in code, in the `Default`
@@ -391,11 +391,11 @@ down = 0
 Accepted `easing` values (one of the `ConfigEasing` enum variants):
 
 - `"linear"`
-- `"ease-in"`, `"ease-out"`, `"ease-in-out"`
-- `"ease-in-quad"`, `"ease-out-quad"`, `"ease-in-out-quad"`
-- `"ease-in-cubic"`, `"ease-out-cubic"`, `"ease-in-out-cubic"`
-- `"ease-in-expo"`, `"ease-out-expo"`, `"ease-in-out-expo"`
-- `"constant"` (jumps to the end value immediately — equivalent to `enabled = false` for the motion itself, but still goes through the animator)
+- `"ease-in-<curve>"`, `"ease-out-<curve>"`, `"ease-in-out-<curve>"` for each
+  curve `sine`, `quad`, `cubic`, `quart`, `quint`, `expo`, `circ`, `back`,
+  `elastic`, `bounce` (for example `"ease-in-out-cubic"`, `"ease-out-back"`)
+
+To have layout changes jump without motion, set `enabled = false`.
 
 Example:
 
@@ -513,8 +513,8 @@ cap applies only to the fallback path.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `default_width` | `Option<u32>` | `None` | Explicit default width (pixels) for newly floated windows. |
-| `default_height` | `Option<u32>` | `None` | Explicit default height (pixels) for newly floated windows. |
+| `default_width` | `Option<i32>` | `None` | Explicit default width (pixels) for newly floated windows. |
+| `default_height` | `Option<i32>` | `None` | Explicit default height (pixels) for newly floated windows. |
 | `always_on_top` | `bool` | `false` | The **floating layer**, as in niri: floating windows always sit above the tiled windows, even when a tiled window has the focus, so a dialog is never hidden behind the strip and never has to be hunted for. Applies to every floating window and to every window your rules ignore (`Ignored::ExplicitRule` — dialogs, popups, File Explorer through a bundled rule); not to windows ignored because they are maximized or fullscreen, nor to minimized or hidden ones (they are raised again when restored or shown). Implemented with Windows' "topmost" band (`WS_EX_TOPMOST`): a window leaves it when it is tiled, minimized, hidden or put fullscreen (`set-window fullscreen` keeps its own window topmost; a float and a fullscreen window then stack by whichever was activated last), on `flow dispatch tiling off`, on `flow stop` and in a fail-back; a window that was already "always on top" on its own keeps that flag. If an app clears the flag itself, FlowWM puts it back within a quarter second. Notification toasts are topmost anyway. `flow query all` reports `on_top` per window. `false` = a focused tile covers the floats (stock behaviour). |
 
 Example:
@@ -537,7 +537,7 @@ query.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `foreground_sync_interval_ms` | `u32` | `250` | Interval (milliseconds) between reconciliation passes. The common in-sync pass is a single microsecond-scale read that no-ops. |
+| `foreground_sync_interval_ms` | `u64` | `250` | Interval (milliseconds) between reconciliation passes. The common in-sync pass is a single microsecond-scale read that no-ops. |
 | `new_window_monitor` | `"focused"` \| `"placed"` | `"focused"` | The screen a new window opens on. `"focused"` (niri behaviour) seats it on the screen that has the focus, at that screen's width preset, whatever screen Windows put it on; `"placed"` keeps the screen Windows chose. Windows found when the daemon starts and windows coming back from minimize or the tray keep their own screen either way. A window that first shows up by taking the foreground (one flow could not classify earlier, now clicked) also stays where it is. Why: `docs/adr/0023-new-windows-open-on-the-focused-screen.md`. |
 
 Example:
@@ -790,7 +790,7 @@ ignore entirely. Rules are evaluated **top-to-bottom, first match wins**. If no
 rule matches, `default_action` is used.
 
 Schema:
-[`schemas/flow-rules.schema.json`](https://github.com/CCpcalvin/flow-wm/blob/master/schemas/flow-rules.schema.json).
+[`schemas/flow-rules.schema.json`](https://github.com/darth-feir/flow-wm/blob/feat/multi-monitor/schemas/flow-rules.schema.json).
 
 > FlowWM ships a set of built-in defaults for common Windows system windows
 > (taskbar, Search UI, system dialogs, Task Manager, on-screen keyboard,
@@ -798,7 +798,7 @@ Schema:
 > compile time — they cannot be deleted or corrupted at runtime — and your
 > `flow-rules.toml` is checked **first**, so your rules always outrank the
 > built-in ones. See
-> [`default-flow-rules.toml`](https://github.com/CCpcalvin/flow-wm/blob/master/default-flow-rules.toml)
+> [`default-flow-rules.toml`](https://github.com/darth-feir/flow-wm/blob/feat/multi-monitor/default-flow-rules.toml)
 > in the repo root for the full list of what's ignored by default.
 
 ### Top-level fields
@@ -875,8 +875,8 @@ fullscreen = "app"
 Put `fullscreen = "frame"` on a rule for the same window in your
 `flow-rules.toml` to go back to the frame. In its own full screen Remote
 Desktop sends the Windows key combinations to the remote session (the
-`.rdp` setting `keyboardhook:i:2`, its default); the bundled keymap
-(`flow.ahk`) puts its keyboard hook back in front whenever a Remote Desktop
+`.rdp` setting `keyboardhook:i:2`, its default); the win-niri keymap
+(`keymaps/win-niri/flow.ahk`) puts its keyboard hook back in front whenever a Remote Desktop
 full screen becomes active, so the FlowWM chords keep working there and
 every other Windows key combination still reaches the session.
 

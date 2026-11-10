@@ -7,10 +7,11 @@
 # starting point.
 #
 # It is NOT read at runtime. The canonical default values live in code, in
-# src/config/defaults.rs, and are applied by serde when fields are absent from
-# your flow.toml. That means your flow.toml may be partial or even empty.
+# the Default impls in src/config/types.rs, and are applied by serde when
+# fields are absent from your flow.toml. That means your flow.toml may be
+# partial or even empty.
 #
-# Keep this file in sync with src/config/defaults.rs: the test
+# Keep this file in sync with src/config/types.rs: the test
 # `default_config_toml_matches_compiled_defaults` enforces that deserializing
 # this file yields exactly FlowConfig::default().
 #
@@ -219,7 +220,8 @@ edge_hop = true
 # Loadout save/restore settings.
 #
 # - default_path:  file name (relative to config dir) used by
-#                   `flow loadout save` and `flow loadout restore`.
+#                   `flow loadout save` and `flow loadout load`, saved on
+#                   `flow stop` and restored by `flow start`.
 #                   A plain file name: no directories, no "..", no drive.
 [loadout]
 default_path = "loadout.json"

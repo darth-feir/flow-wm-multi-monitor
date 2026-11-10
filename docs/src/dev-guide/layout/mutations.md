@@ -1,6 +1,6 @@
 # Mutations
 
-Every layout change in FlowWM is expressed as a **pure function** that takes the current `VirtualLayout` and returns a new one. There is no in-place mutation, no side effects, no Win32 calls — every function is `#[must_use]` and fully unit-testable on any platform. The `src/layout/mutations.rs` module contains the complete catalog of these operations, each consuming only the virtual layout and a [`MutationConfig`](../../src/layout/mutations.rs) struct that carries the monitor dimensions, column width, gap settings, and the precomputed expand/shrink ladder.
+Every layout change in FlowWM is expressed as a **pure function** that takes the current `VirtualLayout` and returns a new one. There is no in-place mutation, no side effects, no Win32 calls — every function is `#[must_use]` and fully unit-testable on any platform. The `src/layout/mutations.rs` module contains the complete catalog of these operations, each consuming only the virtual layout and a `MutationConfig` (`src/layout/mutations.rs`) struct that carries the monitor dimensions, column width, gap settings, and the precomputed expand/shrink ladder.
 
 ## Mutation catalog
 
@@ -14,12 +14,16 @@ Every layout change in FlowWM is expressed as a **pure function** that takes the
 | Structural | Swap window | `swap_window(layout, focused, dir, config)` | Swaps the focused window with a specific adjacent window. For up/down, swaps the `Row` items within the same column (height travels with the window) and the row viewport follows the focused window. For left/right, picks the nearest row in the adjacent column and exchanges the **window ids only** — a row's height is a share of its own column's budget, so the heights stay with their slots. Row counts are preserved on both sides, so nothing is redistributed. |
 | Structural | Add window | `add_window(layout, window, config)` | Appends a new column to the right end of the canvas at `column_width`. The column's single row is seeded with the n=1 distributed height. No viewport adjustment — the caller decides whether to scroll. |
 | Structural | Insert after focused | `insert_window_after_focused(layout, focused, window, config)` | Inserts a new column immediately after the focused window's column. Calls `ensure_column_visible` on the new column. |
+| Structural | Insert after focused, sized | `insert_window_after_focused_with_width(layout, focused, window, width, config)` | As above, at an explicit (caller-quantized) width instead of `column_width`. |
+| Structural | Insert at index | `insert_window_at(layout, col_idx, window, config)` | Inserts a single-row column at `col_idx` (clamped to the column count) and calls `ensure_column_visible` on it. Used to attach a window arriving from another monitor at the strip's near edge. |
+| Structural | Seat at index | `seat_window_at(layout, col_idx, window, config)` | The silent counterpart of `insert_window_at`: same insert, viewport untouched. Used to put a window back into a slot it used to hold (the hotplug reconcile restoring a column Windows minimized). |
 | Structural | Add to column | `add_window_to_column(layout, col_idx, window, config)` | Appends a window as a new bottom row in an existing column, then redistributes all rows in that column via `column_heights`. A column already holding `max_rows` rows is not exceeded: the window becomes a new single-row column right after it. |
 | Structural | Merge column | `merge_column(layout, focused, dir, config)` | Detaches the focused window from its column and appends it as a new bottom row of the left/right neighbour column. Redistributes both columns and scrolls the destination's row viewport to the new row. Returns `None` if there is no neighbour, the direction is vertical, or `min_window_height_px` would be violated in the destination column's visible slots. A destination holding `max_rows` rows is **walked past** instead (`move_past_column`): alone in its column the window swaps columns with it (`swap_column`), sharing its column it is extracted into a new column on the far side. |
 | Structural | Promote window | `promote_window(layout, focused, dir, config)` | Extracts the focused window into a new single-row column placed to the left/right of the source column. Redistributes the source column's remaining rows. No-op (`None`) when the focused window is already alone in its column, or when the direction is vertical. |
 | Structural | Remove window | `remove_window(layout, window, config)` | Removes a window from its column. If the column still has rows, redistributes them to equal heights and clamps the column's `row_offset`; if the column becomes empty, the column is removed entirely. Clamps `viewport_offset` to prevent scrolling past the new rightmost column. |
 | Structural | Set layout | `set_layout(config, columns, viewport_offset)` | Builds a layout from `(width, row ids)` specs — the loadout restore primitive. A spec with more than `max_rows` rows keeps the first `max_rows`; the rest follow as single-row columns. |
 | Row viewport | Ensure row visible | `ensure_row_visible(layout, window, config)` | Shifts the row viewport of `window`'s column by the minimum so the window is a visible row. The vertical analogue of `ensure_column_visible`. |
+| Row viewport | Scroll column rows | `scroll_column_rows(layout, col, down, config)` | Shifts column `col`'s row viewport by one row up or down; `None` when the column has no parked rows that way or `visible_rows` is `0`. The tile-drag row-scroll bands commit this live. |
 | Row viewport | Normalize | `normalize_row_viewports(layout, focused, config)` | Clamps every column's `row_offset` and reveals `focused`. `ScrollingSpace::apply_mutation` runs this on every result, so whatever a mutation did the focused window is never parked inside its own column. |
 | Structural | Initialize windows | `initialize_windows(ids, config, focus_idx, widths)` | Builds the initial layout from a list of window IDs. Each becomes a single-row column. When `widths` is `Some`, each width is quantized to the nearest slot-ladder rung (clamped to `[column_width, abs_max_width]`); when `None`, all columns use `column_width`. Sets `viewport_offset` via the canvas-width fit predicate (see [Center behaviors](#center-behaviors-three-modes)). |
 | Sizing | Expand column | `expand_column(layout, focused, config)` | Grows the focused column by one rung on the slot ladder. Two-step top jumps to `abs_max_width`. No-op if already at `abs_max_width`. |
@@ -37,20 +41,18 @@ Expand and shrink move along a discrete **slot ladder** rather than by arbitrary
 ```mermaid
 flowchart LR
     subgraph Ladder["Expand/Shrink Slot Ladder"]
-        R0["n=0\n960px\n(base)"]
-        R1["n=1\n960+964=1924px"]
-        R2["n=2\n960+2*964=2888px"]
-        SM["slot_max\nn=max_n"]
+        R0["n=0\n624px\n(base)"]
+        R1["n=1\n624+628=1252px"]
+        R2["n=2 = max_n\n624+2*628=1880px\n(slot_max)"]
         AM["abs_max_width\n1912px\n(monitor - 2*gap)"]
     end
 
-    R0 -->|"column_shift = 964"| R1
+    R0 -->|"column_shift = 628"| R1
     R1 -->|"column_shift"| R2
-    R2 -->|"..."| SM
-    SM -->|"two-step\ntop"| AM
+    R2 -->|"two-step\ntop"| AM
 ```
 
-The ladder is defined by: `column_shift = column_width + window_gap` (one slot step), and rungs at `column_width + n * column_shift` for `n` in `[0, max_n]`. The `abs_max_width = monitor_width - 2 * window_gap` sits above the top regular rung (`slot_max`) as a **two-step top** — the leftover pixels between `slot_max` and `abs_max_width` are smaller than one `column_shift`, so they get absorbed in a single jump to full width. This is the monocle width.
+(Example: a 1920 px work area, `window_gap = 4`, `column_width = 624`.) The ladder is defined by: `column_shift = column_width + window_gap` (one slot step), and rungs at `column_width + n * column_shift` for `n` in `[0, max_n]`, with `max_n = floor((abs_max_width − column_width) / column_shift)` (computed when the `MutationConfig` is built; `0` when the base width leaves no room for a full step, as with `column_width = 960` on 1920 px). The `abs_max_width = monitor_width - 2 * window_gap` sits above the top regular rung (`slot_max`) as a **two-step top** — the leftover pixels between `slot_max` and `abs_max_width` are smaller than one `column_shift`, so they get absorbed in a single jump to full width. This is the monocle width.
 
 Expand snaps **up** to the next rung using `floor((W - column_width) / column_shift)` to find the current rung, then advancing `n` by 1. Shrink snaps **down** using the same logic in reverse with `ceil`. Free-form widths from drag-resize that fall between rungs are handled gracefully: expand snaps them up to the next boundary, shrink snaps them down.
 
@@ -119,12 +121,12 @@ Fullscreen columns (ADR-0021) add three rules, applied after the above:
 
 ### Fullscreen columns: `set_fullscreen`, `expel_to_column`, `merge_back`
 
-`set_fullscreen(layout, window, on)` sets the flag of the window's column;
+`set_fullscreen(layout, window, on, config)` sets the flag of the window's column;
 turning it on for a window that shares a stack first expels it into a new
 single-row column right after the stack, at the stack's width
 (`expel_to_column`; the stack re-shares its height). The camera is the
 caller's (`ScrollingSpace::enter_fullscreen` / `leave_fullscreen`).
-`merge_back(layout, window, sibling, row)` puts a window that is alone in
+`merge_back(layout, window, sibling, row, config)` puts a window that is alone in
 its column back into the column holding `sibling` at `row`; it refuses
 (`None`) a full stack, a fullscreen one, or one where the row would fall
 below `min_window_height_px`, and the window then stays a column of its own.
@@ -186,7 +188,7 @@ Builds the initial `VirtualLayout` from a list of `WindowId` values. Each window
 
 **Viewport offset.** The `viewport_offset` is decided by the canvas-width fit predicate (see [Center behaviors](#center-behaviors-three-modes)):
 
-- If `canvas_width(layout, window_gap) ≤ monitor_width` (all columns fit), the canvas is centered via `center_viewport_canvas`.
+- If `canvas_width(layout, window_gap, monitor_width) ≤ monitor_width` (all columns fit), the canvas is centered via `center_viewport_canvas`.
 - Else if a focus column is provided, `ensure_column_visible` shifts the viewport to reveal the focus column with a `window_gap` margin.
 - Else (overflow with no focus), `viewport_offset = 0`.
 
@@ -217,14 +219,14 @@ canvas_x(f) = Σ width[i] for i in 0..f + (f + 1) * window_gap
 viewport_offset = canvas_x(focused) - (monitor_width - focused_width) / 2
 ```
 
-The `(f + 1) * window_gap` term is the easy off-by-one trap: the canvas starts with a left-edge gap, then each column contributes its width plus a trailing gap, so column `f`'s left edge sits at `(f + 1)` gaps plus the widths of all preceding columns. `focused_width` is the focused column's **actual** `width_px` (read from the layout, not assumed) — this is the fix for the original bug where the old `center_viewport_grid`/`center_viewport_absolute` functions assumed uniform widths and computed `f * slot` instead.
+The `(f + 1) * window_gap` term is the easy off-by-one trap: the canvas starts with a left-edge gap, then each column contributes its width plus a trailing gap, so column `f`'s left edge sits at `(f + 1)` gaps plus the widths of all preceding columns. `focused_width` is the focused column's **actual** `width_px` (read from the layout, not assumed) — this is the fix for the original bug where the old `center_viewport_grid`/`center_viewport_absolute` functions assumed uniform widths and computed `f * slot` instead. In code `canvas_x(f)` is `projection::column_left`, so a fullscreen column before `f` counts one whole screen; when the focused column is itself fullscreen the result is `canvas_x(f) − window_gap` (it starts the view, ADR-0021).
 
-This is the only behavior that centers **unconditionally** — the user explicitly asked for it via `flow dispatch center`. The other two behaviors are policy decisions made by automated flows.
+This is the only behavior that centers **unconditionally** — the user explicitly asked for it via `flow dispatch center`. The other two behaviors are policy decisions made by automated flows. (On a screen with a width pattern the result still goes through `apply_mutation`, whose slot pin re-starts the view on a column boundary, so there the centred offset is snapped back to the run of slots; see [Width patterns](#width-patterns-pin-columns-to-screen-slots).)
 
 ### `center_viewport_canvas` — center the entire canvas
 
 ```
-viewport_offset = (canvas_width(layout, window_gap) - monitor_width) / 2
+viewport_offset = (canvas_width(layout, window_gap, monitor_width) - monitor_width) / 2
 ```
 
 Uses `projection::canvas_width` as the authoritative canvas math (`window_gap + Σ(width_px + window_gap)`). When the canvas is narrower than the monitor, this returns a negative offset — projection already supports this (the column's left edge is shifted right of the canvas origin by the gap, which compensates). Used when an automated flow knows everything fits and wants a clean visual midpoint.
@@ -261,10 +263,10 @@ A `[columns]` preset with two or more terms (`"2/3+1/3"`) is a **pattern**: its 
 
 ## The pure-function convention
 
-Every mutation in the catalog follows the same signature pattern: `fn(&VirtualLayout, ...) -> Option<VirtualLayout>`. They never modify the input — they clone it internally and return a new value. This makes the mutation layer:
+Every mutation in the catalog follows the same signature pattern: `fn(&VirtualLayout, ...) -> Option<VirtualLayout>` where the operation can be refused (focus, swap, merge, promote, sizing, scroll), or `-> VirtualLayout` where it always succeeds (add, insert, seat, remove, `ensure_row_visible`, `normalize_row_viewports`). The exceptions are `focus` (`Option<FocusResult>`, the new focus plus the layout), `toggle_monocle` (`Option<(VirtualLayout, Option<i32>)>`, the layout plus the saved width), the two centering helpers (an `i32` offset), and the builders `initialize_windows` / `set_layout`, which take window ids rather than a layout. They never modify the input — they clone it internally and return a new value. This makes the mutation layer:
 
 - **Composable** — the output of one mutation can be fed directly into another.
 - **Testable** — unit tests construct a `VirtualLayout`, call a mutation, and assert on the result. No mocks, no Win32, no setup.
 - **Deterministic** — the same input always produces the same output.
 
-The `ScrollingSpace` orchestrator in [`src/workspace/scrolling_space.rs`](../../src/workspace/scrolling_space.rs) is the only code that calls these functions and applies the results. See [Pipeline](./pipeline.md) for how mutations flow into projection and animation.
+The `ScrollingSpace` orchestrator in `src/workspace/scrolling_space.rs` is the only code that calls these functions and applies the results. See [Pipeline](./pipeline.md) for how mutations flow into projection and animation.

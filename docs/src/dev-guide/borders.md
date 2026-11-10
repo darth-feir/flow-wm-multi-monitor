@@ -72,6 +72,16 @@ The layout engine computes **visible content rects** (`entry.rect` in
 rects before issuing `SetWindowPos`, using each window's measured
 `InvisibleBounds` (see [Window Registry](./window-registry.md)).
 
+Those bounds are not fixed at registration. WPF and Visual Studio shell
+windows (SSMS) apply their chrome after the window is registered, so the
+first reading is zero and the content sat 5 px inside the ring. The daemon
+re-measures them (`src/daemon/frame_bounds.rs`, ADR-0028,
+`docs/adr/0028-late-chrome-invisible-bounds.md`) before every layout batch
+for the windows it moves, at drag start, when a float's rect is read back,
+and for the focused window on the periodic foreground sync (which then
+re-places only that window). The ring itself does not change: it hugs the
+slot, and only the window rect inside it is corrected.
+
 The border overlay is positioned at the **visible content rect directly** — no
 translation, no invisible-bounds expansion:
 
@@ -139,14 +149,17 @@ stateDiagram-v2
 
 ### Creation: `refresh_border_for`
 
-[`daemon::borders::refresh_border_for`](../../src/daemon/borders.rs) is the
+`daemon::borders::refresh_border_for` (`src/daemon/borders.rs`) is the
 single entry point for border lifecycle changes. It resolves the desired
 `BorderStyle` from the window's registry state, then:
 
-- **`None`** (minimized / hidden / ignored) → sets `window.border = None`,
+- **`None`** (minimized / hidden / ignored / daemon-fullscreen, or
+  `[borders] enabled = false`) → sets `window.border = None`,
   dropping the `Border` and triggering `DestroyWindow` via `Drop`.
 - **`Some(style)` + border exists** → re-seats the overlay just above its target
-  (`seat_above_target`), then calls `set_style(style)`. `set_style` compares the
+  (`seat_above_target`), re-seats a float's overlay geometry
+  (`float_border_rect` of its stored rect; a tile's geometry belongs to the
+  animator), then calls `set_style(style)`. `set_style` compares the
   new style against the current one and **short-circuits when they are equal** —
   no `UpdateLayeredWindow`, no repaint. This makes no-op recolors free.
 - **`Some(style)` + no border** → creates the overlay via
@@ -181,8 +194,9 @@ focus and the window gaining it — not every managed window. `on_focus_changed`
 captures the previous focused HWND, updates the registry's focus, then calls
 `refresh_border_for` on just those two HWNDs. Combined with the `set_style`
 short-circuit, a focus change that lands on an already-correctly-colored window
-costs nothing. (The full O(N) `refresh_all_border_styles` survives only for the
-one-time init pass.)
+costs nothing. (The full O(N) `refresh_all_border_styles` survives only for
+whole-desktop passes: the init pass, `tiling on`, a config reload and a
+display change.)
 
 ### Init highlight
 
@@ -226,14 +240,14 @@ compositor simply translates the cached bitmap.
 | Path | When | How | Bitmap rebuild? |
 |------|------|-----|-----------------|
 | **Animator** | Tiled window animates | Border flattened into `Vec<WindowTarget>` alongside the window; `SetWindowPos` moves both in lockstep | Yes if size changes (`WM_SIZE` → `on_wm_size`); no for move-only frames |
-| **Float hook** | Floating window dragged | `store_float_rect` calls `set_geometry(visible_rect)` after updating the registry | Same: `set_geometry` calls `SetWindowPos`, which triggers `WM_SIZE` if resized |
-| **Teleport** | Bystander workspace switch | `teleport_workspaces` calls `set_geometry(visible_rect)` directly (instant, no animation) | Same |
+| **Float hook** | Floating window dragged | `store_float_rect` calls `set_geometry(float_border_rect(visible_rect))` after updating the registry | Same: `set_geometry` calls `SetWindowPos`, which triggers `WM_SIZE` if resized |
+| **Teleport** | Bystander workspace switch | `teleport_workspaces` calls `set_geometry` directly with the border rect `float_geometry` gives (the slot for a tile, the outset rect for a float; instant, no animation) | Same |
 | **Tile drag** | Tiled window being title-bar dragged | `on_drag_move` calls `set_geometry(float_border_rect)` directly (same as float hook, not via animator) | Same |
 
 The tile-drag path bypasses the animator because the animator is busy
 reflowing *other* windows during the drag. The dragged window's position is
 controlled by the user's mouse, so sending it through the animator would fight
-the user's drag. See (tile-drag.md) for the full explanation.
+the user's drag. See [Tile Drag](./tile-drag.md) for the full explanation.
 
 ### The overlay is self-sufficient: `WM_SIZE` drives repaint
 
@@ -307,6 +321,8 @@ classDiagram
     class Border {
         +create(style, target_hwnd) Result~Border~
         +hwnd() isize
+        +corner() tuple
+        +note_corner(pref, facts)
         +seat_above_target()
         +set_geometry(visible_rect)
         +set_style(style)
@@ -316,6 +332,8 @@ classDiagram
         -overlay: Mutex~isize~
         -target: isize
         -style: Mutex~BorderStyle~
+        -corner: Mutex~tuple~
+        -surface: Mutex~CachedSurface~
     }
     class BorderStyle {
         +color: Color
@@ -328,7 +346,11 @@ classDiagram
 
 `Border` is `Arc<BorderInner>` — `Clone` is a cheap refcount bump. This keeps
 `Window: Clone` sound (the registry derives `Clone` for snapshots and queries)
-while guaranteeing `DestroyWindow` runs exactly once.
+while guaranteeing `DestroyWindow` runs exactly once. `corner` holds the
+resolved corners and the `CornerFacts` they came from (see
+[Corner preference](#corner-preference)); `surface` is the cached rendered
+ring (DIB + memory DC), so a move-only paint is skipped and a color-only
+change recolors in place.
 
 When recoloring via `set_style` (on focus changes), the border queries its
 *own* overlay position with `GetWindowRect` rather than remembering a commanded
@@ -487,21 +509,23 @@ floating_color = "#AA00FF"     # floating windows
 | `overlap` | `u32` | `1` | Pixels the ring overlaps the visible content per edge. `0` = ring entirely in the reserved gap (window shrinks by the full `thickness`); `thickness` = content fills the layout slot under the ring. Capped at `thickness` by `validate()`. |
 | `focused_color` | `Color` | `#00AAFF` | Color for the OS-foreground window. |
 | `unfocused_color` | `Color` | `#555555` | Color for tiled-but-not-focused windows. |
-| `floating_color` | `Color` | `#AA00FF` | Color for floating windows (komorebi convention: floats always use this regardless of focus). |
+| `floating_color` | `Color` | `#AA00FF` | Color for floating windows that are not focused. Focus takes priority: the focused float uses `focused_color`. |
 
 > **No `corner_preference` field.** Corner shape is **auto-detected** per window
 > from DWM (see [Corner preference](#corner-preference)), not set in config. The
 > border always matches the window's existing corner shape.
 
-The daemon resolves which color applies via `style_for_state(cfg, state)`,
-mapping its internal `WindowState` onto the three-bucket `BorderState` enum
-(`Focused` / `Unfocused` / `Floating`). Minimized, hidden, and ignored windows
-produce no border at all.
+The daemon resolves which color applies in `border_style_for`, mapping its
+internal `WindowState` and the registry's focus onto the three-bucket
+`BorderState` enum (`Focused` / `Unfocused` / `Floating`) and handing that to
+`style_for_state(cfg, state)`. Minimized, hidden, and ignored windows
+(`Ignored(Elevated)` included) produce no border at all, nor does a window the
+daemon put fullscreen, and `enabled = false` turns every overlay off.
 
 ### Config-defaults rule
 
 Code is the single source of truth. The `Default` impl in
-[`src/config/types.rs`](../../src/config/types.rs) defines the actual runtime
+`src/config/types.rs` defines the actual runtime
 defaults; `default-config.toml` is a hand-written example synced by a
 compile-time test. See [config and persistence](./config-and-persistence.md).
 

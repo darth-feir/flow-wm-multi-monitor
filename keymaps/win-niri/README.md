@@ -19,7 +19,7 @@ setup.
 | `selection.ahk` | The selection buffer (`[keymap] selection_buffer`, off by default): text highlighted with the mouse is kept apart from the clipboard and a middle click pastes it. See *Selection buffer* below. |
 | `help.ahk` | Key-binding overlay (the `show-hotkey-overlay` action, Mod+Shift+/ by default). Its rows come from the same `flow query binds` listing the hotkeys are registered from, so it cannot disagree with them. |
 | `flow-resident.ahk` | Optional resident starter: runs all the time (shortcut in `shell:startup`) and turns Mod+Ctrl+T into an on/off switch for the whole of FlowWM. |
-| `flow.toml.example` | The daemon side of the map: `[columns]` width presets (fractions and `2/3+1/3`-style slot patterns, per-screen `[[columns.screen]]` rules), `edge_hop = false`, `[focus] new_window_monitor`, and commented `[binds]` / `[keymap]` / `[startup]` examples. |
+| `flow.toml.example` | The daemon side of the map: `[columns]` width presets (fractions and `2/3+1/3`-style slot patterns, per-screen `[[columns.screen]]` rules, stack rows, `layout` / `wrap_around`), `min_column_width_px`, `adopt_maximized`, `edge_hop = false`, `[focus] new_window_monitor`, `[floating] always_on_top`, and commented `[binds]` / `[keymap]` / `[startup]` examples. |
 
 Install: copy `flow.ahk`, `flow-exe.ahk`, `selection.ahk`, `launcher.ahk` and `help.ahk` to
 `%USERPROFILE%\.config\flow\` (the files must sit next to each other — the
@@ -96,7 +96,8 @@ in step and prints the block to paste when `binds.toml` changes.
 To change a chord: add it to `[binds]` in `flow.toml` and save. `flow query
 binds` shows the result; `flow config check` names mistakes
 (`binds."Mod+Bogus": unknown key ...`); turn on the keymap log (see
-*Tracing*) to see each registration (`binds: 59 registered`).
+*Tracing*) to see each registration (`binds: N registered`, 78 with the
+built-in table).
 
 ## Daemon liveness and fail-back
 

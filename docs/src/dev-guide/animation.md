@@ -11,7 +11,7 @@ for the embedding rationale.
 ## Public API Surface
 
 The animation layer exposes a small set of types through
-[`src/animation/mod.rs`](../../src/animation/mod.rs):
+`src/animation/mod.rs`:
 
 - **`WindowAnimator`** — the main entry point. Owns a background worker thread
   that drives the frame loop. Submit animation batches with `animate()`.
@@ -81,7 +81,7 @@ precise and safe completion signal.
 ## Easing Functions
 
 Position and size channels are eased independently. The animation module
-([`src/animation/easing.rs`](../../src/animation/easing.rs)) provides a
+(`src/animation/easing.rs`) provides a
 comprehensive catalog of 31 named easing curves plus arbitrary CSS cubic-bezier
 curves (solved via Newton-Raphson iteration):
 
@@ -110,7 +110,7 @@ treated as a pure translation. This avoids unnecessary content reflow.
 
 ## Batch Scheduling
 
-The animation layer uses `AnimationBatch` ([`src/animation/batch.rs`](../../src/animation/batch.rs))
+The animation layer uses `AnimationBatch` (`src/animation/batch.rs`)
 to manage all per-window tweens for one animation run. Key design points:
 
 - **No-op filtering**: windows whose current rect already matches the target are
@@ -141,7 +141,7 @@ original position.
 
 ## The Two Backends
 
-The `WindowBackend` trait ([`src/animation/backend/mod.rs`](../../src/animation/backend/mod.rs))
+The `WindowBackend` trait (`src/animation/backend/mod.rs`)
 decouples the animation engine from Win32:
 
 ```mermaid
@@ -164,7 +164,7 @@ classDiagram
     WindowBackend <|-- MockBackend
 ```
 
-**`Win32Backend`** ([`src/animation/backend/win32.rs`](../../src/animation/backend/win32.rs))
+**`Win32Backend`** (`src/animation/backend/win32.rs`)
 uses individual `SetWindowPos` calls rather than the batch `DeferWindowPos` API.
 This is a deliberate resilience choice: `DeferWindowPos` is atomic, so a single
 elevated admin window (protected by UIPI) causes the entire batch to fail with
@@ -184,13 +184,13 @@ size applies there. Visual Studio-shell windows (SSMS 21) answer a *sized* move
 past the right edge by moving themselves to `x = -width`, onto the left monitor
 (ADR-0019, `docs/adr/0019-pure-moves-and-silent-parked-resizes.md`).
 
-**`MockBackend`** ([`src/animation/backend/mock.rs`](../../src/animation/backend/mock.rs))
+**`MockBackend`** (`src/animation/backend/mock.rs`)
 stores rects in a `HashMap` and records call history. Always compiled (no feature
 gate) so both unit tests and integration tests can use it freely.
 
 ## The Bridge: daemon::animation
 
-The daemon's animation bridge ([`src/daemon/animation.rs`](../../src/daemon/animation.rs))
+The daemon's animation bridge (`src/daemon/animation.rs`)
 is the integration point between the layout engine and the animation system. Its
 responsibilities:
 

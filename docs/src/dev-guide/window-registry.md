@@ -8,7 +8,7 @@ with no Win32 dependencies, making it fully unit-testable.
 
 ## What the Registry Owns
 
-`WindowRegistry` ([`src/registry/core.rs`](../../src/registry/core.rs)) is a
+`WindowRegistry` (`src/registry/core.rs`) is a
 single struct that owns:
 
 - A `HashMap<isize, Window>` — the authoritative map of HWND values (as `isize`
@@ -81,13 +81,15 @@ classDiagram
     Window --> VirtualSlot
 ```
 
-The `Window` struct ([`src/registry/types.rs`](../../src/registry/types.rs)) is the
+The `Window` struct (`src/registry/types.rs`) is the
 single record for every tracked window. Its `state` field determines how the
 layout engine and animation layer interact with it. `VirtualSlot` bridges the
 registry to the layout engine — when a tiled window is minimized or hidden, its
-column/row position is saved here. A minimized tile also records its full seat
-in `restore_seat` (`RestoreSeat`: monitor, workspace, column, row, alone, width), which the
-restore hook takes to put it back there (ADR-0027); a float minimized or hidden
+column/row position is saved here; it is only the placeholder slot of the
+`Active` state on restore / re-show and the hotplug reconcile's casualty order,
+not where the tile goes back. A tile minimized or hidden also records its full
+seat in `restore_seat` (`RestoreSeat`: monitor, workspace, column, row, alone, width), which the
+restore and re-show hooks take to put it back there (ADR-0027); a float minimized or hidden
 keeps its rect in `last_float_rect`. The diagram shows the core fields only.
 
 ### State Transitions
@@ -256,7 +258,7 @@ filter exists for a specific reason:
 ### Phase 2: Rule Pipeline
 
 Windows that survive the pre-filters enter the classification pipeline
-([`src/registry/classification.rs`](../../src/registry/classification.rs)). The
+(`src/registry/classification.rs`). The
 pipeline is platform-independent — it receives a `WindowCandidate` (a plain Rust
 struct with no HWND) and returns a `WindowState`.
 
@@ -330,7 +332,7 @@ allocations.
 ### Notable Default Rules
 
 The embedded default rules (from
-[`default-flow-rules.toml`](../../default-flow-rules.toml)) catch several
+`default-flow-rules.toml`) catch several
 well-known Windows edge cases:
 
 **Chromium Legacy Window filtering.** Every Chromium-based application (Chrome,
@@ -389,15 +391,16 @@ window-rect coordinates (what `SetWindowPos` expects). See
 
 ## Hooks Used
 
-The registry listens to eleven Win32 events (nine hooks) registered via `SetWinEventHook` on a
-dedicated background thread:
+The registry listens to fourteen Win32 events through nine hooks registered via `SetWinEventHook` on a
+dedicated background thread (eight in the table, plus `LOCATIONCHANGE` below):
 
 | Hook | Win32 event | Meaning | Action |
 |------|-----------|---------|--------|
 | Create/Destroy range | `EVENT_OBJECT_CREATE` / `EVENT_OBJECT_DESTROY` | Window lifecycle | Classify and register, or remove from registry |
 | Foreground | `EVENT_SYSTEM_FOREGROUND` | Focus changed | Register the window if untracked, then update `focused` field |
-| Minimize range | `EVENT_SYSTEM_MINIMIZESTART` / `EVENT_SYSTEM_MINIMIZEEND` | Minimize/restore | Transition Active to/from Minimized, save/restore virtual slot (`MINIMIZEEND` registers the window first if untracked) |
-| Show/Hide range | `EVENT_OBJECT_SHOW` / `EVENT_OBJECT_HIDE` | Visibility | Reconcile visibility (tray-hide, DWM cloak, re-show) |
+| Move/size range | `EVENT_SYSTEM_MOVESIZESTART` / `EVENT_SYSTEM_MOVESIZEEND` | User drag or resize | Start / end a drag (`on_drag_start` / `on_drag_end`, see [Event Pipelines](./event-pipelines.md)) |
+| Minimize range | `EVENT_SYSTEM_MINIMIZESTART` / `EVENT_SYSTEM_MINIMIZEEND` | Minimize/restore | Transition Active to/from Minimized; the daemon records the tile's restore seat and re-seats it from there (`MINIMIZEEND` registers the window first if untracked) |
+| Show/Hide range | `EVENT_OBJECT_SHOW` / `EVENT_OBJECT_HIDE` | Visibility | Reconcile visibility (tray-hide, DWM cloak, re-show); a hidden tile's restore seat is recorded and used on re-show |
 | StateChange | `EVENT_OBJECT_STATECHANGE` | State bits changed | Recovery: re-classify `Ignored(Maximized/Fullscreen)` windows when the user restores them |
 | NameChange | `EVENT_OBJECT_NAMECHANGE` | Title changed | Recovery: re-attempt registration for windows not yet tracked (late-titling apps like Windows Terminal) |
 | Cloak range | `EVENT_OBJECT_CLOAKED` / `EVENT_OBJECT_UNCLOAKED` | DWM cloaking | `UNCLOAKED`: register an untracked window (UWP frames are created cloaked and never `SHOW`n), re-show a tracked hidden one; `CLOAKED`: reconcile a tracked window to `Hidden` |
@@ -481,7 +484,7 @@ icon rect — at (-32000, -32000) for a window with a taskbar button, at the
 bottom-left of the desktop for one without. Registering or re-measuring
 from that rect would make the icon the window's pre-manage rect, and
 `tiling off` would later hand the window back icon-sized. Every reader
-therefore checks `win32::is_iconic_rect` and waits (the restore handler
+therefore checks `win32::is_icon_rect` and waits (the restore handler
 leaves an untracked window to the pending-creation retry or the activation
 that follows a restore) instead of recording it.
 

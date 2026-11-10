@@ -10,11 +10,24 @@ config, and start.
 > **This fork.** The steps below are upstream's ([CCpcalvin/flow-wm](https://github.com/CCpcalvin/flow-wm)):
 > `cargo install flow-wm` and the upstream clone install upstream FlowWM, and
 > `flow config init --ahk` writes upstream's `Alt`-based `flow.ahk` (the
-> repository's root `flow.ahk`). The fork (darth-feir/flow-wm-fork, branch
-> `feat/multi-monitor`) is built from its own clone, and its Windows-key
-> keymap is the set of `.ahk` files in `keymaps/win-niri/`, copied by hand
-> next to `flow.toml` together with `flow.toml.example` merged into it; see
-> the repository README, *Using the fork*, and `keymaps/win-niri/README.md`.
+> repository's root `flow.ahk`). The fork
+> ([darth-feir/flow-wm](https://github.com/darth-feir/flow-wm), branch
+> `feat/multi-monitor`) is built from its own clone:
+>
+> ```powershell
+> git clone -b feat/multi-monitor https://github.com/darth-feir/flow-wm.git
+> cd flow-wm
+> cargo build --release --locked
+> ```
+>
+> Copy `flow.exe` and `flowd.exe` from `target\release\` into one folder
+> (`flow start` looks for `flowd.exe` next to `flow.exe`; the keymap looks
+> for `flow.exe` in `%FLOW_BIN%`, then `%LOCALAPPDATA%\Programs\flow`, then
+> `PATH`). Its Windows-key keymap is the set of `.ahk` files in
+> `keymaps/win-niri/`, copied by hand into `%USERPROFILE%\.config\flow\`
+> next to `flow.toml` (its `flow.ahk` takes the place of upstream's), with
+> `flow.toml.example` merged into `flow.toml`; see the repository README,
+> *Using the fork*, and `keymaps/win-niri/README.md`.
 
 ## Prerequisites
 
@@ -51,7 +64,7 @@ That's it. Both binaries are installed onto your `PATH`.
 ```powershell
 git clone https://github.com/CCpcalvin/flow-wm.git
 cd flow-wm
-cargo build --release
+cargo build --release --locked
 ```
 
 The binaries land in `target\release\` — you'll need to add that folder to your
@@ -78,7 +91,7 @@ prints the recipe. To actually update a source build:
 
 ```powershell
 git pull
-cargo build --release
+cargo build --release --locked
 flow stop
 # copy target\release\flow.exe and flowd.exe over the installed ones, then
 flow start
@@ -93,12 +106,14 @@ repository and branch the check uses.
 flow config init --ahk
 ```
 
-This writes two files into your config directory:
+This writes these files into your config directory:
 
 | File | Purpose |
 |------|---------|
 | `%USERPROFILE%\.config\flow\flow.toml` | Application config — column counts, padding, animation, borders, etc. Sensible defaults; heavily commented. |
-| `%USERPROFILE%\.config\flow\flow.ahk` | A ready-to-use AutoHotkey v2 script binding every command to a `Alt + <key>` chord. |
+| `%USERPROFILE%\.config\flow\flow-rules.toml` | Window rules — `default_action = "float"` and no rules of your own yet (the bundled rules are compiled in). |
+| `%USERPROFILE%\.config\flow\schemas\` | The JSON schemas the two TOML files point at, for editor completion. |
+| `%USERPROFILE%\.config\flow\flow.ahk` | (with `--ahk`) A ready-to-use AutoHotkey v2 script binding every command to a `Alt + <key>` chord. |
 
 > **Existing files are never overwritten.** Re-running `flow config init --ahk`
 > is safe — it only writes files that don't yet exist. To regenerate, delete
@@ -129,8 +144,11 @@ Want this on every login? Run this once:
 flow enable-autostart --ahk
 ```
 
-It registers both the daemon and the hotkey script to launch at logon. (Use
-`flow disable-autostart` to undo.)
+It puts one shortcut, `flow.lnk`, in your `shell:startup` folder that runs
+`flow start --ahk` at logon, so the daemon starts and launches the hotkey
+script. The shortcut points at the `flow.exe` you ran the command with, so
+run it from the installed copy; with `--ahk` it refuses while `flow.ahk` is
+missing from the config directory. (Use `flow disable-autostart` to undo.)
 
 ## Step 4 — Sanity check
 

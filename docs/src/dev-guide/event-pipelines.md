@@ -142,10 +142,17 @@ The main loop folds a third deadline —
 250 ms) — into its `MsgWaitForMultipleObjects` timeout, so it never sleeps past
 the next reconciliation pass. On every wake, `reconcile_foreground()`:
 
-1. Queries the authoritative `GetForegroundWindow()` (a single microsecond-scale
+1. Re-checks the focused window's own chrome first: its corner facts
+   (`recheck_focused_corners`, see [Borders](./borders.md)) and its invisible
+   frame borders (`recheck_focused_frame` in `daemon::frame_bounds`): when the
+   borders changed while it sat idle, the new value is stored and the window
+   is moved once, instantly, into its slot (tile) or onto its stored rect
+   (float). See [Window Registry](./window-registry.md#re-measured-at-placement-late-chrome)
+   and ADR-0028.
+2. Queries the authoritative `GetForegroundWindow()` (a single microsecond-scale
    read).
-2. **No-ops** when the tracked focus already matches reality — the common case.
-3. Otherwise, if the real foreground is a tracked window **in the active
+3. **No-ops** when the tracked focus already matches reality — the common case.
+4. Otherwise, if the real foreground is a tracked window **in the active
    workspace**, re-runs the `on_focus_changed()` path to correct the border +
    layout cursor.
 
@@ -183,7 +190,7 @@ sequenceDiagram
     Reg-->>flow: Option<&Window>
     alt foreground is Tiling(Active)
         flow->>Layout: active_scrolling_mut().focus(id, Left)
-        Layout-->>flow: Some((WindowId, Option<LayoutDiff>))
+        Layout-->>flow: Some((WindowId, Option<AppliedLayout>))
         flow->>Win32: SetForegroundWindow(hwnd)
         flow->>Reg: set_focused(hwnd)
         flow->>Anim: animate_layout(diff)
@@ -200,7 +207,7 @@ Every IPC command follows the same pattern:
 1. **Busy gate**: if a tile drag is in progress (`drag_state.is_some()`) and
    the command is layout-mutating (`is_layout_mutating()`), `dispatch()` returns
    `SocketResponse::Busy` immediately. Read-only queries and daemon lifecycle
-   commands still pass through. See (tile-drag.md) for the full classification.
+   commands still pass through. See [Tile Drag](./tile-drag.md) for the full classification.
 2. `dispatch()` matches on the `SocketMessage` variant and calls the appropriate
    subsystem method.
 3. **Tiled-only ops** (focus / swap-window / swap-column / merge / promote /
@@ -213,7 +220,8 @@ Every IPC command follows the same pattern:
    these ops to act on the stale `last_focused_window` tile cursor. See
    [Floating Space / Focus Model](./floating-space.md#focus-model-clarification).
 4. Layout commands call `active_scrolling_mut()` to reach the `ScrollingSpace`,
-   mutate the virtual layout, and receive an `AppliedLayout` or `Option<LayoutDiff>`.
+   mutate the virtual layout, and receive an `AppliedLayout` or an `Option` of one (`focus` returns
+   `Option<(WindowId, Option<AppliedLayout>)>`).
    The target `WindowId` is now passed explicitly from the dispatch layer rather
    than re-resolved inside `ScrollingSpace` from `last_focused_window`.
  5. Some commands require OS-level side effects (e.g. `FocusLeft` calls
@@ -228,7 +236,7 @@ asynchronous window destruction.
 
 ## The `animate_layout` Bridge
 
-`animate_layout()` in [`src/daemon/animation.rs`](../../src/daemon/animation.rs) is
+`animate_layout()` in `src/daemon/animation.rs` is
 the conversion point between the layout engine's output and the animation
 system's input:
 
@@ -365,7 +373,7 @@ A window coming back into a layout (restored, re-shown, recovered from
 maximized) is seated on its *home* monitor (`home_monitor_for_hwnd`,
 `readd_tile`), resolved in this order of trust:
 
-1. the **owning-monitor memory** (`Window::owner_monitor`), recorded whenever
+1. the **owning-monitor memory** (`Window::monitor`), recorded whenever
    the daemon seats the window and surviving minimize / hide;
 2. `MonitorFromWindow` matched to a known `HMONITOR` — authoritative for a
    window the daemon never seated, but for a window that was parked beyond
@@ -407,8 +415,9 @@ above.
 | Condition | Action |
 |-----------|--------|
 | Not tracked | Skip |
-| Was tiling (active or minimized) | `remove_window()` with focus successor resolution, `remove_from_layout_and_registry()`, animate |
-| Was floating or ignored | `registry.remove_window()` only |
+| Was tiling (active or minimized) | `remove_from_layout_and_refocus()` (focus successor resolution, animate), then `registry.remove_window()` |
+| Was floating or ignored | Out of the float-tracking set and every `FloatingSpace`, then `registry.remove_window()` |
+| Tiling paused (`tiling off`) | Bookkeeping only: out of every strip and floating space and the registry, no animation or successor focus |
 
 The successor window is chosen by `next_available_window`: prefer a sibling in
 the same column (the window directly below, else the one above), then the left
@@ -524,7 +533,8 @@ tracked `Ignored(Maximized|Fullscreen)` window has its `WS_MAXIMIZE` bit
 cleared (the user restores it), `reclassify_os_state()` re-runs the classifier
 (and re-measures the window's rect and invisible borders, which were those of
 the maximized frame). If the window now qualifies as tiling, it is appended to
-the layout via `add_window()`.
+its home monitor's strip via `add_window()` (`readd_tile_to_home_monitor`, no
+view follow).
 
 The handler only acts on windows currently in `Ignored(Maximized|Fullscreen)`
 state, so the common case (no recoverable windows) costs a single `HashMap`
@@ -547,14 +557,14 @@ switched off while tiling is paused.
 |-----------|--------|
 | Not tracked | Skip |
 | Tracked, not `Tiling::Active` | Skip (float/ignored/minimized windows manage their own move) |
-| Tracked, `Tiling::Active` | `on_drag_start`: create `DragState`, `set_dragged_hwnd` (gates LOCATIONCHANGE filter) |
+| Tracked, `Tiling::Active` | `on_drag_start`: re-measure the window's invisible borders (ADR-0028), create `DragState`, `set_dragged_hwnd` (gates LOCATIONCHANGE filter) |
 | `MoveSizeEnd` on a tracked `Ignored(Maximized\|Fullscreen)` window | Run the [State Change](#state-change-event_object_statechange) recovery (dragging a maximized title bar un-maximizes the window) |
 | `MoveSizeEnd` with no active `DragState` | Skip (double-fire or spurious end) |
 | `MoveSizeEnd` with active `DragState` | `on_drag_end`: commit layout or snap-back, `clear_dragged_hwnd` |
 
 These events fire when the user grabs a tiled window's title bar. The full
 drag lifecycle — zone detection, preview reflow, commit — is documented in
-(tile-drag.md).
+[Tile Drag](./tile-drag.md).
 
 ### LocationChange (extended for tile drag)
 

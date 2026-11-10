@@ -22,7 +22,7 @@ flowchart LR
 ```
 
 1. **Parse.** `[binds]` deserialises into
-   [`BindsConfig`](../../src/config/binds.rs): the `defaults` switch and the
+   `BindsConfig` (`src/config/binds.rs`): the `defaults` switch and the
    entries as written. A value is either an action line (a string) or a
    `{ spawn = [...], admin, help }` table; the deserialiser names an
    unknown field in the table rather than failing the whole value.
@@ -43,9 +43,11 @@ flowchart LR
    `0` last, letters, the other named keys). A chord a user adds lands next
    to its siblings in the overlay whatever line it was written on.
 4. **Validate.** `FlowConfig::validate` calls `BindsConfig::validate`, so a
-   bad table is refused wherever the config is loaded: at start (stage
-   `config`), on `flow config reload`, by the file watcher (the running
-   config is kept), and by `flow config check`.
+   bad table is refused on `flow config reload` and by the file watcher (the
+   running config is kept) and listed by `flow config check`. At start (stage
+   `config`) `load_app_config` only logs a validation failure as a warning
+   and the daemon runs; `query binds` then answers with the error and the
+   keymap registers its baked defaults (below).
 5. **Report.** `flow query binds` answers with `config::binds::report`: one
    record per bind (canonical chord, AutoHotkey hotkey string, action text,
    kind, argv, admin flag, scope, help line), the overlay rows with
@@ -72,7 +74,12 @@ flowchart LR
    `launcher` / `help` / `quit` / `toggle-tiling` call the script's own
    functions. The gates are named functions so a chord registered under one
    can be found again: a reload turns every registered chord off under the
-   gate it was registered with before registering the new set.
+   gate it was registered with before registering the new set. Every Win
+   chord also gets a *Remote Desktop twin*, the same hotkey without `#`,
+   registered under `RdpTilingGate` / `RdpAlwaysGate` (`rdp-` scopes), which
+   pass only while a Remote Desktop session is full screen and a Win key is
+   held (`RdpFullscreenActive`, `RdpWinHeld`; the twin runs through `RdpTwin`
+   in `flow.ahk`).
 
 ## What stays in the script
 
@@ -87,7 +94,8 @@ to the pause; the reserved one is the fallback that works even when the
 table is broken.
 
 The script also carries a baked copy of the default listing
-(`DefaultBindsText`) for a daemon too old to answer `query binds`. The test
+(`DefaultBindsText`) for a daemon too old to answer `query binds`, or one
+whose `query binds` fails (a `[binds]` table that did not validate at start). The test
 `the_keymaps_baked_fallback_matches_the_defaults` in `src/config/binds.rs`
 compares it with the listing the daemon would give and prints the block to
 paste when the defaults change.
@@ -112,12 +120,16 @@ places treat them apart: `help_rows` starts a new overlay row when the key
 family changes (arrows, wheel, the rest), so `Mod+WheelUp/WheelDown/...`
 does not swallow `Mod+Left/Down/Up/Right`; and `flow.ahk`'s `ApplyBinds`
 wraps every `...Wheel(Up|Down|Left|Right)` hotkey in `WheelBind` (menu-mask
-key, per-chord 150 ms cooldown) and registers no Remote Desktop twin for it
-([ADR-0029](../../adr/0029-mod-wheel-chords.md)).
+key, per-chord 150 ms cooldown, the ticks in between swallowed) and
+registers no Remote Desktop twin for it (the twin would be a bare wheel
+hotkey). The sixteen default wheel chords (`Mod`, `Mod+Shift`, `Mod+Ctrl`,
+`Mod+Alt` with each wheel direction) are in `binds.toml`; up / left mean
+Left and down / right mean Right. ADR-0029,
+`docs/adr/0029-mod-wheel-chords.md`.
 
 ## Actions
 
-`resolve_action` turns an action line into an [`Action`](../../src/config/binds.rs):
+`resolve_action` turns an action line into an `Action` (`src/config/binds.rs`):
 the fixed niri names are a table of `(name, dispatch argv, help, group)`;
 `focus-workspace N`, `move-column-to-workspace N` and `set-column-width ±N%`
 take an argument; `dispatch <args>` passes anything the CLI accepts; the
@@ -136,7 +148,7 @@ as written. Our own names stay primary.
 ## Live reload
 
 The daemon looks at `flow.toml` and `flow-rules.toml` once a second from
-the event loop ([`daemon::config_watch`](../../src/daemon/config_watch.rs)):
+the event loop (`daemon::config_watch` (`src/daemon/config_watch.rs`)):
 a changed modification time that is seen unchanged on the next look runs
 the ordinary `ReloadConfig` path, with its validate-before-apply rule, so a
 broken save leaves the running config (and the registered chords) as they
@@ -152,7 +164,10 @@ differs and shows a one-line OSD. The design choice (polling over
 The CLI asks the running daemon (`CheckConfig`), which loads both files from
 disk without applying them and lists every problem: the parse error, each
 `[binds]` entry's error, the rest of the validation, and the preset lists
-against the attached screens, which a daemon-less check cannot see.
+against the attached screens, which a daemon-less check cannot see. It also
+lists warnings, which do not make the config invalid: `flow-rules.toml`
+fields that are accepted but have no effect (`initial_width_px`,
+`override_persist`), one line per rule (`WindowRulesConfig::inert_field_warnings`).
 Without a daemon the CLI falls back to the local check and says so.
 
 ## Tests

@@ -94,7 +94,7 @@ Reads TOML from disk and deserializes into the respective config struct. Load fu
 |-----------|----------|
 | File not found | `Ok(Default)` -- benign (fresh install), logged at `debug` |
 | Parse / I/O error | `Err(FlowError::Config)` carrying `<path>: <reason>` -- caller decides policy |
-| Success | `Ok(parsed)`; for `flow.toml`, `validate()` logs warnings but still returns the config |
+| Success | `Ok(parsed)`; for `flow.toml`, `validate()` logs warnings but still returns the config (a bad `[loadout] default_path` is the exception: an `Err`); for `flow-rules.toml`, each rule field accepted but without effect (`initial_width_px`, `override_persist`) is noted at `info` (`WindowRulesConfig::inert_field_warnings`) |
 
 A private generic core (`load_toml`) and a `ConfigLoadError { Missing, Io, Parse }` enum sit behind both loaders, so the file-backed read/parse path is shared rather than duplicated.
 
@@ -127,7 +127,7 @@ After loading `flow.toml`, the daemon calls `FlowConfig::validate()` to catch se
 
 ### 3. Validate -- `check_config`
 
-The local validation pass: parse both files and run `FlowConfig::validate` (which covers `[binds]` and `[startup]` too). Missing files are not errors -- they simply mean defaults will be used. Logs nothing (designed for pure CLI output). `flow config check` uses it only when no daemon answers; with one running it sends `CheckConfig` and the daemon lists every problem, screens included (see [Live reload](#live-reload-the-file-watcher) below).
+The local validation pass: parse both files and run `FlowConfig::validate` (which covers `[binds]` and `[startup]` too). Missing files are not errors -- they simply mean defaults will be used. Returns `Ok(warnings)`: one `flow-rules.toml: rule N (...): ... has no effect` line per inert rule field, which `flow config check` prints without failing (`Err` is the first problem). Logs nothing (designed for pure CLI output). `flow config check` uses it only when no daemon answers; with one running it sends `CheckConfig` and the daemon lists every problem, screens included (see [Live reload](#live-reload-the-file-watcher) below).
 
 ### 4. Use -- daemon subsystems
 
@@ -192,7 +192,7 @@ sequenceDiagram
 ## Live reload: the file watcher
 
 The daemon also reloads on its own when `flow.toml` or `flow-rules.toml`
-changes on disk ([`daemon::config_watch`](../../src/daemon/config_watch.rs)).
+changes on disk (`daemon::config_watch` (`src/daemon/config_watch.rs`)).
 Once a second — the event loop wakes at least that often for its liveness
 check — it reads both files' modification times. A change counts only when
 it is seen unchanged on the next look, which rides out editors that
@@ -214,8 +214,10 @@ in [Key Bindings](keybinds.md#live-reload).
 
 `flow config check` asks the daemon (`CheckConfig`) rather than reading the
 files itself, so the check sees the attached screens (preset lists are
-validated per screen) and lists every problem rather than the first; with
-no daemon running the CLI falls back to the local `check_config`.
+validated per screen) and lists every problem rather than the first, plus
+the inert-rule-field warnings (`Data { "ok", "problems", "warnings",
+"screens" }`; warnings never make `ok` false); with no daemon running the
+CLI falls back to the local `check_config`.
 
 ## Application Config Fields
 
@@ -263,6 +265,8 @@ The `exe` and `process_path` fields are case-insensitive because Windows paths a
 | `tile` | Managed by the layout engine |
 | `float` | Free-floating, user-positioned |
 | `ignore` | Excluded from tiling entirely |
+
+A rule may also set `fullscreen` (ADR-0020). Two older rule fields still parse but do nothing: `initial_width_px` (a new tile's width comes from the `[columns]` width patterns, ADR-0017) and `override_persist` (an explicit user rule already wins over learned rules). `flow config check` warns about each per rule, and the daemon notes them at `info` when it loads the file.
 
 ### Default Rules
 

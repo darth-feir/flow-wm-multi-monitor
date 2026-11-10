@@ -11,7 +11,7 @@ The IPC transport uses the Windows named pipe `\\.\pipe\flow` (configurable via 
 `FLOW_PIPE_NAME` environment variable for integration tests). The wire format is
 newline-delimited JSON: each message is a single JSON object terminated by `\n`,
 serialised by `serde_json`. The encoding and decoding helpers live in
-[`src/ipc/message.rs`](../../src/ipc/message.rs).
+`src/ipc/message.rs`.
 
 The pipe uses byte mode (`PIPE_TYPE_BYTE | PIPE_READMODE_BYTE`) with duplex
 access. The server accepts one client at a time (sequential, not concurrent).
@@ -138,7 +138,7 @@ daemon holds the pipe busy forever.
 
 ### Server-Side Architecture
 
-The `PipeServer` struct in [`src/ipc/transport.rs`](../../src/ipc/transport.rs)
+The `PipeServer` struct in `src/ipc/transport.rs`
 manages a background accept thread: `start_accept()` spawns a short-lived
 thread that issues an overlapped `ConnectNamedPipe`, waits for it while
 polling a `stopping` flag every `ACCEPT_POLL`, then signals a Win32 event to
@@ -174,7 +174,7 @@ format with a `"type"` field and snake_case variant names.
 
 | Group | Variants | Description |
 |-------|----------|-------------|
-| Control | `Stop`, `ReloadConfig`, `CheckConfig` | Daemon lifecycle and config; `CheckConfig` loads both files from disk without applying them and answers `Data { "ok", "problems": [...], "screens" }` (every problem, the `[binds]` entries one by one, the preset lists against the attached screens) |
+| Control | `Stop`, `ReloadConfig`, `CheckConfig` | Daemon lifecycle and config; `CheckConfig` loads both files from disk without applying them and answers `Data { "ok", "problems": [...], "warnings": [...], "screens" }` (every problem, the `[binds]` entries one by one, the preset lists against the attached screens; `warnings` lists `flow-rules.toml` fields accepted but without effect, `initial_width_px` and `override_persist`, one line per rule, and does not make `ok` false) |
 | Liveness | `Ping` | Answered with `Pong` (version, pid, monitor count, registered hooks, tiling on/off); not layout-mutating, so it works mid-drag. Used by `flow start` and `flow ping` |
 | Tiling on/off | `SetTiling { enabled }`, `ToggleTiling` | Pause / resume tiling without stopping the daemon (see [Tiling on/off](#tiling-onoff-pause-and-resume)); layout-mutating (rejected mid-drag) but the only mutating commands accepted while tiling is off. Answered with `Data { "tiling_enabled": bool }` — the resulting state |
 | Keymap drag session | `DragBegin`, `DragEnd` | Bracket a drag the hotkey script performs itself (Mod + left-button drag, see [Tile Drag](./tile-drag.md), *Keymap-driven sessions*). `DragBegin` puts the focused window into the `MoveSizeStart` state and answers `Data { "drag": "tile" or "float", "hwnd" }` (error: a drag already active, nothing draggable focused, tiling off); `DragEnd` runs the `MoveSizeEnd` path and answers `Data { "ended": true, "drag" }`, or `Data { "ended": false }` with no session. Neither is layout-mutating |
@@ -190,15 +190,21 @@ format with a `"type"` field and snake_case variant names.
 | Window state | `SetWindow { mode }`, `ToggleFloat`, `ToggleMonocle`, `PlaceAbove`, `Promote`, `MergeColumn`, `ConsumeOrExpel`, `CloseWindow`, `MinimizeWindow` | Per-window operations; `SetWindow` takes `float`, `tile`, `cycle` or `fullscreen` (a toggle — see `daemon::fullscreen`); `ConsumeOrExpel { direction }` is `Promote` for a window that shares its column, `MergeColumn` for one alone in it |
 | Workspace | `SwitchWorkspace { workspace_id }`, `SwapWorkspace { workspace_id }`, `MoveWindowToWorkspace { workspace_id }` | niri-style virtual desktops (`Switch`/`Move` implemented; `Swap` stub) |
 | Programs | `Spawn { argv }` | Start a program with its first window on the focused screen (`flow spawn`, the keymap's spawn binds): `argv[0]` resolved like a `[startup] spawn` entry, an `.exe` started with `CreateProcessW` + `STARTF_USEPOSITION \| STARTF_USESIZE` at the rect its new column will get on the active monitor (a dry run of the seat; `daemon::spawn`, ADR-0023 *Spawning on the focused screen*, stage 30d). Answers `Data { "pid", "path", "x", "y", "width", "height", "monitor" }` (position fields `null` when Windows decides: tiling off, `new_window_monitor = "placed"`, not an `.exe`), or an error when the program is not found or does not start. Not layout-mutating; accepted mid-drag and while tiling is off |
-| Query | `QueryWindowsAll`, `QueryLayoutVirtual`, `QueryLayoutActual`, `QueryState`, `QueryBinds` | Read-only introspection; `QueryBinds` answers the resolved `[binds]` table for the hotkey script (see [Key Bindings](./keybinds.md)) |
-| Config mutation | `SetConfigValue { key, value }` | Runtime config change |
-| App preferences | `ForgetApp { exe }`, `ForgetAllApps` | Clear per-app learned state |
+| Query | `QueryWindowsAll`, `QueryLayoutVirtual`, `QueryLayoutActual`, `QueryState`, `QueryBinds` | Read-only introspection; `QueryBinds` answers the resolved `[binds]` table for the hotkey script (see [Key Bindings](./keybinds.md)), or an error listing the problems when the table does not validate; `QueryState` is a stub (`unimplemented_command`) |
+| Config mutation | `SetConfigValue { key, value }` | Runtime config change — stub, answers `unimplemented_command` |
+| App preferences | `ForgetApp { exe }`, `ForgetAllApps` | Clear per-app learned state — stubs, answer `unimplemented_command` |
+| Loadouts | `LoadoutSave { path }`, `LoadoutLoad { path }` | Save / restore the window arrangement (`path: None` = the config's `loadout.default_path`); see [Loadouts](./loadout.md) |
 
 The `MoveWindow` variant is deliberately semantic: for tiled windows moving
 left or right it delegates to `SwapColumn`, but the daemon owns the translation
-so keybindings stay stable as floating support lands. Vertical movement
-(within-column swap) and floating-window nudging are deferred — only the
-tiled left/right path is wired today.
+so keybindings stay stable as floating support lands. Up / down delegates to
+the within-column window swap. A row-preserving cross-column move and
+floating-window nudging are deferred; the handler does not look at the
+window's state yet.
+
+`PlaceAbove`, `QueryState`, `SetConfigValue`, `ForgetApp` and
+`ForgetAllApps` are protocol stubs: the daemon answers each with
+`unimplemented_command`.
 
 Of the three workspace variants, `SwitchWorkspace` and `MoveWindowToWorkspace`
 are fully implemented (see [Workspace Hierarchy](./workspace.md) for the
@@ -215,7 +221,7 @@ undecided.
 | `Error` | `message: String` | Command failed |
 | `Data` | `payload: serde_json::Value` | Response to a query command |
 | `Busy` | -- | A tile drag is in progress; layout-mutating commands are rejected for now |
-| `Pong` | `version: String`, `pid: u32`, `monitors: usize`, `hooks_registered: usize`, `ahk_pid: Option<u32>`, `tiling_enabled: bool` | Reply to `Ping` — identity and health (including the pid of the hotkey script the daemon launched, if still running, and whether tiling is on; `tiling_enabled` defaults to `true` when an older daemon omits it), never touches layout |
+| `Pong` | `version: String`, `pid: u32`, `monitors: usize`, `hooks_registered: usize`, `ahk_pid: Option<u32>`, `tiling_enabled: bool`, `floating_layer: Option<String>` | Reply to `Ping` — identity and health (including the pid of the hotkey script the daemon launched, if still running, and whether tiling is on; `tiling_enabled` defaults to `true` when an older daemon omits it; `floating_layer` is `"raised"` / `"dropped"` with `[floating] always_on_top`, `null` when that option or tiling is off), never touches layout |
 
 A line the daemon cannot decode as a `SocketMessage` — typically a newer
 `flow` CLI sending a command an older daemon does not know — is answered with
@@ -225,13 +231,14 @@ the daemon disconnects the client (`unrecognised_message_response` in
 
 Responses use a `"status"` tag (`"ok"`, `"error"`, `"data"`, `"busy"`,
 `"pong"`), distinct from the message `"type"` tag. A response-shaped JSON will not parse as a `SocketMessage`
-and vice versa -- the tests in [`src/ipc/message.rs`](../../src/ipc/message.rs)
+and vice versa -- the tests in `src/ipc/message.rs`
 enforce this explicitly.
 
 ## The `flow` CLI Client
 
-The CLI ([`src/bin/flow.rs`](../../src/bin/flow.rs)) is built with `clap` and
-structured into four top-level command groups. Every dispatch command sends a
+The CLI (`src/bin/flow.rs`) is built with `clap`; its top-level commands are
+grouped below (lifecycle, autostart, config, query, dispatch, spawn, loadout;
+`flow update` is described in [Update Checker](./updater.md)). Every dispatch command sends a
 single `SocketMessage` and prints a one-line success or error message. The CLI
 does no layout computation -- it is a thin transport layer. See
 [event pipelines](event-pipelines.md) for what happens on the daemon side after
@@ -280,7 +287,7 @@ is inherited unchanged (so `RUST_LOG`, `FLOW_PIPE_NAME` and the test-only
 #### Startup stages, status file and exit codes
 
 `flowd` boots in a fixed sequence of stages
-([`src/daemon/startup.rs`](../../src/daemon/startup.rs)). Each one logs
+(`src/daemon/startup.rs`). Each one logs
 `startup: [n/11] <stage> ok` at `info`; a failure logs
 `startup: FAILED at <stage>: <reason>` at `error`, rescues any windows the
 daemon already moved, and exits with `10 + index`:
@@ -367,7 +374,7 @@ every start (`logging::prune_old_logs`, judged by the date in the name).
 `flowd`. The **daemon** launches the script once it has reported `ready`
 (so the first hotkey reaches a listening daemon), inside a **Job Object**
 created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
-([`src/job.rs`](../../src/job.rs), [`autostart::launch_ahk_in_job`](../../src/autostart.rs)):
+(`src/job.rs`, `autostart::launch_ahk_in_job` (`src/autostart.rs`)):
 
 1. The AutoHotkey v2 interpreter is resolved directly — `InstallDir` from
    `HKLM\Software\AutoHotkey` then `HKCU` (the machine-wide key needs
@@ -474,7 +481,7 @@ because there is only ever one shortcut.
 | `flow config reload` | Send `ReloadConfig` to daemon |
 | `flow config edit` | Open config dir in `$EDITOR` / `VISUAL` / `notepad.exe` |
 | `flow config path` | Print resolved config directory path |
-| `flow config check` | Send `CheckConfig`; list every problem the daemon finds (local, screen-blind check when no daemon runs) |
+| `flow config check` | Send `CheckConfig`; list every problem and every warning the daemon finds (local, screen-blind check when no daemon runs) |
 
 All config commands except `reload` and `check` operate on local files without
 contacting the daemon. The config directory resolution chain is documented in
@@ -507,6 +514,9 @@ owning monitor the registry remembers for a minimized or hidden window), or
 | `flow dispatch expand-column` | `ExpandColumn` |
 | `flow dispatch shrink-column` | `ShrinkColumn` |
 | `flow dispatch width next/prev/cycle/<preset>` | `SetWidthPreset` — prints `flow: column width <preset>` |
+| `flow dispatch set-layout strip/book/toggle` | `SetLayout` — prints `flow: layout <layout> on monitor <n>` |
+| `flow dispatch center` | `Center` |
+| `flow dispatch focus-floating` / `focus-tiling` / `switch-focus-between-floating-and-tiling` | `FocusLayer { target }` (`floating` / `tiling` / `other`) |
 | `flow dispatch set-window float/tile/cycle/fullscreen` | `SetWindow { mode }` |
 | `flow dispatch close-window` | `CloseWindow` |
 | `flow dispatch minimize-window` | `MinimizeWindow` |
@@ -539,13 +549,23 @@ which quotes them again for the child's command line (MSVC CRT rules,
 non-admin `.exe` spawn bind and falls back to its own `Run` when `flow
 spawn` fails; admin spawns (`*RunAs`) keep the `Run` path.
 
+### Loadout
+
+| Command | Maps to |
+|---------|---------|
+| `flow loadout save [PATH]` | `LoadoutSave { path }` — prints `flow: loadout saved` |
+| `flow loadout load [PATH]` | `LoadoutLoad { path }` (layout-mutating) — prints `flow: loadout loaded` |
+
+`PATH` is a `.json` file relative to the config directory (no `..`); without
+it the daemon uses `[loadout] default_path`. See [Loadout Save/Restore](./loadout.md).
+
 ## Tiling on/off (pause and resume)
 
 The user's requirement: *a toggle to turn tiling on and off; when it is off
 the desktop goes back to the normal Windows window manager and the apps are
 moved back on screen.* The hotkey script owns the toggle key and must keep
 running, so this is **not** a stop: it is a pause inside the daemon
-([`src/daemon/tiling.rs`](../../src/daemon/tiling.rs)), reached through
+(`src/daemon/tiling.rs`), reached through
 `SetTiling { enabled }` / `ToggleTiling` (`flow dispatch tiling
 on|off|toggle`, `Alt + Shift + t` in the bundled keymap). Both directions are
 idempotent, and the state is never persisted: a restart always starts
@@ -648,7 +668,7 @@ wiring is covered by `tests/cli/tiling.rs`.
 The user's requirement is simple: *if a part fails, default to the normal
 Windows desktop instead of a half-broken state — especially with the Win key
 overrides.* `FlowWM::fail_back`
-([`src/daemon/shutdown.rs`](../../src/daemon/shutdown.rs)) is the single
+(`src/daemon/shutdown.rs`) is the single
 teardown every exit path runs, in this fixed order:
 
 | # | Step | Why this position |
@@ -687,7 +707,7 @@ code.
 **Signals.** The daemon's only windows are the border overlays, which exist
 only while there are windows to decorate — and message-only windows never
 receive session broadcasts. So the `hooks` stage also creates an invisible
-top-level **session-sink** window ([`src/daemon/session.rs`](../../src/daemon/session.rs))
+top-level **session-sink** window (`src/daemon/session.rs`)
 on the main thread; its window procedure (and the overlay's) turns
 `WM_CLOSE`, `WM_QUERYENDSESSION` (answered `TRUE`, never vetoing a logoff) and
 `WM_ENDSESSION` into `registry::hooks::request_shutdown()`, which sets a
@@ -704,7 +724,7 @@ process after the hook has run; the job object then kills the hotkey script.
 
 **Daemon-less rescue.** When none of the above could run (power loss,
 `taskkill /f`, an older build), `flow rescue`
-([`src/rescue.rs`](../../src/rescue.rs)) brings every off-screen top-level
+(`src/rescue.rs`) brings every off-screen top-level
 window back without a daemon: it enumerates the windows the daemon's scan
 would consider (visible, titled, Alt-Tab-visible, unowned), strips the
 invisible borders, and clamps any window whose visible content does not
@@ -836,12 +856,12 @@ A watchdog that restores from an on-disk snapshot is still planned (see the
 
 | Step | Location |
 |------|----------|
-| Wired after the event loop exits | [`src/main.rs`](../../src/main.rs) -- `flow.run()` under `catch_unwind`, then `flow.fail_back(reason, clean)` |
-| Wired on startup failure after windows moved | [`src/daemon/new.rs`](../../src/daemon/new.rs) (free function `rescue_stranded_windows_with`, before `FlowWM` exists) and `main.rs` (`loadout_restore` / `ready` stages, via `fail_back`) |
-| The rescue loop | [`src/daemon/shutdown.rs`](../../src/daemon/shutdown.rs) -- `rescue_stranded_windows_with`; `FlowWM::rescue_stranded_windows` cancels the animator synchronously and wraps it; `FlowWM::fail_back` is the full teardown |
-| Daemon-less rescue | [`src/rescue.rs`](../../src/rescue.rs) -- `rescue_target` (pure geometry) and `rescue_offscreen_windows` (`flow rescue`, `flow start`) |
-| Which windows are controlled | `WindowRegistry::restorable_windows` in [`src/registry/core.rs`](../../src/registry/core.rs) |
-| Clamp geometry | `Rect::clamped_into` in [`src/common/types.rs`](../../src/common/types.rs) |
+| Wired after the event loop exits | `src/main.rs` -- `flow.run()` under `catch_unwind`, then `flow.fail_back(reason, clean)` |
+| Wired on startup failure after windows moved | `src/daemon/new.rs` (free function `rescue_stranded_windows_with`, before `FlowWM` exists) and `main.rs` (`loadout_restore` / `ready` stages, via `fail_back`) |
+| The rescue loop | `src/daemon/shutdown.rs` -- `rescue_stranded_windows_with`; `FlowWM::rescue_stranded_windows` cancels the animator synchronously and wraps it; `FlowWM::fail_back` is the full teardown |
+| Daemon-less rescue | `src/rescue.rs` -- `rescue_target` (pure geometry) and `rescue_offscreen_windows` (`flow rescue`, `flow start`) |
+| Which windows are controlled | `WindowRegistry::restorable_windows` in `src/registry/core.rs` |
+| Clamp geometry | `Rect::clamped_into` in `src/common/types.rs` |
 
 ## Monitor hotplug
 
@@ -851,7 +871,7 @@ virtual screen, one monitor height away). Attaching or detaching a display,
 changing a resolution or moving the taskbar invalidates all of it: before this
 pass the daemon kept animating windows to a dead rect, and a slot that used to
 be "off every monitor" could sit inside a new neighbour. The handling lives in
-[`src/daemon/hotplug.rs`](../../src/daemon/hotplug.rs) and runs in three
+`src/daemon/hotplug.rs` and runs in three
 steps.
 
 **Detect.** The session-sink window and the border overlays receive

@@ -35,9 +35,11 @@ If you haven't built FlowWM yet, start with [Building from Source](./building-fr
 flow/
 ├── Cargo.toml
 ├── build.rs
-├── default-config.toml              # hand-written EXAMPLE (not read at runtime)
+├── default-config.toml              # hand-written EXAMPLE, the `flow config init` template (not read for defaults)
 ├── default-flow-rules.toml           # bundled default window rules (include_str!)
-├── docs/                            # this mdBook
+├── flow.ahk                         # AutoHotkey starter template (`flow config init --ahk`, include_str!)
+├── keymaps/win-niri/                # niri-style keymap; binds.toml is the built-in [binds] default (include_str!)
+├── docs/                            # this mdBook (src/) and the ADRs (adr/, outside the book)
 ├── schemas/                         # generated JSON schemas for config/rules
 ├── src/
 │   ├── main.rs                      # flowd entry point
@@ -45,14 +47,22 @@ flow/
 │   ├── bin/
 │   │   └── flow.rs                   # CLI client
 │   ├── common/                      # shared types: Rect, WindowId, Direction, errors
-│   ├── config/                      # TOML loading, schema gen, dirs, lifecycle
+│   ├── config/                      # TOML loading, schema gen, dirs, lifecycle, [binds], history
 │   ├── registry/                    # WindowRegistry: OS sync, classification, hooks
-│   ├── layout/                      # PURE layout math: types, mutations, projection
-│   ├── workspace/                   # Monitor → Workspace → Scrolling/Floating spaces
+│   ├── layout/                      # PURE layout math: types, mutations, projection, resize, preview
+│   ├── workspace/                   # Monitor → Workspace → Scrolling/Floating spaces, y_offset
 │   ├── animation/                   # embedded window-animation crate
+│   ├── borders/                     # border overlay windows (colored ring per managed window)
+│   ├── loadout/                     # loadout save/restore data model (pure serde types)
 │   ├── ipc/                         # named-pipe transport + SocketMessage types
-│   └── daemon/                      # FlowWM orchestrator + submodules
-└── tests/                           # integration tests
+│   ├── daemon/                      # FlowWM orchestrator + submodules
+│   ├── updater/                     # `flow update` release checker (never installs)
+│   ├── autostart.rs                 # daemon autostart (`flow enable-autostart`) + hotkey-script lifecycle
+│   ├── build_info.rs                # commit / branch / origin embedded at build time
+│   ├── job.rs                       # kill-on-close job object for the hotkey script
+│   ├── logging.rs                   # daemon log setup
+│   └── rescue.rs                    # daemon-less off-screen window rescue (`flow rescue`)
+└── tests/                           # integration tests (tests/cli.rs + tests/cli/)
 ```
 
 The two big ideas to internalise before reading any source file:
@@ -62,6 +72,6 @@ The two big ideas to internalise before reading any source file:
    orchestrates `mutate → project → animate` and is the only thing that touches
    all three layers.
 2. **The daemon is the single coordinator.**
-   [`FlowWM`](../../src/daemon/types.rs) owns every subsystem and
+   `FlowWM` (`src/daemon/types.rs`) owns every subsystem and
    routes events between them. No subsystem knows about any other subsystem —
    they only expose methods that take inputs and return outputs.

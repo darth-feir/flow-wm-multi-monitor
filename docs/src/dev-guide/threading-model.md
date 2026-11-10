@@ -22,13 +22,14 @@ sequenceDiagram
     participant IPC as IPC Thread (main)
     participant Subsystems as Registry / ScrollingSpace / Animator
 
-    Note over Hook: SetWinEventHook x6<br/>GetMessageW loop
+    Note over Hook: SetWinEventHook x9<br/>GetMessageW loop
     Note over IPC: owns FlowWM<br/>(all fields)
 
     OS->>Hook: WinEvent callback
     Hook->>Chan: sender.send(HookEvent)
     Hook->>IPC: SetEvent(hook_signal)
-    IPC->>IPC: WaitForMultipleObjects wakes
+    IPC->>IPC: MsgWaitForMultipleObjects wakes
+    IPC->>IPC: pump_messages()
     IPC->>IPC: ResetEvent(hook_signal)
     IPC->>Chan: try_recv() loop (drain all)
     IPC->>Subsystems: process_hook_events() via &mut self
@@ -45,10 +46,13 @@ sequenceDiagram
 
 ### Hook Thread (background)
 
-- Registers six `SetWinEventHook` callbacks covering window lifecycle (create,
-  destroy), focus changes, minimize/restore, show/hide, state changes, and name
-  changes. `EVENT_OBJECT_LOCATIONCHANGE` is deliberately excluded — it fires on
-  every pixel of movement and would flood the channel.
+- Registers nine `SetWinEventHook` callbacks covering window lifecycle (create,
+  destroy), focus changes, move/size start and end, minimize/restore, show/hide,
+  state changes, name changes, DWM cloak/uncloak, and location changes.
+  `EVENT_OBJECT_LOCATIONCHANGE` fires on every pixel of movement system-wide, so
+  the callback drops it unless the window is a tracked float (while float
+  tracking is on), the window being dragged, the foreground window, or a window
+  watched for an app full-screen switch; only those reach the channel.
 - Runs a `GetMessageW` message loop (required for `WINEVENT_OUTOFCONTEXT`).
 - On each callback: sends a typed `HookEvent` through the `mpsc::Sender` and
   signals a Win32 manual-reset event (`SetEvent`) to wake the IPC thread.
@@ -61,11 +65,18 @@ sequenceDiagram
 ### IPC Thread (main)
 
 - Owns `FlowWM` and all subsystems directly — no `Arc`, no `Mutex`.
-- Runs the main event loop via `WaitForMultipleObjects`, waiting on two handles:
-  1. **hook_signal** (index 0, highest priority) — wakes when any `HookEvent` is sent.
+- Runs the main event loop via `MsgWaitForMultipleObjects`, waiting on two handles
+  plus the thread's message queue (`QS_ALLINPUT`):
+  1. **hook_signal** (index 0) — wakes when any `HookEvent` is sent.
   2. **connected_event** (index 1) — wakes when a CLI client connects.
-- Calls `process_hook_events()` to drain the channel, then processes any IPC
-  session if a client connected.
+  3. A window message for a window this thread owns (border overlays, the
+     session sink).
+- On every wake it first pumps window messages (`pump_messages()`, so the
+  animator's cross-thread `SetWindowPos` on an overlay never blocks), then
+  calls `process_hook_events()` to drain the channel, then serves an IPC
+  session if a client connected. The connection is tested with a zero-timeout
+  `WaitForSingleObject(connected_event)`, not the wait's return index: the
+  hook signal is index 0 and would otherwise shadow it.
 - All subsystem methods are called with `&mut self` — the borrow checker
   guarantees exclusive access at compile time.
 
@@ -100,13 +111,14 @@ within microseconds, so the latency is imperceptible.
 
 ## The Main Event Loop
 
-The `run()` method in [`src/daemon/run.rs`](../../src/daemon/run.rs) implements the
+The `run()` method in `src/daemon/run.rs` implements the
 event-driven loop:
 
 ```mermaid
 flowchart TB
-    Start["start_accept()"] --> Loop["WaitForMultipleObjects"]
-    Loop -->|"hook_signal<br/>or timeout"| Reset["ResetEvent(hook_signal)"]
+    Start["start_accept()"] --> Loop["MsgWaitForMultipleObjects"]
+    Loop -->|"hook_signal, message,<br/>connect or timeout"| Pump["pump_messages()"]
+    Pump --> Reset["ResetEvent(hook_signal)"]
     Reset --> Drain["process_hook_events()"]
     Drain --> CheckIPC{"connected_event<br/>signaled?"}
     CheckIPC -->|"yes"| InnerLoop["IPC session loop"]
@@ -132,7 +144,12 @@ Key details:
   fully initialized (not yet visible, no title, styles not finalized). Windows
   that fail classification are added to `pending_creations` and retried on each
   `process_hook_events()` call. When this list is non-empty, the wait timeout
-  is 100 ms instead of infinite, ensuring retries happen even without new events.
+  is at most 100 ms, ensuring retries happen even without new events.
+- **The wait is never infinite.** Its timeout is the soonest of: the 100 ms
+  pending-creation retry, the float-tracking resume deadline, the next
+  foreground reconciliation (`[focus] foreground_sync_interval_ms`), a drag's
+  edge-scroll repeat, the display-topology settle deadline, and the 1 s liveness
+  tick (`LIVENESS_TICK_MS`) that checks the helper threads and the config files.
 - **IPC is one-shot.** The CLI connects, sends one command, reads the response,
   and disconnects. The inner loop rarely runs more than once.
 - **Hook events are drained between IPC reads.** Inside the IPC inner loop,
@@ -141,19 +158,25 @@ Key details:
 
 ## Hook Registration
 
-Six hooks are registered as four ranges and two single-event hooks. The single-
-event registration for `STATECHANGE` and `NAMECHANGE` is deliberate — there is a
-noisy event (`EVENT_OBJECT_LOCATIONCHANGE` at `0x800B`) between them that would
-flood the channel if registered as a range.
+Nine hooks are registered (`register_hooks` in `src/registry/hooks.rs`):
+five ranges and four single-event hooks. `STATECHANGE` (`0x800A`),
+`LOCATIONCHANGE` (`0x800B`) and `NAMECHANGE` (`0x800C`) each get a hook of their
+own so the ranges stay disjoint, and so the noisy `LOCATIONCHANGE` can be
+filtered in the callback (see above) before anything is sent.
 
 | Hook | Event Range | Purpose |
 |------|-------------|---------|
 | Create / Destroy | `0x8000` -- `0x8001` | Window lifecycle |
 | Foreground | `0x0003` | Focus changes |
+| Move / Size | `0x000A` -- `0x000B` | Tile-drag and resize-drag detection |
 | Minimize / Restore | `0x0016` -- `0x0017` | Minimize and restore |
-| Show / Hide | `0x8002` -- `0x8003` | Tray-hide, DWM cloak, re-show |
+| Show / Hide | `0x8002` -- `0x8003` | Tray-hide, re-show |
 | State Change | `0x800A` (single) | Maximized/fullscreen recovery |
 | Name Change | `0x800C` (single) | Late-title recovery |
+| Location Change | `0x800B` (single, filtered) | Float and drag position tracking, foreground resize, app full-screen watch |
+| Cloak / Uncloak | `0x8017` -- `0x8018` | UWP frames: registered when DWM uncloaks them, hidden while cloaked |
+
+`flow ping` reports the registered-hook count.
 
 The recovery hooks (`STATECHANGE` and `NAMECHANGE`) handle windows that
 `EVENT_OBJECT_CREATE` misses — see [Event Pipelines](./event-pipelines.md) for the

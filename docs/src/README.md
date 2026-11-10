@@ -29,7 +29,7 @@ The project ships as two binaries inside a single Cargo package:
 - [Command Reference](./user-guide/dispatch-reference.md) — every `flow` command, annotated, with its default hotkey.
 - [Config Reference](./user-guide/config-reference.md) — every `flow.toml` and `flow-rules.toml` field, its default, and what it does.
 - [Contributing & Reporting Issues](./user-guide/contributing.md) — how to file a useful bug report, send a patch, or request a feature.
-- [Report an Issue](https://github.com/CCpcalvin/flow-wm/issues) — open an issue directly on GitHub.
+- [Report an Issue](https://github.com/darth-feir/flow-wm/issues) — open an issue directly on GitHub (this fork; upstream FlowWM is [CCpcalvin/flow-wm](https://github.com/CCpcalvin/flow-wm)).
 
 ## Building From Source
 

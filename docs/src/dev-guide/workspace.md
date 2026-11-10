@@ -2,7 +2,8 @@
 
 The workspace module models a niri-style virtual-desktop stack. A physical
 monitor owns one or more workspaces, and each workspace splits into a tiled
-half ([`ScrollingSpace`]) and a floating half ([`FloatingSpace`]). The daemon
+half (`ScrollingSpace`, `src/workspace/scrolling_space.rs`) and a floating
+half (`FloatingSpace`, `src/workspace/floating_space.rs`). The daemon
 owns the top-level `Vec<Monitor>` and routes every tiling operation through
 the active monitor's active workspace.
 
@@ -21,14 +22,10 @@ graph TB
     W --> FS["FloatingSpace<br/>(on-screen pixel rects)"]
 ```
 
-`FlowWM` is defined in [`src/daemon/mod.rs`](../../src/daemon/mod.rs). It
+`FlowWM` is defined in `src/daemon/types.rs`. It
 holds `monitors: Vec<Monitor>` and `active_monitor: usize`, giving O(1) access
-to the active monitor through [`active_scrolling()`] and [`active_scrolling_mut()`].
-
-[`ScrollingSpace`]: ../../src/workspace/scrolling_space.rs
-[`FloatingSpace`]: ../../src/workspace/floating_space.rs
-[`active_scrolling()`]: ../../src/daemon/mod.rs
-[`active_scrolling_mut()`]: ../../src/daemon/mod.rs
+to the active monitor through `active_scrolling()` and `active_scrolling_mut()`
+(same file).
 
 ## Accessing the Active Scrolling Space
 
@@ -42,28 +39,30 @@ on `FlowWM`:
 These accessors chain through two indirection layers:
 `FlowWM` -> active `Monitor` -> active `Workspace` -> `ScrollingSpace`.
 The daemon never exposes raw monitor or workspace indices to callers; the accessors
-hide the traversal. See [`Monitor::active_scrolling`](../../src/workspace/monitor.rs)
+hide the traversal. See `Monitor::active_scrolling` (`src/workspace/monitor.rs`)
 for the implementation.
 
 ## Current Skeleton Invariant
 
-At this stage the daemon creates exactly **one monitor** (the primary
-display) carrying a fixed stack of **ten workspaces** (id `1..=10`,
-1-indexed, default active = workspace 1). Multi-monitor support is future
-work. Workspace 1 inherits the scrolling space built from the windows that
-were already open at startup; workspaces 2..=10 start empty. All ten
-workspaces share the same layout parameters so columns size consistently
-when the user switches between them or moves windows across. The count is
-hard-coded in [`src/daemon/new.rs`](../../src/daemon/new.rs)
+The daemon creates **one monitor per attached display** (ADR-0007, `docs/adr/0007-one-scrolling-space-per-monitor.md`),
+each carrying its own fixed stack of **ten workspaces** (id `1..=10`,
+1-indexed, default active = workspace 1). On each monitor, workspace 1
+inherits the scrolling space built from the windows that were already open
+on that display at startup; workspaces 2..=10 start empty. The active
+monitor at startup is the one holding the foreground window (monitor 0
+otherwise); display hot-plug rebuilds the vector (`src/daemon/hotplug.rs`).
+All ten workspaces of a monitor share that monitor's layout parameters so
+columns size consistently when the user switches between them or moves
+windows across; monitors can differ (per-screen width presets and
+patterns). The count is hard-coded in `src/daemon/new.rs`
 (`WORKSPACE_COUNT = 10`) rather than read from config.
 
 The monitor carries two rectangles: the full physical `screen_rect`
 (taskbar included, used for parking non-active workspaces off-screen) and
 the taskbar-excluded `work_area` (used for in-workspace tiling). The
 `work_area` is also copied into each workspace's `ScrollingSpace`
-(inside its `MonitorInfo`) for the projection pipeline. The duplication is
-benign with a single monitor and will be rationalised when multi-monitor
-lands.
+(inside its `MonitorInfo`, alongside `screen_rect`, the virtual-screen
+bounds and the four `neighbour_*` flags) for the projection pipeline.
 
 ## Two Coordinate Spaces
 
@@ -118,9 +117,14 @@ one of three buckets during a switch:
 
 | Bucket | Workspaces | Action |
 |--------|------------|--------|
-| **Animate** | source (previously active) + destination | submitted to `animate_workspaces` as a single coordinated batch |
-| **Teleport** | bystanders whose parked side changed (e.g. ws 3-7 when switching 2 → 8) | submitted to `teleport_workspaces` — instant `SetWindowPos`, no animator |
-| **Untouched** | bystanders whose parked side stayed the same | skipped entirely |
+| **Animate** | source (previously active) + destination | tweened by `animate_workspaces_on` as a single coordinated batch |
+| **Teleport** | bystanders whose parked side changed (e.g. ws 3-7 when switching 2 → 8) | pre-snapped by `teleport_workspaces` — instant `SetWindowPos`, no tween |
+| **Untouched** | bystanders whose parked side stayed the same | not moved |
+
+Every non-empty workspace is still handed to the animator; it drops windows
+already at their target (the teleported and untouched bystanders) as no-ops
+and retargets any window still mid-flight from a previous switch, which is
+what keeps rapid switches from stranding windows.
 
 Parked workspaces sit one full physical monitor height (plus one
 `window_gap`) above or below the active workspace — the full height keeps
@@ -132,9 +136,9 @@ in [Projection](./layout/projection.md#neighbours-on-four-sides)) and the
 animation bridge moves it instantly rather than sliding it across the
 neighbour. Teleport runs before animate so the bystander "backdrop" snaps
 into place before the participant transition begins. Floating windows merge with tiles per workspace and ride
-along in the same batch. See `switch_active_workspace` in
-[`src/daemon/dispatch.rs`](../../src/daemon/dispatch.rs) for the full
-algorithm, and [roadmap](./roadmap.md) for the remaining `SwapWorkspace`
+along in the same batch. See `switch_workspace_layout` in
+`src/daemon/dispatch.rs` for the full
+algorithm (`switch_active_workspace` wraps it and then pushes OS focus), and [roadmap](./roadmap.md) for the remaining `SwapWorkspace`
 work.
 
 ## What Lives Here vs. What Doesn't

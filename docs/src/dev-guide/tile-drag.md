@@ -30,31 +30,46 @@ bar fires `EVENT_SYSTEM_MOVESIZESTART`; releasing fires
 ```mermaid
 stateDiagram-v2
     [*] --> Idle
-    Idle --> Dragging: MoveSizeStart (Tiling::Active)
-    Dragging --> Dragging: LocationChange
-    Dragging --> Committing: MoveSizeEnd
-    Committing --> Idle: commit zone, animate (incl. dragged)
-    Dragging --> Idle: window destroyed (clean cancel)
+    Idle --> Classifying: MoveSizeStart (Tiling Active)
+    Idle --> Float: MoveSizeStart (Floating Active)
+    Classifying --> Translate: first move is a translate
+    Classifying --> Resize: first move moves an edge
+    Translate --> Translate: LocationChange
+    Resize --> Resize: LocationChange
+    Float --> Float: LocationChange (rect stored)
+    Translate --> Idle: MoveSizeEnd (commit zone, animate incl. dragged)
+    Resize --> Idle: MoveSizeEnd (commit resize)
+    Classifying --> Idle: MoveSizeEnd (snap back)
+    Float --> Idle: MoveSizeEnd (rect stored)
 ```
 
-Each `LocationChange` while dragging does three things — follow the dragged
-window's border to the mouse, resolve the drop zone under the cursor, and
-re-submit a non-committing preview of how the *other* windows would reflow.
-Details in *Continuous Preview & Commit-on-Release* below.
+Each `LocationChange` of a title-bar move (`Translate`) does three things —
+follow the dragged window's border to the mouse, resolve the drop zone under
+the cursor, and, when the zone changed, submit a non-committing preview of
+how the *other* windows would reflow. Details in *Continuous Preview &
+Commit-on-Release* below. Edge and corner resizes (`Resize`) are the
+boundary-move drag of the resize contract (ADR-0004,
+`docs/adr/0004-tile-resize-contract.md`) and are not covered on this page.
 
-The `Dragging` state is `Option<DragState>` on the `FlowWM` struct.
-`DragState` (`src/daemon/drag.rs`) holds only three fields:
+The drag state is `drag_state: Option<DragMode>` on the `FlowWM` struct.
+`DragMode` (`src/daemon/drag.rs`) has four variants: `Classifying` (a
+tile's provisional state from `MoveSizeStart` until the first
+`LOCATIONCHANGE` classifies it by rect diff), `Translate(DragState)`,
+`Resize` and `Float`. The `DragState` of a move drag holds:
 
 - `dragged_id: WindowId` — the dragged window's layout-engine identity.
 - `dragged_hwnd: isize` — its Win32 HWND, used for `GetWindowRect` and for
   the `DRAGGED_HWND` global that bridges the hook thread and the main loop.
 - `current_zone: Option<DropZone>` — the drop zone currently under the
-  cursor. `None` until the first `on_drag_move`; this is the value committed
-  on release.
+  cursor. `None` until the first move and while the cursor is outside every
+  work area; this is the value committed on release.
 - `zone_monitor: Option<usize>` — the monitor whose strip `current_zone`
   belongs to (another monitor than the window's own makes the drop a
   cross-screen move), and `touched`, the other monitors the drag previewed
   on (see *Cross-screen drop*).
+- `edge_scroll`, `edge_scroll_timings`, `edge_scroll_deadline` — the
+  edge-scroll scheduler, its clamped timings and the armed repeat deadline
+  (see *Edge Scroll During Drag*).
 
 There is no `DragSource`, no dwell timer, no animation lock, no center-preview
 flag — those belonged to the float-conversion and dwell models and are gone.
@@ -62,17 +77,19 @@ flag — those belonged to the float-conversion and dwell models and are gone.
 Three handlers on `FlowWM` (`src/daemon/drag.rs`) respond to the three hook
 events:
 
-- `on_drag_start` — only a `Tiling::Active` window enters `DragState`. Any
-  other window state causes an early return. This single guard is the entire
-  reason floating drags need no special routing (see *Event Pipeline* below).
-- `on_drag_move` — follows the border, resolves the zone, submits a
+- `on_drag_start` — an active tile enters `Classifying`, an active float
+  enters `Float` (*Floats in the drag state* below); any other window state,
+  or tiling off, sets no state.
+- `on_drag_move` — promotes `Classifying` on the first real movement, then
+  for `Translate` follows the border, resolves the zone and submits a
   non-committing preview. Never mutates the committed layout's window
   placement.
 - `on_drag_end` — the **sole** point at which window placement is committed.
-  Runs the final `preview_move`, calls `ensure_column_visible` to scroll the
-  dropped window's column into view if it landed off-screen, commits the
-  resulting virtual layout, and animates — this time *including* the dragged
-  window, which snaps from its mouse-following position into its tile.
+  For `Translate` it runs the final `preview_move`, calls
+  `ensure_column_visible` to scroll the dropped window's column into view if
+  it landed off-screen, commits the resulting virtual layout, and animates —
+  this time *including* the dragged window, which snaps from its
+  mouse-following position into its tile.
 
 **Abort paths.** If the dragged window is destroyed mid-drag (closed from the
 taskbar, monitor detached, etc.), `on_drag_end` finds it absent from the
@@ -99,11 +116,14 @@ and clears it (`clear_dragged_hwnd`, writes 0) on `MoveSizeEnd`. The hook
 callback reads it with an `Acquire` load.
 
 **`LOCATIONCHANGE` forwarding.** The existing `EVENT_OBJECT_LOCATIONCHANGE`
-hook forwards an event when either condition is true:
+hook (`src/registry/hooks.rs`) forwards an event when any condition is true:
 
 - `(is_float_hwnd(hwnd) && FLOAT_TRACKING_ACTIVE)` — the pre-existing
   float-sync filter (float windows outside a drag).
-- `hwnd == DRAGGED_HWND.load(Acquire)` — the dragged tile.
+- `hwnd == DRAGGED_HWND.load(Acquire)` — the dragged window (tile or float).
+- `hwnd == FOREGROUND_HWND` — the floating layer re-checks a foreground
+  window that resizes to fullscreen.
+- the window is watched for an app full-screen switch (ADR-0020).
 
 All other `LOCATIONCHANGE` events are dropped. The callback remains
 stateless.
@@ -140,10 +160,14 @@ For `LOCATIONCHANGE`, the router (`src/daemon/run.rs`) is exclusive on
 
 ```text
 if drag_state.dragged_hwnd == hwnd { on_drag_move(hwnd)              }
-else                               { on_float_location_changed(hwnd) }
+else                               { sync_app_fullscreen(hwnd);
+                                     on_float_location_changed(hwnd);
+                                     /* foreground: evaluate_top_layer */ }
 ```
 
-`MoveSizeStart` routes to `on_drag_start`; `MoveSizeEnd` to `on_drag_end`.
+`MoveSizeStart` routes to `on_drag_start`; `MoveSizeEnd` to `on_drag_end` —
+unless a keymap session owns that window (`native_drag_event_shadowed`, see
+*Keymap-driven sessions* below), in which case the native event is ignored.
 
 ### Floats in the drag state
 
@@ -187,7 +211,9 @@ flowchart TB
     Edge -- right --> SR[ScrollRight]
     Edge -- no --> Gap{"gap beside or<br/>between columns?"}
     Gap -- yes --> CG["Column (insert there)"]
-    Gap -- no --> Band{"outer third<br/>of the column?"}
+    Gap -- no --> Card{"book mode: top card<br/>of a non-empty pile?"}
+    Card -- yes --> CC["Card { col, side }"]
+    Card -- no --> Band{"outer third<br/>of the column?"}
     Band -- left --> CL["Column k (insert before)"]
     Band -- right --> CR["Column k+1 (insert after)"]
     Band -- middle --> RB{"row band AND rows<br/>parked that way?"}
@@ -202,6 +228,8 @@ The function returns a `DropZone` (`src/layout/preview.rs`):
 
 - `Row { col, row }` — insert as row `row` of column `col`.
 - `Column { col }` — insert a new single-row column at index `col`.
+- `Card { col, side }` — book mode only: insert a new column at `col` and
+  make it the top card of the `side` pile (see *Book mode: top cards*).
 - `ScrollLeft` / `ScrollRight` — scroll the strip's viewport one column.
 - `ScrollUp { col }` / `ScrollDown { col }` — scroll column `col`'s row
   viewport one row.
@@ -229,7 +257,7 @@ under the cursor instead (*Cross-screen drop* below).
 
 **1. Screen-edge scroll.** A band on each side of the work area,
 `max(edge_scroll_width, edge_scroll_ratio · work-area width)` wide — a
-twelfth of the screen by default. On an edge shared with a neighbouring
+twelfth of the screen by default (the ratio is clamped to `0.5`). On an edge shared with a neighbouring
 monitor the band is only `edge_scroll_width` pixels, so a drag crossing to
 the neighbour does not sweep through a wide band (entering a band scrolls
 at once). The cursor in the left band maps to `ScrollLeft` only if content
@@ -319,7 +347,8 @@ corrupting the layout:
   `ensure_column_visible` so a drop that lands off-screen auto-scrolls the
   viewport to bring the dropped column into view, commits the resulting
   virtual layout via `ScrollingSpace::commit_layout`, and calls
-  `animate_layout` — which this time *includes* the dragged window (because
+  `animate_layouts_on` (with any other strip the drag touched, in one
+  batch) — which this time *includes* the dragged window (because
   `drag_state` has been `take()`n). The dragged window visibly snaps from its
   mouse-following position into its tile.
 
@@ -361,7 +390,8 @@ cursor to rest in a zone before it "fired," and directional zones **committed
 on fire**. That model existed to gate mid-drag commits. Once nothing commits
 mid-drag, every justification for dwell dissolves:
 
-- **Anti-jitter.** Re-submitting the same preview is free (animator no-op).
+- **Anti-jitter.** The preview fires only when the zone changes, and a
+  preview never commits anything.
 - **Anti-accident.** A fast sweep across the layout commits nothing, because
   nothing *can* commit until release, dwell or no dwell.
 - **Mid-drag commit gating.** Moot — the only commit is on release.
@@ -376,7 +406,8 @@ Two animator properties make the gateless continuous-preview design work.
 
 ### The drag-exclusion filter
 
-`submit_animation` (`src/daemon/animation.rs`) builds the per-window animation
+`collect_targets` (`src/daemon/animation.rs`, called by both
+`submit_animation` and `animate_layouts_on`) builds the per-window animation
 target list. Near its top it checks `self.drag_state`: if it is `Some`, it
 extracts the dragged window's `WindowId` and its border HWND and **skips
 both** when building the target list. The dragged window's border keeps
@@ -390,36 +421,37 @@ reflows would submit a target for the dragged window at its committed tile
 position, fighting the user's mouse.
 
 The filter is lifted automatically by `on_drag_end`'s `drag_state.take()`,
-which runs *before* the final `animate_layout`. On release `DragState` is
+which runs *before* the final `animate_layouts_on`. On release `DragState` is
 gone, the filter does not trigger, and the dragged window is included in the
 batch that snaps it into its tile.
 
-> `animate_preview` (the non-committing preview path, renamed from the old
-> `animate_gap_close_preview`) goes through the same `submit_animation`, so the
-> exclusion filter applies there too — the dragged window keeps following the
-> mouse while the other tiles animate to the preview.
+> `animate_previews_on` (the non-committing preview path) goes through the
+> same `submit_animation`, so the exclusion filter applies there too — the
+> dragged window keeps following the mouse while the other tiles animate to
+> the preview.
 
-### No-op filtering — why "always submit" is free
+### No-op filtering — and why the preview is still gated
 
 The animator's `build_tweens` (`src/animation/batch.rs`) drops every window
 whose `from == to` position, and `start_batch` (`src/animation/animator.rs`)
 early-returns when the resulting tween list is empty — no batch is started,
 no `animating` flag is set, nothing is rendered.
 
-That means submitting a layout whose windows are already at their targets is
-genuinely zero-cost. Which is why `on_drag_move` can re-submit the preview on
-every move without a zone-change gate: if the cursor hasn't actually changed
-the outcome, the animator filters the batch down to nothing and returns. The
-animator is the natural dedupe point — it already compares `from`/`to` to
-build tweens — so pushing the dedupe into the drag controller would just
-duplicate that work, and would risk staleness (if a viewport scroll shifted
-the visible rects while the zone label stayed the same, a controller-side gate
-would skip the re-preview the animator would have caught).
+That makes submitting a layout whose windows have *settled* at their targets
+zero-cost, but not one whose windows are still mid-flight: under
+`RetargetFromCurrent` each submit restarts the batch from the windows'
+current positions, so re-submitting the same preview on every pixel of
+movement would keep resetting the reflow and it would never finish. So
+`on_translate_move` submits a preview only when `(monitor, zone)` changed
+since the previous move (`should_submit_preview`, see *`on_drag_move`*
+above). The staleness a zone gate could cause after a viewport scroll does
+not arise: a scroll band is a zone of its own, so leaving it always changes
+the zone and the next preview fires.
 
 ## Border Following — The Fourth Movement Path
 
-(borders.md) documents three ways a border overlay moves: the animator path
-(for tiled windows), the float-hook path (for floating drags), and the
+[Borders](./borders.md) documents three ways a border overlay moves: the animator path
+(for tiled windows), the float-hook path (for floating moves), and the
 teleport path (for workspace switch). Tile-drag adds a fourth.
 
 During a drag, `on_drag_move` reads the window's current screen rect via
@@ -441,7 +473,7 @@ puts the border where the mouse actually is.)
 | Path | When | How |
 |------|------|-----|
 | Animator | Tiled window animates to a new slot | Flattened into `Vec<WindowTarget>` alongside the window |
-| Float hook | Floating window dragged (outside a tile drag) | `set_geometry(visible_rect)` after registry update |
+| Float hook | Floating window moved (passively, or in the `Float` drag arm, both through `store_float_rect`) | `set_geometry(visible_rect)` after registry update |
 | Teleport | Bystander during a workspace switch | `set_geometry(visible_rect)` directly |
 | **Tile drag** | **Tiled window being dragged** | **`set_geometry(float_border_rect)` directly** |
 
@@ -498,9 +530,10 @@ step; the row scroll does not pull the strip's focused window back into
 view, and the drop then focuses the dropped window, whose row
 `insert_row_at` revealed, so the window that was on top moves off screen
 and Mod+Up reaches it. This is
-a **live commit**: `scroll_left` / `scroll_right` mutate `viewport_offset`
-immediately, then `animate_layout` animates the *other* windows to their
-scrolled slots. The dragged window's border keeps following the mouse (the
+a **live commit**: `perform_edge_scroll` calls `scroll_left` /
+`scroll_right` / `scroll_column_rows` on the strip under the cursor, which
+mutate the committed view immediately, then `animate_layouts_on` animates
+the *other* windows to their scrolled slots. The dragged window's border keeps following the mouse (the
 exclusion filter skips it); only the background canvas moves.
 
 This is the one intentional exception to "the committed layout is frozen
@@ -514,8 +547,8 @@ A column scroll that would overshoot the end of the strip stops at the end
 (`scroll_right` clamps to the last offset), so the band always reaches the
 last column. The scroll is **bounded by content**. `layout::mutations::scroll_left` /
 `scroll_right` (`src/layout/mutations.rs`) return `None` once there is nothing
-left to reveal (their own `viewport_offset <= 0` / `new_offset > max_offset`
-checks), so holding the window at the edge scrolls until the content runs out
+left to reveal (`scroll_left` at `viewport_offset <= 0`, `scroll_right` when
+the clamped offset would not move past the current one), so holding the window at the edge scrolls until the content runs out
 and then stops — no runaway.
 
 A cursor held still in a band keeps scrolling: the repeat runs off the
@@ -532,23 +565,27 @@ At the top of `dispatch()`, before matching on the `SocketMessage` variant,
 the daemon checks (`src/daemon/dispatch.rs`):
 
 ```rust
-if self.drag_state.is_some() && msg.is_layout_mutating() {
+if (self.drag_state.is_some() || self.manual_drag.is_some()) && msg.is_layout_mutating() {
     return SocketResponse::Busy;
 }
 ```
 
-`SocketMessage::is_layout_mutating()` returns `true` for commands that touch
-window positions, focus, layout state, or workspace assignment — focus moves,
-swaps, scroll, column resize, mode toggles, workspace switch, promote/merge,
-`set-window`, `close-window`, and `reload-config`. Read-only queries
+`SocketMessage::is_layout_mutating()` (`src/ipc/message.rs`) returns `true`
+for commands that touch window positions, focus, layout state, or workspace
+and monitor assignment — focus moves (including the layer switch), swaps and
+moves, scroll, column width and width presets, `set-layout`, center, mode
+toggles, promote/merge/consume, workspace and monitor commands,
+`set-window`, `close-window`, `minimize-window`, `loadout load`,
+`tiling on|off|toggle` and `reload-config`. Read-only queries
 (`query-*`, `get-*`) and daemon lifecycle commands (`ping`, `stop`) pass
 through normally. The client receives `{"status":"busy"}` and may retry once
 the drag ends.
 
 A keymap drag session (next section) is gated the same way — `manual_drag`
 counts like `drag_state` — with one difference: `tiling off|on|toggle` and
-`stop` end the session first (committing it) instead of being refused,
-because they take the desktop away from it anyway. `drag begin` / `drag
+`stop` end the session first (committing it, `ends_manual_drag`) instead of
+being refused, because they take the desktop away from it anyway. During a
+native title-bar drag with no session, `tiling` commands get `busy`. `drag begin` / `drag
 end` are not layout-mutating themselves: they *are* the drag.
 
 ## Config
@@ -564,6 +601,12 @@ knobs:
 | `col_edge_max_px` | `0` | Pixel cap on that band; `0` = no cap |
 | `edge_scroll_initial_delay_ms` | `500` | Gap from the immediate scroll on entering a band to the first repeat |
 | `edge_scroll_repeat_interval_ms` | `240` | Gap between repeats (column or row) while the cursor stays in a band |
+
+The two timings are clamped once at drag start
+(`DragConfig::effective_repeat_interval_ms` / `effective_initial_delay_ms`):
+the repeat interval is at least 80 ms, and at least
+`[animation] duration_ms` while animation is enabled; the initial delay is
+at least the effective repeat interval.
 
 Per the project's config-defaults rule, **code is the single source of
 truth**: the `Default` impl on `DragConfig` holds the authoritative defaults,
@@ -600,15 +643,15 @@ including rows parked off screen. Halves of the visible windows keep the
 bijection (each slot is the union of the two halves that border it) and put
 every boundary where the user sees one: the middle of a window. ADR-0018.
 
-**Always-submit + animator no-op, instead of a controller-side gate.** The
-alternative — gating `on_drag_move` on "did the zone change?" — would save one
-`preview_move` + projection per move but would introduce a latent bug: after a
-viewport scroll the visible column rects shift even though the zone label has
-not, so a gated preview would be stale. Pushing the dedupe into the animator
-(which already compares `from`/`to` to build tweens) is both cheaper (no
-duplicate work) and correct-by-construction. It also makes the scroll arms
-trivially correct — a scroll zone is *cumulative*, and a gate that suppressed
-re-entry into the same zone would cap scrolling at one column per band entry.
+**A zone-change gate on the preview, not always-submit.** An earlier design
+re-submitted the preview on every move and relied on the animator to drop
+no-op targets. That breaks under `RetargetFromCurrent`: an identical target
+submitted while windows are mid-flight restarts the batch, so the reflow
+never finished while the cursor kept moving. The preview is therefore gated
+on `(monitor, zone)` (`should_submit_preview`). The worry that a gate goes
+stale after a viewport scroll is met by making every scroll band a zone of
+its own, and the scroll itself is cumulative without re-entry: it repeats
+off the `EdgeScrollScheduler` timer, not off moves.
 
 **Commit on release, not mid-drag.** The dragged window's screen position is
 not on the layout grid while the user is moving it — it is wherever the mouse
@@ -673,16 +716,18 @@ is described in `keymaps/win-niri/README.md`.
 
 ## Cross-References
 
-- (event-pipelines.md) — the general Win32 hook pipeline and the IPC command
+- [Event Pipelines](./event-pipelines.md) — the general Win32 hook pipeline and the IPC command
   pipeline that the drag hooks into.
-- (borders.md) — the first three border movement paths and the overlay
+- [Borders](./borders.md) — the first three border movement paths and the overlay
   architecture; this chapter documents the fourth.
-- (animation.md) — the `RetargetFromCurrent` policy that smooths rapid
+- [Animation](./animation.md) — the `RetargetFromCurrent` policy that smooths rapid
   retargets, and the batch/tween pipeline the exclusion filter and no-op
   filter live inside.
-- (layout/pipeline.md) — how `AppliedLayout` is produced by the
+- [Layout pipeline](./layout/pipeline.md) — how `AppliedLayout` is produced by the
   mutate-then-project pipeline that `resolve_drop_zone` reads and
   `preview_move` writes.
-- (floating-space.md) — the float-sync path (`store_float_rect`) that the
+- [Book Mode: Piles](./piles.md) — the `Card` drop zone and the pile
+  ordering the dragged window is kept out of.
+- [Floating Space](./floating-space.md) — the float-sync path (`store_float_rect`) that the
   `Float` drag arm shares with passive float moves, and the floating layer
   the focus switch (`switch-focus-between-floating-and-tiling`) reaches.

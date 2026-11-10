@@ -136,7 +136,7 @@ book → strip slides them off from under their tops on a free side.
 |---|---|
 | minimize / hide / close of a member | it leaves the strip as in strip mode; the order of the rest is unchanged |
 | close of a top | the next member is the new top (already directly under it) |
-| restore / show | the window is re-added at the end of the strip, as in strip mode (its old slot is not kept); activation flips the book to it |
+| restore / show | as in strip mode, the window returns to its restore seat (the column and row it left, clamped; ADR-0027, `[minimize_restore] strategy`) and the view follows it into the open run, not a pile; see [Event Pipelines](./event-pipelines.md#restored-event_system_minimizeend) |
 | workspace switch | the whole book (piles too) parks vertically with its workspace and comes back with its piles in order |
 | `move-to-monitor` | both strips re-project; each seats its own piles |
 | `tiling off` / `flow stop` / fail-back | nothing to undo: every window is on screen and in the taskbar |
