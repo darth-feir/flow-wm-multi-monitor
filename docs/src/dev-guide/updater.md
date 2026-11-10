@@ -28,7 +28,7 @@ crate as `FLOW_BUILD_*` environment variables, which
 | `BRANCH` | `git rev-parse --abbrev-ref HEAD` (empty for a detached `HEAD`) | `feat/multi-monitor` |
 | `DIRTY` | `git status --porcelain --untracked-files=no` non-empty | `false` |
 | `COMMIT_DATE` | `git log -1 --format=%cs` (committer date) | `2026-10-22` |
-| `ORIGIN_URL` | `git config --get remote.origin.url` | `https://github.com/darth-feir/flow-wm.git` |
+| `ORIGIN_URL` | `git config --get remote.origin.url` | `https://github.com/darth-feir/flow-wm-multi-monitor.git` |
 
 Every variable is always set — to the empty string when `git` is not
 installed or the source is not a checkout (a crates.io tarball) — so the crate
@@ -72,8 +72,8 @@ GitHub.
 Which repository a build checks is therefore decided by the checkout it was
 built from, not by `Cargo.toml` (whose `repository` field still names
 upstream and is not read by the checker). A build from a clone of the fork
-(`origin` = `https://github.com/darth-feir/flow-wm`, branch
-`feat/multi-monitor`) checks `darth-feir/flow-wm` `feat/multi-monitor`; a
+(`origin` = `https://github.com/darth-feir/flow-wm-multi-monitor`, branch
+`feat/multi-monitor`) checks `darth-feir/flow-wm-multi-monitor` `feat/multi-monitor`; a
 clone of upstream checks `CCpcalvin/flow-wm`. `UPSTREAM_REPO`
 (`CCpcalvin/flow-wm`) is used only when neither `[update] repo` nor a
 github.com `origin` names a repository. A checkout whose `origin` is a private

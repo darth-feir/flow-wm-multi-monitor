@@ -6,7 +6,7 @@ from crates.io with `cargo install flow-wm`.
 
 > **This fork.** `cargo install flow-wm` installs upstream FlowWM
 > ([CCpcalvin/flow-wm](https://github.com/CCpcalvin/flow-wm)). The fork
-> ([darth-feir/flow-wm](https://github.com/darth-feir/flow-wm), branch
+> ([darth-feir/flow-wm-multi-monitor](https://github.com/darth-feir/flow-wm-multi-monitor), branch
 > `feat/multi-monitor`) is only built from source, as below.
 
 > If you only want to *use* FlowWM, the high-level overview lives in the
@@ -28,8 +28,8 @@ rustup default stable-x86_64-pc-windows-msvc
 ## Clone and Build
 
 ```powershell
-git clone -b feat/multi-monitor https://github.com/darth-feir/flow-wm.git
-cd flow-wm
+git clone -b feat/multi-monitor https://github.com/darth-feir/flow-wm-multi-monitor.git
+cd flow-wm-multi-monitor
 cargo build --release --locked   # optimised, stripped binaries (LTO)
 cargo build                      # debug build
 ```

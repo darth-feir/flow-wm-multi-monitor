@@ -2,7 +2,7 @@
 
 Contributions are welcome — bug reports, feature ideas, and pull requests all
 help. This page is the user-facing short version. The canonical contributor
-reference is the repo's [`CONTRIBUTING.md`](https://github.com/darth-feir/flow-wm/blob/feat/multi-monitor/CONTRIBUTING.md),
+reference is the repo's [`CONTRIBUTING.md`](https://github.com/darth-feir/flow-wm-multi-monitor/blob/feat/multi-monitor/CONTRIBUTING.md),
 and the architecture is documented in the
 [Developer Guide](../dev-guide/index.md).
 
@@ -80,7 +80,7 @@ override it, the `logs/` folder moves with it — mention your config dir in the
 report.
 
 > **Where to file:** open an issue at
-> <https://github.com/darth-feir/flow-wm/issues>. A bug that also happens
+> <https://github.com/darth-feir/flow-wm-multi-monitor/issues>. A bug that also happens
 > with upstream FlowWM (without the fork's changes) belongs upstream, at
 > <https://github.com/CCpcalvin/flow-wm/issues>.
 
@@ -98,7 +98,7 @@ This fork's work happens on the branch `feat/multi-monitor`, which is based
 on upstream's `master` ([CCpcalvin/flow-wm](https://github.com/CCpcalvin/flow-wm));
 the fork's own `master` tracks upstream. Branch off `feat/multi-monitor` and
 open pull requests against it at
-[darth-feir/flow-wm](https://github.com/darth-feir/flow-wm).
+[darth-feir/flow-wm-multi-monitor](https://github.com/darth-feir/flow-wm-multi-monitor).
 
 A change of behaviour or design comes with its rationale written down rather
 than left in code comments: the fork's decisions are ADRs in `docs/adr/`
@@ -129,7 +129,7 @@ A few project-wide conventions:
 
 For the full conventions (including the 3-layer documentation model and
 contributor gates), see
-[`CONTRIBUTING.md`](https://github.com/darth-feir/flow-wm/blob/feat/multi-monitor/CONTRIBUTING.md)
+[`CONTRIBUTING.md`](https://github.com/darth-feir/flow-wm-multi-monitor/blob/feat/multi-monitor/CONTRIBUTING.md)
 in the repo root (upstream's text, which applies to the fork too).
 
 ## Understanding the codebase

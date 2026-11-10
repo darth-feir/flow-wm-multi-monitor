@@ -63,8 +63,8 @@ Each row has a design record in `docs/adr` (ADR-0007 onwards) and a page in the 
 Rust MSVC toolchain and the Visual Studio "Desktop development with C++" workload, as for upstream. Then:
 
 ```powershell
-git clone -b feat/multi-monitor https://github.com/darth-feir/flow-wm.git
-cd flow-wm
+git clone -b feat/multi-monitor https://github.com/darth-feir/flow-wm-multi-monitor.git
+cd flow-wm-multi-monitor
 cargo build --release --locked
 target\release\flow.exe config init   # writes %USERPROFILE%\.config\flow\flow.toml and flow-rules.toml
 ```
@@ -84,7 +84,7 @@ Every stage of the fork was built and proven in a Hyper-V guest with two virtual
 
 ## Docs and contributing
 
-The fork's guides live in `docs/src` and build with `mdbook build docs`. The published book linked above is upstream's and does not cover the fork's pages. Issues and pull requests go to [darth-feir/flow-wm](https://github.com/darth-feir/flow-wm), against `feat/multi-monitor`; see [Contributing](docs/src/user-guide/contributing.md) for the workflow and [Building from source](docs/src/dev-guide/building-from-source.md) for the gates:
+The fork's guides live in `docs/src` and build with `mdbook build docs`. The published book linked above is upstream's and does not cover the fork's pages. Issues and pull requests go to [darth-feir/flow-wm-multi-monitor](https://github.com/darth-feir/flow-wm-multi-monitor), against `feat/multi-monitor`; see [Contributing](docs/src/user-guide/contributing.md) for the workflow and [Building from source](docs/src/dev-guide/building-from-source.md) for the gates:
 
 ```powershell
 cargo test

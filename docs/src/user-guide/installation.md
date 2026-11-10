@@ -11,12 +11,12 @@ config, and start.
 > `cargo install flow-wm` and the upstream clone install upstream FlowWM, and
 > `flow config init --ahk` writes upstream's `Alt`-based `flow.ahk` (the
 > repository's root `flow.ahk`). The fork
-> ([darth-feir/flow-wm](https://github.com/darth-feir/flow-wm), branch
+> ([darth-feir/flow-wm-multi-monitor](https://github.com/darth-feir/flow-wm-multi-monitor), branch
 > `feat/multi-monitor`) is built from its own clone:
 >
 > ```powershell
-> git clone -b feat/multi-monitor https://github.com/darth-feir/flow-wm.git
-> cd flow-wm
+> git clone -b feat/multi-monitor https://github.com/darth-feir/flow-wm-multi-monitor.git
+> cd flow-wm-multi-monitor
 > cargo build --release --locked
 > ```
 >

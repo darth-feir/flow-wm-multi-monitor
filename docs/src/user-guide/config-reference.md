@@ -93,9 +93,9 @@ existing layout is never disrupted.
 ## `flow.toml`
 
 The application config. Schema:
-[`schemas/flow-config.schema.json`](https://github.com/darth-feir/flow-wm/blob/feat/multi-monitor/schemas/flow-config.schema.json).
+[`schemas/flow-config.schema.json`](https://github.com/darth-feir/flow-wm-multi-monitor/blob/feat/multi-monitor/schemas/flow-config.schema.json).
 A hand-written, fully-commented example lives at
-[`default-config.toml`](https://github.com/darth-feir/flow-wm/blob/feat/multi-monitor/default-config.toml)
+[`default-config.toml`](https://github.com/darth-feir/flow-wm-multi-monitor/blob/feat/multi-monitor/default-config.toml)
 in the repo root — `flow config init` copies it verbatim.
 
 > **Single source of truth.** Default values live in code, in the `Default`
@@ -790,7 +790,7 @@ ignore entirely. Rules are evaluated **top-to-bottom, first match wins**. If no
 rule matches, `default_action` is used.
 
 Schema:
-[`schemas/flow-rules.schema.json`](https://github.com/darth-feir/flow-wm/blob/feat/multi-monitor/schemas/flow-rules.schema.json).
+[`schemas/flow-rules.schema.json`](https://github.com/darth-feir/flow-wm-multi-monitor/blob/feat/multi-monitor/schemas/flow-rules.schema.json).
 
 > FlowWM ships a set of built-in defaults for common Windows system windows
 > (taskbar, Search UI, system dialogs, Task Manager, on-screen keyboard,
@@ -798,7 +798,7 @@ Schema:
 > compile time — they cannot be deleted or corrupted at runtime — and your
 > `flow-rules.toml` is checked **first**, so your rules always outrank the
 > built-in ones. See
-> [`default-flow-rules.toml`](https://github.com/darth-feir/flow-wm/blob/feat/multi-monitor/default-flow-rules.toml)
+> [`default-flow-rules.toml`](https://github.com/darth-feir/flow-wm-multi-monitor/blob/feat/multi-monitor/default-flow-rules.toml)
 > in the repo root for the full list of what's ignored by default.
 
 ### Top-level fields

@@ -3,7 +3,7 @@
 This is the complete, annotated list of every `flow` command — what it does,
 what arguments it takes, and (where relevant) the default hotkey it's bound to in
 `flow.ahk`. For the guided tour, see the README's
-[*Getting started*](https://github.com/darth-feir/flow-wm/tree/feat/multi-monitor#getting-started)
+[*Install*](https://github.com/darth-feir/flow-wm-multi-monitor/tree/feat/multi-monitor#install)
 (and, for this fork's Windows-key keymap, its *Using the fork* section).
 
 ## How a keypress reaches the daemon
