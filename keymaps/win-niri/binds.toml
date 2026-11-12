@@ -4,7 +4,8 @@
 # no `[binds]` section in flow.toml at all. To change a chord, put a `[binds]` table in flow.toml:
 # its entries are laid over these defaults (same chord = replaced, new chord = added,
 # `"Mod+X" = "none"` = unbound), or start from nothing with `defaults = false`. The grammar and
-# the full action table are in the user guide (Config Reference, `[binds]`).
+# the full action table are in the user guide (Config Reference, `[binds]`). `Mod`, `Win` and
+# `Super` are one modifier, the Windows key; the overlay prints it as `Win`.
 #
 # Hardwired in flow.ahk, not in this table: Mod + left-button drag, Mod+Ctrl+T (FlowWM off / on)
 # and Mod+Ctrl+Shift+T (tiling pause).

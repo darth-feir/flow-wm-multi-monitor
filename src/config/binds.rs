@@ -60,11 +60,12 @@ impl Modifier {
         }
     }
 
-    /// The name the canonical chord text uses.
+    /// The name the canonical chord text uses: the Windows key prints as
+    /// `Win`, the key it is, though a table may spell it `Mod` (ADR-0031).
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Mod => "Mod",
+            Self::Mod => "Win",
             Self::Ctrl => "Ctrl",
             Self::Alt => "Alt",
             Self::Shift => "Shift",
@@ -157,7 +158,7 @@ impl Key {
         let lower = word.to_ascii_lowercase();
         if lower.starts_with("mouse") || lower.ends_with("button") {
             return Err(format!(
-                "\"{word}\": mouse buttons are not configurable (Mod + left button is the drag)"
+                "\"{word}\": mouse buttons are not configurable (Win + left button is the drag)"
             ));
         }
         if word.len() == 1 {
@@ -293,7 +294,7 @@ impl Key {
 }
 
 /// A chord: a set of modifiers and one key. Two spellings of the same chord
-/// (`Shift+Mod+Left`, `mod+shift+left`) parse equal.
+/// (`Shift+Mod+Left`, `mod+shift+left`, `Win+Shift+Left`) parse equal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Chord {
     mods: Vec<Modifier>,
@@ -317,7 +318,11 @@ impl Chord {
                 format!("unknown modifier \"{word}\" (Mod / Super / Win, Ctrl, Alt, Shift)")
             })?;
             if mods.contains(&m) {
-                return Err(format!("modifier {} given twice", m.name()));
+                return Err(if m == Modifier::Mod {
+                    format!("modifier \"{word}\" given twice (Mod, Win and Super are one key)")
+                } else {
+                    format!("modifier \"{word}\" given twice")
+                });
             }
             mods.push(m);
         }
@@ -331,7 +336,7 @@ impl Chord {
         Ok(Self { mods, key })
     }
 
-    /// The canonical text, modifiers in [`Modifier`] order: `Mod+Ctrl+Alt+Shift+Key`.
+    /// The canonical text, modifiers in [`Modifier`] order: `Win+Ctrl+Alt+Shift+Key`.
     #[must_use]
     pub fn canonical(&self) -> String {
         let mut out = String::new();
@@ -351,7 +356,7 @@ impl Chord {
         out
     }
 
-    /// The modifier prefix of the canonical text (`Mod+Shift+`), for help rows.
+    /// The modifier prefix of the canonical text (`Win+Shift+`), for help rows.
     #[must_use]
     pub fn mod_prefix(&self) -> String {
         self.mods.iter().map(|m| format!("{}+", m.name())).collect()
@@ -974,7 +979,7 @@ impl JsonSchema for BindsConfig {
     fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
         json_schema!({
             "type": "object",
-            "description": "Key bindings in niri's spelling: \"Mod+Shift+Left\" = \"move-column-left\". Entries are laid over the keymap's built-in defaults; \"none\" unbinds a chord.",
+            "description": "Key bindings in niri's spelling: \"Mod+Shift+Left\" = \"move-column-left\" (Mod, Win and Super all name the Windows key; the overlay prints Win). Entries are laid over the keymap's built-in defaults; \"none\" unbinds a chord.",
             "properties": {
                 "defaults": {
                     "type": "boolean",
@@ -1081,7 +1086,7 @@ impl BindsConfig {
             seen.push((chord.clone(), text.as_str()));
             if chord.is_reserved() {
                 problems.push(format!(
-                    "binds.\"{text}\": {chord} is reserved by the keymap (Mod+Ctrl+T is FlowWM off/on, Mod+Ctrl+Shift+T the tiling pause)"
+                    "binds.\"{text}\": {chord} is reserved by the keymap (Win+Ctrl+T is FlowWM off/on, Win+Ctrl+Shift+T the tiling pause)"
                 ));
                 continue;
             }
@@ -1183,7 +1188,7 @@ pub fn default_binds() -> Vec<Bind> {
 /// One line of the key-binding overlay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelpRow {
-    /// The chord or chords (`Mod+Left/Down/Up/Right`, `Mod+1..9, Mod+0`).
+    /// The chord or chords (`Win+Left/Down/Up/Right`, `Win+1..9, Win+0`).
     pub chords: String,
     /// What they do.
     pub help: String,
@@ -1249,15 +1254,15 @@ impl BindsReport {
 pub fn hardwired_rows() -> Vec<HelpRow> {
     vec![
         HelpRow {
-            chords: "Mod + left-button drag".into(),
+            chords: "Win + left-button drag".into(),
             help: "move a window grabbed anywhere (a tile drops into the zone under the cursor, a float moves; a click without moving only activates it)".into(),
         },
         HelpRow {
-            chords: "Mod+Ctrl+T".into(),
+            chords: "Win+Ctrl+T".into(),
             help: "FlowWM off (and on again, via flow-resident.ahk)".into(),
         },
         HelpRow {
-            chords: "Mod+Ctrl+Shift+T".into(),
+            chords: "Win+Ctrl+Shift+T".into(),
             help: "pause toggle (off: Windows manages windows, chords fall through)".into(),
         },
     ]
@@ -1289,8 +1294,8 @@ pub fn report(binds: &[Bind], from_config: bool) -> BindsReport {
 
 /// Collapse the binds into overlay rows: consecutive binds of the same
 /// group with the same modifiers and the same key family (arrows, wheel,
-/// other) share a row (`Mod+Left/Down/Up/Right`,
-/// `Mod+WheelUp/WheelDown/WheelLeft/WheelRight`, `Mod+1..9, Mod+0`,
+/// other) share a row (`Win+Left/Down/Up/Right`,
+/// `Win+WheelUp/WheelDown/WheelLeft/WheelRight`, `Win+1..9, Win+0`,
 /// `Alt+H/J/K/L`); everything else is one row each.
 #[must_use]
 pub fn help_rows(binds: &[Bind]) -> Vec<HelpRow> {
@@ -1467,7 +1472,7 @@ mod tests {
             " Win + Shift + Left ",
         ] {
             let c = Chord::parse(text).expect(text);
-            assert_eq!(c.canonical(), "Mod+Shift+Left", "{text}");
+            assert_eq!(c.canonical(), "Win+Shift+Left", "{text}");
             assert_eq!(c.ahk(), "#+Left", "{text}");
         }
         assert_eq!(Chord::parse("Mod+Ctrl+Alt+Shift+H").unwrap().ahk(), "#^!+h");
@@ -1480,9 +1485,9 @@ mod tests {
             "#WheelDown"
         );
         assert_eq!(Chord::parse("Mod+Page_Up").unwrap().ahk(), "#PgUp");
-        assert_eq!(Chord::parse("Mod+F12").unwrap().canonical(), "Mod+F12");
+        assert_eq!(Chord::parse("Win+F12").unwrap().canonical(), "Win+F12");
         assert_eq!(Chord::parse("Mod+vkbf").unwrap().ahk(), "#vkBF");
-        assert_eq!(Chord::parse("Mod+sc01a").unwrap().canonical(), "Mod+sc01A");
+        assert_eq!(Chord::parse("Win+sc01a").unwrap().canonical(), "Win+sc01A");
         assert_eq!(Chord::parse("Print").unwrap().ahk(), "PrintScreen");
     }
 
@@ -1502,12 +1507,12 @@ mod tests {
     #[test]
     fn wheel_keys_parse_in_both_spellings_and_never_bare() {
         for (text, canonical, ahk) in [
-            ("Mod+WheelUp", "Mod+WheelUp", "#WheelUp"),
-            ("mod+wheeldown", "Mod+WheelDown", "#WheelDown"),
-            ("Shift+Mod+WheelLeft", "Mod+Shift+WheelLeft", "#+WheelLeft"),
-            ("Alt+Win+WheelRight", "Mod+Alt+WheelRight", "#!WheelRight"),
-            ("Mod+Ctrl+WheelScrollUp", "Mod+Ctrl+WheelUp", "#^WheelUp"),
-            ("Mod+WheelScrollRight", "Mod+WheelRight", "#WheelRight"),
+            ("Mod+WheelUp", "Win+WheelUp", "#WheelUp"),
+            ("mod+wheeldown", "Win+WheelDown", "#WheelDown"),
+            ("Shift+Mod+WheelLeft", "Win+Shift+WheelLeft", "#+WheelLeft"),
+            ("Alt+Win+WheelRight", "Win+Alt+WheelRight", "#!WheelRight"),
+            ("Mod+Ctrl+WheelScrollUp", "Win+Ctrl+WheelUp", "#^WheelUp"),
+            ("Mod+WheelScrollRight", "Win+WheelRight", "#WheelRight"),
         ] {
             let c = Chord::parse(text).expect(text);
             assert_eq!(c.canonical(), canonical, "{text}");
@@ -1565,7 +1570,7 @@ mod tests {
         )
         .resolve()
         .unwrap();
-        let find = |c: &str| binds.iter().find(|b| b.chord.canonical() == c);
+        let find = |c: &str| binds.iter().find(|b| b.chord == Chord::parse(c).unwrap());
         assert_eq!(
             find("Mod+WheelDown").unwrap().action.argv,
             vec!["focus-monitor", "right"]
@@ -1729,7 +1734,7 @@ mod tests {
         let find = |chord: &str| {
             binds
                 .iter()
-                .find(|b| b.chord.canonical() == chord)
+                .find(|b| b.chord == Chord::parse(chord).unwrap())
                 .unwrap_or_else(|| panic!("{chord} bound"))
         };
         assert_eq!(find("Mod+Left").action.argv, vec!["focus", "left"]);
@@ -1825,10 +1830,10 @@ mod tests {
         let defaults = default_binds();
         // One unbound, two added, one replaced.
         assert_eq!(binds.len(), defaults.len() + 1);
-        assert!(binds.iter().all(|b| b.chord.canonical() != "Mod+Q"));
+        assert!(binds.iter().all(|b| b.chord.canonical() != "Win+Q"));
         let moved = binds
             .iter()
-            .find(|b| b.chord.canonical() == "Mod+Shift+Left")
+            .find(|b| b.chord.canonical() == "Win+Shift+Left")
             .unwrap();
         assert_eq!(moved.action.argv, vec!["focus", "right"]);
         // The listing is canonical whatever the table's order: the
@@ -1841,10 +1846,10 @@ mod tests {
                 .position(|x| x == c)
                 .unwrap_or_else(|| panic!("{c}"))
         };
-        assert_eq!(at("Mod+Left"), 0);
-        assert!(at("Mod+Shift+Left") < at("Alt+H"), "{chords:?}");
-        assert_eq!(at("Mod+Shift+R"), at("Mod+R") + 1, "{chords:?}");
-        assert!(at("Mod+Z") < at("Mod+C"), "{chords:?}");
+        assert_eq!(at("Win+Left"), 0);
+        assert!(at("Win+Shift+Left") < at("Alt+H"), "{chords:?}");
+        assert_eq!(at("Win+Shift+R"), at("Win+R") + 1, "{chords:?}");
+        assert!(at("Win+Z") < at("Win+C"), "{chords:?}");
     }
 
     #[test]
@@ -1855,9 +1860,77 @@ mod tests {
         let p = cfg.resolve().expect_err("duplicate");
         assert_eq!(p.len(), 1, "{p:?}");
         assert!(
-            p[0].contains("the same chord as \"Mod+Shift+Left\" (Mod+Shift+Left)"),
+            p[0].contains("the same chord as \"Mod+Shift+Left\" (Win+Shift+Left)"),
             "{}",
             p[0]
+        );
+    }
+
+    #[test]
+    fn mod_win_and_super_are_one_modifier() {
+        let cfg = parse_binds(
+            "[binds]\ndefaults = false\n\"Win+Q\" = \"close-window\"\n\"Super+Shift+Left\" = \"move-column-left\"\n\"mod+c\" = \"center-column\"\n",
+        );
+        let binds = cfg.resolve().unwrap();
+        let hotkeys: Vec<String> = binds.iter().map(|b| b.chord.ahk()).collect();
+        assert!(hotkeys.contains(&"#q".to_owned()), "{hotkeys:?}");
+        assert!(hotkeys.contains(&"#+Left".to_owned()), "{hotkeys:?}");
+        assert!(hotkeys.contains(&"#c".to_owned()), "{hotkeys:?}");
+        // A Win spelling replaces the default bound under the Mod spelling.
+        let over = parse_binds("[binds]\n\"Win+Left\" = \"focus-column-right\"\n");
+        let binds = over.resolve().unwrap();
+        assert_eq!(binds.len(), default_binds().len());
+        let left: Vec<&Bind> = binds.iter().filter(|b| b.chord.ahk() == "#Left").collect();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].action.argv, vec!["focus", "right"]);
+    }
+
+    #[test]
+    fn mod_and_win_spellings_in_one_table_are_a_duplicate() {
+        for (a, b) in [("Mod+Left", "Win+Left"), ("Super+Left", "Mod+Left")] {
+            let cfg = parse_binds(&format!(
+                "[binds]\n\"{a}\" = \"focus-column-left\"\n\"{b}\" = \"focus-column-right\"\n"
+            ));
+            let p = cfg.resolve().expect_err("duplicate");
+            assert_eq!(p.len(), 1, "{p:?}");
+            // Both of the user's spellings are quoted as written.
+            assert!(p[0].contains("the same chord as"), "{}", p[0]);
+            assert!(
+                p[0].contains(&format!("\"{a}\"")) && p[0].contains(&format!("\"{b}\"")),
+                "{}",
+                p[0]
+            );
+        }
+        let err = Chord::parse("Mod+Win+Left").expect_err("twice");
+        assert!(err.contains("\"Win\" given twice"), "{err}");
+    }
+
+    #[test]
+    fn overlay_and_hardwired_rows_name_the_windows_key() {
+        let r = report(&default_binds(), false);
+        assert!(
+            r.rows
+                .iter()
+                .chain(&r.hardwired)
+                .all(|row| !row.chords.contains("Mod")),
+            "{:?}",
+            r.rows
+        );
+        let hard: Vec<&str> = r.hardwired.iter().map(|h| h.chords.as_str()).collect();
+        assert_eq!(
+            hard,
+            ["Win + left-button drag", "Win+Ctrl+T", "Win+Ctrl+Shift+T"]
+        );
+        assert!(r.binds.iter().all(|b| !b.chord.contains("Mod")));
+        // The hotkey strings the keymap registers do not change.
+        assert_eq!(r.binds[0].hotkey, "#Left");
+        let problem = parse_binds("[binds]\n\"Mod+Ctrl+T\" = \"close-window\"\n")
+            .resolve()
+            .expect_err("reserved");
+        assert!(
+            problem[0].starts_with("binds.\"Mod+Ctrl+T\": Win+Ctrl+T is reserved"),
+            "{}",
+            problem[0]
         );
     }
 
@@ -1867,7 +1940,7 @@ mod tests {
         assert!(!cfg.defaults);
         let binds = cfg.resolve().unwrap();
         assert_eq!(binds.len(), 1);
-        assert_eq!(binds[0].chord.canonical(), "Mod+Q");
+        assert_eq!(binds[0].chord.canonical(), "Win+Q");
         // And an absent section is the defaults.
         assert_eq!(
             BindsConfig::default().resolve().unwrap().len(),
@@ -1924,20 +1997,20 @@ mod tests {
         assert_eq!(
             &chords[..14],
             &[
-                "Mod+Left/Down/Up/Right",
-                "Mod+WheelUp/WheelDown/WheelLeft/WheelRight",
+                "Win+Left/Down/Up/Right",
+                "Win+WheelUp/WheelDown/WheelLeft/WheelRight",
                 "Alt+H/J/K/L",
-                "Mod+Shift+Left/Down/Up/Right",
-                "Mod+Shift+WheelUp/WheelDown/WheelLeft/WheelRight",
+                "Win+Shift+Left/Down/Up/Right",
+                "Win+Shift+WheelUp/WheelDown/WheelLeft/WheelRight",
                 "Alt+Shift+H/J/K/L",
-                "Mod+Ctrl+Left/Down/Up/Right",
-                "Mod+Ctrl+WheelUp/WheelDown/WheelLeft/WheelRight",
-                "Mod+Alt+Left/Down/Up/Right",
-                "Mod+Alt+WheelUp/WheelDown/WheelLeft/WheelRight",
-                "Mod+1..9, Mod+0",
-                "Mod+Ctrl+1..9, Mod+Ctrl+0",
-                "Mod+Q",
-                "Mod+M",
+                "Win+Ctrl+Left/Down/Up/Right",
+                "Win+Ctrl+WheelUp/WheelDown/WheelLeft/WheelRight",
+                "Win+Alt+Left/Down/Up/Right",
+                "Win+Alt+WheelUp/WheelDown/WheelLeft/WheelRight",
+                "Win+1..9, Win+0",
+                "Win+Ctrl+1..9, Win+Ctrl+0",
+                "Win+Q",
+                "Win+M",
             ]
         );
         assert_eq!(rows[0].help, "focus the next window on this screen");
@@ -1945,12 +2018,12 @@ mod tests {
         assert_eq!(rows[9].help, "move the window to the other screen");
         assert_eq!(rows[10].help, "switch to that workspace");
         assert!(
-            chords.contains(&"Mod+BracketLeft, Mod+BracketRight"),
+            chords.contains(&"Win+BracketLeft, Win+BracketRight"),
             "{chords:?}"
         );
-        assert!(chords.contains(&"Mod+Space, Mod+D"), "{chords:?}");
-        assert!(chords.contains(&"Mod+Shift+Slash"));
-        assert_eq!(*chords.last().unwrap(), "Mod+Shift+E");
+        assert!(chords.contains(&"Win+Space, Win+D"), "{chords:?}");
+        assert!(chords.contains(&"Win+Shift+Slash"));
+        assert_eq!(*chords.last().unwrap(), "Win+Shift+E");
         // 2 focus + 2 move + monitors 2 + wheel 4 + workspaces 2 + q alt+m c v shift+v r f shift+b + consume + launcher + 4 spawn + help + quit
         assert_eq!(rows.len(), 2 + 2 + 2 + 4 + 2 + 8 + 1 + 1 + 4 + 1 + 1);
     }
@@ -1963,7 +2036,7 @@ mod tests {
         assert_eq!(r.binds.len(), binds.len());
         assert_eq!(r.hardwired.len(), 3);
         let first = &r.binds[0];
-        assert_eq!(first.chord, "Mod+Left");
+        assert_eq!(first.chord, "Win+Left");
         assert_eq!(first.hotkey, "#Left");
         assert_eq!(first.kind, ActionKind::Dispatch);
         assert_eq!(first.scope, Scope::Tiling);
@@ -1976,21 +2049,21 @@ mod tests {
         let lines: Vec<&str> = plain.lines().collect();
         assert_eq!(
             lines[0],
-            "bind\t#Left\ttiling\tdispatch\t0\tMod+Left\tfocus the next window on this screen\tfocus\u{1f}left"
+            "bind\t#Left\ttiling\tdispatch\t0\tWin+Left\tfocus the next window on this screen\tfocus\u{1f}left"
         );
         assert!(lines.contains(
-            &"bind\t#+t\talways\tspawn\t1\tMod+Shift+T\trun alacritty as admin\talacritty"
+            &"bind\t#+t\talways\tspawn\t1\tWin+Shift+T\trun alacritty as admin\talacritty"
         ));
-        assert!(lines.contains(&"bind\t#Space\talways\tlauncher\t0\tMod+Space\tapplication launcher (apps; window - x and file - x search those instead)\t"));
+        assert!(lines.contains(&"bind\t#Space\talways\tlauncher\t0\tWin+Space\tapplication launcher (apps; window - x and file - x search those instead)\t"));
         assert!(
             lines
                 .iter()
-                .any(|l| l.starts_with("row\tMod+1..9, Mod+0\t"))
+                .any(|l| l.starts_with("row\tWin+1..9, Win+0\t"))
         );
         assert!(
             lines
                 .iter()
-                .any(|l| l.starts_with("hardwired\tMod+Ctrl+T\t"))
+                .any(|l| l.starts_with("hardwired\tWin+Ctrl+T\t"))
         );
         assert!(lines.contains(&"option\tselection_buffer\t0"));
         assert!(

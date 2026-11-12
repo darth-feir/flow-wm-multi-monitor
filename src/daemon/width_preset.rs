@@ -1153,7 +1153,7 @@ default = "1/2"
             report
                 .binds
                 .iter()
-                .any(|b| b.chord == "Mod+R" && b.argv == ["width", "next"])
+                .any(|b| b.chord == "Win+R" && b.argv == ["width", "next"])
         );
 
         flow.config.binds = toml::from_str::<crate::config::FlowConfig>(
@@ -1168,13 +1168,13 @@ default = "1/2"
         let report: crate::config::BindsReport = serde_json::from_value(payload).unwrap();
         assert_eq!(report.source, "flow.toml");
         assert!(
-            report.binds.iter().any(|b| b.chord == "Mod+Shift+R"
+            report.binds.iter().any(|b| b.chord == "Win+Shift+R"
                 && b.hotkey == "#+r"
                 && b.argv == ["width", "prev"])
         );
-        assert!(report.binds.iter().all(|b| b.chord != "Mod+Q"));
-        assert!(report.rows.iter().any(|r| r.chords == "Mod+R"));
-        assert!(report.rows.iter().any(|r| r.chords == "Mod+Shift+R"));
+        assert!(report.binds.iter().all(|b| b.chord != "Win+Q"));
+        assert!(report.rows.iter().any(|r| r.chords == "Win+R"));
+        assert!(report.rows.iter().any(|r| r.chords == "Win+Shift+R"));
         assert!(!report.selection_buffer);
 
         // [keymap] selection_buffer reaches the keymap through the listing.

@@ -1,6 +1,7 @@
 # win-niri keymap
 
-FlowWM keybindings in niri's flavour: the Windows key is Mod, arrows instead
+FlowWM keybindings in niri's flavour: the Windows key is Mod (a table may
+also spell it `Win` or `Super`; the overlay prints it as `Win`), arrows instead
 of hjkl, and every chord maps onto a `flow dispatch` command. The bindings
 are configuration: the `[binds]` table of `flow.toml`, in niri's spelling,
 laid over the default table in `binds.toml` here (see *The keymap is an
@@ -60,14 +61,15 @@ UTF-8, so nothing is decoded with the console code page and no console
 window flashes) and registers every `bind` record with `Hotkey()`:
 
 ```text
-bind  #Left  tiling  dispatch  0  Mod+Left  focus the next window on this screen  focus<US>left
-row   Mod+Left/Down/Up/Right  focus the next window on this screen
-hardwired  Mod+Ctrl+T  FlowWM off (and on again, via flow-resident.ahk)
+bind  #Left  tiling  dispatch  0  Win+Left  focus the next window on this screen  focus<US>left
+row   Win+Left/Down/Up/Right  focus the next window on this screen
+hardwired  Win+Ctrl+T  FlowWM off (and on again, via flow-resident.ahk)
 source  defaults
 ```
 
 - The **hotkey** is the daemon's translation of the chord (`Mod+Shift+Slash`
-  → `#+vkBF`, see the lesson below); the **scope** picks the `HotIf`
+  → `#+vkBF`, see the lesson below); the chord and row text name the Windows
+  key `Win` (ADR-0031), the hotkey string is what `Hotkey()` registers; the **scope** picks the `HotIf`
   criterion: `tiling` = `TilingGate` (daemon up and tiling on), `always` =
   `AlwaysGate` (daemon up). The gates are named functions so a reload can
   turn a chord off under the criterion it was registered with.

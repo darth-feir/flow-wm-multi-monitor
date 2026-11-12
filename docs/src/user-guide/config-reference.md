@@ -672,8 +672,10 @@ shows what is bound. See `flow query binds` for the resolved list.
 ```
 
 **Chords.** `Modifier+...+Key`, any order, any case; the last word is the
-key. Modifiers: `Mod` (also `Super`, `Win` — the Windows key), `Ctrl`
-(`Control`), `Alt`, `Shift`. Keys: a letter, a digit, `F1`..`F24`, one of
+key. Modifiers: `Mod`, `Win` and `Super` are one modifier, the Windows
+key (the examples use niri's `Mod`; the overlay and `flow query binds`
+print it as `Win`, e.g. `Win+Left`), then `Ctrl` (`Control`), `Alt`,
+`Shift`. Keys: a letter, a digit, `F1`..`F24`, one of
 `Left Right Up Down Home End Page_Up Page_Down Insert Delete BackSpace
 Return Tab Escape Space Print Pause Minus Equal BracketLeft BracketRight
 Semicolon Apostrophe Grave Backslash Comma Period Slash WheelUp
@@ -684,7 +686,8 @@ AutoHotkey `vkXX` / `scXXX` code. A bare key needs a modifier (`Print` and
 configurable. `Mod+Ctrl+T` and
 `Mod+Ctrl+Shift+T` are reserved by the keymap (FlowWM off/on, tiling
 pause), as is Mod + left-button drag. Two spellings of one chord in the
-same table are an error.
+same table are an error, `"Mod+Left"` next to `"Win+Left"` included; the
+message quotes both as written.
 
 **Actions.** A string is an action line; a table is a program to run.
 

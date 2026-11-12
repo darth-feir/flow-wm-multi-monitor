@@ -76,7 +76,8 @@ new_window_monitor = "focused"
 # Key bindings. Without this section the keymap uses its built-in table (binds.toml next to this
 # file: Mod+Arrows focus, Mod+Shift+Arrows move, Mod+wheel like Mod+Left/Right, Mod+1..9 workspaces,
 # Mod+R widths, Mod+T Alacritty, Mod+Space launcher, Mod+Shift+/ help, ...). Entries here are laid over it in niri's spelling: the
-# same chord replaces the default, a new chord is added, "none" unbinds one. Saved changes apply
+# same chord replaces the default, a new chord is added, "none" unbinds one. Mod, Win and Super
+# are one modifier (the Windows key; the overlay shows Win). Saved changes apply
 # within a few seconds; `flow query binds` shows the result, `flow config check` names mistakes.
 # The full grammar and action table are in the user guide (Config Reference, [binds]).
 [binds]

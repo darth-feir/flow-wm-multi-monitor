@@ -1,5 +1,5 @@
 ; ════════════════════════════════════════════════════════════════════════════
-; FlowWM key-binding overlay (the `show-hotkey-overlay` action, Mod+Shift+/
+; FlowWM key-binding overlay (the `show-hotkey-overlay` action, Win+Shift+/
 ; by default). Included from flow.ahk.
 ;
 ; Toggles an always-on-top dark panel listing every chord the daemon bound
@@ -31,11 +31,11 @@ BuildHelpGui() {
     HelpGui.BackColor := 0x1E1E1E
     HelpGui.MarginX := 24, HelpGui.MarginY := 20
     HelpGui.SetFont("s13 bold cFFFFFF", "Segoe UI")
-    HelpGui.AddText(, "FlowWM key bindings   (Mod = Win)")
+    HelpGui.AddText(, "FlowWM key bindings")
     HelpGui.SetFont("s12 norm cE0E0E0", "Consolas")
     HelpGui.AddText("xm y+12", HelpRows.Length ? HelpText(HelpRows) : "(no bindings loaded)")
     HelpGui.SetFont("s9 norm c9A9A9A", "Segoe UI")
-    HelpGui.AddText("xm y+14", "Esc closes this overlay. Win+L is the Windows lock. Tiling off (Mod+Ctrl+Shift+T) releases the window-management chords to Windows; the launcher, this help, programs, Mod+Ctrl+T and the stop chord stay bound. Bindings: [binds] in flow.toml, applied on save.")
+    HelpGui.AddText("xm y+14", "Esc closes this overlay. Win+L is the Windows lock. Tiling off (Win+Ctrl+Shift+T) releases the window-management chords to Windows; the launcher, this help, programs, Win+Ctrl+T and the stop chord stay bound. Bindings: [binds] in flow.toml, applied on save.")
     HelpGui.OnEvent("Escape", HelpHide)
 }
 

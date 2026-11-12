@@ -198,7 +198,7 @@
       }
     },
     "BindsConfig": {
-      "description": "Key bindings in niri's spelling: \"Mod+Shift+Left\" = \"move-column-left\". Entries are laid over the keymap's built-in defaults; \"none\" unbinds a chord.",
+      "description": "Key bindings in niri's spelling: \"Mod+Shift+Left\" = \"move-column-left\" (Mod, Win and Super all name the Windows key; the overlay prints Win). Entries are laid over the keymap's built-in defaults; \"none\" unbinds a chord.",
       "type": "object",
       "properties": {
         "defaults": {

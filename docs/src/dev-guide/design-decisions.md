@@ -545,3 +545,11 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   `set-window` target), and a hidden lock surface leaves the registry instead
   of lingering as a stale entry. A user `exe = "explorer.exe"` rule without a
   class still wins. `docs/adr/0030-lock-screen-surfaces-are-ignored.md`
+- **ADR-0031 — The overlay names the Windows key `Win`; `Mod`, `Win` and
+  `Super` are one modifier.** The keymap's modifier is always the Windows key,
+  so the canonical chord text says `Win`: the overlay and hardwired rows, the
+  `chord` field of `flow query binds` (JSON and `--plain`) and the canonical
+  chord in config messages. The AutoHotkey hotkey strings (`#Left`) are
+  unchanged. `[binds]` keeps niri's `Mod` and also accepts `Win` / `Super`;
+  two spellings of one chord in a table are a duplicate whose message quotes
+  both keys as written. `docs/adr/0031-the-overlay-names-the-windows-key.md`

@@ -1,7 +1,7 @@
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 ; ════════════════════════════════════════════════════════════════════════════
-; FlowWM keybindings, niri flavour, Windows key as Mod, arrow keys.
+; FlowWM keybindings, niri flavour, Windows key as Mod (shown as Win), arrow keys.
 ;
 ; This script is an interpreter: the chords come from the daemon. At start
 ; (and again whenever flow.toml is saved) it runs `flow query binds --plain`,
@@ -16,11 +16,11 @@
 ; the user guide (Config Reference, `[binds]`).
 ;
 ; Hardwired here, not in the table:
-;   Mod + left-button drag        move a window grabbed anywhere (a tile drops into the zone under the cursor, a float
+;   Win + left-button drag        move a window grabbed anywhere (a tile drops into the zone under the cursor, a float
 ;                                 moves; a click that moves less than 8 px only activates the window)
-;   Mod+Ctrl+T                    stop FlowWM fully (daemon and this script); flow-resident.ahk,
+;   Win+Ctrl+T                    stop FlowWM fully (daemon and this script); flow-resident.ahk,
 ;                                 if it runs, starts FlowWM again with the same chord
-;   Mod+Ctrl+Shift+T              pause toggle: `flow dispatch tiling toggle` (daemon keeps running)
+;   Win+Ctrl+Shift+T              pause toggle: `flow dispatch tiling toggle` (daemon keeps running)
 ;   middle click                  paste the selection buffer, only with `[keymap] selection_buffer = true`
 ;                                 (selection.ahk; README.md *Selection buffer*)
 ;
@@ -787,115 +787,115 @@ StopFlow() {
 ; BEGIN DEFAULT BINDS (generated)
 DefaultBindsText := "
 (
-bind	#Left	tiling	dispatch	0	Mod+Left	focus the next window on this screen	focus<US>left
-bind	#Down	tiling	dispatch	0	Mod+Down	focus the next window on this screen	focus<US>down
-bind	#Up	tiling	dispatch	0	Mod+Up	focus the next window on this screen	focus<US>up
-bind	#Right	tiling	dispatch	0	Mod+Right	focus the next window on this screen	focus<US>right
-bind	#WheelUp	tiling	dispatch	0	Mod+WheelUp	focus the next window on this screen	focus<US>left
-bind	#WheelDown	tiling	dispatch	0	Mod+WheelDown	focus the next window on this screen	focus<US>right
-bind	#WheelLeft	tiling	dispatch	0	Mod+WheelLeft	focus the next window on this screen	focus<US>left
-bind	#WheelRight	tiling	dispatch	0	Mod+WheelRight	focus the next window on this screen	focus<US>right
+bind	#Left	tiling	dispatch	0	Win+Left	focus the next window on this screen	focus<US>left
+bind	#Down	tiling	dispatch	0	Win+Down	focus the next window on this screen	focus<US>down
+bind	#Up	tiling	dispatch	0	Win+Up	focus the next window on this screen	focus<US>up
+bind	#Right	tiling	dispatch	0	Win+Right	focus the next window on this screen	focus<US>right
+bind	#WheelUp	tiling	dispatch	0	Win+WheelUp	focus the next window on this screen	focus<US>left
+bind	#WheelDown	tiling	dispatch	0	Win+WheelDown	focus the next window on this screen	focus<US>right
+bind	#WheelLeft	tiling	dispatch	0	Win+WheelLeft	focus the next window on this screen	focus<US>left
+bind	#WheelRight	tiling	dispatch	0	Win+WheelRight	focus the next window on this screen	focus<US>right
 bind	!h	tiling	dispatch	0	Alt+H	focus the next window on this screen	focus<US>left
 bind	!j	tiling	dispatch	0	Alt+J	focus the next window on this screen	focus<US>down
 bind	!k	tiling	dispatch	0	Alt+K	focus the next window on this screen	focus<US>up
 bind	!l	tiling	dispatch	0	Alt+L	focus the next window on this screen	focus<US>right
-bind	#+Left	tiling	dispatch	0	Mod+Shift+Left	move the window along the strip (up/down inside a stacked column)	move-window<US>left
-bind	#+Down	tiling	dispatch	0	Mod+Shift+Down	move the window along the strip (up/down inside a stacked column)	move-window<US>down
-bind	#+Up	tiling	dispatch	0	Mod+Shift+Up	move the window along the strip (up/down inside a stacked column)	move-window<US>up
-bind	#+Right	tiling	dispatch	0	Mod+Shift+Right	move the window along the strip (up/down inside a stacked column)	move-window<US>right
-bind	#+WheelUp	tiling	dispatch	0	Mod+Shift+WheelUp	move the window along the strip (up/down inside a stacked column)	move-window<US>left
-bind	#+WheelDown	tiling	dispatch	0	Mod+Shift+WheelDown	move the window along the strip (up/down inside a stacked column)	move-window<US>right
-bind	#+WheelLeft	tiling	dispatch	0	Mod+Shift+WheelLeft	move the window along the strip (up/down inside a stacked column)	move-window<US>left
-bind	#+WheelRight	tiling	dispatch	0	Mod+Shift+WheelRight	move the window along the strip (up/down inside a stacked column)	move-window<US>right
+bind	#+Left	tiling	dispatch	0	Win+Shift+Left	move the window along the strip (up/down inside a stacked column)	move-window<US>left
+bind	#+Down	tiling	dispatch	0	Win+Shift+Down	move the window along the strip (up/down inside a stacked column)	move-window<US>down
+bind	#+Up	tiling	dispatch	0	Win+Shift+Up	move the window along the strip (up/down inside a stacked column)	move-window<US>up
+bind	#+Right	tiling	dispatch	0	Win+Shift+Right	move the window along the strip (up/down inside a stacked column)	move-window<US>right
+bind	#+WheelUp	tiling	dispatch	0	Win+Shift+WheelUp	move the window along the strip (up/down inside a stacked column)	move-window<US>left
+bind	#+WheelDown	tiling	dispatch	0	Win+Shift+WheelDown	move the window along the strip (up/down inside a stacked column)	move-window<US>right
+bind	#+WheelLeft	tiling	dispatch	0	Win+Shift+WheelLeft	move the window along the strip (up/down inside a stacked column)	move-window<US>left
+bind	#+WheelRight	tiling	dispatch	0	Win+Shift+WheelRight	move the window along the strip (up/down inside a stacked column)	move-window<US>right
 bind	!+h	tiling	dispatch	0	Alt+Shift+H	move the window along the strip (up/down inside a stacked column)	move-window<US>left
 bind	!+j	tiling	dispatch	0	Alt+Shift+J	move the window along the strip (up/down inside a stacked column)	move-window<US>down
 bind	!+k	tiling	dispatch	0	Alt+Shift+K	move the window along the strip (up/down inside a stacked column)	move-window<US>up
 bind	!+l	tiling	dispatch	0	Alt+Shift+L	move the window along the strip (up/down inside a stacked column)	move-window<US>right
-bind	#^Left	tiling	dispatch	0	Mod+Ctrl+Left	focus the other screen	focus-monitor<US>left
-bind	#^Down	tiling	dispatch	0	Mod+Ctrl+Down	focus the other screen	focus-monitor<US>down
-bind	#^Up	tiling	dispatch	0	Mod+Ctrl+Up	focus the other screen	focus-monitor<US>up
-bind	#^Right	tiling	dispatch	0	Mod+Ctrl+Right	focus the other screen	focus-monitor<US>right
-bind	#^WheelUp	tiling	dispatch	0	Mod+Ctrl+WheelUp	focus the other screen	focus-monitor<US>left
-bind	#^WheelDown	tiling	dispatch	0	Mod+Ctrl+WheelDown	focus the other screen	focus-monitor<US>right
-bind	#^WheelLeft	tiling	dispatch	0	Mod+Ctrl+WheelLeft	focus the other screen	focus-monitor<US>left
-bind	#^WheelRight	tiling	dispatch	0	Mod+Ctrl+WheelRight	focus the other screen	focus-monitor<US>right
-bind	#!Left	tiling	dispatch	0	Mod+Alt+Left	move the window to the other screen	move-to-monitor<US>left
-bind	#!Down	tiling	dispatch	0	Mod+Alt+Down	move the window to the other screen	move-to-monitor<US>down
-bind	#!Up	tiling	dispatch	0	Mod+Alt+Up	move the window to the other screen	move-to-monitor<US>up
-bind	#!Right	tiling	dispatch	0	Mod+Alt+Right	move the window to the other screen	move-to-monitor<US>right
-bind	#!WheelUp	tiling	dispatch	0	Mod+Alt+WheelUp	move the window to the other screen	move-to-monitor<US>left
-bind	#!WheelDown	tiling	dispatch	0	Mod+Alt+WheelDown	move the window to the other screen	move-to-monitor<US>right
-bind	#!WheelLeft	tiling	dispatch	0	Mod+Alt+WheelLeft	move the window to the other screen	move-to-monitor<US>left
-bind	#!WheelRight	tiling	dispatch	0	Mod+Alt+WheelRight	move the window to the other screen	move-to-monitor<US>right
-bind	#1	tiling	dispatch	0	Mod+1	switch to workspace 1	switch-workspace<US>1
-bind	#2	tiling	dispatch	0	Mod+2	switch to workspace 2	switch-workspace<US>2
-bind	#3	tiling	dispatch	0	Mod+3	switch to workspace 3	switch-workspace<US>3
-bind	#4	tiling	dispatch	0	Mod+4	switch to workspace 4	switch-workspace<US>4
-bind	#5	tiling	dispatch	0	Mod+5	switch to workspace 5	switch-workspace<US>5
-bind	#6	tiling	dispatch	0	Mod+6	switch to workspace 6	switch-workspace<US>6
-bind	#7	tiling	dispatch	0	Mod+7	switch to workspace 7	switch-workspace<US>7
-bind	#8	tiling	dispatch	0	Mod+8	switch to workspace 8	switch-workspace<US>8
-bind	#9	tiling	dispatch	0	Mod+9	switch to workspace 9	switch-workspace<US>9
-bind	#0	tiling	dispatch	0	Mod+0	switch to workspace 10	switch-workspace<US>10
-bind	#^1	tiling	dispatch	0	Mod+Ctrl+1	move the window to workspace 1	move-to-workspace<US>1
-bind	#^2	tiling	dispatch	0	Mod+Ctrl+2	move the window to workspace 2	move-to-workspace<US>2
-bind	#^3	tiling	dispatch	0	Mod+Ctrl+3	move the window to workspace 3	move-to-workspace<US>3
-bind	#^4	tiling	dispatch	0	Mod+Ctrl+4	move the window to workspace 4	move-to-workspace<US>4
-bind	#^5	tiling	dispatch	0	Mod+Ctrl+5	move the window to workspace 5	move-to-workspace<US>5
-bind	#^6	tiling	dispatch	0	Mod+Ctrl+6	move the window to workspace 6	move-to-workspace<US>6
-bind	#^7	tiling	dispatch	0	Mod+Ctrl+7	move the window to workspace 7	move-to-workspace<US>7
-bind	#^8	tiling	dispatch	0	Mod+Ctrl+8	move the window to workspace 8	move-to-workspace<US>8
-bind	#^9	tiling	dispatch	0	Mod+Ctrl+9	move the window to workspace 9	move-to-workspace<US>9
-bind	#^0	tiling	dispatch	0	Mod+Ctrl+0	move the window to workspace 10	move-to-workspace<US>10
-bind	#q	tiling	dispatch	0	Mod+Q	close window	close-window
-bind	#m	tiling	dispatch	0	Mod+M	minimize window	minimize-window
-bind	#c	tiling	dispatch	0	Mod+C	center the focused column	center
-bind	#v	tiling	dispatch	0	Mod+V	toggle floating	set-window<US>cycle
-bind	#+v	tiling	dispatch	0	Mod+Shift+V	switch focus between the floating and the tiled windows	switch-focus-between-floating-and-tiling
-bind	#r	tiling	dispatch	0	Mod+R	cycle this screen's column widths (flow.toml [columns] presets)	width<US>next
-bind	#f	tiling	dispatch	0	Mod+F	fullscreen toggle	set-window<US>fullscreen
-bind	#[	tiling	dispatch	0	Mod+BracketLeft	alone: merge into the column on that side; stacked: pop out to that side	consume-or-expel<US>left
-bind	#]	tiling	dispatch	0	Mod+BracketRight	alone: merge into the column on that side; stacked: pop out to that side	consume-or-expel<US>right
-bind	#+b	tiling	dispatch	0	Mod+Shift+B	book / strip layout on this screen (columns out of view piled or parked)	set-layout<US>toggle
-bind	#Space	always	launcher	0	Mod+Space	application launcher (apps; window - x and file - x search those instead)	
-bind	#d	always	launcher	0	Mod+D	application launcher (apps; window - x and file - x search those instead)	
-bind	#t	always	spawn	0	Mod+T	run alacritty	alacritty
-bind	#+t	always	spawn	1	Mod+Shift+T	run alacritty as admin	alacritty
-bind	#!t	always	spawn	0	Mod+Alt+T	run wt	wt
-bind	#!+t	always	spawn	1	Mod+Alt+Shift+T	run wt as admin	wt
-bind	#+vkBF	always	help	0	Mod+Shift+Slash	this help (Esc hides it)	
-bind	#+e	always	quit	0	Mod+Shift+E	stop FlowWM	
-row	Mod+Left/Down/Up/Right	focus the next window on this screen
-row	Mod+WheelUp/WheelDown/WheelLeft/WheelRight	focus the next window on this screen
+bind	#^Left	tiling	dispatch	0	Win+Ctrl+Left	focus the other screen	focus-monitor<US>left
+bind	#^Down	tiling	dispatch	0	Win+Ctrl+Down	focus the other screen	focus-monitor<US>down
+bind	#^Up	tiling	dispatch	0	Win+Ctrl+Up	focus the other screen	focus-monitor<US>up
+bind	#^Right	tiling	dispatch	0	Win+Ctrl+Right	focus the other screen	focus-monitor<US>right
+bind	#^WheelUp	tiling	dispatch	0	Win+Ctrl+WheelUp	focus the other screen	focus-monitor<US>left
+bind	#^WheelDown	tiling	dispatch	0	Win+Ctrl+WheelDown	focus the other screen	focus-monitor<US>right
+bind	#^WheelLeft	tiling	dispatch	0	Win+Ctrl+WheelLeft	focus the other screen	focus-monitor<US>left
+bind	#^WheelRight	tiling	dispatch	0	Win+Ctrl+WheelRight	focus the other screen	focus-monitor<US>right
+bind	#!Left	tiling	dispatch	0	Win+Alt+Left	move the window to the other screen	move-to-monitor<US>left
+bind	#!Down	tiling	dispatch	0	Win+Alt+Down	move the window to the other screen	move-to-monitor<US>down
+bind	#!Up	tiling	dispatch	0	Win+Alt+Up	move the window to the other screen	move-to-monitor<US>up
+bind	#!Right	tiling	dispatch	0	Win+Alt+Right	move the window to the other screen	move-to-monitor<US>right
+bind	#!WheelUp	tiling	dispatch	0	Win+Alt+WheelUp	move the window to the other screen	move-to-monitor<US>left
+bind	#!WheelDown	tiling	dispatch	0	Win+Alt+WheelDown	move the window to the other screen	move-to-monitor<US>right
+bind	#!WheelLeft	tiling	dispatch	0	Win+Alt+WheelLeft	move the window to the other screen	move-to-monitor<US>left
+bind	#!WheelRight	tiling	dispatch	0	Win+Alt+WheelRight	move the window to the other screen	move-to-monitor<US>right
+bind	#1	tiling	dispatch	0	Win+1	switch to workspace 1	switch-workspace<US>1
+bind	#2	tiling	dispatch	0	Win+2	switch to workspace 2	switch-workspace<US>2
+bind	#3	tiling	dispatch	0	Win+3	switch to workspace 3	switch-workspace<US>3
+bind	#4	tiling	dispatch	0	Win+4	switch to workspace 4	switch-workspace<US>4
+bind	#5	tiling	dispatch	0	Win+5	switch to workspace 5	switch-workspace<US>5
+bind	#6	tiling	dispatch	0	Win+6	switch to workspace 6	switch-workspace<US>6
+bind	#7	tiling	dispatch	0	Win+7	switch to workspace 7	switch-workspace<US>7
+bind	#8	tiling	dispatch	0	Win+8	switch to workspace 8	switch-workspace<US>8
+bind	#9	tiling	dispatch	0	Win+9	switch to workspace 9	switch-workspace<US>9
+bind	#0	tiling	dispatch	0	Win+0	switch to workspace 10	switch-workspace<US>10
+bind	#^1	tiling	dispatch	0	Win+Ctrl+1	move the window to workspace 1	move-to-workspace<US>1
+bind	#^2	tiling	dispatch	0	Win+Ctrl+2	move the window to workspace 2	move-to-workspace<US>2
+bind	#^3	tiling	dispatch	0	Win+Ctrl+3	move the window to workspace 3	move-to-workspace<US>3
+bind	#^4	tiling	dispatch	0	Win+Ctrl+4	move the window to workspace 4	move-to-workspace<US>4
+bind	#^5	tiling	dispatch	0	Win+Ctrl+5	move the window to workspace 5	move-to-workspace<US>5
+bind	#^6	tiling	dispatch	0	Win+Ctrl+6	move the window to workspace 6	move-to-workspace<US>6
+bind	#^7	tiling	dispatch	0	Win+Ctrl+7	move the window to workspace 7	move-to-workspace<US>7
+bind	#^8	tiling	dispatch	0	Win+Ctrl+8	move the window to workspace 8	move-to-workspace<US>8
+bind	#^9	tiling	dispatch	0	Win+Ctrl+9	move the window to workspace 9	move-to-workspace<US>9
+bind	#^0	tiling	dispatch	0	Win+Ctrl+0	move the window to workspace 10	move-to-workspace<US>10
+bind	#q	tiling	dispatch	0	Win+Q	close window	close-window
+bind	#m	tiling	dispatch	0	Win+M	minimize window	minimize-window
+bind	#c	tiling	dispatch	0	Win+C	center the focused column	center
+bind	#v	tiling	dispatch	0	Win+V	toggle floating	set-window<US>cycle
+bind	#+v	tiling	dispatch	0	Win+Shift+V	switch focus between the floating and the tiled windows	switch-focus-between-floating-and-tiling
+bind	#r	tiling	dispatch	0	Win+R	cycle this screen's column widths (flow.toml [columns] presets)	width<US>next
+bind	#f	tiling	dispatch	0	Win+F	fullscreen toggle	set-window<US>fullscreen
+bind	#[	tiling	dispatch	0	Win+BracketLeft	alone: merge into the column on that side; stacked: pop out to that side	consume-or-expel<US>left
+bind	#]	tiling	dispatch	0	Win+BracketRight	alone: merge into the column on that side; stacked: pop out to that side	consume-or-expel<US>right
+bind	#+b	tiling	dispatch	0	Win+Shift+B	book / strip layout on this screen (columns out of view piled or parked)	set-layout<US>toggle
+bind	#Space	always	launcher	0	Win+Space	application launcher (apps; window - x and file - x search those instead)	
+bind	#d	always	launcher	0	Win+D	application launcher (apps; window - x and file - x search those instead)	
+bind	#t	always	spawn	0	Win+T	run alacritty	alacritty
+bind	#+t	always	spawn	1	Win+Shift+T	run alacritty as admin	alacritty
+bind	#!t	always	spawn	0	Win+Alt+T	run wt	wt
+bind	#!+t	always	spawn	1	Win+Alt+Shift+T	run wt as admin	wt
+bind	#+vkBF	always	help	0	Win+Shift+Slash	this help (Esc hides it)	
+bind	#+e	always	quit	0	Win+Shift+E	stop FlowWM	
+row	Win+Left/Down/Up/Right	focus the next window on this screen
+row	Win+WheelUp/WheelDown/WheelLeft/WheelRight	focus the next window on this screen
 row	Alt+H/J/K/L	focus the next window on this screen
-row	Mod+Shift+Left/Down/Up/Right	move the window along the strip (up/down inside a stacked column)
-row	Mod+Shift+WheelUp/WheelDown/WheelLeft/WheelRight	move the window along the strip (up/down inside a stacked column)
+row	Win+Shift+Left/Down/Up/Right	move the window along the strip (up/down inside a stacked column)
+row	Win+Shift+WheelUp/WheelDown/WheelLeft/WheelRight	move the window along the strip (up/down inside a stacked column)
 row	Alt+Shift+H/J/K/L	move the window along the strip (up/down inside a stacked column)
-row	Mod+Ctrl+Left/Down/Up/Right	focus the other screen
-row	Mod+Ctrl+WheelUp/WheelDown/WheelLeft/WheelRight	focus the other screen
-row	Mod+Alt+Left/Down/Up/Right	move the window to the other screen
-row	Mod+Alt+WheelUp/WheelDown/WheelLeft/WheelRight	move the window to the other screen
-row	Mod+1..9, Mod+0	switch to that workspace
-row	Mod+Ctrl+1..9, Mod+Ctrl+0	move the window to that workspace
-row	Mod+Q	close window
-row	Mod+M	minimize window
-row	Mod+C	center the focused column
-row	Mod+V	toggle floating
-row	Mod+Shift+V	switch focus between the floating and the tiled windows
-row	Mod+R	cycle this screen's column widths (flow.toml [columns] presets)
-row	Mod+F	fullscreen toggle
-row	Mod+BracketLeft, Mod+BracketRight	alone: merge into the column on that side; stacked: pop out to that side
-row	Mod+Shift+B	book / strip layout on this screen (columns out of view piled or parked)
-row	Mod+Space, Mod+D	application launcher (apps; window - x and file - x search those instead)
-row	Mod+T	run alacritty
-row	Mod+Shift+T	run alacritty as admin
-row	Mod+Alt+T	run wt
-row	Mod+Alt+Shift+T	run wt as admin
-row	Mod+Shift+Slash	this help (Esc hides it)
-row	Mod+Shift+E	stop FlowWM
-hardwired	Mod + left-button drag	move a window grabbed anywhere (a tile drops into the zone under the cursor, a float moves; a click without moving only activates it)
-hardwired	Mod+Ctrl+T	FlowWM off (and on again, via flow-resident.ahk)
-hardwired	Mod+Ctrl+Shift+T	pause toggle (off: Windows manages windows, chords fall through)
+row	Win+Ctrl+Left/Down/Up/Right	focus the other screen
+row	Win+Ctrl+WheelUp/WheelDown/WheelLeft/WheelRight	focus the other screen
+row	Win+Alt+Left/Down/Up/Right	move the window to the other screen
+row	Win+Alt+WheelUp/WheelDown/WheelLeft/WheelRight	move the window to the other screen
+row	Win+1..9, Win+0	switch to that workspace
+row	Win+Ctrl+1..9, Win+Ctrl+0	move the window to that workspace
+row	Win+Q	close window
+row	Win+M	minimize window
+row	Win+C	center the focused column
+row	Win+V	toggle floating
+row	Win+Shift+V	switch focus between the floating and the tiled windows
+row	Win+R	cycle this screen's column widths (flow.toml [columns] presets)
+row	Win+F	fullscreen toggle
+row	Win+BracketLeft, Win+BracketRight	alone: merge into the column on that side; stacked: pop out to that side
+row	Win+Shift+B	book / strip layout on this screen (columns out of view piled or parked)
+row	Win+Space, Win+D	application launcher (apps; window - x and file - x search those instead)
+row	Win+T	run alacritty
+row	Win+Shift+T	run alacritty as admin
+row	Win+Alt+T	run wt
+row	Win+Alt+Shift+T	run wt as admin
+row	Win+Shift+Slash	this help (Esc hides it)
+row	Win+Shift+E	stop FlowWM
+hardwired	Win + left-button drag	move a window grabbed anywhere (a tile drops into the zone under the cursor, a float moves; a click without moving only activates it)
+hardwired	Win+Ctrl+T	FlowWM off (and on again, via flow-resident.ahk)
+hardwired	Win+Ctrl+Shift+T	pause toggle (off: Windows manages windows, chords fall through)
 option	selection_buffer	0
 source	defaults
 )"

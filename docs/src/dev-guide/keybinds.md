@@ -33,8 +33,9 @@ flowchart LR
    problem is collected, not just the first, and named by its key
    (`binds."Mod+Bogus": unknown key "Bogus" (...)`), so `flow config check`
    lists them all. Two spellings of one chord in the same table
-   (`Mod+Shift+Left`, `shift+mod+left`) are an error rather than a silent
-   last-wins.
+   (`Mod+Shift+Left`, `shift+mod+left`, `Win+Shift+Left`) are an error
+   rather than a silent last-wins; the message quotes both keys as the
+   user wrote them and the canonical chord in parentheses.
 3. **Order.** TOML tables are unordered and the parser sorts their keys, so
    the resolved list is put in a canonical order instead: by group (focus,
    move, monitors, workspaces, the column actions, then raw dispatches,
@@ -52,7 +53,7 @@ flowchart LR
    record per bind (canonical chord, AutoHotkey hotkey string, action text,
    kind, argv, admin flag, scope, help line), the overlay rows with
    consecutive binds of one group and modifier set collapsed
-   (`Mod+Left/Down/Up/Right`, `Mod+1..9, Mod+0`, `Alt+H/J/K/L`), the
+   (`Win+Left/Down/Up/Right`, `Win+1..9, Win+0`, `Alt+H/J/K/L`), the
    hardwired chords, the keymap options (`[keymap] selection_buffer`, carried
    to the script as an `option selection_buffer 0|1` record in `--plain`,
    ADR-0026), and the source (`defaults` or `flow.toml`). `--plain`
@@ -104,7 +105,11 @@ paste when the defaults change.
 
 `Chord::parse` splits on `+`; the last word is the key, the rest modifiers
 (`Mod` / `Super` / `Win`, `Ctrl` / `Control`, `Alt`, `Shift`, any order and
-case). The AutoHotkey string is the modifiers' prefixes (`#`, `^`, `!`,
+case). The canonical text, which every output uses (the report's `chord`
+field, the overlay rows, the hardwired rows, the `(...)` in a duplicate
+message), names the Windows key `Win` (`Win+Shift+Left`), the key on the
+keyboard, while the tables keep niri's `Mod` (ADR-0031). The AutoHotkey
+hotkey string (`#+Left`) is unaffected. The AutoHotkey string is the modifiers' prefixes (`#`, `^`, `!`,
 `+`) and the key's AutoHotkey name. Letters, digits and `F1`..`F24` map to
 themselves; the named keys are a table in `binds.rs` (`BracketLeft` → `[`,
 `Page_Up` → `PgUp`, `WheelDown` → `WheelDown`, ...), and `KEY_ALIASES`
