@@ -56,6 +56,18 @@ pub struct WindowCandidate {
     pub process_path: String,
 }
 
+// ── Lock screen ─────────────────────────────────────────────────────
+
+/// Whether `exe` / `class` name a lock-screen surface: LockApp.exe's
+/// window, or one of explorer.exe's `LockScreen*` frames. The same windows
+/// the bundled lock-screen rules ignore; the registry uses this to log them
+/// quietly and to drop them when they hide. ADR-0030.
+#[must_use]
+pub fn is_lock_surface(exe: &str, class: &str) -> bool {
+    exe.eq_ignore_ascii_case("LockApp.exe")
+        || (exe.eq_ignore_ascii_case("explorer.exe") && class.starts_with("LockScreen"))
+}
+
 // ── matches_rule ────────────────────────────────────────────────────
 
 /// Test whether a window candidate matches all specified fields in a rule.
@@ -1523,6 +1535,96 @@ mod tests {
             WindowAction::Tile,
             "user rule should override embedded default for Shell_TrayWnd"
         );
+    }
+
+    /// ADR-0030: the lock-screen surfaces (explorer's two `LockScreen*`
+    /// frames, LockApp's window) are ignored by the bundled rules whatever
+    /// the fallback action, and LockApp stays ignored when it is not
+    /// full-screen (an offset rect).
+    #[test]
+    fn embedded_default_rules_ignore_lock_screen_surfaces() {
+        use crate::config::lifecycle::load_default_rules;
+        let surfaces = [
+            candidate("explorer.exe", "", "LockScreenBackstopFrame", ""),
+            candidate("explorer.exe", "", "LockScreenInputOcclusionFrame", ""),
+            candidate(
+                "LockApp.exe",
+                "Windows Default Lock Screen",
+                "Windows.UI.Core.CoreWindow",
+                "",
+            ),
+        ];
+        for fallback in [WindowAction::Float, WindowAction::Tile] {
+            let pipeline = ClassificationPipeline::new(
+                WindowRulesConfig {
+                    default_action: fallback,
+                    rules: vec![],
+                },
+                load_default_rules(),
+            );
+            for c in &surfaces {
+                assert!(
+                    matches!(
+                        classify_with_state_pipeline(c, false, false, &pipeline),
+                        WindowState::Ignored(IgnoredReason::ExplicitRule)
+                    ),
+                    "{} {} under {fallback:?}",
+                    c.exe,
+                    c.class
+                );
+                assert!(is_lock_surface(&c.exe, &c.class));
+            }
+            // An ordinary explorer window still falls through to the fallback.
+            let other = candidate("explorer.exe", "", "SomeOtherFrame", "");
+            assert_eq!(pipeline.classify(&other), fallback);
+            assert!(!is_lock_surface(&other.exe, &other.class));
+        }
+        // The class prefix alone is not enough: another exe is not a lock surface.
+        assert!(!is_lock_surface("app.exe", "LockScreenBackstopFrame"));
+    }
+
+    /// ADR-0030: the lock-screen rules are bundled defaults, so a user rule
+    /// that matches the same windows still wins (precedence is unchanged):
+    /// `exe = "explorer.exe"` with no class floats the lock frames too, while
+    /// a class-scoped explorer rule leaves them to the bundled ignore.
+    #[test]
+    fn user_explorer_rule_outranks_the_lock_screen_rules() {
+        use crate::config::lifecycle::load_default_rules;
+        let frame = candidate("explorer.exe", "", "LockScreenBackstopFrame", "");
+        let cabinet = candidate("explorer.exe", "Home", "CabinetWClass", "");
+
+        let broad = ClassificationPipeline::new(
+            WindowRulesConfig {
+                default_action: WindowAction::Tile,
+                rules: vec![rule(
+                    MatchRule {
+                        exe: Some("explorer.exe".into()),
+                        ..Default::default()
+                    },
+                    WindowAction::Float,
+                )],
+            },
+            load_default_rules(),
+        );
+        assert_eq!(broad.classify(&cabinet), WindowAction::Float);
+        assert_eq!(broad.classify(&frame), WindowAction::Float);
+
+        let scoped = ClassificationPipeline::new(
+            WindowRulesConfig {
+                default_action: WindowAction::Tile,
+                rules: vec![rule(
+                    MatchRule {
+                        exe: Some("explorer.exe".into()),
+                        class: Some("CabinetWClass".into()),
+                        ..Default::default()
+                    },
+                    WindowAction::Float,
+                )],
+            },
+            load_default_rules(),
+        );
+        assert_eq!(scoped.classify(&cabinet), WindowAction::Float);
+        assert_eq!(scoped.classify(&frame), WindowAction::Ignore);
     }
 
     // --- Pipeline regex rule tests (pre-compiled via ClassificationPipeline) ---

@@ -536,3 +536,12 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   wheel chord step at most once per 150 ms, swallowing the ticks between; the
   plain wheel and unbound chords are never registered, and wheel chords get
   no Remote Desktop twin. `docs/adr/0029-mod-wheel-chords.md`
+- **ADR-0030 — Lock-screen surfaces are ignored.** When the session locks,
+  explorer.exe shows two `LockScreen*` frames and LockApp.exe its
+  `Windows.UI.Core.CoreWindow`; with no rule they became floats or tiles and
+  were centred, foregrounded and made topmost, which shifted the lock picture.
+  Built-in ignore rules cover `LockApp.exe` and explorer's `^LockScreen`
+  classes, those classes are shell classes (never learned, never topmost, no
+  `set-window` target), and a hidden lock surface leaves the registry instead
+  of lingering as a stale entry. A user `exe = "explorer.exe"` rule without a
+  class still wins. `docs/adr/0030-lock-screen-surfaces-are-ignored.md`

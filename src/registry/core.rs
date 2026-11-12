@@ -327,6 +327,17 @@ impl WindowRegistry {
         } else {
             classified
         };
+        if matches!(state, WindowState::Ignored(_))
+            && classification::is_lock_surface(&info.exe, &info.class)
+        {
+            log::debug!(
+                "lock surface {:#x} ({} {:?}) ignored: {:?}",
+                info.hwnd.0 as isize,
+                info.exe,
+                info.class,
+                state
+            );
+        }
 
         let invisible_bounds = if info.is_iconic {
             InvisibleBounds::zero()
@@ -452,6 +463,30 @@ impl WindowRegistry {
         } else {
             log::debug!("remove_window: isize={hwnd_val} not in registry");
         }
+    }
+
+    /// Drop `hwnd_val` when it is an ignored lock surface
+    /// ([`classification::is_lock_surface`]) that is no longer user-visible
+    /// (hidden, cloaked or iconic); `true` when it was dropped. LockApp's
+    /// window is hidden at unlock, not destroyed, so without this it stays
+    /// in the registry until the next lock. Shown again, it registers anew.
+    /// ADR-0030.
+    pub fn drop_hidden_lock_surface(&mut self, hwnd_val: isize) -> bool {
+        let Some(window) = self.windows.get(&hwnd_val) else {
+            return false;
+        };
+        if !matches!(window.state, WindowState::Ignored(_))
+            || !classification::is_lock_surface(&window.exe, &window.class)
+        {
+            return false;
+        }
+        let h = HWND(hwnd_val as *mut _);
+        if win32::is_window_visible(h) && !win32::is_cloaked(h) && !win32::is_iconic(h) {
+            return false;
+        }
+        log::debug!("lock surface {hwnd_val:#x} hidden; dropped from the registry");
+        self.remove_window(hwnd_val);
+        true
     }
 
     /// Updates the focused window handle.
@@ -3568,6 +3603,65 @@ mod tests {
     // (untracked → Unchanged, already-Hidden → Unchanged when the Win32
     // check agrees).
     // TODO: integration test with a real hidden window.
+
+    /// ADR-0030: an ignored lock surface that is not user-visible (a test
+    /// handle never is) leaves the registry; an ignored ordinary window, a
+    /// lock surface a user rule floats, and an untracked handle stay as
+    /// they are.
+    #[test]
+    fn drop_hidden_lock_surface_only_drops_ignored_lock_surfaces() {
+        let (user, default) = default_rules();
+        let mut reg = WindowRegistry::new(&user, &default);
+        let mut add = |hwnd: isize, exe: &str, class: &str, state: WindowState| {
+            let window = Window::new(
+                HWND(hwnd as *mut _),
+                exe.into(),
+                String::new(),
+                class.into(),
+                std::path::PathBuf::new(),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                },
+                state,
+                InvisibleBounds::zero(),
+            );
+            reg.windows.insert(hwnd, window);
+        };
+        add(
+            71,
+            "LockApp.exe",
+            "Windows.UI.Core.CoreWindow",
+            WindowState::Ignored(IgnoredReason::Fullscreen),
+        );
+        add(
+            72,
+            "explorer.exe",
+            "LockScreenBackstopFrame",
+            WindowState::Ignored(IgnoredReason::ExplicitRule),
+        );
+        add(
+            73,
+            "explorer.exe",
+            "CabinetWClass",
+            WindowState::Ignored(IgnoredReason::ExplicitRule),
+        );
+        add(
+            74,
+            "explorer.exe",
+            "LockScreenInputOcclusionFrame",
+            WindowState::Floating(FloatingState::Hidden),
+        );
+        assert!(reg.drop_hidden_lock_surface(71));
+        assert!(reg.drop_hidden_lock_surface(72));
+        assert!(!reg.drop_hidden_lock_surface(73));
+        assert!(!reg.drop_hidden_lock_surface(74));
+        assert!(!reg.drop_hidden_lock_surface(75));
+        assert!(!reg.is_tracked(71) && !reg.is_tracked(72));
+        assert!(reg.is_tracked(73) && reg.is_tracked(74));
+    }
 
     #[test]
     fn reconcile_visibility_untracked_returns_unchanged() {

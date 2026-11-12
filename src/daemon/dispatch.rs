@@ -1979,8 +1979,17 @@ impl FlowWM {
             self.registry.set_focused(fg);
             return Ok((WindowId(fg), mode));
         }
+        // The registry's focus is no target either when it is a shell
+        // surface (a lock-screen frame the foreground hook recorded,
+        // ADR-0030): `set-window` would adopt it.
         self.registry
             .focused()
+            .filter(|f| {
+                !self
+                    .registry
+                    .get_window(HWND(f.0 as *mut _))
+                    .is_some_and(|w| top_layer::is_shell_class(&w.class))
+            })
             .map(|f| (f, mode))
             .ok_or_else(|| "no focused window".to_owned())
     }
@@ -3089,6 +3098,35 @@ mod tests {
         assert_eq!(exes, ["alacritty.exe", "Code.exe"]);
     }
 
+    /// ADR-0030: a learned rule for a lock-screen surface (explorer's two
+    /// `LockScreen*` frames, LockApp's `Windows.UI.Core.CoreWindow`) never
+    /// reaches the pipeline either.
+    #[test]
+    fn learned_rules_for_pipeline_skips_lock_screen_surfaces() {
+        let mut history = HistoryStore::default();
+        history.record(
+            WindowAction::Float,
+            "explorer.exe",
+            Some("LockScreenBackstopFrame"),
+        );
+        history.record(
+            WindowAction::Tile,
+            "explorer.exe",
+            Some("LockScreenInputOcclusionFrame"),
+        );
+        history.record(
+            WindowAction::Float,
+            "LockApp.exe",
+            Some("Windows.UI.Core.CoreWindow"),
+        );
+        history.record(WindowAction::Tile, "explorer.exe", Some("CabinetWClass"));
+        let kept: Vec<_> = learned_rules_for_pipeline(&history)
+            .into_iter()
+            .map(|r| r.match_.class.unwrap_or_default())
+            .collect();
+        assert_eq!(kept, ["CabinetWClass"]);
+    }
+
     // ── resolve_unknown_focus: set-window on a window the registry never met ──
 
     /// A tracked foreground is untouched: the mode passes through, no
@@ -3319,6 +3357,34 @@ mod tests {
                     .map(|w| &w.state),
                 Some(WindowState::Ignored(IgnoredReason::Elevated))
             ));
+        }
+    }
+
+    /// ADR-0030: a lock-screen frame (or any shell surface) the registry
+    /// holds as its focus is no `set-window` target: refused, not adopted,
+    /// nothing learned.
+    #[test]
+    fn set_window_on_a_focused_shell_surface_is_refused() {
+        for mode in [WindowMode::Tile, WindowMode::Float, WindowMode::Cycle] {
+            let mut flow =
+                flow_with_focused_state(WindowState::Ignored(IgnoredReason::ExplicitRule));
+            if let Some(w) = flow.registry.get_window_mut(HWND(TEST_HWND as *mut _)) {
+                w.exe = "explorer.exe".into();
+                w.class = "LockScreenBackstopFrame".into();
+            }
+            match flow.dispatch_set_window(mode) {
+                SocketResponse::Error { message } => {
+                    assert!(message.contains("no focused window"), "{message}")
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+            assert!(matches!(
+                flow.registry
+                    .get_window(HWND(TEST_HWND as *mut _))
+                    .map(|w| &w.state),
+                Some(WindowState::Ignored(IgnoredReason::ExplicitRule))
+            ));
+            assert!(flow.history.rules().is_empty());
         }
     }
 

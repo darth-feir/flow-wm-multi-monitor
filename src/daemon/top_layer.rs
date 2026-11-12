@@ -100,13 +100,17 @@ impl TopmostProbe for Win32Topmost {
 /// taskbars, the desktop, Start / search, the Alt+Tab host, and the
 /// daemon's own surfaces (the keymap's OSD is shown `NoActivate` and never
 /// takes the foreground). Why they are not "non-flow windows" is in the dev
-/// guide (*The floating layer*, the shell exception).
+/// guide (*The floating layer*, the shell exception). The two explorer
+/// lock-screen frames are here too (LockApp's own window is a
+/// `Windows.UI.Core.CoreWindow`): ADR-0030.
 pub(super) const SHELL_CLASSES: &[&str] = &[
     "Shell_TrayWnd",
     "Shell_SecondaryTrayWnd",
     "Progman",
     "WorkerW",
     "Windows.UI.Core.CoreWindow",
+    "LockScreenBackstopFrame",
+    "LockScreenInputOcclusionFrame",
     "XamlExplorerHostIslandWindow",
     "ForegroundStaging",
     "FlowBorderOverlay",

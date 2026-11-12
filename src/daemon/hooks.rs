@@ -452,6 +452,10 @@ impl FlowWM {
         self.abandon_manual_drag_for(hwnd);
         // A hidden rider leaves the band and is forgotten (ADR-0024).
         self.forget_rider(hwnd, false);
+        // A lock surface leaves the registry once it hides (ADR-0030).
+        if self.registry.drop_hidden_lock_surface(hwnd) {
+            return;
+        }
 
         // Tiling off: registry only (see `on_window_minimized`).
         if self.tiling_paused {

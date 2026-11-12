@@ -86,6 +86,22 @@ action = "ignore"
 match = { exe = "ShellExperienceHost.exe", class = "Windows.UI.Core.CoreWindow" }
 action = "ignore"
 
+# ── Lock screen ─────────────────────────────────────────────────────
+
+# The lock screen is left entirely to Windows. Locking the session shows
+# LockApp.exe's full-screen `Windows.UI.Core.CoreWindow` over two explorer.exe
+# frames (`LockScreenBackstopFrame`, `LockScreenInputOcclusionFrame`). Without
+# these rules default_action = "float" centred, animated and foregrounded the
+# frames and shifted the lock picture off the screen. A user rule that matches
+# these windows (say `exe = "explorer.exe"` with no class) still wins. ADR-0030.
+[[rules]]
+match = { exe = "LockApp.exe" }
+action = "ignore"
+
+[[rules]]
+match = { exe = "explorer.exe", class_regex = '^LockScreen' }
+action = "ignore"
+
 # ── System Dialogs ──────────────────────────────────────────────────
 
 # Common Win32 dialog boxes (Open/Save As, Properties, etc.)
