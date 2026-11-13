@@ -225,11 +225,15 @@ follow the `[binds]` table; the list above is the default one.
 - **`#+/` never fires in AutoHotkey v2** (Shift changes how `/` resolves),
   so the help chord binds the physical key by virtual-key code: `vkBF` =
   `VK_OEM_2` = the `/ ?` key on US layouts.
-- **Never `TrayTip` for status messages.** Windows 11 turns a tray tip into
-  a toast that stays until dismissed and holds the foreground lock, so
-  neither this script's windows nor the daemon's focus pushes can take the
-  foreground meanwhile. `Osd()` shows a click-through (`E0x20`), no-activate
-  tool window in the bottom-right corner of the primary screen instead.
+- **`Osd()`, not `TrayTip`, for status messages.** Windows 11 turns a tray
+  tip into a toast that lingers for seconds and queues behind others, which
+  is wrong for a short status line. A toast does not take the foreground and
+  does not block `WinActivate` or the daemon's focus pushes (VM matrix,
+  ADR-0033; an older note here said it did, from a build with a since-fixed
+  `AttachThreadInput` bug). What does refuse every push is a shell flyout the
+  user opened (Start, the notification center): Windows keeps it in front
+  until it is dismissed. `Osd()` shows a click-through (`E0x20`), no-activate
+  tool window in the bottom-right corner of the primary screen.
 - **A GUI shown from a chord may not get the foreground** while the Win key
   is still held. `ShowCentered()` centres the window on the work area of
   the monitor that holds the active window, then retries `WinActivate` for

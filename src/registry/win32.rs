@@ -38,6 +38,7 @@ use windows::Win32::Graphics::Dwm::{
     DWM_WINDOW_CORNER_PREFERENCE, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
     DWMWA_WINDOW_CORNER_PREFERENCE, DwmGetWindowAttribute,
 };
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentThreadId, OpenProcess, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -102,6 +103,10 @@ pub struct WindowInfo {
     /// UIPI: elevated (or its token unreadable) while flowd is not
     /// ([`elevation_blocks`], ADR-0025).
     pub is_elevated: bool,
+    /// The window's z-order band (`GetWindowBand`, [`window_band`]); `None`
+    /// when it could not be read. Above the UIAccess band it marks a shell
+    /// surface flow never manages (ADR-0033).
+    pub band: Option<u32>,
 }
 
 // ── String conversion helpers ──────────────────────────────────────
@@ -698,13 +703,30 @@ pub fn window_description(hwnd_val: isize) -> String {
 /// the outcome themselves ([`clear_foreground_window`]).
 fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> ForegroundPush {
     let target_hwnd = HWND(hwnd_val as *mut _);
+    // Get the current foreground window.
+    let foreground_hwnd = unsafe { GetForegroundWindow() };
+    // A shell surface in front (Start, a flyout, Alt+Tab, the lock screen:
+    // a band above the desktop's, ADR-0033) may refuse the push; that is
+    // the shell's call, not a fault, so it is reported at debug.
+    let fg_band = if foreground_hwnd.0.is_null() {
+        None
+    } else {
+        window_band(foreground_hwnd)
+    };
+    let shell_in_front = crate::registry::classification::is_shell_band(fg_band);
     let report = |message: String| {
-        if quiet {
-            log::debug!("{message}");
+        if quiet || shell_in_front {
+            let note = if shell_in_front {
+                format!(" (foreground held by shell band {})", fg_band.unwrap_or(0))
+            } else {
+                String::new()
+            };
+            log::debug!("{message}{note}");
         } else {
             log::warn!("{message}");
         }
     };
+
     // A direct `SetForegroundWindow` (no foreground lock to defeat), with
     // its error code classified. The report is deferred by the caller: with
     // another thread's input attached, a FALSE here is often followed by
@@ -741,9 +763,6 @@ fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> ForegroundPush {
         ));
         outcome
     };
-
-    // Get the current foreground window.
-    let foreground_hwnd = unsafe { GetForegroundWindow() };
 
     // No foreground window means no foreground lock to defeat — try the
     // direct call. Benign (happens at startup or with no app focused),
@@ -1752,6 +1771,37 @@ pub fn window_is_elevated(hwnd: HWND) -> bool {
     elevation_blocks(daemon, process_elevation(pid))
 }
 
+/// `GetWindowBand` (user32, exported but undocumented): the z-order band
+/// of a top-level window.
+type GetWindowBandFn = unsafe extern "system" fn(HWND, *mut u32) -> windows::core::BOOL;
+
+/// `user32!GetWindowBand`, looked up once per process; `None` when this
+/// Windows build does not export it.
+fn get_window_band_fn() -> Option<GetWindowBandFn> {
+    static FN: std::sync::OnceLock<Option<GetWindowBandFn>> = std::sync::OnceLock::new();
+    *FN.get_or_init(|| {
+        let module = unsafe { GetModuleHandleW(windows::core::w!("user32.dll")) }.ok()?;
+        let proc = unsafe { GetProcAddress(module, windows::core::s!("GetWindowBand")) }?;
+        // SAFETY: the export has this signature on every build that has it
+        // (ADR-0033); a FARPROC is a plain function pointer of the same size.
+        Some(unsafe {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, GetWindowBandFn>(proc)
+        })
+    })
+}
+
+/// The z-order band of `hwnd` (`ZBID_*`: 1 desktop, 2 UIAccess, 4
+/// notifications, 6 Start, 16 Alt+Tab, 17+ lock screen). `None` when the
+/// export is missing or the call fails: callers treat that as "not a shell
+/// surface", so the class and exe rules decide alone. ADR-0033.
+#[must_use]
+pub fn window_band(hwnd: HWND) -> Option<u32> {
+    let f = get_window_band_fn()?;
+    let mut band = 0u32;
+    // SAFETY: `band` outlives the call; a stale handle makes it return FALSE.
+    unsafe { f(hwnd, &mut band) }.as_bool().then_some(band)
+}
+
 /// Internal helper: queries the full image name from an open process handle.
 ///
 /// # Buffer Strategy
@@ -1867,6 +1917,8 @@ pub fn get_window_info(hwnd: HWND) -> Result<WindowInfo, String> {
         )
     };
 
+    let band = window_band(hwnd);
+
     let pid = match get_window_thread_process_id(hwnd) {
         Ok(p) => p,
         Err(_) => {
@@ -1882,6 +1934,7 @@ pub fn get_window_info(hwnd: HWND) -> Result<WindowInfo, String> {
                 is_fullscreen,
                 is_iconic,
                 is_elevated: false,
+                band,
             });
         }
     };
@@ -1902,6 +1955,7 @@ pub fn get_window_info(hwnd: HWND) -> Result<WindowInfo, String> {
         is_fullscreen,
         is_iconic,
         is_elevated,
+        band,
     })
 }
 
@@ -2280,6 +2334,11 @@ pub fn set_window_placement(hwnd: HWND, placement: &WindowPlacement) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_band_of_a_dead_handle_is_unknown() {
+        assert_eq!(window_band(HWND(std::ptr::null_mut())), None);
+    }
 
     /// Helper to create a null HWND (invalid, not a real window).
     fn null_hwnd() -> HWND {

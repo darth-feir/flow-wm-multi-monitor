@@ -69,8 +69,8 @@ AhkLog(msg) {
 }
 
 ; Short on-screen message in the bottom-right corner of the primary screen,
-; gone after `ms`. Never TrayTip: on Windows 11 the toast holds the
-; foreground lock until dismissed (see README.md).
+; gone after `ms`. Not TrayTip: a toast lingers and queues, the wrong tool for
+; a short status line; it does not block focus changes (ADR-0033, README.md).
 ; The static must not be called `gui`: a local of that name shadows the Gui
 ; class (names are case-insensitive) and `Gui(...)` then calls an Integer.
 Osd(msg, ms := 2500) {

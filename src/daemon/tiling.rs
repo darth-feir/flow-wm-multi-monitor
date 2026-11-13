@@ -906,6 +906,7 @@ mod tests {
             is_fullscreen: false,
             is_iconic: false,
             is_elevated: false,
+            band: None,
         }
     }
 

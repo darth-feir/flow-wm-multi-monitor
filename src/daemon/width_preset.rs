@@ -420,6 +420,7 @@ mod tests {
             is_fullscreen: false,
             is_iconic: false,
             is_elevated: false,
+            band: None,
         };
         registry.register_window_from_info(&info);
         if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {
@@ -1187,7 +1188,6 @@ default = "1/2"
         assert!(report.hardwired.iter().any(|r| r.chords == "Middle click"));
     }
 
-    #[test]
     /// A `[binds]` table set aside at start: `flow query binds` answers with
     /// the defaults and the problems; a refused reload keeps them, an applied
     /// one clears them.
@@ -1253,6 +1253,7 @@ default = "1/2"
         assert!(report.set_aside.is_empty());
     }
 
+    #[test]
     fn reload_refuses_a_list_that_does_not_fit_a_screen_and_keeps_the_old_config() {
         let mut flow = fixture();
         flow.config.borders.enabled = false;

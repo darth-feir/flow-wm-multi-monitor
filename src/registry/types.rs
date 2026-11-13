@@ -271,6 +271,12 @@ pub struct Window {
     #[serde(default)]
     pub on_top: bool,
 
+    /// The window's z-order band at arrival (`GetWindowBand`; `None` when
+    /// it could not be read). Reported as `band` by `flow query all`.
+    /// ADR-0033.
+    #[serde(default)]
+    pub band: Option<u32>,
+
     /// The `WS_EX_TOPMOST` flag the window had **before** the daemon put it
     /// in the floating layer, meaningful only while [`on_top`](Self::on_top)
     /// is set. A window that was topmost on its own (some apps' "always on
@@ -343,6 +349,7 @@ impl Window {
             geometry_from_placement: false,
             on_top: false,
             was_topmost: false,
+            band: None,
         }
     }
 }
@@ -525,7 +532,8 @@ pub enum FloatingState {
 /// with tiling.
 ///
 /// `Elevated` wins over everything: no rule, maximize or fullscreen state
-/// can make flow manage a window it is not allowed to move.
+/// can make flow manage a window it is not allowed to move. `ShellBand`
+/// comes next, also ahead of every rule (ADR-0033).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IgnoredReason {
     /// Window is maximized (`WS_MAXIMIZE` style).
@@ -538,6 +546,11 @@ pub enum IgnoredReason {
     /// is not: UIPI refuses every move, so it is left unmanaged. Decided
     /// once at arrival and never re-evaluated (ADR-0025).
     Elevated,
+    /// The window sits in a z-order band above the desktop's and the
+    /// UIAccess band (a toast, a flyout, Start, Alt+Tab, the lock screen):
+    /// a shell surface, never managed whatever the rules say. Decided once
+    /// at arrival (ADR-0033).
+    ShellBand(u32),
 }
 
 // ── RestoreSeat ─────────────────────────────────────────────────────

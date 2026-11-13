@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
 
+use crate::registry::classification::is_shell_band;
 use crate::registry::types::{FloatingState, IgnoredReason, TilingState, WindowState};
 use crate::registry::win32 as registry_win32;
 
@@ -61,6 +62,11 @@ pub(super) trait TopmostProbe {
     fn owner_of(&self, hwnd: isize) -> Option<isize>;
     /// `IsWindowVisible` ([`registry_win32::is_window_visible`]).
     fn is_visible(&self, hwnd: isize) -> bool;
+    /// The window's z-order band ([`registry_win32::window_band`]);
+    /// `None` when unknown, which is also what test probes answer.
+    fn band(&self, _hwnd: isize) -> Option<u32> {
+        None
+    }
 }
 
 /// The production [`TopmostProbe`]: plain Win32.
@@ -94,6 +100,10 @@ impl TopmostProbe for Win32Topmost {
     fn is_visible(&self, hwnd: isize) -> bool {
         registry_win32::is_window_visible(HWND(hwnd as *mut _))
     }
+
+    fn band(&self, hwnd: isize) -> Option<u32> {
+        registry_win32::window_band(HWND(hwnd as *mut _))
+    }
 }
 
 /// Window classes whose activation leaves the layer's decision alone: the
@@ -121,6 +131,15 @@ pub(super) const SHELL_CLASSES: &[&str] = &[
 #[must_use]
 pub(super) fn is_shell_class(class: &str) -> bool {
     SHELL_CLASSES.contains(&class)
+}
+
+/// Whether a window is a shell surface: its class is one of
+/// [`SHELL_CLASSES`], or its z-order band (`None`: unknown) is above the
+/// desktop's and the UIAccess band ([`is_shell_band`], ADR-0033). The band
+/// is the backstop for a shell surface no class list names yet.
+#[must_use]
+pub(super) fn is_shell_surface(class: &str, band: Option<u32>) -> bool {
+    is_shell_class(class) || is_shell_band(band)
 }
 
 /// How many `GW_OWNER` hops [`anchor_of`] walks before it gives up.
@@ -361,7 +380,7 @@ impl FlowWM {
         let window = self.registry.get_window(HWND(hwnd as *mut _))?;
         // Start / search surfaces an explicit rule ignores are never members
         // (they would get `HWND_TOPMOST` on every raise).
-        if is_shell_class(&window.class) {
+        if is_shell_surface(&window.class, window.band) {
             return Some(false);
         }
         Some(layer_wanted(
@@ -411,6 +430,9 @@ impl FlowWM {
             return (ForegroundOwner::Shell, None);
         };
         if let Some(w) = self.registry.get_window(HWND(hwnd as *mut _)) {
+            if is_shell_band(w.band) {
+                return (ForegroundOwner::Shell, None);
+            }
             let fullscreen_live = owns_foreground(&w.state) && probe.is_fullscreen_live(hwnd);
             return (
                 classify_foreground(Some(&w.class), Some(&w.state), fullscreen_live),
@@ -418,6 +440,9 @@ impl FlowWM {
             );
         }
         let class = probe.class_name(hwnd);
+        if class.is_some() && is_shell_band(probe.band(hwnd)) {
+            return (ForegroundOwner::Shell, None);
+        }
         let anchor = class
             .as_deref()
             .filter(|c| !is_shell_class(c))
@@ -979,6 +1004,7 @@ mod tests {
             is_fullscreen: false,
             is_iconic: false,
             is_elevated: false,
+            band: None,
         };
         registry.register_window_from_info(&info);
         if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {
@@ -1049,6 +1075,7 @@ mod tests {
         below: RefCell<Vec<(isize, isize)>>,
         owners: RefCell<HashMap<isize, isize>>,
         hidden: RefCell<HashSet<isize>>,
+        bands: RefCell<HashMap<isize, u32>>,
     }
 
     impl MockTopmost {
@@ -1067,6 +1094,12 @@ mod tests {
         /// An untracked window of class `class` owned by `owner`.
         fn with_owned(self, hwnd: isize, class: &str, owner: isize) -> Self {
             self.owners.borrow_mut().insert(hwnd, owner);
+            self.with_window(hwnd, class)
+        }
+
+        /// An untracked window of class `class` in z-order band `band`.
+        fn with_band(self, hwnd: isize, class: &str, band: u32) -> Self {
+            self.bands.borrow_mut().insert(hwnd, band);
             self.with_window(hwnd, class)
         }
 
@@ -1114,6 +1147,10 @@ mod tests {
 
         fn is_visible(&self, hwnd: isize) -> bool {
             !self.hidden.borrow().contains(&hwnd)
+        }
+
+        fn band(&self, hwnd: isize) -> Option<u32> {
+            self.bands.borrow().get(&hwnd).copied()
         }
     }
 
@@ -1520,6 +1557,36 @@ mod tests {
         // A handle that vanished before the sink ran: kept too.
         assert_eq!(flow.evaluate_top_layer_with(Some(0x99), &probe), None);
         assert!(!flow.top_layer_raised);
+    }
+
+    /// ADR-0033: a surface of an unknown class in a shell band (a new
+    /// flyout, a renamed toast host) leaves the decision alone like a known
+    /// shell class; the same class in the desktop band is foreign.
+    #[test]
+    fn a_window_in_a_shell_band_leaves_the_decision_alone() {
+        const N: isize = 0x8;
+        const D: isize = 0x9;
+        let mut flow = fixture();
+        let probe =
+            desktop()
+                .with_band(N, "SomeFutureFlyout", 4)
+                .with_band(D, "SomeFutureFlyout", 1);
+        flow.sync_all_top_layer_with(&probe);
+        assert_eq!(flow.evaluate_top_layer_with(Some(N), &probe), None);
+        assert!(flow.top_layer_raised);
+        assert_eq!(flow.evaluate_top_layer_with(Some(D), &probe), Some(false));
+        assert!(!flow.top_layer_raised);
+    }
+
+    #[test]
+    fn a_shell_surface_is_a_shell_class_or_a_shell_band() {
+        assert!(is_shell_surface("Shell_TrayWnd", None));
+        assert!(is_shell_surface("Shell_TrayWnd", Some(1)));
+        assert!(is_shell_surface("SomeFutureFlyout", Some(4)));
+        assert!(is_shell_surface("SomeFutureFlyout", Some(16)));
+        assert!(!is_shell_surface("SomeFutureFlyout", Some(1)));
+        assert!(!is_shell_surface("OSKMainClass", Some(2)));
+        assert!(!is_shell_surface("SomeFutureFlyout", None));
     }
 
     #[test]

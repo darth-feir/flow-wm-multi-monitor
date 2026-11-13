@@ -255,6 +255,33 @@ like under any other app, and its own dialogs never ride. If flowd itself runs
 elevated, the check is skipped and elevated windows are managed as usual. Why:
 ADR-0025 (`docs/adr/0025-elevated-windows-are-unmanaged.md`).
 
+## Shell Bands Are Unmanaged
+
+Since Windows 8 every top-level window sits in a z-order band; ordinary
+windows are in the desktop band (1), and a normal process cannot create a
+window anywhere else. `get_window_info` reads the band once at arrival through
+`GetWindowBand`, an undocumented user32 export resolved with `GetProcAddress`
+(`registry::win32::window_band`). A known band above the UIAccess band (2) is a
+shell surface: notifications, toasts and flyouts (4), Start and search (6),
+Alt+Tab (16), the lock screen (17 and up). Such a window is registered
+`Ignored(ShellBand(n))` right after the elevated gate and before every rule;
+the registry logs `window 0x.. (exe "class") is in shell band n; left
+unmanaged`, and `flow query all` shows the state `Ignored::ShellBand` and
+`band` for every window (`null` when it could not be read). Like elevation it
+outranks every rule and cannot be overridden: the window is drawn above every
+desktop window whatever flow does, and Windows refuses to hand it the
+foreground. `set-window` on it is refused with a message.
+
+The band is a backstop behind the class lists, not a replacement: the
+taskbar, the desktop and explorer's lock-screen frames are band 1, so
+`SHELL_CLASSES` and the lock-screen rules (ADR-0030) still name them. The
+floating layer, the dispatch foreground and the `set-window` target ask
+`top_layer::is_shell_surface(class, band)`, which is either test. Learned-rule
+filtering keeps the class test, because a rule has no band. Without the
+export, or when the call fails, the band is unknown and everything works as
+before. Why, and the probe table: ADR-0033
+(`docs/adr/0033-window-bands-and-foreground-pushes.md`).
+
 ## Where the Code Lives
 
 | Concern | Location |

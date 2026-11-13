@@ -1727,6 +1727,7 @@ mod tests {
                 is_fullscreen: false,
                 is_iconic: false,
                 is_elevated: false,
+                band: None,
             });
         }
         let info = laptop_under_external();
@@ -1888,6 +1889,7 @@ mod tests {
                 is_fullscreen: false,
                 is_iconic: false,
                 is_elevated: false,
+                band: None,
             });
         }
         let info = primary_with_left_neighbour();
@@ -2090,6 +2092,7 @@ mod tests {
                 is_fullscreen: false,
                 is_iconic: false,
                 is_elevated: false,
+                band: None,
             });
             // Fake handles classify as floats (no styles to read): make
             // them the tiles the seat sees.
@@ -2200,6 +2203,7 @@ mod float_geometry_tests {
             is_fullscreen: false,
             is_iconic: false,
             is_elevated: false,
+            band: None,
         };
         registry.register_window_from_info(&info);
         if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {

@@ -346,6 +346,7 @@ mod tests {
             is_fullscreen: false,
             is_iconic: false,
             is_elevated: false,
+            band: None,
         };
         registry.register_window_from_info(&info);
         if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {

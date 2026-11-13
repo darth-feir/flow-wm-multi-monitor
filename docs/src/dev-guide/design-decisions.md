@@ -565,3 +565,15 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   `TrayTip` out of the keymap, disturbs nothing. Windows does not keep such
   a toast in the notification center; the log is the record.
   `docs/adr/0032-a-bad-binds-table-is-visible-at-start.md`
+- **ADR-0033 — Window bands mark shell surfaces; a foreground push injects
+  no input.** `GetWindowBand` (an undocumented user32 export, read
+  once at arrival) puts every window in a z-order band; one above the
+  UIAccess band (toasts and flyouts 4, Start 6, Alt+Tab 16, lock 17+) is
+  `Ignored::ShellBand` ahead of every rule, never a floating-layer member or
+  a `set-window` target, and `flow query all` reports `band`. Unknown band:
+  the rules decide alone. A push refused under a shell surface is a debug
+  line (nothing gets past it). A retry after an empty `SendInput` mouse event
+  was tried and dropped: it never fired in the VM and injected input resets
+  the idle timer, so `AttachThreadInput` stays the push path. A toast does not block focus
+  pushes, so the keymap's `TrayTip` ban is no longer a hard rule.
+  `docs/adr/0033-window-bands-and-foreground-pushes.md`

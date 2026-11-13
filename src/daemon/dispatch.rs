@@ -1895,6 +1895,15 @@ impl FlowWM {
                 ),
             };
         }
+        // A shell surface by its z-order band (ADR-0033): never managed.
+        if let WindowState::Ignored(IgnoredReason::ShellBand(band)) = win.state {
+            return SocketResponse::Error {
+                message: format!(
+                    "window {:#x} ({}) is a shell surface (z-order band {band}); flow leaves it to Windows",
+                    focused.0, win.exe
+                ),
+            };
+        }
 
         // Capture the window's identity for history recording before the
         // immutable borrow of `self.registry` (via `win`) ends — the
@@ -1990,7 +1999,7 @@ impl FlowWM {
                 !self
                     .registry
                     .get_window(HWND(f.0 as *mut _))
-                    .is_some_and(|w| top_layer::is_shell_class(&w.class))
+                    .is_some_and(|w| top_layer::is_shell_surface(&w.class, w.band))
             })
             .map(|f| (f, mode))
             .ok_or_else(|| "no focused window".to_owned())
@@ -1998,7 +2007,7 @@ impl FlowWM {
 
     /// `GetForegroundWindow()` for the dispatch handlers that act on "the
     /// focused window". A shell surface in the foreground (Start, search,
-    /// the taskbar: [`top_layer::is_shell_class`]) is not a target, so the
+    /// the taskbar, a flyout: [`top_layer::is_shell_surface`]) is not a target, so the
     /// registry's focus is used, as with no foreground at all. `None` under
     /// `cfg(test)`: the unit tests run on a developer's desktop whose
     /// foreground is a real window of theirs, and registering it into a test
@@ -2008,7 +2017,9 @@ impl FlowWM {
     #[cfg(not(test))]
     pub(super) fn os_foreground_for_dispatch(&self) -> Option<isize> {
         let fg = registry_win32::get_foreground_window()?;
-        if registry_win32::class_name(fg).is_some_and(|c| top_layer::is_shell_class(&c)) {
+        if registry_win32::class_name(fg).is_some_and(|c| {
+            top_layer::is_shell_surface(&c, registry_win32::window_band(HWND(fg as *mut _)))
+        }) {
             log::debug!(
                 "dispatch: foreground {fg:#x} is a shell surface; acting on the registry's focus"
             );
@@ -2348,6 +2359,8 @@ impl FlowWM {
         // Publish the new config first: animate_layout and the border refresh
         // below read `self.config.borders` live.
         self.config = new_config;
+        // The file's own table is running now.
+        self.binds_set_aside.clear();
         // `adopt_maximized` applies to the next maximized window the daemon
         // meets (reload is refused while tiling is off, so this is the live
         // value).
@@ -2359,8 +2372,6 @@ impl FlowWM {
         // workspace is on-screen; parked ones re-project silently and animate
         // on their next switch. Each monitor derives its own base column
         // width — from its width preset when `[columns]` is configured, else
-        // The file's own table is running now.
-        self.binds_set_aside.clear();
         // from `columns_per_screen` / `column_width` and its own work area.
         self.reapply_presets_after_reload(&previous_presets);
 
@@ -3407,6 +3418,7 @@ mod tests {
             is_fullscreen: false,
             is_iconic: false,
             is_elevated: false,
+            band: None,
         };
         registry.register_window_from_info(&info);
 
@@ -3780,6 +3792,7 @@ mod tests {
             is_fullscreen: false,
             is_iconic: false,
             is_elevated: false,
+            band: None,
         };
         registry.register_window_from_info(&info);
         if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {
@@ -4177,6 +4190,7 @@ mod tests {
                 is_fullscreen: false,
                 is_iconic: false,
                 is_elevated: false,
+                band: None,
             };
             flow.registry.register_window_from_info(&info);
         }
@@ -4286,6 +4300,7 @@ mod tests {
                 is_fullscreen: false,
                 is_iconic: false,
                 is_elevated: false,
+                band: None,
             };
             flow.registry.register_window_from_info(&info);
         }
@@ -4463,6 +4478,7 @@ mod tests {
             is_fullscreen: false,
             is_iconic: false,
             is_elevated: false,
+            band: None,
         };
         flow.registry.register_window_from_info(&info);
         if let Some(win) = flow.registry.get_window_mut(HWND(hwnd as *mut _)) {

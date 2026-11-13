@@ -355,6 +355,18 @@ pushes the first one that takes the foreground (`resolve_focus_target_with`):
   ~50 ms and counts the target being there as focused. Without that,
   `focus-floating` skipped the only float as refused while it took the
   foreground.
+- a push refused with a **shell surface in front** (a band above the
+  desktop's: Start, the notification center, Alt+Tab, ADR-0033) is reported
+  at `debug` with `(foreground held by shell band n)`, not as a warning:
+  Windows keeps a shell flyout in front until the user dismisses it, and no
+  call from a desktop process changes that (the VM tried `AttachThreadInput`,
+  an empty `SendInput` mouse event, a zero move and an Alt tap);
+- flowd injects **no input** to win a push: `AttachThreadInput` to the
+  foreground thread is the push path. Stage 39 tried a retry after an empty
+  `SendInput` mouse event for a push refused with a desktop window in
+  front; it never fired in the VM (such a push is not refused there) and
+  injected input resets the session's idle timer, so stage 39b dropped it
+  (ADR-0033);
 
 With nothing live and visible left, the monitor still becomes active, the
 tracked focus is cleared (so a later command cannot act on the window the

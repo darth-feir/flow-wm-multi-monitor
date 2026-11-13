@@ -314,6 +314,17 @@ impl WindowRegistry {
                 info.exe
             );
             WindowState::Ignored(IgnoredReason::Elevated)
+        } else if classification::is_shell_band(info.band) {
+            let band = info.band.unwrap_or_default();
+            // A shell surface by the OS's own z-order band (ADR-0033): no
+            // rule applies, whatever its class or exe.
+            log::info!(
+                "window {:#x} ({} {:?}) is in shell band {band}; left unmanaged",
+                info.hwnd.0 as isize,
+                info.exe,
+                info.class
+            );
+            WindowState::Ignored(IgnoredReason::ShellBand(band))
         } else {
             classification::classify_with_state_pipeline(
                 &candidate,
@@ -355,6 +366,7 @@ impl WindowRegistry {
             state,
             invisible_bounds,
         );
+        window.band = info.band;
         if info.is_iconic {
             window.geometry_from_placement = true;
             if matches!(
@@ -983,6 +995,7 @@ impl WindowRegistry {
                     }),
                     "adopted_from_maximized": w.adopted_from_maximized,
                     "on_top": w.on_top,
+                    "band": w.band,
                 })
             })
             .collect();
@@ -1823,6 +1836,9 @@ fn state_to_json(state: &WindowState) -> serde_json::Value {
         WindowState::Ignored(IgnoredReason::Elevated) => {
             serde_json::json!("Ignored::Elevated")
         }
+        WindowState::Ignored(IgnoredReason::ShellBand(_)) => {
+            serde_json::json!("Ignored::ShellBand")
+        }
     }
 }
 
@@ -2218,6 +2234,7 @@ mod tests {
             is_fullscreen: false,
             is_iconic: false,
             is_elevated: false,
+            band: None,
         };
 
         reg.register_window_from_info(&info);
@@ -2383,6 +2400,7 @@ mod tests {
             is_fullscreen: false,
             is_iconic: true,
             is_elevated: false,
+            band: None,
         }
     }
 
@@ -2876,6 +2894,7 @@ mod tests {
                 is_fullscreen: false,
                 is_iconic: iconic,
                 is_elevated: true,
+                band: None,
             };
             reg.register_window_from_info(&info);
             let w = reg.get_window(HWND(hwnd_val as *mut _)).unwrap();
@@ -2890,6 +2909,90 @@ mod tests {
             );
         }
     }
+    fn banded_info(hwnd_val: isize, band: Option<u32>, elevated: bool) -> win32::WindowInfo {
+        win32::WindowInfo {
+            hwnd: HWND(hwnd_val as *mut _),
+            title: "New notification".to_owned(),
+            class: "SomeFutureFlyout".to_owned(),
+            rect: crate::common::Rect {
+                x: 1500,
+                y: 800,
+                width: 400,
+                height: 150,
+            },
+            exe: "ShellExperienceHost.exe".to_owned(),
+            process_path: r"C:\Windows\SystemApps\ShellExperienceHost.exe".to_owned(),
+            is_visible: true,
+            is_maximized: false,
+            is_fullscreen: false,
+            is_iconic: false,
+            is_elevated: elevated,
+            band,
+        }
+    }
+
+    /// ADR-0033: a window in a band above the UIAccess band is registered
+    /// `Ignored(ShellBand)` whatever its class, exe or rules say; the
+    /// desktop and UIAccess bands and an unreadable band are classified as
+    /// before; elevation still wins. `flow query all` reports the band.
+    #[test]
+    fn a_window_in_a_shell_band_is_registered_ignored_shell_band() {
+        let (user, default) = default_rules();
+        let mut reg = WindowRegistry::new(&user, &default);
+        for (i, band) in [3u32, 4, 6, 16, 17, 18].into_iter().enumerate() {
+            let hwnd_val = 4201 + i as isize;
+            reg.register_window_from_info(&banded_info(hwnd_val, Some(band), false));
+            let w = reg.get_window(HWND(hwnd_val as *mut _)).unwrap();
+            assert!(
+                matches!(w.state, WindowState::Ignored(IgnoredReason::ShellBand(b)) if b == band),
+                "band {band}: {:?}",
+                w.state
+            );
+            assert_eq!(
+                state_to_json(&w.state),
+                serde_json::json!("Ignored::ShellBand")
+            );
+            assert_eq!(w.band, Some(band));
+        }
+        let mut reg2 = WindowRegistry::new(&user, &default);
+        reg2.register_window_from_info(&banded_info(4300, None, false));
+        let unknown = reg2
+            .get_window(HWND(4300isize as *mut _))
+            .unwrap()
+            .state
+            .clone();
+        for (i, band) in [Some(0u32), Some(1), Some(2), None].into_iter().enumerate() {
+            let hwnd_val = 4301 + i as isize;
+            reg2.register_window_from_info(&banded_info(hwnd_val, band, false));
+            let w = reg2.get_window(HWND(hwnd_val as *mut _)).unwrap();
+            assert!(
+                !matches!(w.state, WindowState::Ignored(IgnoredReason::ShellBand(_))),
+                "band {band:?}: {:?}",
+                w.state
+            );
+            assert_eq!(
+                std::mem::discriminant(&w.state),
+                std::mem::discriminant(&unknown),
+                "band {band:?}"
+            );
+        }
+        reg2.register_window_from_info(&banded_info(4400, Some(4), true));
+        assert!(matches!(
+            reg2.get_window(HWND(4400isize as *mut _)).unwrap().state,
+            WindowState::Ignored(IgnoredReason::Elevated)
+        ));
+        let q = reg.to_json_value(0);
+        let first = q["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["hwnd"] == 4202)
+            .unwrap()
+            .clone();
+        assert_eq!(first["band"], 4);
+        assert_eq!(first["state"], "Ignored::ShellBand");
+    }
+
     #[test]
     fn register_window_from_info_inserts_new_window() {
         let (user, default) = default_rules();
@@ -2913,6 +3016,7 @@ mod tests {
             is_fullscreen: false,
             is_iconic: false,
             is_elevated: false,
+            band: None,
         };
 
         assert!(reg.is_empty());
@@ -2947,6 +3051,7 @@ mod tests {
             is_fullscreen: false,
             is_iconic: false,
             is_elevated: false,
+            band: None,
         };
 
         reg.register_window_from_info(&info);
@@ -2991,6 +3096,7 @@ mod tests {
             is_fullscreen: false,
             is_iconic: false,
             is_elevated: false,
+            band: None,
         };
 
         reg.register_window_from_info(&info);

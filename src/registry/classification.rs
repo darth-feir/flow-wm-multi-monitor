@@ -68,6 +68,26 @@ pub fn is_lock_surface(exe: &str, class: &str) -> bool {
         || (exe.eq_ignore_ascii_case("explorer.exe") && class.starts_with("LockScreen"))
 }
 
+// ── Window bands ────────────────────────────────────────────────────
+
+/// `ZBID_DESKTOP`: the z-order band of every ordinary application window.
+pub const BAND_DESKTOP: u32 = 1;
+/// `ZBID_UIACCESS`: windows of UIAccess processes (On-Screen Keyboard,
+/// Magnifier, an AutoHotkey started with UI access). Real tools a user may
+/// arrange, so they are managed like the desktop band.
+pub const BAND_UIACCESS: u32 = 2;
+
+/// Whether a window's z-order band (`GetWindowBand`, `None` when it could
+/// not be read) marks it as a shell surface flow never manages: a band
+/// above [`BAND_UIACCESS`] (notifications and flyouts 4, Start and search 6,
+/// Alt+Tab 16, the lock screen 17 and up). `ZBID_DEFAULT` (0), the desktop
+/// and the UIAccess band are managed; an unknown band is not a shell
+/// surface (the class and exe rules decide alone). ADR-0033.
+#[must_use]
+pub const fn is_shell_band(band: Option<u32>) -> bool {
+    matches!(band, Some(b) if b > BAND_UIACCESS)
+}
+
 // ── matches_rule ────────────────────────────────────────────────────
 
 /// Test whether a window candidate matches all specified fields in a rule.
@@ -613,6 +633,17 @@ pub(super) fn classify_with_state_pipeline(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_bands_above_uiaccess_are_shell_surfaces() {
+        assert!(!is_shell_band(None));
+        assert!(!is_shell_band(Some(0)));
+        assert!(!is_shell_band(Some(BAND_DESKTOP)));
+        assert!(!is_shell_band(Some(BAND_UIACCESS)));
+        for band in [3, 4, 6, 16, 17, 18] {
+            assert!(is_shell_band(Some(band)), "band {band}");
+        }
+    }
+
     use super::*;
     use crate::registry::types::IgnoredReason;
 
