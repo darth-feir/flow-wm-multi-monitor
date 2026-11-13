@@ -97,9 +97,11 @@ in step and prints the block to paste when `binds.toml` changes.
 
 To change a chord: add it to `[binds]` in `flow.toml` and save. `flow query
 binds` shows the result; `flow config check` names mistakes
-(`binds."Mod+Bogus": unknown key ...`); turn on the keymap log (see
-*Tracing*) to see each registration (`binds: N registered`, 78 with the
-built-in table).
+(`flow.toml: binds."Mod+Bogus": unknown key ...`); a table with a mistake
+is set aside at daemon start (the built-in chords run, and `flow start`
+warns, or shows a Windows notification when started from autostart);
+turn on the keymap log (see *Tracing*) to see each registration
+(`binds: N registered`, 78 with the built-in table).
 
 ## Daemon liveness and fail-back
 

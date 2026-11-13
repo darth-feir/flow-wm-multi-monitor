@@ -553,3 +553,15 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   unchanged. `[binds]` keeps niri's `Mod` and also accepts `Win` / `Super`;
   two spellings of one chord in a table are a duplicate whose message quotes
   both keys as written. `docs/adr/0031-the-overlay-names-the-windows-key.md`
+- **ADR-0032 — A bad `[binds]` table is visible at start.** A table with
+  problems is set aside whole at daemon start (the built-in defaults run;
+  a reload still refuses it). `flow start` prints one
+  `flow: warning: flow.toml: binds."<key>": <reason>` line per entry and what
+  the daemon does instead; `flow config check`, the daemon log and
+  `flow query binds` (`set_aside`) use the same lines. With no console to
+  read (autostart) it sends a notification-area toast after the daemon is
+  ready, and a failed start writes its cause to the log and sends one too:
+  no daemon runs then, so the toast's hold on the foreground, which keeps
+  `TrayTip` out of the keymap, disturbs nothing. Windows does not keep such
+  a toast in the notification center; the log is the record.
+  `docs/adr/0032-a-bad-binds-table-is-visible-at-start.md`

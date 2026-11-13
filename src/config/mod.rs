@@ -40,8 +40,9 @@ pub mod width_preset;
 pub use binds::{Bind, BindsConfig, BindsReport};
 pub use color::Color;
 pub use lifecycle::{
-    check_config, init_config_dir, load_app_config, load_default_rules, load_rules_config,
-    rules_file_warnings, write_ahk_template,
+    binds_fallback_note, binds_problem_keys, binds_problems, check_config, init_config_dir,
+    load_app_config, load_default_rules, load_rules_config, rules_file_warnings,
+    set_aside_bad_binds, write_ahk_template,
 };
 pub use startup::StartupConfig;
 pub use types::BorderConfig;

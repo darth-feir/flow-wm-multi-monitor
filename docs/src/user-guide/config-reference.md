@@ -763,8 +763,13 @@ itself. `flow spawn <program> [args...]` does the same from a shell. With
 **Where to look.** `flow query binds` prints the resolved table as JSON
 (`flow query binds --plain` is the listing the keymap reads); the overlay
 (`show-hotkey-overlay`, Mod+Shift+/ by default) shows it on screen;
-`flow config check` names every bad entry (`binds."Mod+Bogus": unknown key
-"Bogus" (...)`). Help texts and chord names are ASCII so the overlay renders
+`flow config check` names every bad entry (`flow.toml: binds."Mod+Bogus":
+unknown key "Bogus" (...)`). A table with a bad entry is set aside whole when
+the daemon starts: you get the built-in chords, `flow start` prints the same
+lines as warnings (from autostart, where there is no console, a Windows
+notification says so and names the log), and `flow query binds` lists the
+problems under `set_aside`. Fix the entry and save: the reload applies the
+table. A reload with a bad entry is refused and the running table kept. Help texts and chord names are ASCII so the overlay renders
 the same everywhere.
 
 ### `[startup]` — programs to run

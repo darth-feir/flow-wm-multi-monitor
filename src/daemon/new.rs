@@ -92,6 +92,23 @@ impl FlowWM {
     ) -> Result<Self, StartupError> {
         use StartupStage as S;
 
+        // A `[binds]` table with problems is set aside for the built-in
+        // defaults: the daemon starts, and `flow start` has already told the
+        // user (docs/adr/0032-a-bad-binds-table-is-visible-at-start.md).
+        let mut app_config = app_config;
+        let binds_set_aside = crate::config::set_aside_bad_binds(&mut app_config);
+        if !binds_set_aside.is_empty() {
+            for problem in &binds_set_aside {
+                log::warn!("flowd: {problem}");
+            }
+            log::warn!(
+                "flowd: {}",
+                crate::config::binds_fallback_note(&crate::config::dirs::user_app_config_path_in(
+                    &config_dir
+                ))
+            );
+        }
+
         log::debug!(
             "effective config: columns_per_screen={}, column_width={:?}, min_column_width_px={}, padding.window_gap={}, padding.up={}, padding.down={}, animation.duration_ms={}",
             app_config.columns_per_screen,
@@ -458,6 +475,7 @@ impl FlowWM {
             animator,
             server,
             config: app_config,
+            binds_set_aside,
             config_watch: super::config_watch::ConfigWatch::new(&config_dir),
             config_dir,
             hook_receiver,
@@ -594,6 +612,7 @@ impl FlowWM {
             ),
             server: PipeServer::test_dummy(),
             config: FlowConfig::default(),
+            binds_set_aside: Vec::new(),
             config_watch: super::config_watch::ConfigWatch::new(std::path::Path::new("")),
             config_dir: std::path::PathBuf::new(),
             hook_receiver,

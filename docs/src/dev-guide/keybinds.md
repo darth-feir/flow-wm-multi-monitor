@@ -45,10 +45,13 @@ flowchart LR
    to its siblings in the overlay whatever line it was written on.
 4. **Validate.** `FlowConfig::validate` calls `BindsConfig::validate`, so a
    bad table is refused on `flow config reload` and by the file watcher (the
-   running config is kept) and listed by `flow config check`. At start (stage
-   `config`) `load_app_config` only logs a validation failure as a warning
-   and the daemon runs; `query binds` then answers with the error and the
-   keymap registers its baked defaults (below).
+   running config is kept) and listed by `flow config check`. At start the
+   daemon sets a bad table aside and runs with the built-in one
+   (`config::set_aside_bad_binds`): it logs each problem, `query binds`
+   answers with the defaults and the problems (`set_aside`), and `flow start`
+   has printed them, or sent a toast when it has no console to print to
+   (ADR-0032). Every caller words a problem the same way
+   (`config::binds_problems`: `flow.toml: binds."<key>": <reason>`).
 5. **Report.** `flow query binds` answers with `config::binds::report`: one
    record per bind (canonical chord, AutoHotkey hotkey string, action text,
    kind, argv, admin flag, scope, help line), the overlay rows with

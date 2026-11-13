@@ -384,10 +384,12 @@ impl FlowWM {
     /// [`dispatch_close_window`](Self::dispatch_close_window): an active
     /// tile (a fullscreen one included) or an active float. Like closing it
     /// is asynchronous: `ShowWindowAsync(SW_MINIMIZE)` only queues the
-    /// request, and the minimize hook (`on_window_minimized`) then takes the
-    /// window out of the layout and hands the focus to its successor on the
-    /// same screen (ADR-0023's focus handoff). A restore puts it back in
-    /// its slot. See `docs/src/dev-guide/floating-space.md`.
+    /// request, and the minimize hook (`on_window_minimized`) then takes a
+    /// tile out of the layout and hands the focus to its successor on the
+    /// same screen (`remove_from_layout_and_refocus`); a float only leaves
+    /// the floating layer, and Windows picks the next foreground window. A
+    /// restore puts it back in its slot (ADR-0027). See
+    /// `docs/src/dev-guide/floating-space.md`.
     ///
     /// # Errors
     ///
@@ -2357,6 +2359,8 @@ impl FlowWM {
         // workspace is on-screen; parked ones re-project silently and animate
         // on their next switch. Each monitor derives its own base column
         // width — from its width preset when `[columns]` is configured, else
+        // The file's own table is running now.
+        self.binds_set_aside.clear();
         // from `columns_per_screen` / `column_width` and its own work area.
         self.reapply_presets_after_reload(&previous_presets);
 
@@ -2428,17 +2432,11 @@ impl FlowWM {
         match load_app_config(&user_app_config_path_in(&self.config_dir)) {
             Err(error) => problems.push(format!("{error}")),
             Ok(cfg) => {
-                // Binds are reported entry by entry; the rest of the config
-                // is validated with an always-valid table so each problem
-                // is listed once.
-                if let Err(p) = cfg.binds.resolve() {
-                    problems.extend(p);
-                }
-                let rest = crate::config::FlowConfig {
-                    binds: crate::config::binds::BindsConfig::default(),
-                    ..cfg.clone()
-                };
-                if let Err(reason) = rest.validate() {
+                // Binds are reported entry by entry, in the wording
+                // `flow start` warns with; the rest of the config without
+                // them, so each problem is listed once.
+                problems.extend(crate::config::binds_problems(&cfg));
+                if let Err(reason) = cfg.validate_except_binds() {
                     problems.push(reason);
                 }
                 let screens: Vec<crate::config::width_preset::ScreenFacts> =

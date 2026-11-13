@@ -157,8 +157,11 @@ fn load_toml<T: DeserializeOwned>(path: &Path) -> Result<T, ConfigLoadError> {
 /// - **File not found** → returns `Ok(FlowConfig::default())` (benign: fresh install).
 /// - **Parse error or I/O error** → returns `Err(FlowError::Config)` carrying the
 ///   path and underlying cause, so callers can surface the failure to the user.
-/// - **Success** → calls [`FlowConfig::validate()`] and logs warnings if validation
-///   fails, but still returns the loaded config. Logs at `info` level on success.
+/// - **Success** → calls [`FlowConfig::validate_except_binds()`] and logs a
+///   warning if validation fails, but still returns the loaded config. Logs at
+///   `info` level on success. The `[binds]` table is not checked here: every
+///   caller reports it entry by entry ([`binds_problems`]) and decides what a
+///   bad table means (the daemon start sets it aside, a reload is refused).
 ///
 /// This function never panics and imposes no error policy -- callers decide how
 /// to handle `Err` (`docs/src/dev-guide/config-and-persistence.md`).
@@ -194,7 +197,8 @@ pub fn load_app_config(path: &Path) -> FlowResult<FlowConfig> {
                 )));
             }
             // Everything else post-deserialization — log warnings but don't fail.
-            if let Err(warning) = config.validate() {
+            // `[binds]` is the caller's (`binds_problems`), so it is told once.
+            if let Err(warning) = config.validate_except_binds() {
                 log::warn!("config validation warning for {:?}: {warning}", path);
             }
             log::info!("loaded app config from {:?}", path);
@@ -209,6 +213,63 @@ pub fn load_app_config(path: &Path) -> FlowResult<FlowConfig> {
             path.display()
         ))),
     }
+}
+
+/// The `[binds]` problems of a loaded `flow.toml`, one line per entry, named
+/// by the file and the key: `flow.toml: binds."Mod+Bogus": unknown key ...`.
+/// Empty when the table resolves. The one wording `flow start`,
+/// `flow config check` and the daemon's log use
+/// (`docs/adr/0032-a-bad-binds-table-is-visible-at-start.md`).
+#[must_use]
+pub fn binds_problems(config: &FlowConfig) -> Vec<String> {
+    config
+        .binds
+        .resolve()
+        .err()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| format!("flow.toml: {p}"))
+        .collect()
+}
+
+/// The keys named by [`binds_problems`] lines (`Mod+Bogus` from
+/// `flow.toml: binds."Mod+Bogus": ...`), in order, each once.
+#[must_use]
+pub fn binds_problem_keys(problems: &[String]) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for line in problems {
+        let Some(rest) = line.split_once("binds.\"").map(|(_, r)| r) else {
+            continue;
+        };
+        if let Some((key, _)) = rest.split_once("\": ")
+            && !keys.iter().any(|k| k == key)
+        {
+            keys.push(key.to_owned());
+        }
+    }
+    keys
+}
+
+/// What the daemon does with a `[binds]` table that has problems at start,
+/// one line naming the file at `path`.
+#[must_use]
+pub fn binds_fallback_note(path: &Path) -> String {
+    format!(
+        "the daemon starts with the built-in default binds (the whole [binds] table is set aside); fix it in {} and save to apply it",
+        path.display()
+    )
+}
+
+/// Daemon start: set aside a `[binds]` table that has problems, so the
+/// daemon runs (and `flow query binds` answers) with the built-in defaults.
+/// Returns the problems ([`binds_problems`]); empty when the table was kept.
+/// A reload refuses such a table instead and keeps the running one.
+pub fn set_aside_bad_binds(config: &mut FlowConfig) -> Vec<String> {
+    let problems = binds_problems(config);
+    if !problems.is_empty() {
+        config.binds = super::binds::BindsConfig::default();
+    }
+    problems
 }
 
 /// Load window rules config from a TOML file.
@@ -498,7 +559,8 @@ pub fn write_ahk_template(dir: &Path) -> Result<bool, String> {
 /// Checks both `flow.toml` and `flow-rules.toml` in the given directory:
 ///
 /// - Loads `flow.toml` and deserializes it as [`FlowConfig`], then runs semantic
-///   validation. Because every field carries a serde default (see
+///   validation: the `[binds]` table entry by entry ([`binds_problems`]), then
+///   the rest. Because every field carries a serde default (see
 ///   each struct`s `Default` impl), partial user files are valid —
 ///   missing keys are filled in automatically, exactly as the daemon does.
 /// - Loads `flow-rules.toml` and checks it parses correctly as [`WindowRulesConfig`].
@@ -519,7 +581,8 @@ pub fn write_ahk_template(dir: &Path) -> Result<bool, String> {
 /// `Ok(warnings)` if all present files are valid (or no files exist):
 /// one line per accepted-but-inert setting
 /// ([`WindowRulesConfig::inert_field_warnings`]), empty when there is none.
-/// `Err(message)` describing the first validation/parse failure found.
+/// `Err(message)` describing the first validation/parse failure found; for a
+/// `[binds]` table with problems, every problem, one per line.
 ///
 /// # Example
 ///
@@ -543,8 +606,12 @@ pub fn check_config(dir: &Path) -> Result<Vec<String>, String> {
             .map_err(|e| format!("failed to read {flow_path:?}: {e}"))?;
         let config: FlowConfig =
             toml::from_str(&contents).map_err(|e| format!("flow.toml parse error: {e}"))?;
+        let binds = binds_problems(&config);
+        if !binds.is_empty() {
+            return Err(binds.join("\n"));
+        }
         config
-            .validate()
+            .validate_except_binds()
             .map_err(|e| format!("flow.toml validation error: {e}"))?;
     }
 
@@ -960,6 +1027,60 @@ strategy = "original_slot"
         // The user's content must survive.
         let contents = std::fs::read_to_string(dir.join("flow.ahk")).unwrap();
         assert_eq!(contents, custom);
+    }
+
+    // ── [binds] problems at start ───────────────────────────────────────
+
+    /// A bad `[binds]` entry is named by the file and its key; the daemon
+    /// start sets the whole table aside (the defaults), a good table is kept.
+    #[test]
+    fn bad_binds_are_named_and_set_aside_whole() {
+        let mut config: FlowConfig = toml::from_str(
+            "[binds]\n\"Mod+Bogus\" = \"focus-column-left\"\n\"Mod+Q\" = \"fly\"\n\"Mod+W\" = \"close-window\"\n",
+        )
+        .unwrap();
+        let problems = binds_problems(&config);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems[0].starts_with("flow.toml: binds.\"Mod+Bogus\": unknown key"),
+            "{}",
+            problems[0]
+        );
+        assert!(
+            problems[1].starts_with("flow.toml: binds.\"Mod+Q\": unknown action \"fly\""),
+            "{}",
+            problems[1]
+        );
+        assert_eq!(binds_problem_keys(&problems), ["Mod+Bogus", "Mod+Q"]);
+        assert_eq!(set_aside_bad_binds(&mut config), problems);
+        assert_eq!(config.binds, crate::config::BindsConfig::default());
+        let note = binds_fallback_note(Path::new(r"C:\cfg\flow.toml"));
+        assert!(note.contains("built-in default binds"), "{note}");
+        assert!(note.contains(r"C:\cfg\flow.toml"), "{note}");
+
+        let mut good: FlowConfig =
+            toml::from_str("[binds]\n\"Mod+W\" = \"close-window\"\n").unwrap();
+        let kept = good.binds.clone();
+        assert!(set_aside_bad_binds(&mut good).is_empty());
+        assert_eq!(good.binds, kept);
+    }
+
+    /// `flow config check` without a daemon lists every bad bind, one per
+    /// line, in the wording `flow start` warns with.
+    #[test]
+    fn check_config_lists_every_bad_bind() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("flow.toml"),
+            "[binds]\n\"Mod+Bogus\" = \"focus-column-left\"\n\"Mod+Q\" = \"fly\"\n",
+        )
+        .unwrap();
+        let err = check_config(tmp.path()).expect_err("two bad binds");
+        let lines: Vec<&str> = err.lines().collect();
+        let config: FlowConfig =
+            toml::from_str(&std::fs::read_to_string(tmp.path().join("flow.toml")).unwrap())
+                .unwrap();
+        assert_eq!(lines, binds_problems(&config));
     }
 
     // ── check_config tests ──────────────────────────────────────────────

@@ -62,7 +62,8 @@ pub(super) enum DragTarget {
     Tile,
     /// An active float.
     Float,
-    /// A fullscreen window (a float the daemon places itself).
+    /// A tile in a fullscreen column (`set-window fullscreen`, ADR-0021):
+    /// the daemon owns its rect.
     Fullscreen,
     /// Minimized.
     Minimized,

@@ -50,7 +50,7 @@ pub struct WorkspaceSnapshot {
     /// Absent in files written by single-monitor builds, which maps to 0.
     #[serde(default)]
     pub monitor: u32,
-    /// 0-based workspace index.
+    /// The workspace's id on its monitor ([`WorkspaceId`](crate::workspace::WorkspaceId)), 1..=10.
     pub workspace_id: u32,
     /// Whether this workspace was active (visible) when saved.
     pub active: bool,

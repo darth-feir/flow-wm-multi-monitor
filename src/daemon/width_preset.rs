@@ -1113,12 +1113,12 @@ default = "1/2"
         let problems: Vec<String> = serde_json::from_value(payload["problems"].clone()).unwrap();
         assert_eq!(problems.len(), 4, "{problems:?}");
         assert!(
-            problems[0].starts_with("binds.\"Mod+Bogus\": unknown key"),
+            problems[0].starts_with("flow.toml: binds.\"Mod+Bogus\": unknown key"),
             "{}",
             problems[0]
         );
         assert!(
-            problems[1].starts_with("binds.\"Mod+Q\": unknown action"),
+            problems[1].starts_with("flow.toml: binds.\"Mod+Q\": unknown action"),
             "{}",
             problems[1]
         );
@@ -1188,6 +1188,71 @@ default = "1/2"
     }
 
     #[test]
+    /// A `[binds]` table set aside at start: `flow query binds` answers with
+    /// the defaults and the problems; a refused reload keeps them, an applied
+    /// one clears them.
+    #[test]
+    fn query_binds_reports_a_table_set_aside_until_a_reload_applies() {
+        let mut flow = fixture();
+        flow.config.borders.enabled = false;
+        flow.binds_set_aside = vec!["flow.toml: binds.\"Mod+Bogus\": unknown key".into()];
+        let SocketResponse::Data { payload } = flow.dispatch(&SocketMessage::QueryBinds) else {
+            panic!("expected Data");
+        };
+        let report: crate::config::BindsReport = serde_json::from_value(payload).unwrap();
+        assert_eq!(report.source, "defaults");
+        assert_eq!(report.set_aside.len(), 1);
+        assert_eq!(
+            report.binds.len(),
+            crate::config::binds::default_binds().len()
+        );
+        assert!(
+            crate::config::binds::plain_text(&report).contains("set_aside\t1\nsource\tdefaults\n")
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "flowwm-binds-set-aside-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("config dir");
+        flow.config_dir = dir.clone();
+        let toml_path = dir.join("flow.toml");
+        std::fs::write(
+            &toml_path,
+            "[borders]\nenabled = false\n[binds]\n\"Mod+Bogus\" = \"focus-column-left\"\n",
+        )
+        .expect("write");
+        let resp = flow.dispatch(&SocketMessage::ReloadConfig);
+        let SocketResponse::Error { message } = resp else {
+            panic!("expected Error, got {resp:?}");
+        };
+        assert!(
+            message.contains("binds.\"Mod+Bogus\": unknown key"),
+            "{message}"
+        );
+        assert_eq!(flow.binds_set_aside.len(), 1);
+        assert!(flow.config.binds.entries.is_empty());
+
+        std::fs::write(
+            &toml_path,
+            "[borders]\nenabled = false\n[binds]\n\"Mod+Shift+R\" = \"switch-preset-column-width-back\"\n",
+        )
+        .expect("write");
+        assert_eq!(
+            flow.dispatch(&SocketMessage::ReloadConfig),
+            SocketResponse::Ok
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(flow.binds_set_aside.is_empty());
+        let SocketResponse::Data { payload } = flow.dispatch(&SocketMessage::QueryBinds) else {
+            panic!("expected Data");
+        };
+        let report: crate::config::BindsReport = serde_json::from_value(payload).unwrap();
+        assert_eq!(report.source, "flow.toml");
+        assert!(report.set_aside.is_empty());
+    }
+
     fn reload_refuses_a_list_that_does_not_fit_a_screen_and_keeps_the_old_config() {
         let mut flow = fixture();
         flow.config.borders.enabled = false;

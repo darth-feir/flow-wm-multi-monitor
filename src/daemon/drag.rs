@@ -124,7 +124,8 @@ pub(super) enum DragMode {
     /// Title-bar reorder drag — the existing translate behavior. Unchanged by
     /// ticket #9 (it was previously the only drag state).
     Translate(DragState),
-    /// Horizontal edge/corner column resize — ticket #9.
+    /// Edge/corner resize of a tile: its column's width, its row's height,
+    /// or both (tickets #9 and #10).
     Resize(ResizeDrag),
     /// A floating window being moved or resized, natively or by a keymap
     /// session. Entered directly (no classification), held for the whole

@@ -88,7 +88,7 @@ pub struct WorkspaceId(pub u32);
 /// keeps the tiling math pure and leaves room for floating-window logic to
 /// grow independently. The daemon always consults the **active** workspace of
 /// the **active** monitor — see
-/// [`FlowWM::active_workspace`](crate::daemon::FlowWM).
+/// [`Monitor::active_workspace`](crate::workspace::Monitor::active_workspace).
 pub struct Workspace {
     /// Stable identifier for this workspace. Never reused within a session.
     pub id: WorkspaceId,

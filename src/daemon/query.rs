@@ -63,8 +63,10 @@ impl FlowWM {
     /// `flow query binds`: the resolved `[binds]` table for the hotkey script
     /// and the overlay — every bind with its AutoHotkey hotkey string, kind,
     /// argv and scope, the collapsed help rows and the hardwired chords
-    /// (`config::binds::report`). The running config validated at load, so
-    /// a resolve failure here is answered as an error rather than reached.
+    /// (`config::binds::report`), plus the problems of a table the daemon
+    /// set aside at start. The running table resolved at load (a bad one
+    /// was set aside, a bad reload refused), so a resolve failure here is
+    /// answered as an error rather than reached.
     pub(super) fn query_binds(&self) -> SocketResponse {
         let binds = &self.config.binds;
         match binds.resolve() {
@@ -74,6 +76,7 @@ impl FlowWM {
                     payload: serde_json::json!(
                         crate::config::binds::report(&resolved, from_config)
                             .with_selection_buffer(self.config.keymap.selection_buffer)
+                            .with_set_aside(self.binds_set_aside.clone())
                     ),
                 }
             }

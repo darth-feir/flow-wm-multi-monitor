@@ -107,7 +107,7 @@ The two processes apply different policy because the detached daemon's stdout/st
 | **`flow` client** (pre-flight, user terminal) | fatal: refuse to spawn | warning on stderr + continue |
 | **`flowd` daemon** (authoritative load) | fatal: `run()` Err -> `exit(1)` | non-fatal: warn + default rules |
 
-Both call the **same compiled** `load_app_config`/`load_rules_config` (one crate), so the pre-flight verdict matches the daemon's -- no desync. Rules failures are non-fatal everywhere because rules are advisory and the daemon is usable with defaults. The daemon's fatal load catches a config edit landing in the spawn race window (the pipe is never created, so `flow` reports a startup timeout rather than silently starting on defaults).
+Both call the **same compiled** `load_app_config`/`load_rules_config` (one crate), so the pre-flight verdict matches the daemon's -- no desync. A `[binds]` table with problems is not a load failure: the pre-flight prints one `flow: warning: flow.toml: binds."<key>": <reason>` line per entry (`config::binds_problems`, the wording `flow config check` and the daemon log use too) and says the daemon starts with the built-in default binds; the daemon sets the whole table aside (`config::set_aside_bad_binds`) and `flow query binds` reports it (`set_aside`). When `flow start` has no console another process shares (the Startup-folder shortcut, `flow-resident.ahk`), nobody reads stderr: it sends the same news as a notification-area toast after the daemon is ready, and a failed start appends `flow start failed: <cause>` to the daemon's log and sends a toast naming that log (`src/start_notice.rs`; ADR-0032). Rules failures are non-fatal everywhere because rules are advisory and the daemon is usable with defaults. The daemon's fatal load catches a config edit landing in the spawn race window (the pipe is never created, so `flow` reports a startup timeout rather than silently starting on defaults).
 
 ```mermaid
 flowchart TD
@@ -123,11 +123,11 @@ flowchart TD
 
 `flow config reload` reuses these same loaders to hot-reload a running daemon (see [Hot-reload](#hot-reload----flow-config-reload) below).
 
-After loading `flow.toml`, the daemon calls `FlowConfig::validate()` to catch semantically invalid values (negative padding, `min_column_width_px` exceeding `column_width`). Validation failures produce warnings but do not prevent the daemon from running.
+After loading `flow.toml`, `load_app_config` calls `FlowConfig::validate_except_binds()` to catch semantically invalid values (negative padding, `min_column_width_px` exceeding `column_width`). Validation failures produce warnings but do not prevent the daemon from running. `[binds]` is left to the callers, which report it entry by entry (above).
 
 ### 3. Validate -- `check_config`
 
-The local validation pass: parse both files and run `FlowConfig::validate` (which covers `[binds]` and `[startup]` too). Missing files are not errors -- they simply mean defaults will be used. Returns `Ok(warnings)`: one `flow-rules.toml: rule N (...): ... has no effect` line per inert rule field, which `flow config check` prints without failing (`Err` is the first problem). Logs nothing (designed for pure CLI output). `flow config check` uses it only when no daemon answers; with one running it sends `CheckConfig` and the daemon lists every problem, screens included (see [Live reload](#live-reload-the-file-watcher) below).
+The local validation pass: parse both files, list every `[binds]` problem (one per line, `config::binds_problems`), then run `FlowConfig::validate_except_binds` (which covers `[startup]` too). Missing files are not errors -- they simply mean defaults will be used. Returns `Ok(warnings)`: one `flow-rules.toml: rule N (...): ... has no effect` line per inert rule field, which `flow config check` prints without failing (`Err` is the first problem). Logs nothing (designed for pure CLI output). `flow config check` uses it only when no daemon answers; with one running it sends `CheckConfig` and the daemon lists every problem, screens included (see [Live reload](#live-reload-the-file-watcher) below).
 
 ### 4. Use -- daemon subsystems
 

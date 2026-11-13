@@ -472,10 +472,20 @@ impl FlowConfig {
     /// `min_column_width_px` is deferred to runtime (after the
     /// daemon computes the actual width from `columns_per_screen`).
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_except_binds()?;
+        self.binds.validate()
+    }
+
+    /// [`FlowConfig::validate`] without the `[binds]` table, which callers
+    /// report entry by entry (`config::binds_problems`).
+    ///
+    /// # Errors
+    ///
+    /// The first problem found, one line.
+    pub fn validate_except_binds(&self) -> Result<(), String> {
         self.padding.validate()?;
         self.borders.validate()?;
         self.loadout.validate()?;
-        self.binds.validate()?;
         self.startup.validate()?;
         if self.columns_per_screen == 0 {
             return Err("columns_per_screen must be at least 1, got 0".into());

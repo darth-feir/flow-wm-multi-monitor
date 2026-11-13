@@ -1230,6 +1230,11 @@ pub struct BindsReport {
     /// (`selection.ahk`). Absent from an older daemon's answer: off.
     #[serde(default)]
     pub selection_buffer: bool,
+    /// The problems of the `flow.toml` `[binds]` table the daemon set aside
+    /// at start for these defaults, one line each; empty when the table in
+    /// use is the file's. Absent from an older daemon's answer: empty.
+    #[serde(default)]
+    pub set_aside: Vec<String>,
 }
 
 impl BindsReport {
@@ -1244,6 +1249,13 @@ impl BindsReport {
                 help: "paste the text last highlighted with the mouse (selection buffer; the clipboard is kept)".into(),
             });
         }
+        self
+    }
+
+    /// Carry the problems of a `[binds]` table set aside at start.
+    #[must_use]
+    pub fn with_set_aside(mut self, problems: Vec<String>) -> Self {
+        self.set_aside = problems;
         self
     }
 }
@@ -1289,6 +1301,7 @@ pub fn report(binds: &[Bind], from_config: bool) -> BindsReport {
         rows: help_rows(binds),
         hardwired: hardwired_rows(),
         selection_buffer: false,
+        set_aside: Vec::new(),
     }
 }
 
@@ -1381,7 +1394,9 @@ fn collapse_keys(prefix: &str, keys: &[&Key]) -> String {
 /// tab-separated. `bind` records carry the hotkey, scope, kind, admin flag,
 /// chord, help and the argv (items joined by [`PLAIN_ARGV_SEP`]); `row` and
 /// `hardwired` records carry the overlay text; `option` records carry the
-/// keymap options (`option <name> 0|1`); `source` closes the list.
+/// keymap options (`option <name> 0|1`); `set_aside <n>` counts the
+/// problems of a `[binds]` table set aside at start (only when there are
+/// any); `source` closes the list.
 #[must_use]
 pub fn plain_text(report: &BindsReport) -> String {
     let mut out = String::new();
@@ -1421,6 +1436,9 @@ pub fn plain_text(report: &BindsReport) -> String {
         "option{PLAIN_SEP}selection_buffer{PLAIN_SEP}{}\n",
         u8::from(report.selection_buffer)
     ));
+    if !report.set_aside.is_empty() {
+        out.push_str(&format!("set_aside{PLAIN_SEP}{}\n", report.set_aside.len()));
+    }
     out.push_str(&format!("source{PLAIN_SEP}{}\n", report.source));
     out
 }

@@ -366,6 +366,7 @@ Backslashes(n) {
 ;   row <chords> <help>            an overlay row for the table
 ;   hardwired <chords> <help>      an overlay row for the chords below
 ;   option <name> 0|1              a keymap option ([keymap] in flow.toml): selection_buffer
+;   set_aside <n>                  n problems of the flow.toml [binds] table the daemon set aside at start (listed: the defaults)
 ;   source defaults|flow.toml
 ; The output goes through a file (UTF-8, no console window), never through
 ; WScript's Exec, which decodes with the OEM code page.

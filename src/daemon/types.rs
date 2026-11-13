@@ -129,9 +129,9 @@ pub struct FlowWM {
     /// The monitor stack — one [`Monitor`] per physical display, each owning
     /// its own vertical stack of [`Workspace`]s.
     ///
-    /// The daemon currently initialises exactly one monitor (the primary
-    /// display) with ten workspaces (see `new.rs`); multi-monitor support
-    /// will grow this vector. Use [`active_monitor`](Self::active_monitor) to
+    /// The daemon initialises one monitor per attached display, each with
+    /// ten workspaces (see `new.rs`), and hot-plug re-enumerates them
+    /// (`hotplug.rs`). Use [`active_monitor`](Self::active_monitor) to
     /// reach the monitor that currently owns keyboard focus.
     pub(super) monitors: Vec<Monitor>,
 
@@ -152,6 +152,12 @@ pub struct FlowWM {
     /// and animation code) and the target of hot-reload. The layout engine owns
     /// its own derived width/bounds state internally (see [`crate::workspace`]).
     pub(super) config: FlowConfig,
+
+    /// The problems of the `[binds]` table the daemon started with and set
+    /// aside for the built-in defaults (`config::set_aside_bad_binds`);
+    /// empty when it was kept, cleared by the next applied reload.
+    /// `flow query binds` reports them.
+    pub(super) binds_set_aside: Vec<String>,
 
     /// Path to the configuration directory — used to locate `flow.toml` and
     /// `flow-rules.toml` on hot-reload.

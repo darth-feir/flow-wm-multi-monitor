@@ -53,5 +53,6 @@ pub mod loadout;
 pub mod logging;
 pub mod registry;
 pub mod rescue;
+pub mod start_notice;
 pub mod updater;
 pub mod workspace;

@@ -48,6 +48,7 @@ use flow_wm::ipc::message::{LayerTarget, SocketMessage};
 use flow_wm::ipc::transport;
 use flow_wm::logging;
 use flow_wm::rescue;
+use flow_wm::start_notice::{self, NoticeKind};
 use flow_wm::updater;
 
 /// Maximum time to wait for the daemon to become ready after spawning.
@@ -605,6 +606,11 @@ fn main() {
             verbose,
             log_level,
         } => {
+            let config_dir = config::dirs::resolve_config_dir(config.as_deref().map(Path::new));
+            let log_path = match log_file.as_deref() {
+                Some(p) => PathBuf::from(p),
+                None => logging::default_log_path(&config_dir),
+            };
             let opts = StartOptions {
                 config_override: config,
                 log_file_override: log_file,
@@ -617,6 +623,9 @@ fn main() {
                 Ok(()) => Ok(()),
                 Err(StartError { message, exit_code }) => {
                     eprintln!("flow: {message}");
+                    if message != ALREADY_RUNNING {
+                        report_start_failure(&message, &log_path);
+                    }
                     std::process::exit(exit_code);
                 }
             }
@@ -640,6 +649,50 @@ fn main() {
         eprintln!("flow: {e}");
         std::process::exit(1);
     }
+}
+
+/// `flow start`'s refusal while a daemon answers: not a failure to report
+/// (the running daemon is fine, and a notice would take its foreground).
+const ALREADY_RUNNING: &str = "daemon is already running";
+
+/// A failed `flow start`: the cause goes into the log the daemon would have
+/// written (it may never have run), and, when nobody reads stderr, into a
+/// notice naming that log. No daemon is running, so the notice's hold on
+/// the foreground disturbs nothing. See
+/// `docs/adr/0032-a-bad-binds-table-is-visible-at-start.md`.
+fn report_start_failure(message: &str, log_path: &Path) {
+    let cause = message.replace(['\r', '\n'], " ");
+    if let Err(e) = append_log_line(log_path, &format!("flow start failed: {cause}")) {
+        eprintln!("flow: warning: could not write {}: {e}", log_path.display());
+    }
+    if !start_notice::stderr_is_watched() {
+        let text = start_notice::fit_notice(
+            "flow start failed: ",
+            &cause,
+            &format!(". Check the log at {}", log_path.display()),
+        );
+        if let Err(e) = start_notice::notify(NoticeKind::Error, &text) {
+            let _ = append_log_line(log_path, &format!("flow start: {e}"));
+        }
+    }
+}
+
+/// Append one `ERROR` line from `flow` to the daemon's log file, in the
+/// shape of the daemon's own lines.
+fn append_log_line(log_path: &Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = log_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    writeln!(
+        file,
+        "[{} ERROR flow] {line}",
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
+    )
 }
 
 /// Options for `flow start`, mirroring the `Commands::Start` flags.
@@ -750,7 +803,7 @@ fn cmd_start(opts: StartOptions) -> Result<(), StartError> {
     }
 
     if transport::is_daemon_running() {
-        return Err("daemon is already running".to_owned().into());
+        return Err(ALREADY_RUNNING.to_owned().into());
     }
 
     // Pre-flight config check: surface `flow.toml`/`flow-rules.toml` errors on the
@@ -824,6 +877,24 @@ fn cmd_start(opts: StartOptions) -> Result<(), StartError> {
         }
     }
 
+    // A `[binds]` table set aside: the warning went to stderr before the
+    // spawn; nobody reads that on an autostart, so a notice now, after the
+    // daemon is ready and has placed its windows.
+    let bind_keys = config::binds_problem_keys(&config::binds_problems(&config));
+    if !bind_keys.is_empty() && !start_notice::stderr_is_watched() {
+        let text = start_notice::fit_notice(
+            &format!(
+                "flow started with default binds for {} key(s): ",
+                bind_keys.len()
+            ),
+            &bind_keys.join(", "),
+            &format!(". Check the log at {}", expected_log_path.display()),
+        );
+        if let Err(e) = start_notice::notify(NoticeKind::Warning, &text) {
+            eprintln!("flow: warning: {e}");
+        }
+    }
+
     maybe_notify_update(&config);
 
     Ok(())
@@ -892,7 +963,9 @@ fn maybe_notify_update(config: &config::FlowConfig) {
 /// # Errors
 ///
 /// `Err(String)` only if `flow.toml` cannot be loaded (identifying file and
-/// cause). A `flow-rules.toml` failure is warned on stderr and does *not* error.
+/// cause). A `flow-rules.toml` failure is warned on stderr and does *not* error,
+/// nor does a `[binds]` table with problems: each is warned on stderr
+/// ([`config::binds_problems`]) with what the daemon does instead.
 /// On success returns the parsed app config so the caller can reuse it without
 /// a second file read (e.g. for the start-time update-notification flag).
 fn preflight_config_check(config_dir: &Path) -> Result<config::FlowConfig, String> {
@@ -902,6 +975,13 @@ fn preflight_config_check(config_dir: &Path) -> Result<config::FlowConfig, Strin
         // Fatal: surface why+where and refuse to spawn.
         Err(e) => return Err(format!("cannot start: {e}")),
     };
+    let binds = config::binds_problems(&config);
+    if !binds.is_empty() {
+        for problem in &binds {
+            eprintln!("flow: warning: {problem}");
+        }
+        eprintln!("flow: warning: {}", config::binds_fallback_note(&app_path));
+    }
 
     let rules_path = config::dirs::user_rules_path_in(config_dir);
     if let Err(e) = config::load_rules_config(&rules_path) {
@@ -1343,11 +1423,23 @@ fn cmd_config_check() -> Result<(), String> {
         Ok(other) => Err(format!("unexpected reply to check: {other:?}")),
         Err(_) => {
             let dir = config::dirs::config_dir();
-            for w in config::check_config(&dir)? {
-                eprintln!("flow: warning: {w}");
+            match config::check_config(&dir) {
+                Ok(warnings) => {
+                    for w in warnings {
+                        eprintln!("flow: warning: {w}");
+                    }
+                    println!("flow: configuration is valid (no daemon running; checked locally)");
+                    Ok(())
+                }
+                // One problem per line (every bad `[binds]` entry).
+                Err(problems) => {
+                    let lines: Vec<&str> = problems.lines().collect();
+                    for p in &lines {
+                        eprintln!("flow: {p}");
+                    }
+                    Err(format!("configuration has {} problem(s)", lines.len()))
+                }
             }
-            println!("flow: configuration is valid (no daemon running; checked locally)");
-            Ok(())
         }
     }
 }
