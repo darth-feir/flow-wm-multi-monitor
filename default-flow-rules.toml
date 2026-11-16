@@ -43,64 +43,24 @@ action = "ignore"
 match = { class = "Windows.UI.Composition.DesktopWindowContentBridge" }
 action = "ignore"
 
-# Windows 11 Start Menu host. The actual start menu runs in
-# StartMenuExperienceHost.exe (NOT ShellExperienceHost.exe below, which hosts
-# the older shell surfaces). Its popup surface is a top-level
-# `Xaml_WindowedPopupClass` window titled "PopupHost" that passes every gate,
-# so without this rule it is classified Floating and gets a border drawn around
-# the start menu.
-[[rules]]
-match = { exe = "StartMenuExperienceHost.exe" }
-action = "ignore"
-
-# XAML windowed-popups — the class used by the Start Menu popup, Action Center
-# flyouts, jump lists, and other OS-level XAML popups. All are transient system
-# surfaces, never app windows. Ignored by class (race-free) so any host gets
-# covered regardless of its exe name.
+# XAML windowed-popups. On Windows 11 22H2 the Win+X menu, the tray overflow
+# and the snap layouts flyout are top-level `Xaml_WindowedPopupClass` windows
+# of explorer.exe in the desktop band (1), and WinUI 3 apps use the class for
+# their own windowed popups, so the z-order band does not cover it. Ignored by
+# class (race-free) so any host gets covered regardless of its exe name.
 [[rules]]
 match = { class = "Xaml_WindowedPopupClass" }
 action = "ignore"
 
-# Windows Search overlay — Windows 10 (`SearchUI.exe`).
-[[rules]]
-match = { exe = "SearchUI.exe" }
-action = "ignore"
+# ── Shell surfaces in a shell band ─────────────────────────────────
 
-# Windows Search overlay — Windows 11 22H2+ (`SearchHost.exe`). Win11 split the
-# search UI out of `SearchUI.exe` into `SearchHost.exe`, so the Win10 rule above
-# no longer catches it. The surface is a top-level, titled, non-cloaked-while-
-# open, ownerless popup that passes every gate, so without this rule it gets
-# floated and bordered whenever the user opens Search.
-[[rules]]
-match = { exe = "SearchHost.exe" }
-action = "ignore"
-
-# Older shell-experience host (Action Center / Cortana surfaces). The modern
-# Start Menu is hosted by StartMenuExperienceHost.exe, handled above.
-[[rules]]
-match = { exe = "ShellExperienceHost.exe" }
-action = "ignore"
-
-# Windows Action Center / Quick Settings / notification toasts
-[[rules]]
-match = { exe = "ShellExperienceHost.exe", class = "Windows.UI.Core.CoreWindow" }
-action = "ignore"
-
-# ── Lock screen ─────────────────────────────────────────────────────
-
-# The lock screen is left entirely to Windows. Locking the session shows
-# LockApp.exe's full-screen `Windows.UI.Core.CoreWindow` over two explorer.exe
-# frames (`LockScreenBackstopFrame`, `LockScreenInputOcclusionFrame`). Without
-# these rules default_action = "float" centred, animated and foregrounded the
-# frames and shifted the lock picture off the screen. A user rule that matches
-# these windows (say `exe = "explorer.exe"` with no class) still wins. ADR-0030.
-[[rules]]
-match = { exe = "LockApp.exe" }
-action = "ignore"
-
-[[rules]]
-match = { exe = "explorer.exe", class_regex = '^LockScreen' }
-action = "ignore"
+# Start, search, the notification center, quick settings, toasts, jump lists,
+# Task View, Alt+Tab, the emoji panel and the lock screen (LockApp.exe and
+# explorer's LockScreen* frames) have no rule here: Windows draws them in a
+# z-order band above the desktop's, and flow leaves every such window alone
+# ahead of all rules (`Ignored::ShellBand` in `flow query all`). The windows
+# that arrive while the session is locked are held until the unlock
+# (`Ignored::SessionLocked`). ADR-0033, ADR-0034.
 
 # ── System Dialogs ──────────────────────────────────────────────────
 

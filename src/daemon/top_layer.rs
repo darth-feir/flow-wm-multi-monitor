@@ -107,22 +107,18 @@ impl TopmostProbe for Win32Topmost {
 }
 
 /// Window classes whose activation leaves the layer's decision alone: the
-/// taskbars, the desktop, Start / search, the Alt+Tab host, and the
+/// shell surfaces of the desktop band (the taskbars, the desktop) and the
 /// daemon's own surfaces (the keymap's OSD is shown `NoActivate` and never
 /// takes the foreground). Why they are not "non-flow windows" is in the dev
-/// guide (*The floating layer*, the shell exception). The two explorer
-/// lock-screen frames are here too (LockApp's own window is a
-/// `Windows.UI.Core.CoreWindow`): ADR-0030.
+/// guide (*The floating layer*, the shell exception). Start, search, the
+/// flyouts, Task View, Alt+Tab and the lock screen are recognised by their
+/// z-order band ([`is_shell_surface`]); the table of what left this list
+/// and why is ADR-0034.
 pub(super) const SHELL_CLASSES: &[&str] = &[
     "Shell_TrayWnd",
     "Shell_SecondaryTrayWnd",
     "Progman",
     "WorkerW",
-    "Windows.UI.Core.CoreWindow",
-    "LockScreenBackstopFrame",
-    "LockScreenInputOcclusionFrame",
-    "XamlExplorerHostIslandWindow",
-    "ForegroundStaging",
     "FlowBorderOverlay",
     "FlowSessionSink",
 ];
@@ -134,9 +130,9 @@ pub(super) fn is_shell_class(class: &str) -> bool {
 }
 
 /// Whether a window is a shell surface: its class is one of
-/// [`SHELL_CLASSES`], or its z-order band (`None`: unknown) is above the
-/// desktop's and the UIAccess band ([`is_shell_band`], ADR-0033). The band
-/// is the backstop for a shell surface no class list names yet.
+/// [`SHELL_CLASSES`] (the desktop-band ones), or its z-order band (`None`:
+/// unknown) is above the desktop's and the UIAccess band
+/// ([`is_shell_band`], ADR-0033, ADR-0034).
 #[must_use]
 pub(super) fn is_shell_surface(class: &str, band: Option<u32>) -> bool {
     is_shell_class(class) || is_shell_band(band)
@@ -915,6 +911,10 @@ impl FlowWM {
             return;
         }
         self.last_top_layer_reassert = Instant::now();
+        // No z-order work while the session is locked (ADR-0034).
+        if self.registry.session_locked() {
+            return;
+        }
         let fg = registry_win32::get_foreground_window();
         self.reassert_top_layer_with(fg, &Win32Topmost);
     }
@@ -2003,7 +2003,7 @@ mod tests {
     #[test]
     fn a_shell_surface_wins_even_when_owned() {
         let mut flow = fixture();
-        let probe = owned_desktop().with_owned(0x30, "XamlExplorerHostIslandWindow", F);
+        let probe = owned_desktop().with_owned(0x30, "WorkerW", F);
         flow.sync_all_top_layer_with(&probe);
         assert_eq!(activate(&mut flow, 0x30, &probe), None);
         assert!(flow.riders.is_empty());
@@ -2119,6 +2119,7 @@ mod tests {
         let mut flow = fixture();
         if let Some(w) = flow.registry.get_window_mut(HWND(I as *mut _)) {
             w.class = "Windows.UI.Core.CoreWindow".into();
+            w.band = Some(6);
         }
         let probe = MockTopmost::default();
         let summary = flow.sync_all_top_layer_with(&probe);

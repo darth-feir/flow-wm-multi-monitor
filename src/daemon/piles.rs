@@ -223,6 +223,10 @@ impl FlowWM {
             return;
         }
         self.last_pile_check = Instant::now();
+        // No z-order work while the session is locked (ADR-0034).
+        if self.registry.session_locked() {
+            return;
+        }
         let _ = self.check_piles_with(&Win32Piles);
     }
 

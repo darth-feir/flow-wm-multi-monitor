@@ -48,6 +48,7 @@ windows = { version = "0.62.2", features = [
   "Win32_System_JobObjects",
   "Win32_System_Console",
   "Win32_System_Shutdown",
+  "Win32_System_RemoteDesktop",
 ] }
 regex = "1.12.3"
 crossbeam-channel = "0.5.15"

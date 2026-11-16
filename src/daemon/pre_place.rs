@@ -55,9 +55,11 @@ impl FlowWM {
     /// shown yet), on the focused monitor when it is a candidate
     /// ([`is_pre_place_candidate`]) on another monitor and no rule would
     /// ignore it. At most once per window ([`FlowWM::pre_placed`]). Never
-    /// while tiling is off or with `[focus] new_window_monitor = "placed"`.
+    /// while tiling is off, while the session is locked (ADR-0034) or with
+    /// `[focus] new_window_monitor = "placed"`.
     pub(super) fn pre_place_created(&mut self, hwnd: isize) {
         if self.tiling_paused
+            || self.registry.session_locked()
             || self.config.focus.new_window_monitor != NewWindowMonitor::Focused
             || self.monitors.len() < 2
             || self.pre_placed.contains(&hwnd)

@@ -179,9 +179,11 @@ and every time the Start menu showed the search surface it was tiled into the
 strip and taken out again when it hid: the other tiles reflowed as if an app
 had opened and closed (seen on the host from 2026-10-27, fixed 2026-10-31).
 
-Two guards close it, both keyed on the shell classes of the floating layer
-(`top_layer::SHELL_CLASSES`: taskbars, desktop, `Windows.UI.Core.CoreWindow`,
-`XamlExplorerHostIslandWindow`, the daemon's own surfaces):
+Since ADR-0033 the search host is in a shell band (6 or 13) and the band
+gate leaves it alone ahead of every rule, learned ones included. Two guards
+remain for the shell surfaces of the desktop band, keyed on the shell
+classes of the floating layer (`top_layer::SHELL_CLASSES`: taskbars,
+desktop, the daemon's own surfaces):
 
 - a shell surface in the foreground is not a dispatch target; `set-window` and
   the manual drag use the registry's focus instead, as with no foreground;
@@ -262,8 +264,9 @@ windows are in the desktop band (1), and a normal process cannot create a
 window anywhere else. `get_window_info` reads the band once at arrival through
 `GetWindowBand`, an undocumented user32 export resolved with `GetProcAddress`
 (`registry::win32::window_band`). A known band above the UIAccess band (2) is a
-shell surface: notifications, toasts and flyouts (4), Start and search (6),
-Alt+Tab (16), the lock screen (17 and up). Such a window is registered
+shell surface: the emoji panel (3), notifications, toasts and flyouts (4),
+Task View (5), Start and jump lists (6), search (13), Alt+Tab (16), the lock
+screen (17). Such a window is registered
 `Ignored(ShellBand(n))` right after the elevated gate and before every rule;
 the registry logs `window 0x.. (exe "class") is in shell band n; left
 unmanaged`, and `flow query all` shows the state `Ignored::ShellBand` and
@@ -272,15 +275,51 @@ outranks every rule and cannot be overridden: the window is drawn above every
 desktop window whatever flow does, and Windows refuses to hand it the
 foreground. `set-window` on it is refused with a message.
 
-The band is a backstop behind the class lists, not a replacement: the
-taskbar, the desktop and explorer's lock-screen frames are band 1, so
-`SHELL_CLASSES` and the lock-screen rules (ADR-0030) still name them. The
-floating layer, the dispatch foreground and the `set-window` target ask
+The band replaces the class and exe lists wherever it covers them
+(ADR-0034): the bundled rules name no shell host any more (Start, search,
+ShellExperienceHost, the lock screen), and `SHELL_CLASSES` keeps only the
+desktop-band surfaces: the taskbars, the desktop and flowd's own windows.
+`Xaml_WindowedPopupClass` keeps its rule, because the Win+X menu, the tray
+overflow and the snap layouts flyout are band 1. The floating layer, the
+dispatch foreground and the `set-window` target ask
 `top_layer::is_shell_surface(class, band)`, which is either test. Learned-rule
-filtering keeps the class test, because a rule has no band. Without the
-export, or when the call fails, the band is unknown and everything works as
-before. Why, and the probe table: ADR-0033
-(`docs/adr/0033-window-bands-and-foreground-pushes.md`).
+filtering keeps the class test, because a rule has no band. Some shell
+windows are created cloaked in band 1 and moved to their band before they
+are shown; flow registers a window only once it is shown and uncloaked, so
+it reads the final band. Without the export, or when the call fails, the
+band is unknown and the removed surfaces are classified by `default_action`;
+no fallback list is kept (the export exists since Windows 8). Why, the probe
+tables and the per-entry table: ADR-0033
+(`docs/adr/0033-window-bands-and-foreground-pushes.md`) and ADR-0034
+(`docs/adr/0034-shell-bands-replace-shell-lists-and-the-session-lock.md`).
+
+## The Session Lock
+
+The session sink (`daemon::session`) registers for `WM_WTSSESSION_CHANGE`
+(`WTSRegisterSessionNotification`, `NOTIFY_FOR_THIS_SESSION`) and reports
+`WTS_SESSION_LOCK` / `WTS_SESSION_UNLOCK` to the main loop
+(`registry::hooks::report_session_lock`), which applies the change before it
+drains the hook events. While the session is locked:
+
+- a window that passes the elevated and shell-band gates is registered
+  `Ignored(SessionLocked)` (`... arrived while the session is locked; held
+  until the unlock`; `flow query all`: `Ignored::SessionLocked`), so it is
+  not seated, moved, bordered or raised, and `set-window` refuses it;
+- flowd pushes nothing to the foreground, and the floating layer's and book
+  mode's backstops leave the z-order alone; nothing is pre-placed.
+
+At the unlock the held windows leave the registry and go through the
+creation pipeline as new windows (a window hidden by then is simply
+dropped; a later show registers it), and every `Ignored(ShellBand)` window
+that is hidden, cloaked or iconic is dropped: LockApp cloaks its window at
+the credential prompt and never destroys it. One info line reports it:
+`session unlocked: N held window(s), C classified, D dropped; S hidden
+shell surface(s) dropped`.
+
+The lock surfaces themselves arrive anywhere from 40 ms after to 400 ms
+before `WTS_SESSION_LOCK` (measured) and go before `WTS_SESSION_UNLOCK`; the
+band (17), not the lock, leaves them alone. Disconnect and connect notifications are only
+logged. Why: ADR-0034.
 
 ## Where the Code Lives
 
@@ -294,6 +333,8 @@ before. Why, and the probe table: ADR-0033
 | Capture on `set-window` transition | `record_learned_transition` in `src/daemon/dispatch.rs` |
 | Daemon-owned history store | `history` field on `FlowWM`, loaded in `new()` |
 | Elevation gate (ADR-0025) | `process_elevation` / `elevation_blocks` in `src/registry/win32.rs`, `register_window_from_info` in `src/registry/core.rs` |
+| Shell-band gate (ADR-0033, ADR-0034) | `window_band` in `src/registry/win32.rs`, `is_shell_band` in `src/registry/classification.rs`, `register_window_from_info` |
+| Session lock (ADR-0034) | `SessionSink` in `src/daemon/session.rs`, `report_session_lock` in `src/registry/hooks.rs`, `on_session_lock_change` in `src/daemon/hooks.rs` |
 
 ## Cross-References
 

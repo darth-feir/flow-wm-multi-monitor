@@ -671,10 +671,10 @@ window".* Clicking the taskbar, opening Start or search, Alt+Tab's host and
 the daemon's own surfaces (`FlowBorderOverlay`, `FlowSessionSink`) all take
 the foreground for a moment and give it straight back to a flow window;
 dropping and re-raising on each would flash every float on every taskbar
-click. These classes (`SHELL_CLASSES` in `top_layer.rs`: `Shell_TrayWnd`,
-`Shell_SecondaryTrayWnd`, `Progman`, `WorkerW`, `Windows.UI.Core.CoreWindow`,
-`XamlExplorerHostIslandWindow`, `ForegroundStaging`, and the two above) leave
-the decision as it was, as does a null foreground. The keymap's OSD is shown
+click. These windows (`SHELL_CLASSES` in `top_layer.rs`: `Shell_TrayWnd`,
+`Shell_SecondaryTrayWnd`, `Progman`, `WorkerW` and the two above; Start,
+search, the flyouts, Task View, Alt+Tab and the lock screen by their z-order
+band, ADR-0034) leave the decision as it was, as does a null foreground. The keymap's OSD is shown
 `NoActivate` and never takes the foreground, so it needs no entry; any other
 AutoHotkey window is an ordinary app. A dialog owned by a flow window (a
 Save-As box, a connect dialog, an error box) is not on the list either; it

@@ -56,18 +56,6 @@ pub struct WindowCandidate {
     pub process_path: String,
 }
 
-// ── Lock screen ─────────────────────────────────────────────────────
-
-/// Whether `exe` / `class` name a lock-screen surface: LockApp.exe's
-/// window, or one of explorer.exe's `LockScreen*` frames. The same windows
-/// the bundled lock-screen rules ignore; the registry uses this to log them
-/// quietly and to drop them when they hide. ADR-0030.
-#[must_use]
-pub fn is_lock_surface(exe: &str, class: &str) -> bool {
-    exe.eq_ignore_ascii_case("LockApp.exe")
-        || (exe.eq_ignore_ascii_case("explorer.exe") && class.starts_with("LockScreen"))
-}
-
 // ── Window bands ────────────────────────────────────────────────────
 
 /// `ZBID_DESKTOP`: the z-order band of every ordinary application window.
@@ -79,8 +67,9 @@ pub const BAND_UIACCESS: u32 = 2;
 
 /// Whether a window's z-order band (`GetWindowBand`, `None` when it could
 /// not be read) marks it as a shell surface flow never manages: a band
-/// above [`BAND_UIACCESS`] (notifications and flyouts 4, Start and search 6,
-/// Alt+Tab 16, the lock screen 17 and up). `ZBID_DEFAULT` (0), the desktop
+/// above [`BAND_UIACCESS`] (the emoji panel 3, notifications and flyouts 4,
+/// Task View 5, Start and jump lists 6, search 13, Alt+Tab 16, the lock
+/// screen 17; ADR-0033, ADR-0034). `ZBID_DEFAULT` (0), the desktop
 /// and the UIAccess band are managed; an unknown band is not a shell
 /// surface (the class and exe rules decide alone). ADR-0033.
 #[must_use]
@@ -1568,94 +1557,49 @@ mod tests {
         );
     }
 
-    /// ADR-0030: the lock-screen surfaces (explorer's two `LockScreen*`
-    /// frames, LockApp's window) are ignored by the bundled rules whatever
-    /// the fallback action, and LockApp stays ignored when it is not
-    /// full-screen (an offset rect).
+    /// ADR-0034: the shell surfaces that sit in a shell band (Start,
+    /// search, the notification center and its flyouts, the lock screen)
+    /// have no bundled rule any more, the band gate leaves them alone; the
+    /// desktop-band ones (taskbars, XAML popups) and the UIAccess tools
+    /// keep theirs.
     #[test]
-    fn embedded_default_rules_ignore_lock_screen_surfaces() {
+    fn embedded_default_rules_leave_band_covered_shell_surfaces_to_the_band() {
         use crate::config::lifecycle::load_default_rules;
-        let surfaces = [
-            candidate("explorer.exe", "", "LockScreenBackstopFrame", ""),
-            candidate("explorer.exe", "", "LockScreenInputOcclusionFrame", ""),
-            candidate(
-                "LockApp.exe",
-                "Windows Default Lock Screen",
-                "Windows.UI.Core.CoreWindow",
-                "",
-            ),
-        ];
-        for fallback in [WindowAction::Float, WindowAction::Tile] {
-            let pipeline = ClassificationPipeline::new(
-                WindowRulesConfig {
-                    default_action: fallback,
-                    rules: vec![],
-                },
-                load_default_rules(),
+        let pipeline = ClassificationPipeline::new(
+            WindowRulesConfig {
+                default_action: WindowAction::Float,
+                rules: vec![],
+            },
+            load_default_rules(),
+        );
+        for (exe, class) in [
+            ("StartMenuExperienceHost.exe", "Windows.UI.Core.CoreWindow"),
+            ("SearchHost.exe", "Windows.UI.Core.CoreWindow"),
+            ("SearchUI.exe", "Windows.UI.Core.CoreWindow"),
+            ("ShellExperienceHost.exe", "Windows.UI.Core.CoreWindow"),
+            ("LockApp.exe", "Windows.UI.Core.CoreWindow"),
+            ("explorer.exe", "LockScreenBackstopFrame"),
+            ("explorer.exe", "LockScreenInputOcclusionFrame"),
+        ] {
+            assert_eq!(
+                pipeline.classify(&candidate(exe, "", class, "")),
+                WindowAction::Float,
+                "{exe} {class}"
             );
-            for c in &surfaces {
-                assert!(
-                    matches!(
-                        classify_with_state_pipeline(c, false, false, &pipeline),
-                        WindowState::Ignored(IgnoredReason::ExplicitRule)
-                    ),
-                    "{} {} under {fallback:?}",
-                    c.exe,
-                    c.class
-                );
-                assert!(is_lock_surface(&c.exe, &c.class));
-            }
-            // An ordinary explorer window still falls through to the fallback.
-            let other = candidate("explorer.exe", "", "SomeOtherFrame", "");
-            assert_eq!(pipeline.classify(&other), fallback);
-            assert!(!is_lock_surface(&other.exe, &other.class));
         }
-        // The class prefix alone is not enough: another exe is not a lock surface.
-        assert!(!is_lock_surface("app.exe", "LockScreenBackstopFrame"));
-    }
-
-    /// ADR-0030: the lock-screen rules are bundled defaults, so a user rule
-    /// that matches the same windows still wins (precedence is unchanged):
-    /// `exe = "explorer.exe"` with no class floats the lock frames too, while
-    /// a class-scoped explorer rule leaves them to the bundled ignore.
-    #[test]
-    fn user_explorer_rule_outranks_the_lock_screen_rules() {
-        use crate::config::lifecycle::load_default_rules;
-        let frame = candidate("explorer.exe", "", "LockScreenBackstopFrame", "");
-        let cabinet = candidate("explorer.exe", "Home", "CabinetWClass", "");
-
-        let broad = ClassificationPipeline::new(
-            WindowRulesConfig {
-                default_action: WindowAction::Tile,
-                rules: vec![rule(
-                    MatchRule {
-                        exe: Some("explorer.exe".into()),
-                        ..Default::default()
-                    },
-                    WindowAction::Float,
-                )],
-            },
-            load_default_rules(),
-        );
-        assert_eq!(broad.classify(&cabinet), WindowAction::Float);
-        assert_eq!(broad.classify(&frame), WindowAction::Float);
-
-        let scoped = ClassificationPipeline::new(
-            WindowRulesConfig {
-                default_action: WindowAction::Tile,
-                rules: vec![rule(
-                    MatchRule {
-                        exe: Some("explorer.exe".into()),
-                        class: Some("CabinetWClass".into()),
-                        ..Default::default()
-                    },
-                    WindowAction::Float,
-                )],
-            },
-            load_default_rules(),
-        );
-        assert_eq!(scoped.classify(&cabinet), WindowAction::Float);
-        assert_eq!(scoped.classify(&frame), WindowAction::Ignore);
+        for (exe, class) in [
+            ("explorer.exe", "Shell_TrayWnd"),
+            ("explorer.exe", "Shell_SecondaryTrayWnd"),
+            ("explorer.exe", "Xaml_WindowedPopupClass"),
+            ("osk.exe", "OSKMainClass"),
+            ("Magnify.exe", "MagUIClass"),
+        ] {
+            assert_eq!(
+                pipeline.classify(&candidate(exe, "", class, "")),
+                WindowAction::Ignore,
+                "{exe} {class}"
+            );
+        }
     }
 
     // --- Pipeline regex rule tests (pre-compiled via ClassificationPipeline) ---

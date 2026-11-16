@@ -443,6 +443,46 @@ pub fn take_topology_dirty() -> bool {
     TOPOLOGY_DIRTY.swap(false, Ordering::AcqRel)
 }
 
+// ── Session lock (WTS_SESSION_LOCK / WTS_SESSION_UNLOCK) ─────────────
+
+/// Whether the session is locked, as the session sink last heard it
+/// (`WM_WTSSESSION_CHANGE`, ADR-0034). Read by the foreground push, which
+/// does nothing while it is set.
+static SESSION_LOCKED: AtomicBool = AtomicBool::new(false);
+
+/// Set by [`report_session_lock`]; taken by the main loop
+/// ([`take_session_lock_change`]) before it drains the hook events.
+static SESSION_LOCK_CHANGED: AtomicBool = AtomicBool::new(false);
+
+/// Report a lock (`true`) or an unlock (`false`) of the session and wake
+/// the main loop, like [`request_topology_refresh`]. Called from the
+/// session sink's window procedure.
+pub fn report_session_lock(locked: bool) {
+    SESSION_LOCKED.store(locked, Ordering::Release);
+    SESSION_LOCK_CHANGED.store(true, Ordering::Release);
+    if let Some(&raw) = HOOK_SIGNAL.get() {
+        // SAFETY: the raw value is the signal event created in
+        // `start_hook_thread`; it lives for the daemon's lifetime.
+        let _ = unsafe { SetEvent(HANDLE(raw as *mut core::ffi::c_void)) };
+    }
+}
+
+/// `true` while the session is locked ([`report_session_lock`]).
+#[must_use]
+pub fn session_locked() -> bool {
+    SESSION_LOCKED.load(Ordering::Acquire)
+}
+
+/// The session's lock state if a lock or unlock was reported since the
+/// last call (`Some(true)`: locked), clearing the report. Only the main
+/// loop calls this.
+#[must_use]
+pub fn take_session_lock_change() -> Option<bool> {
+    SESSION_LOCK_CHANGED
+        .swap(false, Ordering::AcqRel)
+        .then(session_locked)
+}
+
 // ── Floating-location tracking (shared with the hook callback) ───────
 
 /// HWND values of the active workspace's floating windows.
@@ -1365,6 +1405,16 @@ fn hook_callback_body(event: u32, hwnd: HWND, id_object: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unlock report is taken once. (A lock report is not exercised: the
+    /// flag gates every foreground push of the test binary.)
+    #[test]
+    fn a_session_lock_report_is_taken_once() {
+        report_session_lock(false);
+        assert_eq!(take_session_lock_change(), Some(false));
+        assert_eq!(take_session_lock_change(), None);
+        assert!(!session_locked());
+    }
 
     #[test]
     fn shutdown_request_sets_flag_and_complete_releases_waiter() {

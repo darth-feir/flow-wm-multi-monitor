@@ -22,6 +22,13 @@
 //! A *message-only* window (`HWND_MESSAGE`) would not do: those are
 //! excluded from broadcasts and never receive session messages.
 //!
+//! The sink also hears the session lock: it registers for
+//! `WM_WTSSESSION_CHANGE` (`WTSRegisterSessionNotification`,
+//! `NOTIFY_FOR_THIS_SESSION`) and reports `WTS_SESSION_LOCK` /
+//! `WTS_SESSION_UNLOCK` through
+//! [`report_session_lock`](crate::registry::hooks::report_session_lock); what
+//! the daemon does with it is ADR-0034.
+//!
 //! [`install_console_ctrl_handler`] covers console runs (`flowd` started in
 //! a terminal): Ctrl-C, Ctrl-Break, closing the console, logoff and shutdown
 //! all request the same graceful shutdown. For the last three Windows kills
@@ -39,15 +46,21 @@ use windows::Win32::System::Console::{
     SetConsoleCtrlHandler,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::RemoteDesktop::{
+    NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
+};
 use windows::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SPI_SETWORKAREA,
     WINDOW_EX_STYLE, WM_CLOSE, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_QUERYENDSESSION,
-    WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_SETTINGCHANGE, WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
-use crate::registry::hooks::{request_shutdown, request_topology_refresh, wait_shutdown_complete};
+use crate::registry::hooks::{
+    report_session_lock, request_shutdown, request_topology_refresh, wait_shutdown_complete,
+};
 
 /// Window class of the session sink.
 const SINK_CLASS_NAME: PCWSTR = w!("FlowSessionSink");
@@ -67,8 +80,13 @@ static SESSION_RESCUE_DONE: AtomicBool = AtomicBool::new(false);
 /// The invisible top-level window that receives session-end messages.
 ///
 /// Created on the main thread (which pumps messages) so the window
-/// procedure runs there. Destroyed on drop.
-pub struct SessionSink(HWND);
+/// procedure runs there. Destroyed on drop, after its session-notification
+/// registration is withdrawn.
+pub struct SessionSink {
+    hwnd: HWND,
+    /// `WTSRegisterSessionNotification` succeeded for `hwnd`.
+    lock_notifications: bool,
+}
 
 impl SessionSink {
     /// Register the class (once) and create the hidden window.
@@ -105,24 +123,52 @@ impl SessionSink {
         }
         .map_err(|e| format!("CreateWindowExW(session sink) failed: {e}"))?;
         log::debug!("session sink window created ({:?})", hwnd);
-        Ok(Self(hwnd))
+        // The lock and unlock of this session (ADR-0034). Without them the
+        // daemon still runs; windows that arrive during a lock are then
+        // classified as at any other time.
+        // SAFETY: `hwnd` is the window just created on this thread.
+        let lock_notifications = match unsafe {
+            WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)
+        } {
+            Ok(()) => {
+                log::debug!("session sink: registered for session lock notifications");
+                true
+            }
+            Err(e) => {
+                log::warn!(
+                    "session sink: WTSRegisterSessionNotification failed ({e}); windows that arrive while the session is locked are managed as usual"
+                );
+                false
+            }
+        };
+        Ok(Self {
+            hwnd,
+            lock_notifications,
+        })
     }
 
     /// A sink with no window, for unit tests that build a `FlowWM` without
     /// touching Win32.
     #[cfg(test)]
     pub(crate) fn test_dummy() -> Self {
-        Self(HWND::default())
+        Self {
+            hwnd: HWND::default(),
+            lock_notifications: false,
+        }
     }
 }
 
 impl Drop for SessionSink {
     fn drop(&mut self) {
-        if self.0.is_invalid() {
+        if self.hwnd.is_invalid() {
             return;
         }
+        if self.lock_notifications {
+            // SAFETY: the registration was made for this window.
+            let _ = unsafe { WTSUnRegisterSessionNotification(self.hwnd) };
+        }
         // SAFETY: we created this window on this (main) thread and own it.
-        let _ = unsafe { DestroyWindow(self.0) };
+        let _ = unsafe { DestroyWindow(self.hwnd) };
     }
 }
 
@@ -167,6 +213,9 @@ fn ensure_class_registered() -> Result<(), String> {
 /// to auto-hide) report a display-topology change through
 /// [`request_topology_refresh`](crate::registry::hooks::request_topology_refresh);
 /// the main loop debounces and reconciles (see `daemon::hotplug`).
+/// `WM_WTSSESSION_CHANGE` with `WTS_SESSION_LOCK` / `WTS_SESSION_UNLOCK`
+/// is reported through [`report_session_lock`] (ADR-0034); the other
+/// session changes (connect, disconnect, logon) are only logged.
 ///
 /// A panic in the body is caught ([`catch_unwind`]): unwinding out of an
 /// `extern "system"` callback would abort the process with no fail-back.
@@ -231,6 +280,23 @@ fn sink_wnd_proc_body(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> L
         WM_SETTINGCHANGE if is_work_area_change(wparam) => {
             log::info!("session sink: WM_SETTINGCHANGE(SPI_SETWORKAREA) — work area changed");
             request_topology_refresh();
+            LRESULT(0)
+        }
+        WM_WTSSESSION_CHANGE => {
+            match session_lock_of(wparam) {
+                Some(locked) => {
+                    log::info!(
+                        "session sink: the session was {}",
+                        if locked { "locked" } else { "unlocked" }
+                    );
+                    report_session_lock(locked);
+                }
+                None => log::debug!(
+                    "session sink: WM_WTSSESSION_CHANGE {:#x} (session {})",
+                    wparam.0,
+                    lparam.0
+                ),
+            }
             LRESULT(0)
         }
         // SAFETY: pass-through with unchanged arguments.
@@ -338,6 +404,18 @@ pub(crate) fn is_work_area_change(wparam: WPARAM) -> bool {
     wparam.0 == SPI_SETWORKAREA.0 as usize
 }
 
+/// The lock state a `WM_WTSSESSION_CHANGE` reports: `Some(true)` for
+/// `WTS_SESSION_LOCK`, `Some(false)` for `WTS_SESSION_UNLOCK`, `None` for
+/// every other change (connect, disconnect, logon, logoff, remote control).
+#[must_use]
+pub(crate) fn session_lock_of(wparam: WPARAM) -> Option<bool> {
+    match u32::try_from(wparam.0).ok()? {
+        WTS_SESSION_LOCK => Some(true),
+        WTS_SESSION_UNLOCK => Some(false),
+        _ => None,
+    }
+}
+
 /// `true` for the console events after which Windows terminates the
 /// process as soon as the handler returns (close, logoff, shutdown).
 #[must_use]
@@ -385,7 +463,16 @@ mod tests {
     #[test]
     fn test_dummy_sink_has_no_window_and_drops_quietly() {
         let sink = SessionSink::test_dummy();
-        assert!(sink.0.is_invalid());
+        assert!(sink.hwnd.is_invalid());
         drop(sink);
+    }
+
+    #[test]
+    fn only_lock_and_unlock_change_the_lock_state() {
+        assert_eq!(session_lock_of(WPARAM(7)), Some(true));
+        assert_eq!(session_lock_of(WPARAM(8)), Some(false));
+        for other in [1, 2, 3, 4, 5, 6, 9, 10] {
+            assert_eq!(session_lock_of(WPARAM(other)), None, "{other}");
+        }
     }
 }

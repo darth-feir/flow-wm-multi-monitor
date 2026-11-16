@@ -452,11 +452,6 @@ impl FlowWM {
         self.abandon_manual_drag_for(hwnd);
         // A hidden rider leaves the band and is forgotten (ADR-0024).
         self.forget_rider(hwnd, false);
-        // A lock surface leaves the registry once it hides (ADR-0030).
-        if self.registry.drop_hidden_lock_surface(hwnd) {
-            return;
-        }
-
         // Tiling off: registry only (see `on_window_minimized`).
         if self.tiling_paused {
             let _ = self.registry.reconcile_visibility(hwnd);
@@ -1055,8 +1050,54 @@ impl FlowWM {
     /// `EVENT_SYSTEM_FOREGROUND` path so a background poll never triggers an
     /// unintended workspace switch. The common (in-sync) path is a
     /// microsecond-scale guard clause.
+    /// Apply a lock or unlock the session sink reported
+    /// ([`take_session_lock_change`](crate::registry::hooks::take_session_lock_change)).
+    /// Called before the hook events are drained, so the windows that
+    /// arrive with the change meet the new state (ADR-0034).
+    pub(super) fn apply_session_lock_change(&mut self) {
+        if let Some(locked) = crate::registry::hooks::take_session_lock_change() {
+            self.on_session_lock_change(locked);
+        }
+    }
+
+    /// The session was locked (`true`) or unlocked. Locked: windows that
+    /// arrive are held `Ignored(SessionLocked)`, nothing is pushed to the
+    /// foreground and the backstops leave the z-order alone. Unlocked: the
+    /// held windows leave the registry and those still there go through
+    /// the creation pipeline as new windows; shell-band windows that are
+    /// hidden by now (the lock screen's own) are dropped. ADR-0034.
+    pub(super) fn on_session_lock_change(&mut self, locked: bool) {
+        if locked {
+            if !self.registry.session_locked() {
+                self.registry.set_session_locked(true);
+                log::info!("session locked: windows that arrive are held until the unlock");
+            }
+            return;
+        }
+        self.registry.set_session_locked(false);
+        let held = self.registry.take_session_locked_windows();
+        let dropped = self.registry.drop_hidden_shell_band_windows();
+        let mut classified = 0usize;
+        for hwnd in &held {
+            if self.on_window_created(*hwnd) {
+                classified += 1;
+            } else {
+                log::debug!("window {hwnd:#x} held during the lock is gone or hidden; dropped");
+            }
+        }
+        log::info!(
+            "session unlocked: {} held window(s), {classified} classified, {} dropped; {dropped} hidden shell surface(s) dropped",
+            held.len(),
+            held.len() - classified
+        );
+    }
+
     pub(super) fn reconcile_foreground(&mut self) {
         self.last_foreground_sync = std::time::Instant::now();
+        // The lock screen holds the foreground until the unlock (ADR-0034).
+        if self.registry.session_locked() {
+            return;
+        }
         self.recheck_focused_corners();
         self.recheck_focused_frame();
 
@@ -1405,6 +1446,28 @@ mod readd_tests {
         if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {
             w.state = WindowState::Tiling(TilingState::Active { col: 0, row: 0 });
         }
+    }
+
+    /// ADR-0034: a lock holds arrivals and freezes the backstops; the
+    /// unlock lets the held windows go (a test handle is never shown, so it
+    /// is dropped) and leaves the tiles alone.
+    #[test]
+    fn the_unlock_releases_held_windows_and_keeps_the_tiles() {
+        let mut flow = flow();
+        flow.on_session_lock_change(true);
+        assert!(flow.registry.session_locked());
+        let held = 0x5E;
+        tiled(&mut flow.registry, held);
+        if let Some(w) = flow.registry.get_window_mut(HWND(held as *mut _)) {
+            w.state = WindowState::Ignored(crate::registry::types::IgnoredReason::SessionLocked);
+        }
+        flow.on_session_lock_change(true);
+        assert!(flow.registry.is_tracked(held));
+        flow.on_session_lock_change(false);
+        assert!(!flow.registry.session_locked());
+        assert!(!flow.registry.is_tracked(held));
+        assert!(flow.registry.is_tiling_active(A) && flow.registry.is_tracked(B));
+        assert_eq!(columns_holding(&flow, 1, A), 1);
     }
 
     /// One monitor, workspaces 1 (active, holding A) and 2 (parked, holding B).

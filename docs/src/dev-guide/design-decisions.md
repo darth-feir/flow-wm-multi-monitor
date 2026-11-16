@@ -544,7 +544,8 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   classes, those classes are shell classes (never learned, never topmost, no
   `set-window` target), and a hidden lock surface leaves the registry instead
   of lingering as a stale entry. A user `exe = "explorer.exe"` rule without a
-  class still wins. `docs/adr/0030-lock-screen-surfaces-are-ignored.md`
+  class still wins. Superseded in part by ADR-0034 (the lock surfaces are
+  band 17). `docs/adr/0030-lock-screen-surfaces-are-ignored.md`
 - **ADR-0031 — The overlay names the Windows key `Win`; `Mod`, `Win` and
   `Super` are one modifier.** The keymap's modifier is always the Windows key,
   so the canonical chord text says `Win`: the overlay and hardwired rows, the
@@ -577,3 +578,17 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   the idle timer, so `AttachThreadInput` stays the push path. A toast does not block focus
   pushes, so the keymap's `TrayTip` ban is no longer a hard rule.
   `docs/adr/0033-window-bands-and-foreground-pushes.md`
+- **ADR-0034 — Shell bands replace the shell lists; the session lock is a
+  signal.** Measured with the real lock screen: the lock frames and LockApp
+  are band 17, Task View 5, jump lists 6, search 13, the emoji panel 3. The
+  bundled rules for Start, search, ShellExperienceHost and the lock screen
+  and the shell classes CoreWindow, `LockScreen*`,
+  `XamlExplorerHostIslandWindow` and `ForegroundStaging` are gone; the
+  desktop-band ones (taskbars, desktop, `Xaml_WindowedPopupClass`) stay. No
+  fallback list when the band cannot be read (Windows 11 always has the
+  export). The session sink registers for `WM_WTSSESSION_CHANGE`: a window
+  that arrives while the session is locked is `Ignored::SessionLocked` (no
+  seat, move or push), and at the unlock it is classified afresh or dropped
+  when hidden, and hidden shell-band windows (LockApp's) leave the registry.
+  `WTS_SESSION_LOCK` comes from 38 ms before to 391 ms after the lock
+  surfaces, so it cannot replace the band for them. `docs/adr/0034-shell-bands-replace-shell-lists-and-the-session-lock.md`

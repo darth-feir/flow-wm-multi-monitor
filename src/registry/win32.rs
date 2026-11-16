@@ -702,6 +702,12 @@ pub fn window_description(hwnd_val: isize) -> String {
 /// of `warn` when `quiet` — for callers that have a fallback and report
 /// the outcome themselves ([`clear_foreground_window`]).
 fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> ForegroundPush {
+    // Nothing is pushed while the session is locked: the lock screen owns
+    // the foreground until the unlock (ADR-0034).
+    if crate::registry::hooks::session_locked() {
+        log::debug!("set_foreground_window: hwnd {hwnd_val:#x} not pushed, the session is locked");
+        return ForegroundPush::Failed(0);
+    }
     let target_hwnd = HWND(hwnd_val as *mut _);
     // Get the current foreground window.
     let foreground_hwnd = unsafe { GetForegroundWindow() };

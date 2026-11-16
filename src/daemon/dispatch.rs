@@ -1904,6 +1904,19 @@ impl FlowWM {
                 ),
             };
         }
+        // Held since it arrived during a lock (ADR-0034): the unlock
+        // classifies it.
+        if matches!(
+            win.state,
+            WindowState::Ignored(IgnoredReason::SessionLocked)
+        ) {
+            return SocketResponse::Error {
+                message: format!(
+                    "window {:#x} ({}) arrived while the session was locked; flow classifies it at the unlock",
+                    focused.0, win.exe
+                ),
+            };
+        }
 
         // Capture the window's identity for history recording before the
         // immutable borrow of `self.registry` (via `win`) ends — the
@@ -3085,19 +3098,16 @@ mod tests {
         assert_eq!(action_to_learned(SetWindowAction::NoOp), None);
     }
 
-    /// A learned rule keyed on a shell-surface class (the search host's
-    /// `Windows.UI.Core.CoreWindow`, learned by an earlier build from a
-    /// `set-window` that landed on Start) never reaches the pipeline; the
-    /// app rules around it do.
+    /// A learned rule keyed on a shell-surface class (the desktop, the
+    /// taskbar) never reaches the pipeline; the app rules around it do. The
+    /// shell surfaces of a shell band (the search host an earlier build
+    /// learned from a `set-window` on Start) are left alone by the band
+    /// gate ahead of every rule (ADR-0033, ADR-0034).
     #[test]
     fn learned_rules_for_pipeline_skips_shell_surfaces() {
         let mut history = HistoryStore::default();
         history.record(WindowAction::Tile, "alacritty.exe", Some("Window Class"));
-        history.record(
-            WindowAction::Tile,
-            "SearchHost.exe",
-            Some("Windows.UI.Core.CoreWindow"),
-        );
+        history.record(WindowAction::Tile, "explorer.exe", Some("Progman"));
         history.record(WindowAction::Float, "explorer.exe", Some("Shell_TrayWnd"));
         history.record(WindowAction::Tile, "Code.exe", None);
         let exes: Vec<_> = learned_rules_for_pipeline(&history)
@@ -3105,35 +3115,6 @@ mod tests {
             .map(|r| r.match_.exe.unwrap_or_default())
             .collect();
         assert_eq!(exes, ["alacritty.exe", "Code.exe"]);
-    }
-
-    /// ADR-0030: a learned rule for a lock-screen surface (explorer's two
-    /// `LockScreen*` frames, LockApp's `Windows.UI.Core.CoreWindow`) never
-    /// reaches the pipeline either.
-    #[test]
-    fn learned_rules_for_pipeline_skips_lock_screen_surfaces() {
-        let mut history = HistoryStore::default();
-        history.record(
-            WindowAction::Float,
-            "explorer.exe",
-            Some("LockScreenBackstopFrame"),
-        );
-        history.record(
-            WindowAction::Tile,
-            "explorer.exe",
-            Some("LockScreenInputOcclusionFrame"),
-        );
-        history.record(
-            WindowAction::Float,
-            "LockApp.exe",
-            Some("Windows.UI.Core.CoreWindow"),
-        );
-        history.record(WindowAction::Tile, "explorer.exe", Some("CabinetWClass"));
-        let kept: Vec<_> = learned_rules_for_pipeline(&history)
-            .into_iter()
-            .map(|r| r.match_.class.unwrap_or_default())
-            .collect();
-        assert_eq!(kept, ["CabinetWClass"]);
     }
 
     // ── resolve_unknown_focus: set-window on a window the registry never met ──
@@ -3369,9 +3350,10 @@ mod tests {
         }
     }
 
-    /// ADR-0030: a lock-screen frame (or any shell surface) the registry
-    /// holds as its focus is no `set-window` target: refused, not adopted,
-    /// nothing learned.
+    /// A shell surface of the desktop band (the desktop, the taskbar) the
+    /// registry holds as its focus is no `set-window` target: refused, not
+    /// adopted, nothing learned (ADR-0030; the lock frames it was found
+    /// with are left alone by their band since ADR-0034).
     #[test]
     fn set_window_on_a_focused_shell_surface_is_refused() {
         for mode in [WindowMode::Tile, WindowMode::Float, WindowMode::Cycle] {
@@ -3379,7 +3361,7 @@ mod tests {
                 flow_with_focused_state(WindowState::Ignored(IgnoredReason::ExplicitRule));
             if let Some(w) = flow.registry.get_window_mut(HWND(TEST_HWND as *mut _)) {
                 w.exe = "explorer.exe".into();
-                w.class = "LockScreenBackstopFrame".into();
+                w.class = "WorkerW".into();
             }
             match flow.dispatch_set_window(mode) {
                 SocketResponse::Error { message } => {

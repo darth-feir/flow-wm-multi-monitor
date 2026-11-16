@@ -533,7 +533,8 @@ pub enum FloatingState {
 ///
 /// `Elevated` wins over everything: no rule, maximize or fullscreen state
 /// can make flow manage a window it is not allowed to move. `ShellBand`
-/// comes next, also ahead of every rule (ADR-0033).
+/// comes next, also ahead of every rule (ADR-0033), then `SessionLocked`
+/// (ADR-0034).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IgnoredReason {
     /// Window is maximized (`WS_MAXIMIZE` style).
@@ -551,6 +552,10 @@ pub enum IgnoredReason {
     /// a shell surface, never managed whatever the rules say. Decided once
     /// at arrival (ADR-0033).
     ShellBand(u32),
+    /// The window arrived while the session was locked: held unmanaged
+    /// until the unlock, then dropped if hidden or classified afresh
+    /// (ADR-0034).
+    SessionLocked,
 }
 
 // ── RestoreSeat ─────────────────────────────────────────────────────

@@ -120,6 +120,11 @@ pub struct WindowRegistry {
     /// default; the daemon turns it on once windows may move (after the
     /// pipe and hook stages) and off while tiling is paused.
     adopt_maximized: bool,
+
+    /// Whether the session is locked (`WTS_SESSION_LOCK` seen, no
+    /// `WTS_SESSION_UNLOCK` since): a window that arrives meanwhile is
+    /// registered `Ignored(SessionLocked)` (ADR-0034). Set by the daemon.
+    session_locked: bool,
 }
 
 impl WindowRegistry {
@@ -140,7 +145,59 @@ impl WindowRegistry {
                 default_rules.clone(),
             ),
             adopt_maximized: false,
+            session_locked: false,
         }
+    }
+
+    /// Record whether the session is locked (ADR-0034). While it is, a
+    /// window that arrives is registered `Ignored(SessionLocked)`.
+    pub fn set_session_locked(&mut self, locked: bool) {
+        self.session_locked = locked;
+    }
+
+    /// Whether the registry treats the session as locked.
+    #[must_use]
+    pub fn session_locked(&self) -> bool {
+        self.session_locked
+    }
+
+    /// Remove every window registered `Ignored(SessionLocked)` and return
+    /// their handles, for the daemon to classify afresh at the unlock
+    /// (ADR-0034).
+    pub fn take_session_locked_windows(&mut self) -> Vec<isize> {
+        let held: Vec<isize> = self
+            .windows
+            .iter()
+            .filter(|(_, w)| matches!(w.state, WindowState::Ignored(IgnoredReason::SessionLocked)))
+            .map(|(h, _)| *h)
+            .collect();
+        for h in &held {
+            self.remove_window(*h);
+        }
+        held
+    }
+
+    /// Drop every `Ignored(ShellBand)` window that is no longer
+    /// user-visible (hidden, cloaked or iconic) and return how many went.
+    /// Run at the unlock: the lock screen hides its own window rather than
+    /// destroying it (ADR-0034). Shown again, such a window registers anew
+    /// through the show / uncloak / foreground recovery.
+    pub fn drop_hidden_shell_band_windows(&mut self) -> usize {
+        let hidden: Vec<isize> = self
+            .windows
+            .iter()
+            .filter(|(_, w)| matches!(w.state, WindowState::Ignored(IgnoredReason::ShellBand(_))))
+            .map(|(h, _)| *h)
+            .filter(|h| {
+                let hw = HWND(*h as *mut _);
+                !win32::is_window_visible(hw) || win32::is_cloaked(hw) || win32::is_iconic(hw)
+            })
+            .collect();
+        for h in &hidden {
+            log::debug!("shell surface {h:#x} hidden; dropped from the registry");
+            self.remove_window(*h);
+        }
+        hidden.len()
     }
 
     /// Turn the maximized-window adoption on or off (the `adopt_maximized`
@@ -325,6 +382,16 @@ impl WindowRegistry {
                 info.class
             );
             WindowState::Ignored(IgnoredReason::ShellBand(band))
+        } else if self.session_locked {
+            // Nothing is placed or focused while the user cannot see the
+            // desktop; the unlock classifies it afresh (ADR-0034).
+            log::info!(
+                "window {:#x} ({} {:?}) arrived while the session is locked; held until the unlock",
+                info.hwnd.0 as isize,
+                info.exe,
+                info.class
+            );
+            WindowState::Ignored(IgnoredReason::SessionLocked)
         } else {
             classification::classify_with_state_pipeline(
                 &candidate,
@@ -338,18 +405,6 @@ impl WindowRegistry {
         } else {
             classified
         };
-        if matches!(state, WindowState::Ignored(_))
-            && classification::is_lock_surface(&info.exe, &info.class)
-        {
-            log::debug!(
-                "lock surface {:#x} ({} {:?}) ignored: {:?}",
-                info.hwnd.0 as isize,
-                info.exe,
-                info.class,
-                state
-            );
-        }
-
         let invisible_bounds = if info.is_iconic {
             InvisibleBounds::zero()
         } else {
@@ -475,30 +530,6 @@ impl WindowRegistry {
         } else {
             log::debug!("remove_window: isize={hwnd_val} not in registry");
         }
-    }
-
-    /// Drop `hwnd_val` when it is an ignored lock surface
-    /// ([`classification::is_lock_surface`]) that is no longer user-visible
-    /// (hidden, cloaked or iconic); `true` when it was dropped. LockApp's
-    /// window is hidden at unlock, not destroyed, so without this it stays
-    /// in the registry until the next lock. Shown again, it registers anew.
-    /// ADR-0030.
-    pub fn drop_hidden_lock_surface(&mut self, hwnd_val: isize) -> bool {
-        let Some(window) = self.windows.get(&hwnd_val) else {
-            return false;
-        };
-        if !matches!(window.state, WindowState::Ignored(_))
-            || !classification::is_lock_surface(&window.exe, &window.class)
-        {
-            return false;
-        }
-        let h = HWND(hwnd_val as *mut _);
-        if win32::is_window_visible(h) && !win32::is_cloaked(h) && !win32::is_iconic(h) {
-            return false;
-        }
-        log::debug!("lock surface {hwnd_val:#x} hidden; dropped from the registry");
-        self.remove_window(hwnd_val);
-        true
     }
 
     /// Updates the focused window handle.
@@ -1839,6 +1870,9 @@ fn state_to_json(state: &WindowState) -> serde_json::Value {
         WindowState::Ignored(IgnoredReason::ShellBand(_)) => {
             serde_json::json!("Ignored::ShellBand")
         }
+        WindowState::Ignored(IgnoredReason::SessionLocked) => {
+            serde_json::json!("Ignored::SessionLocked")
+        }
     }
 }
 
@@ -2565,7 +2599,7 @@ mod tests {
             toml::from_str(crate::config::lifecycle::DEFAULT_RULES_TOML).expect("default rules");
         let reg = WindowRegistry::new(&user, &default);
         assert!(reg.would_ignore_untitled("explorer.exe", "Shell_TrayWnd", ""));
-        assert!(reg.would_ignore_untitled("StartMenuExperienceHost.exe", "X", ""));
+        assert!(reg.would_ignore_untitled("Magnify.exe", "X", ""));
         assert!(!reg.would_ignore_untitled("alacritty.exe", "Window Class", ""));
     }
 
@@ -2991,6 +3025,49 @@ mod tests {
             .clone();
         assert_eq!(first["band"], 4);
         assert_eq!(first["state"], "Ignored::ShellBand");
+    }
+
+    /// ADR-0034: while the session is locked a desktop-band window is
+    /// registered `Ignored(SessionLocked)`; elevation and a shell band keep
+    /// their own reasons; after the unlock the same window is classified
+    /// by the rules again.
+    #[test]
+    fn a_window_arriving_during_the_lock_is_held() {
+        let (user, default) = default_rules();
+        let mut reg = WindowRegistry::new(&user, &default);
+        reg.set_session_locked(true);
+        reg.register_window_from_info(&banded_info(4501, Some(1), false));
+        reg.register_window_from_info(&banded_info(4502, None, false));
+        reg.register_window_from_info(&banded_info(4503, Some(17), false));
+        reg.register_window_from_info(&banded_info(4504, Some(1), true));
+        let state = |reg: &WindowRegistry, h: isize| {
+            reg.get_window(HWND(h as *mut _)).unwrap().state.clone()
+        };
+        for h in [4501, 4502] {
+            assert!(matches!(
+                state(&reg, h),
+                WindowState::Ignored(IgnoredReason::SessionLocked)
+            ));
+            assert_eq!(
+                state_to_json(&state(&reg, h)),
+                serde_json::json!("Ignored::SessionLocked")
+            );
+        }
+        assert!(matches!(
+            state(&reg, 4503),
+            WindowState::Ignored(IgnoredReason::ShellBand(17))
+        ));
+        assert!(matches!(
+            state(&reg, 4504),
+            WindowState::Ignored(IgnoredReason::Elevated)
+        ));
+        reg.set_session_locked(false);
+        assert_eq!(reg.take_session_locked_windows().len(), 2);
+        reg.register_window_from_info(&banded_info(4501, Some(1), false));
+        assert!(!matches!(
+            state(&reg, 4501),
+            WindowState::Ignored(IgnoredReason::SessionLocked)
+        ));
     }
 
     #[test]
@@ -3710,12 +3787,12 @@ mod tests {
     // check agrees).
     // TODO: integration test with a real hidden window.
 
-    /// ADR-0030: an ignored lock surface that is not user-visible (a test
-    /// handle never is) leaves the registry; an ignored ordinary window, a
-    /// lock surface a user rule floats, and an untracked handle stay as
-    /// they are.
+    /// ADR-0034: at the unlock the windows held `Ignored(SessionLocked)`
+    /// leave the registry (for the daemon to classify afresh), and an
+    /// `Ignored(ShellBand)` window that is not user-visible (a test handle
+    /// never is) is dropped; every other window stays as it is.
     #[test]
-    fn drop_hidden_lock_surface_only_drops_ignored_lock_surfaces() {
+    fn the_unlock_takes_held_windows_and_drops_hidden_shell_surfaces() {
         let (user, default) = default_rules();
         let mut reg = WindowRegistry::new(&user, &default);
         let mut add = |hwnd: isize, exe: &str, class: &str, state: WindowState| {
@@ -3740,33 +3817,51 @@ mod tests {
             71,
             "LockApp.exe",
             "Windows.UI.Core.CoreWindow",
-            WindowState::Ignored(IgnoredReason::Fullscreen),
+            WindowState::Ignored(IgnoredReason::ShellBand(17)),
         );
         add(
             72,
-            "explorer.exe",
-            "LockScreenBackstopFrame",
-            WindowState::Ignored(IgnoredReason::ExplicitRule),
+            "app.exe",
+            "AppClass",
+            WindowState::Ignored(IgnoredReason::SessionLocked),
         );
         add(
             73,
+            "app.exe",
+            "AppClass",
+            WindowState::Ignored(IgnoredReason::SessionLocked),
+        );
+        add(
+            74,
             "explorer.exe",
             "CabinetWClass",
             WindowState::Ignored(IgnoredReason::ExplicitRule),
         );
         add(
-            74,
-            "explorer.exe",
-            "LockScreenInputOcclusionFrame",
-            WindowState::Floating(FloatingState::Hidden),
+            75,
+            "app.exe",
+            "AppClass",
+            WindowState::Tiling(TilingState::Active { col: 0, row: 0 }),
         );
-        assert!(reg.drop_hidden_lock_surface(71));
-        assert!(reg.drop_hidden_lock_surface(72));
-        assert!(!reg.drop_hidden_lock_surface(73));
-        assert!(!reg.drop_hidden_lock_surface(74));
-        assert!(!reg.drop_hidden_lock_surface(75));
-        assert!(!reg.is_tracked(71) && !reg.is_tracked(72));
-        assert!(reg.is_tracked(73) && reg.is_tracked(74));
+        let mut held = reg.take_session_locked_windows();
+        held.sort_unstable();
+        assert_eq!(held, vec![72, 73]);
+        assert_eq!(reg.drop_hidden_shell_band_windows(), 1);
+        assert!(!reg.is_tracked(71) && !reg.is_tracked(72) && !reg.is_tracked(73));
+        assert!(reg.is_tracked(74) && reg.is_tracked(75));
+        assert!(reg.take_session_locked_windows().is_empty());
+    }
+
+    /// ADR-0034: the lock flag is the registry's own; it starts unlocked.
+    #[test]
+    fn the_session_lock_flag_round_trips() {
+        let (user, default) = default_rules();
+        let mut reg = WindowRegistry::new(&user, &default);
+        assert!(!reg.session_locked());
+        reg.set_session_locked(true);
+        assert!(reg.session_locked());
+        reg.set_session_locked(false);
+        assert!(!reg.session_locked());
     }
 
     #[test]

@@ -557,6 +557,10 @@ impl FlowWM {
     ///
     /// This ensures hook events are processed promptly without blocking on IPC.
     fn process_hook_events(&mut self) {
+        // 0. A lock or unlock reported by the session sink (ADR-0034)
+        //    applies before anything that arrived with it is classified.
+        self.apply_session_lock_change();
+
         // 1. Retry pending window creations.
         //    handle_created re-checks visibility, title, styles — all of
         //    which may have changed since the initial Created event.

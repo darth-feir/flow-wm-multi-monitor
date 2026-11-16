@@ -1,5 +1,7 @@
 # Lock-screen surfaces are ignored
 
+> Superseded in part by [ADR-0034](0034-shell-bands-replace-shell-lists-and-the-session-lock.md): the real lock surfaces are in z-order band 17 and left alone by the band gate; the lock-screen rules, shell classes and `drop_hidden_lock_surface` below are gone.
+
 **Status:** Accepted (stage 36, 2026-11-10). Extends the bundled rules
 (`default-flow-rules.toml`) and the shell-class list of the floating layer
 (`daemon/top_layer.rs`, `SHELL_CLASSES`; stage 29b, *Shell Surfaces Are

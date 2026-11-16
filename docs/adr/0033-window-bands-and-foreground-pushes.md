@@ -1,5 +1,7 @@
 # Window bands mark shell surfaces; a foreground push injects no input
 
+> Corrected in part by [ADR-0034](0034-shell-bands-replace-shell-lists-and-the-session-lock.md): the real lock-screen frames are band 17 (the band 1 below was the stand-ins), a window can change band before it is first shown, and the class and exe entries the band covers are removed.
+
 **Status:** Accepted (stage 39, 2026-11-12). Adds a hard gate beside the
 elevated-window gate of [ADR-0025](0025-elevated-windows-are-unmanaged.md)
 and a backstop behind the shell classes and lock-screen rules of
