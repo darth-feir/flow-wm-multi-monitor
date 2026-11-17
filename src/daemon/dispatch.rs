@@ -83,6 +83,21 @@ impl FlowWM {
     /// When a tile drag is in progress, layout-mutating commands return
     /// [`SocketResponse::Busy`] to prevent layout conflicts.
     pub(super) fn dispatch(&mut self, msg: &SocketMessage) -> SocketResponse {
+        // A foreground push abandoned while this command ran (the guard
+        // rail, ADR-0035) turns its answer into an error naming the window
+        // that did not answer.
+        let _ = crate::registry::push_guard::take_abandoned_push();
+        let response = self.dispatch_command(msg);
+        match crate::registry::push_guard::take_abandoned_push() {
+            Some(note) if !matches!(response, SocketResponse::Error { .. }) => {
+                SocketResponse::Error { message: note }
+            }
+            _ => response,
+        }
+    }
+
+    /// [`dispatch`](Self::dispatch) without the abandoned-push check.
+    fn dispatch_command(&mut self, msg: &SocketMessage) -> SocketResponse {
         log::debug!("ipc: dispatching {msg:?}");
 
         // A command is the user acting: the removal pipeline's focus
@@ -98,6 +113,10 @@ impl FlowWM {
                 | SocketMessage::CheckConfig
         ) {
             self.focus_handoff = None;
+            // A window that stopped answering since the last tick is
+            // parked before the command moves or focuses anything
+            // (ADR-0035).
+            self.reconcile_hung();
         }
 
         // A keymap drag session is ended (committed) by the commands that
@@ -862,6 +881,15 @@ impl FlowWM {
                     );
                     return Some(candidate);
                 }
+                // Not responding (or the push was abandoned): left seated,
+                // the next window is tried (ADR-0035).
+                ForegroundPush::NotResponding | ForegroundPush::Abandoned => {
+                    log::debug!(
+                        "focus_monitor: hwnd {hwnd} is not responding ({}); trying the next window",
+                        self.describe_window(hwnd)
+                    );
+                    skipped.insert(hwnd);
+                }
             }
         }
     }
@@ -1004,7 +1032,10 @@ impl FlowWM {
                 ForegroundPush::InvalidHandle if !is_live(hwnd) => {
                     self.purge_dead_window(mi, candidate);
                 }
-                ForegroundPush::InvalidHandle | ForegroundPush::Failed(_) => {
+                ForegroundPush::InvalidHandle
+                | ForegroundPush::Failed(_)
+                | ForegroundPush::NotResponding
+                | ForegroundPush::Abandoned => {
                     log::debug!(
                         "focus-layer: SetForegroundWindow refused {hwnd} ({}); trying the next window",
                         self.describe_window(hwnd)

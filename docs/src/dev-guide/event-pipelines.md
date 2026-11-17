@@ -163,6 +163,36 @@ poll is only a backstop for the cases where that event is dropped. The interval
 is hot-reloadable via `flow.toml`'s `[focus]` section — lower values catch drift
 sooner at the cost of more wakeups, higher values the reverse.
 
+### Foreground pushes: responsiveness and the guard rail
+
+Every push (`registry::win32::push_foreground_window`) runs on the
+`foreground-push` thread (`registry::push_guard`); the main thread waits at
+most `PUSH_BOUND` (1 s). The push itself (`push_now`):
+
+1. refuses a target `IsHungAppWindow` reports (`ForegroundPush::NotResponding`;
+   callers try the next window, like a refused push);
+2. asks whether the current foreground answers: `IsHungAppWindow`, then a
+   `WM_NULL` sent with `SendMessageTimeoutW` (`SMTO_ABORTIFHUNG`, 50 ms,
+   `ERROR_TIMEOUT` only). A foreground that does not answer, a frozen app or
+   its `Ghost` (which reports hung too), is pushed past **without**
+   `AttachThreadInput`: with the input queues attached, the activation waits
+   on the frozen thread (measured in the VM: `BringWindowToTop` on a live
+   target held 9 s, until the frozen window answered);
+3. calls `SetForegroundWindow`, then `BringWindowToTop` only when the target
+   answers the same 50 ms probe (it waits on the target's thread), detaches,
+   and settles the verdict as before.
+
+A push that does not come back within the bound (a thread that froze between
+the checks and the call, or the gate turned off with
+`FLOW_TEST_BYPASS_HUNG_GATE=1`) is abandoned: one warning, `foreground push
+to hwnd 0x.. (exe "class") abandoned: no answer within 1000 ms; the
+foreground was hwnd 0x.. (exe "class")`, the IPC request answers with that
+text as its error, a fresh thread takes the next push, and the stuck one logs
+`foreground push: the abandoned push to hwnd 0x.. returned (...)` when the
+window answers (it pushes nothing after being abandoned). With four
+abandoned pushes still waiting, new pushes are refused with a warning. This
+is the backstop; the responsiveness checks are the fix (ADR-0035).
+
 ## The IPC Command Pipeline
 
 The `flow` CLI connects to the daemon's named pipe, sends a JSON command, and

@@ -78,9 +78,13 @@ impl FlowWM {
                     BorderState::Floating
                 }
             }
-            // Minimized / Hidden / Ignored: no overlay.
-            WindowState::Tiling(TilingState::Minimized | TilingState::Hidden)
-            | WindowState::Floating(FloatingState::Minimized | FloatingState::Hidden)
+            // Minimized / Hidden / Hung / Ignored: no overlay.
+            WindowState::Tiling(
+                TilingState::Minimized | TilingState::Hidden | TilingState::Hung,
+            )
+            | WindowState::Floating(
+                FloatingState::Minimized | FloatingState::Hidden | FloatingState::Hung,
+            )
             | WindowState::Ignored(_) => return None,
         };
         let mut style = style_for_state(&self.config.borders, state);

@@ -1326,6 +1326,85 @@ impl WindowRegistry {
         }
     }
 
+    /// `Tiling(Active)` → `Tiling(Hung)` or `Floating(Active)` →
+    /// `Floating(Hung)`: the window's thread stopped answering (ADR-0035).
+    /// The tile's slot and the float's rect are kept as for a hide. `false`
+    /// (no change) for any other state or an untracked window.
+    pub fn mark_hung(&mut self, hwnd_val: isize) -> bool {
+        let Some(window) = self.windows.get_mut(&hwnd_val) else {
+            return false;
+        };
+        let new_state = match &window.state {
+            WindowState::Tiling(TilingState::Active { col, row }) => {
+                window.last_virtual_slot = Some(VirtualSlot {
+                    col: *col,
+                    row: *row,
+                });
+                WindowState::Tiling(TilingState::Hung)
+            }
+            WindowState::Floating(FloatingState::Active { rect }) => {
+                window.last_float_rect = Some(*rect);
+                WindowState::Floating(FloatingState::Hung)
+            }
+            _ => return false,
+        };
+        window.state = new_state;
+        log::info!(
+            "window {hwnd_val:#x} ({}) is not responding (IsHungAppWindow); parked where it is",
+            window.exe
+        );
+        true
+    }
+
+    /// `Tiling(Hung)` → `Tiling(Active)` or `Floating(Hung)` →
+    /// `Floating(Active)` with the rect it had: the window answers again
+    /// (ADR-0035). The tile's column is a placeholder until the daemon
+    /// re-seats it from its restore seat. `false` for any other state.
+    pub fn mark_responding(&mut self, hwnd_val: isize) -> bool {
+        let Some(window) = self.windows.get_mut(&hwnd_val) else {
+            return false;
+        };
+        let new_state = match &window.state {
+            WindowState::Tiling(TilingState::Hung) => {
+                let (col, row) = window
+                    .last_virtual_slot
+                    .as_ref()
+                    .map_or((0, 0), |s| (s.col, s.row));
+                WindowState::Tiling(TilingState::Active { col, row })
+            }
+            WindowState::Floating(FloatingState::Hung) => {
+                let rect = window
+                    .last_float_rect
+                    .take()
+                    .unwrap_or(window.pre_manage_rect);
+                WindowState::Floating(FloatingState::Active { rect })
+            }
+            _ => return false,
+        };
+        window.state = new_state;
+        log::info!(
+            "window {hwnd_val:#x} ({}) answers again; back from not responding",
+            window.exe
+        );
+        true
+    }
+
+    /// Every window the not-responding poll looks at (ADR-0035): the active
+    /// tiles and floats, with `false`, and the parked ones, with `true`.
+    #[must_use]
+    pub fn responsiveness_watch(&self) -> Vec<(isize, bool)> {
+        self.windows
+            .iter()
+            .filter_map(|(&h, w)| match w.state {
+                WindowState::Tiling(TilingState::Active { .. })
+                | WindowState::Floating(FloatingState::Active { .. }) => Some((h, false)),
+                WindowState::Tiling(TilingState::Hung)
+                | WindowState::Floating(FloatingState::Hung) => Some((h, true)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Whether `hwnd_val` is a tracked window in
     /// [`Floating(Active)`](FloatingState::Active): on screen in the
     /// floating layer, neither minimized nor hidden.
@@ -1846,6 +1925,9 @@ fn state_to_json(state: &WindowState) -> serde_json::Value {
         WindowState::Tiling(TilingState::Hidden) => {
             serde_json::json!("Tiling::Hidden")
         }
+        WindowState::Tiling(TilingState::Hung) => {
+            serde_json::json!("Tiling::Hung")
+        }
         WindowState::Floating(FloatingState::Active { rect }) => serde_json::json!({
             "Floating": {"Active": {"rect": {"x": rect.x, "y": rect.y, "width": rect.width, "height": rect.height}}}
         }),
@@ -1854,6 +1936,9 @@ fn state_to_json(state: &WindowState) -> serde_json::Value {
         }
         WindowState::Floating(FloatingState::Hidden) => {
             serde_json::json!("Floating::Hidden")
+        }
+        WindowState::Floating(FloatingState::Hung) => {
+            serde_json::json!("Floating::Hung")
         }
         WindowState::Ignored(IgnoredReason::Maximized) => {
             serde_json::json!("Ignored::Maximized")
@@ -1965,6 +2050,54 @@ unsafe extern "system" fn enum_windows_callback(
 mod tests {
     use super::super::types::ReclassifyResult;
     use super::*;
+
+    /// ADR-0035: Active -> Hung -> Active for a tile (slot kept) and the
+    /// watch list reporting both sides; any other state is left alone.
+    #[test]
+    fn a_window_that_stops_answering_round_trips_through_hung() {
+        let rules = WindowRulesConfig::default();
+        let mut registry = WindowRegistry::new(&rules, &rules);
+        let info = crate::registry::win32::WindowInfo {
+            hwnd: HWND(0x77 as *mut _),
+            title: "t".into(),
+            class: "C".into(),
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+            exe: "app.exe".into(),
+            process_path: "app.exe".into(),
+            is_visible: true,
+            is_maximized: false,
+            is_fullscreen: false,
+            is_iconic: false,
+            is_elevated: false,
+            band: None,
+        };
+        registry.register_window_from_info(&info);
+        if let Some(w) = registry.get_window_mut(HWND(0x77 as *mut _)) {
+            w.state = WindowState::Tiling(TilingState::Active { col: 2, row: 1 });
+        }
+        assert_eq!(registry.responsiveness_watch(), vec![(0x77, false)]);
+        assert!(registry.mark_hung(0x77));
+        assert!(!registry.mark_hung(0x77));
+        assert_eq!(registry.responsiveness_watch(), vec![(0x77, true)]);
+        assert_eq!(
+            state_to_json(&WindowState::Tiling(TilingState::Hung)),
+            serde_json::json!("Tiling::Hung")
+        );
+        assert!(registry.mark_responding(0x77));
+        assert!(!registry.mark_responding(0x77));
+        assert!(matches!(
+            registry.get_window(HWND(0x77 as *mut _)).map(|w| &w.state),
+            Some(WindowState::Tiling(TilingState::Active { col: 2, row: 1 }))
+        ));
+        registry.minimize_window(0x77);
+        assert!(!registry.mark_hung(0x77));
+        assert!(registry.responsiveness_watch().is_empty());
+    }
     use crate::config::types::{WindowAction, WindowRulesConfig};
 
     /// Helper to create a default user rules config and empty default rules.

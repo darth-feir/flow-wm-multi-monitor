@@ -646,6 +646,14 @@ pub enum ForegroundPush {
     /// `SetForegroundWindow` failed with any other Win32 error code (the
     /// foreground lock, mostly). The window exists; the push was refused.
     Failed(u32),
+    /// The window's thread is not responding (`IsHungAppWindow`): it was
+    /// not pushed. Callers treat it like a refused push and try the next
+    /// window (ADR-0035).
+    NotResponding,
+    /// The push did not return within
+    /// [`PUSH_BOUND`](super::push_guard::PUSH_BOUND) and was abandoned
+    /// (ADR-0035): logged with the window that held the foreground.
+    Abandoned,
 }
 
 impl ForegroundPush {
@@ -708,6 +716,33 @@ fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> ForegroundPush {
         log::debug!("set_foreground_window: hwnd {hwnd_val:#x} not pushed, the session is locked");
         return ForegroundPush::Failed(0);
     }
+    // A window whose thread does not answer is never pushed: activating it
+    // and raising it wait on that thread (ADR-0035).
+    if is_hung(hwnd_val) {
+        log::debug!(
+            "set_foreground_window: hwnd {hwnd_val:#x} not pushed, it is not responding (IsHungAppWindow)"
+        );
+        return ForegroundPush::NotResponding;
+    }
+    // On the push thread, bounded in time (the guard rail, ADR-0035).
+    super::push_guard::bounded(hwnd_val, quiet)
+}
+
+/// How long the push waits for a sent `WM_NULL` before it treats a thread
+/// as not answering right now (ADR-0035).
+const RESPONSE_PROBE_MS: u32 = 50;
+
+/// The push itself, run on the `foreground-push` thread
+/// ([`push_guard`](super::push_guard)). `state` turns
+/// [`ABANDONED`](super::push_guard::ABANDONED) when the main thread stopped
+/// waiting: nothing is pushed after that, the attach is only undone.
+pub(super) fn push_now(
+    hwnd_val: isize,
+    quiet: bool,
+    state: &std::sync::atomic::AtomicU8,
+) -> ForegroundPush {
+    let abandoned =
+        || state.load(std::sync::atomic::Ordering::Acquire) == super::push_guard::ABANDONED;
     let target_hwnd = HWND(hwnd_val as *mut _);
     // Get the current foreground window.
     let foreground_hwnd = unsafe { GetForegroundWindow() };
@@ -741,6 +776,9 @@ fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> ForegroundPush {
     // `EVENT_SYSTEM_FOREGROUND` for the target in the same instant), so the
     // verdict is taken after that call, from `GetForegroundWindow`.
     let direct = |target: HWND| -> ForegroundPush {
+        if abandoned() {
+            return ForegroundPush::Abandoned;
+        }
         if unsafe { SetForegroundWindow(target) }.as_bool() {
             ForegroundPush::Focused
         } else {
@@ -752,9 +790,15 @@ fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> ForegroundPush {
     let settle = |target: HWND, outcome: ForegroundPush| -> ForegroundPush {
         let code = match outcome {
             ForegroundPush::Focused => return ForegroundPush::Focused,
+            ForegroundPush::NotResponding | ForegroundPush::Abandoned => return outcome,
             ForegroundPush::InvalidHandle => ERROR_INVALID_HANDLE,
             ForegroundPush::Failed(code) => code,
         };
+        let fg_now = unsafe { GetForegroundWindow() }.0 as isize;
+        log::debug!(
+            "set_foreground_window: SetForegroundWindow returned FALSE for hwnd {hwnd_val:#x} (Win32 error {code:#x}); the foreground is {fg_now:#x} ({})",
+            window_owner_description(fg_now)
+        );
         for _ in 0..5 {
             if unsafe { GetForegroundWindow() } == target {
                 log::debug!(
@@ -770,11 +814,43 @@ fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> ForegroundPush {
         outcome
     };
 
+    // `BringWindowToTop` waits on the target's thread: only a target that
+    // answers a sent message now is raised (ADR-0035).
+    let raise = |target: HWND| {
+        if abandoned() {
+            return;
+        }
+        if misses_message_within(hwnd_val, RESPONSE_PROBE_MS) {
+            log::debug!(
+                "set_foreground_window: hwnd {hwnd_val:#x} did not answer within {RESPONSE_PROBE_MS} ms; not raised"
+            );
+            return;
+        }
+        let _ = unsafe { BringWindowToTop(target) };
+    };
+
     // No foreground window means no foreground lock to defeat — try the
     // direct call. Benign (happens at startup or with no app focused),
-    // so no log here.
+    // so only a debug line.
     if foreground_hwnd.0.is_null() {
+        log::debug!("set_foreground_window: hwnd {hwnd_val:#x}: no foreground window; direct push");
         return settle(target_hwnd, direct(target_hwnd));
+    }
+
+    // Attaching to the input queue of a thread that does not answer makes
+    // the activation wait on that thread (measured: `BringWindowToTop`
+    // held until it answered, ADR-0035). Such a foreground (a hung app,
+    // or its `Ghost` stand-in, which reports hung too) is pushed past
+    // without the attach.
+    let fg_val = foreground_hwnd.0 as isize;
+    if fg_val != hwnd_val && (is_hung(fg_val) || misses_message_within(fg_val, RESPONSE_PROBE_MS)) {
+        log::debug!(
+            "set_foreground_window: foreground {fg_val:#x} ({}) is not responding; hwnd {hwnd_val:#x} pushed without AttachThreadInput",
+            window_owner_description(fg_val)
+        );
+        let outcome = direct(target_hwnd);
+        raise(target_hwnd);
+        return settle(target_hwnd, outcome);
     }
 
     // GetWindowThreadProcessId's RETURN value is the THREAD ID of the
@@ -802,10 +878,20 @@ fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> ForegroundPush {
     // this attach the call only succeeds when AllowSetForegroundWindow
     // granted the daemon one-shot permission (the CLI requests it before
     // every IPC dispatch — see src/bin/flow.rs).
-    let attach_ok =
-        unsafe { AttachThreadInput(our_thread_id, foreground_thread_id, true) }.as_bool();
+    let attach_ok = !abandoned()
+        && unsafe { AttachThreadInput(our_thread_id, foreground_thread_id, true) }.as_bool();
+    // Read before the description below makes Win32 calls of its own.
+    let attach_err = if attach_ok {
+        0
+    } else {
+        unsafe { GetLastError() }.0
+    };
+    log::debug!(
+        "set_foreground_window: hwnd {hwnd_val:#x}: foreground {fg_val:#x} ({}) thread {foreground_thread_id}; attached: {attach_ok}",
+        window_owner_description(fg_val)
+    );
     if !attach_ok {
-        let code = unsafe { GetLastError() }.0;
+        let code = attach_err;
         let line = format!(
             "set_foreground_window: AttachThreadInput(true) failed for our_thread={our_thread_id} fg_thread={foreground_thread_id} fg_pid={foreground_pid} (Win32 error {code:#x})"
         );
@@ -825,7 +911,7 @@ fn set_foreground_window_impl(hwnd_val: isize, quiet: bool) -> ForegroundPush {
     // Bring the window to the top of the Z-order. Failure here is
     // non-fatal — the window still receives focus if SetForegroundWindow
     // succeeded, so we don't log.
-    let _ = unsafe { BringWindowToTop(target_hwnd) };
+    raise(target_hwnd);
 
     // Always detach when we attached, even if SetForegroundWindow failed.
     // Detach failure would leak the attach — rare enough that a warn log
@@ -899,7 +985,7 @@ pub fn clear_foreground_window() -> bool {
 /// previously visible") is not meaningful here and is ignored.
 #[must_use]
 pub fn show_window_restored(hwnd_val: isize) -> bool {
-    if !is_window(hwnd_val) {
+    if !is_window(hwnd_val) || skip_not_responding(hwnd_val, "show_window_restored") {
         return false;
     }
     // SAFETY: ShowWindow is sound for any HWND value.
@@ -919,7 +1005,7 @@ pub fn show_window_restored(hwnd_val: isize) -> bool {
 /// for a dead handle; `ShowWindow`'s own return value is not meaningful.
 #[must_use]
 pub fn maximize_window(hwnd_val: isize) -> bool {
-    if !is_window(hwnd_val) {
+    if !is_window(hwnd_val) || skip_not_responding(hwnd_val, "maximize_window") {
         return false;
     }
     // SAFETY: ShowWindow is sound for any HWND value.
@@ -1188,6 +1274,108 @@ pub fn answers_within(hwnd_val: isize, timeout_ms: u32) -> bool {
     ok.0 != 0
 }
 
+/// Environment variable that turns the not-responding gate off
+/// (`FLOW_TEST_BYPASS_HUNG_GATE=1`): [`is_hung`] always answers `false`
+/// and [`misses_message_within`] never reports a miss, so the push guard
+/// rail can be exercised against a frozen window. Test only (ADR-0035).
+pub const BYPASS_HUNG_GATE_ENV: &str = "FLOW_TEST_BYPASS_HUNG_GATE";
+
+fn hung_gate_bypassed() -> bool {
+    static BYPASS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BYPASS.get_or_init(|| {
+        let on = std::env::var_os(BYPASS_HUNG_GATE_ENV).is_some_and(|v| v == "1");
+        if on {
+            log::warn!(
+                "{BYPASS_HUNG_GATE_ENV}=1: the not-responding gate is off (test only, ADR-0035)"
+            );
+        }
+        on
+    })
+}
+
+/// Whether Windows reports the thread of `hwnd_val` as not responding
+/// (`IsHungAppWindow`: no message pumped for 5 s while not waiting for
+/// input). A read of window-manager state; it never waits on that thread.
+/// `false` for null and while [`BYPASS_HUNG_GATE_ENV`] is set (ADR-0035).
+#[must_use]
+pub fn is_hung(hwnd_val: isize) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::IsHungAppWindow;
+    if hwnd_val == 0 || hung_gate_bypassed() {
+        return false;
+    }
+    // SAFETY: IsHungAppWindow reads state for any handle value; a stale one
+    // answers FALSE.
+    unsafe { IsHungAppWindow(HWND(hwnd_val as *mut _)) }.as_bool()
+}
+
+/// `true` when a `WM_NULL` sent to `hwnd_val` timed out
+/// (`SendMessageTimeoutW`, `SMTO_ABORTIFHUNG`, `ERROR_TIMEOUT`): its
+/// thread is busy or freezing right now, before Windows calls it hung.
+/// `false` when it answered, and when the send failed for another reason
+/// (a stale handle; UIPI refusing a message to an elevated window), which
+/// says nothing about responsiveness. Waits at most `timeout_ms`.
+#[must_use]
+pub fn misses_message_within(hwnd_val: isize, timeout_ms: u32) -> bool {
+    use windows::Win32::Foundation::ERROR_TIMEOUT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SMTO_ABORTIFHUNG, SMTO_NORMAL, SendMessageTimeoutW, WM_NULL,
+    };
+    if hwnd_val == 0 || hung_gate_bypassed() {
+        return false;
+    }
+    let mut result = 0usize;
+    // SAFETY: as in `answers_within`.
+    let ok = unsafe {
+        SendMessageTimeoutW(
+            HWND(hwnd_val as *mut _),
+            WM_NULL,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_NORMAL | SMTO_ABORTIFHUNG,
+            timeout_ms,
+            Some(&mut result),
+        )
+    };
+    ok.0 == 0 && unsafe { GetLastError() } == ERROR_TIMEOUT
+}
+
+/// Give the calling thread a message queue (`AttachThreadInput` needs one
+/// on both sides); the push thread calls it once at start.
+pub(super) fn ensure_message_queue() {
+    use windows::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW};
+    let mut msg = MSG::default();
+    // SAFETY: PeekMessageW with a null window only inspects this thread's
+    // queue (creating it); PM_NOREMOVE leaves any message in place.
+    let _ = unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE) };
+}
+
+/// `exe "class"` of the process owning `hwnd_val`, for log lines about a
+/// window that may not be in the registry (the foreground, a `Ghost`).
+/// Reads only (`GetWindowThreadProcessId`, the process image name,
+/// `GetClassName`): never waits on the window's thread.
+#[must_use]
+pub fn window_owner_description(hwnd_val: isize) -> String {
+    if hwnd_val == 0 {
+        return "none".to_owned();
+    }
+    let hwnd = HWND(hwnd_val as *mut _);
+    let exe = get_window_thread_process_id(hwnd)
+        .and_then(get_process_exe_and_path)
+        .map_or_else(|_| "unknown".to_owned(), |(exe, _)| exe);
+    format!("{exe} {:?}", get_class_name(hwnd).unwrap_or_default())
+}
+
+/// Log at `debug` and answer `true` when `hwnd_val` is not responding: the
+/// synchronous call `what` would wait on its thread and is skipped
+/// (ADR-0035).
+fn skip_not_responding(hwnd_val: isize, what: &str) -> bool {
+    let hung = is_hung(hwnd_val);
+    if hung {
+        log::debug!("{what}: hwnd {hwnd_val:#x} is not responding; left alone");
+    }
+    hung
+}
+
 /// Move `hwnd_val` to `(x, y)` keeping its size, z-order, activation and
 /// visibility (`SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE`, no show flag).
 /// Synchronous like every other move flow makes: an asynchronous request
@@ -1197,6 +1385,9 @@ pub fn answers_within(hwnd_val: isize, timeout_ms: u32) -> bool {
 #[must_use]
 pub fn move_window_keep_size(hwnd_val: isize, x: i32, y: i32) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER;
+    if skip_not_responding(hwnd_val, "move_window_keep_size") {
+        return false;
+    }
     let hwnd = HWND(hwnd_val as *mut _);
     // SAFETY: SetWindowPos on a stale handle fails cleanly.
     match unsafe {
@@ -1244,6 +1435,9 @@ pub fn is_topmost(hwnd_val: isize) -> bool {
 /// that vanished, or a handle from a unit test.
 #[must_use]
 pub fn set_topmost(hwnd_val: isize, topmost: bool) -> bool {
+    if skip_not_responding(hwnd_val, "set_topmost") {
+        return false;
+    }
     let target_hwnd = HWND(hwnd_val as *mut _);
     let after = if topmost {
         HWND_TOPMOST
@@ -1279,6 +1473,9 @@ pub fn set_topmost(hwnd_val: isize, topmost: bool) -> bool {
 /// band, above that foreground). `false` when either handle is gone.
 #[must_use]
 pub fn insert_below(hwnd_val: isize, after_val: isize) -> bool {
+    if skip_not_responding(hwnd_val, "insert_below") {
+        return false;
+    }
     // SAFETY: SetWindowPos with a possibly-stale HWND fails cleanly.
     let result = unsafe {
         SetWindowPos(
@@ -1307,6 +1504,9 @@ pub fn insert_below(hwnd_val: isize, after_val: isize) -> bool {
 /// gone or the call is refused (an elevated window, UIPI).
 #[must_use]
 pub fn insert_below_quiet(hwnd_val: isize, after_val: isize) -> bool {
+    if skip_not_responding(hwnd_val, "insert_below_quiet") {
+        return false;
+    }
     // SAFETY: SetWindowPos with a possibly-stale HWND fails cleanly.
     let result = unsafe {
         SetWindowPos(
@@ -2312,6 +2512,9 @@ pub fn restored_geometry(hwnd: HWND) -> Result<(Rect, bool), String> {
 /// Returns the Win32 error as a string.
 pub fn set_window_placement(hwnd: HWND, placement: &WindowPlacement) -> Result<(), String> {
     use windows::Win32::UI::WindowsAndMessaging::WINDOWPLACEMENT_FLAGS;
+    if skip_not_responding(hwnd.0 as isize, "set_window_placement") {
+        return Err("the window is not responding".to_owned());
+    }
     let n = placement.normal_position;
     let wp = WINDOWPLACEMENT {
         length: size_of::<WINDOWPLACEMENT>() as u32,

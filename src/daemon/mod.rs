@@ -74,6 +74,7 @@ mod frame_bounds;
 mod fullscreen;
 mod hooks;
 mod hotplug;
+mod hung;
 mod loadout;
 mod new;
 mod piles;

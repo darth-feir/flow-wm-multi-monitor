@@ -664,7 +664,12 @@ impl FlowWM {
     /// `idx`, re-seat that strip at its parking offset and sync the
     /// registry's slots and rects for it. No focus push: the user is not
     /// looking at that workspace.
-    fn remove_from_parked_workspace(&mut self, idx: usize, ws_id: WorkspaceId, window: WindowId) {
+    pub(super) fn remove_from_parked_workspace(
+        &mut self,
+        idx: usize,
+        ws_id: WorkspaceId,
+        window: WindowId,
+    ) {
         let (applied, offset) = {
             let m = &mut self.monitors[idx];
             let window_gap = m.active_scrolling().padding().window_gap;
@@ -931,6 +936,8 @@ impl FlowWM {
         if self.redirect_focus_handoff(hwnd) {
             return;
         }
+        // A parked window that answers again is seated first (ADR-0035).
+        self.unpark_if_answering(hwnd);
 
         // The floating layer re-decides against this window below and the
         // hook callback forwards its resizes from now on.
@@ -1098,6 +1105,8 @@ impl FlowWM {
         if self.registry.session_locked() {
             return;
         }
+        // Windows that stopped (or resumed) answering (ADR-0035).
+        self.reconcile_hung();
         self.recheck_focused_corners();
         self.recheck_focused_frame();
 
@@ -1226,6 +1235,17 @@ impl FlowWM {
     /// itself) is left where it is and only its registry slot and rect are
     /// re-synced. The restore seat is used up either way.
     pub(super) fn readd_tile(&mut self, hwnd: isize, follow: bool) {
+        self.readd_tile_with(hwnd, follow, follow);
+    }
+
+    /// [`readd_tile`](Self::readd_tile) back into the restore seat
+    /// (`[minimize_restore] strategy`) without the view following: a tile
+    /// that answers again after being parked as not responding (ADR-0035).
+    pub(super) fn readd_tile_to_seat(&mut self, hwnd: isize) {
+        self.readd_tile_with(hwnd, false, true);
+    }
+
+    fn readd_tile_with(&mut self, hwnd: isize, follow: bool, use_seat: bool) {
         let wid = WindowId(hwnd);
         let seat = self.registry.take_restore_seat(hwnd);
         if let Some(idx) = self.monitor_index_containing(wid) {
@@ -1249,7 +1269,7 @@ impl FlowWM {
             .len();
         // `[minimize_restore] strategy` decides where a restore or a
         // re-show goes; a maximize recovery is always appended.
-        let strategy = if follow {
+        let strategy = if use_seat {
             self.config.minimize_restore.strategy
         } else {
             MinimizeRestoreStrategy::AppendRight
@@ -1629,6 +1649,61 @@ mod readd_tests {
         );
         // The seat is used up: a later re-show appends.
         assert!(flow.registry.take_restore_seat(C).is_none());
+    }
+
+    /// ADR-0035: a tile that stops answering leaves its strip where it is
+    /// (the slot goes to its neighbours, the strip's focus to the
+    /// successor) and goes back into its column when it answers again,
+    /// without the view following.
+    #[test]
+    fn a_tile_that_stops_answering_is_parked_and_comes_back_to_its_column() {
+        let mut flow = flow_acd();
+        flow.registry.set_focused(C);
+        flow.monitors[0]
+            .active_scrolling_mut()
+            .set_focus(WindowId(C));
+        flow.park_hung(C);
+        assert_eq!(active_columns(&flow), vec![vec![A], vec![D]]);
+        assert!(matches!(
+            flow.registry
+                .get_window(HWND(C as *mut _))
+                .map(|w| &w.state),
+            Some(WindowState::Tiling(TilingState::Hung))
+        ));
+        assert_ne!(flow.registry.focused(), Some(WindowId(C)));
+        assert!(flow.registry.focused().is_some());
+        // Parking again is a no-op.
+        flow.park_hung(C);
+        assert_eq!(active_columns(&flow), vec![vec![A], vec![D]]);
+
+        flow.unpark_hung(C);
+        assert_eq!(active_columns(&flow), vec![vec![A], vec![C], vec![D]]);
+        assert!(flow.registry.is_tiling_active(C));
+        assert!(flow.registry.take_restore_seat(C).is_none());
+    }
+
+    /// A float that stops answering is out of the active floats until it
+    /// answers again, with the rect it had.
+    #[test]
+    fn a_float_that_stops_answering_keeps_its_rect() {
+        let mut flow = flow_acd();
+        let rect = Rect {
+            x: 10,
+            y: 20,
+            width: 300,
+            height: 200,
+        };
+        tiled(&mut flow.registry, E);
+        if let Some(w) = flow.registry.get_window_mut(HWND(E as *mut _)) {
+            w.state = WindowState::Floating(FloatingState::Active { rect });
+        }
+        flow.park_hung(E);
+        assert!(!flow.registry.is_floating_active(E));
+        flow.unpark_hung(E);
+        assert!(matches!(
+            flow.registry.get_window(HWND(E as *mut _)).map(|w| &w.state),
+            Some(WindowState::Floating(FloatingState::Active { rect: r })) if *r == rect
+        ));
     }
 
     #[test]

@@ -321,6 +321,46 @@ before `WTS_SESSION_LOCK` (measured) and go before `WTS_SESSION_UNLOCK`; the
 band (17), not the lock, leaves them alone. Disconnect and connect notifications are only
 logged. Why: ADR-0034.
 
+## Windows That Stop Answering
+
+A window whose thread has stopped pumping messages for five seconds is
+reported hung by Windows (`IsHungAppWindow`, documented); half a second later
+DWM covers it with a `Ghost` window (class `Ghost`, owned by `dwm.exe`,
+desktop band, titled "... (Not Responding)") that takes the foreground. Every
+synchronous call that moves, raises or activates the frozen window
+(`SetWindowPos` without `SWP_ASYNCWINDOWPOS`, `SetWindowPlacement`,
+`BringWindowToTop`) waits on its thread, and so would the daemon.
+
+flowd therefore takes such a window out of its hands (ADR-0035):
+
+- **Parked.** The foreground sync tick (`[focus] foreground_sync_interval_ms`)
+  and every command ask `IsHungAppWindow` for each active tile and float
+  (`FlowWM::reconcile_hung`). A hung tile becomes `Tiling(Hung)`: its restore
+  seat is recorded as for a hide, it leaves its strip, the neighbours close
+  the gap and the strip's focus moves to the successor, but the foreground is
+  not pushed (the `Ghost` holds it, and the user may be waiting on that
+  window). A hung float becomes `Floating(Hung)` and leaves the floating
+  layer. Neither is moved: it stays exactly where it froze. The registry
+  logs `window 0x.. (exe) is not responding (IsHungAppWindow); parked where it
+  is`, and `flow query all` shows the state `Tiling::Hung` /
+  `Floating::Hung` and the mode `hung`. Focus commands skip it.
+- **Back.** When `IsHungAppWindow` turns false (the next tick, or the
+  window's next foreground event) the window is `Active` again: a tile goes
+  back into its seat (`[minimize_restore] strategy`, the view does not
+  follow), a float back into the layer with the rect it had. Log line:
+  `window 0x.. (exe) answers again; back from not responding`.
+- **Every call checks too.** The Win32 wrappers that would wait on the
+  window's thread (`place_window` for the animator's frames and the
+  teleports, `set_topmost`, `insert_below[_quiet]`, `move_window_keep_size`,
+  `show_window_restored`, `maximize_window`, `set_window_placement`, the
+  foreground push) skip a window `IsHungAppWindow` reports, at `debug`, which
+  covers the moment between the freeze being reported and the next poll.
+
+`FLOW_TEST_BYPASS_HUNG_GATE=1` in the daemon's environment turns the check
+off; it exists for the VM suite that exercises the push guard rail
+(event pipelines, *Foreground pushes*), logs a warning at start, and is not a
+setting.
+
 ## Where the Code Lives
 
 | Concern | Location |
@@ -335,6 +375,7 @@ logged. Why: ADR-0034.
 | Elevation gate (ADR-0025) | `process_elevation` / `elevation_blocks` in `src/registry/win32.rs`, `register_window_from_info` in `src/registry/core.rs` |
 | Shell-band gate (ADR-0033, ADR-0034) | `window_band` in `src/registry/win32.rs`, `is_shell_band` in `src/registry/classification.rs`, `register_window_from_info` |
 | Session lock (ADR-0034) | `SessionSink` in `src/daemon/session.rs`, `report_session_lock` in `src/registry/hooks.rs`, `on_session_lock_change` in `src/daemon/hooks.rs` |
+| Not-responding windows (ADR-0035) | `is_hung` / `misses_message_within` in `src/registry/win32.rs`, `mark_hung` / `mark_responding` in `src/registry/core.rs`, `src/daemon/hung.rs` |
 
 ## Cross-References
 

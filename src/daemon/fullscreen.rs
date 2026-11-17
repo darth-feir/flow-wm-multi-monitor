@@ -776,8 +776,8 @@ impl FlowWM {
         out
     }
 
-    /// `"fullscreen"`, `"tiled"`, `"floating"`, `"minimized"`, `"hidden"` or
-    /// `"ignored"` for `flow query all`.
+    /// `"fullscreen"`, `"tiled"`, `"floating"`, `"minimized"`, `"hidden"`,
+    /// `"hung"` or `"ignored"` for `flow query all`.
     #[must_use]
     pub(super) fn window_mode(&self, hwnd: isize) -> &'static str {
         if self.is_fullscreen(hwnd) {
@@ -798,6 +798,9 @@ impl FlowWM {
                 WindowState::Tiling(TilingState::Hidden)
                 | WindowState::Floating(FloatingState::Hidden),
             ) => "hidden",
+            Some(
+                WindowState::Tiling(TilingState::Hung) | WindowState::Floating(FloatingState::Hung),
+            ) => "hung",
             Some(WindowState::Ignored(_)) => "ignored",
             None => "untracked",
         }

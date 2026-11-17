@@ -86,12 +86,19 @@ fn read_rect(hwnd: HWND) -> Option<Rect> {
 /// Place a managed window at `rect` (window-rect space) with the flags
 /// [`swp_flags`] picks. Every daemon path that positions a managed window
 /// (the animator's frames, the teleports, fail-back, rescue) goes through
-/// here, so the flag rules hold everywhere.
+/// here, so the flag rules hold everywhere, and a window that is not
+/// responding is skipped here (`Ok`, not moved).
 ///
 /// # Errors
 ///
 /// The `SetWindowPos` error (stale handle, UIPI denial).
 pub(crate) fn place_window(hwnd_val: isize, rect: Rect) -> windows::core::Result<()> {
+    // A window whose thread is not responding is left where it is: a
+    // synchronous `SetWindowPos` would wait on that thread (ADR-0035).
+    if crate::registry::win32::is_hung(hwnd_val) {
+        log::trace!("place_window: hwnd {hwnd_val:#x} is not responding; not moved");
+        return Ok(());
+    }
     let hwnd = HWND(hwnd_val as _);
     let flags = swp_flags(read_rect(hwnd), rect, virtual_screen());
     // SAFETY: SetWindowPos with a possibly-stale HWND fails cleanly;

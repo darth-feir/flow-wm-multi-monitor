@@ -6,10 +6,12 @@ and processes both hook events and IPC commands. There is no `Arc<Mutex<T>>` any
 in the daemon — the borrow checker enforces exclusive access at compile time, which
 is strictly safer than `Mutex` (runtime-only enforcement, potential deadlocks).
 
-Two helper threads own no daemon state: the animator's frame worker
-(`window-animation-worker`, fed over a channel, see [Animation](./animation.md))
-and the pipe's accept thread, which only blocks in `ConnectNamedPipe` and
-signals an event (`src/ipc/transport.rs`). The two threads this chapter is about
+Three helper threads own no daemon state: the animator's frame worker
+(`window-animation-worker`, fed over a channel, see [Animation](./animation.md)),
+the pipe's accept thread, which only blocks in `ConnectNamedPipe` and
+signals an event (`src/ipc/transport.rs`), and the `foreground-push` thread,
+which runs each foreground push while the main thread waits at most 1 s
+(`src/registry/push_guard.rs`, ADR-0035). The two threads this chapter is about
 are the ones that see events and state.
 
 ## The Two Threads

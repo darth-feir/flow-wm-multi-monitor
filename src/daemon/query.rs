@@ -111,7 +111,7 @@ impl FlowWM {
     /// never seated) — and a `mode` field: `"tiled"`, `"floating"`,
     /// `"fullscreen"` (a `set-window fullscreen` window, which the `state`
     /// records as a tile: its column is fullscreen), `"minimized"`,
-    /// `"hidden"` or `"ignored"`. A
+    /// `"hidden"`, `"hung"` (not responding, ADR-0035) or `"ignored"`. A
     /// `parked_row` field says whether a tile is hidden inside its column by
     /// the row viewport (`[columns] visible_rows`); `null` for a window in
     /// no strip. A `border_corner` field names the corners its border ring

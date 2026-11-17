@@ -592,3 +592,14 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   when hidden, and hidden shell-band windows (LockApp's) leave the registry.
   `WTS_SESSION_LOCK` comes from 38 ms before to 391 ms after the lock
   surfaces, so it cannot replace the band for them. `docs/adr/0034-shell-bands-replace-shell-lists-and-the-session-lock.md`
+- **ADR-0035 — A window that stops answering never wedges the daemon.**
+  Measured in the VM: `SetWindowPos`, `SetWindowPlacement` and
+  `BringWindowToTop` on a frozen window wait until it answers, and a push
+  attached to a freezing foreground holds in `BringWindowToTop`; reads,
+  posts and `SMTO_ABORTIFHUNG` do not. A window `IsHungAppWindow` reports
+  is parked (`Tiling::Hung` / `Floating::Hung`, mode `hung`): out of the
+  layout, left where it froze, back to its seat when it answers. Every
+  synchronous call that would wait checks the same signal; the push skips
+  `AttachThreadInput` to a foreground that misses a 50 ms `WM_NULL` and runs
+  on a thread the main loop abandons after 1 s (the request then answers
+  with an error). `docs/adr/0035-windows-that-stop-answering.md`

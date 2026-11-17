@@ -69,6 +69,8 @@ pub(super) enum DragTarget {
     Minimized,
     /// Tray-hidden / cloaked.
     Hidden,
+    /// Not responding (`IsHungAppWindow`, ADR-0035).
+    Hung,
     /// Ignored by the rules or the OS state.
     Ignored,
     /// Not in the registry at all.
@@ -101,6 +103,7 @@ impl BeginRefusal {
                     DragTarget::Fullscreen => "fullscreen",
                     DragTarget::Minimized => "minimized",
                     DragTarget::Hidden => "hidden",
+                    DragTarget::Hung => "not responding",
                     DragTarget::Ignored => "not managed (ignored)",
                     DragTarget::Untracked => "not managed",
                     DragTarget::Tile | DragTarget::Float => "not draggable",
@@ -181,6 +184,9 @@ impl FlowWM {
             | WindowState::Floating(FloatingState::Minimized) => DragTarget::Minimized,
             WindowState::Tiling(TilingState::Hidden)
             | WindowState::Floating(FloatingState::Hidden) => DragTarget::Hidden,
+            WindowState::Tiling(TilingState::Hung) | WindowState::Floating(FloatingState::Hung) => {
+                DragTarget::Hung
+            }
             WindowState::Ignored(_) => DragTarget::Ignored,
         }
     }

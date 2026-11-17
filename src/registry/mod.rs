@@ -37,6 +37,7 @@
 pub mod classification;
 pub mod core;
 pub mod hooks;
+pub mod push_guard;
 pub mod types;
 pub mod win32;
 

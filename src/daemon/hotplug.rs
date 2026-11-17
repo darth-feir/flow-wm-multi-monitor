@@ -884,6 +884,8 @@ impl FlowWM {
                         );
                         true
                     }
+                    // Not responding: the next candidate (ADR-0035).
+                    ForegroundPush::NotResponding | ForegroundPush::Abandoned => false,
                 },
                 None => false,
             };

@@ -427,6 +427,8 @@ impl std::fmt::Display for CreationSkip {
 /// | `Floating(Minimized)` | `MinimizeEnd` | `Floating(Active)` with original rect |
 /// | `Floating(Active)` | `EVENT_OBJECT_HIDE` | `Floating(Hidden)` |
 /// | `Floating(Hidden)` | `EVENT_OBJECT_SHOW` | `Floating(Active)` with the rect it was hidden at |
+/// | `Tiling(Active)` / `Floating(Active)` | `IsHungAppWindow` true (daemon poll) | `Tiling(Hung)` / `Floating(Hung)`; a tile's restore seat is recorded |
+/// | `Tiling(Hung)` / `Floating(Hung)` | `IsHungAppWindow` false again | `Tiling(Active)` (re-seated from its restore seat) / `Floating(Active)` |
 ///
 /// The column a tile goes back to is the daemon's
 /// [`Window::restore_seat`] (ADR-0027), not `last_virtual_slot`: the
@@ -483,6 +485,11 @@ pub enum TilingState {
     /// cloaking. Both remove the window from the live layout but are
     /// tracked separately for future heuristics.
     Hidden,
+    /// The window's thread stopped answering (`IsHungAppWindow`): it is left
+    /// where it is, out of the layout, never moved, raised or focused, and
+    /// its restore seat is recorded as for a hide. When it answers again it
+    /// goes back to that seat (ADR-0035).
+    Hung,
 }
 
 // ── FloatingState ──────────────────────────────────────────────────
@@ -512,6 +519,10 @@ pub enum FloatingState {
     /// cloaking. Both remove the window from the live layout but are
     /// tracked separately for future heuristics.
     Hidden,
+    /// The window's thread stopped answering (`IsHungAppWindow`): left where
+    /// it is and out of the floating layer until it answers again, then
+    /// back to `Active` with the rect it had (ADR-0035).
+    Hung,
 }
 
 // ── IgnoredReason ──────────────────────────────────────────────────
