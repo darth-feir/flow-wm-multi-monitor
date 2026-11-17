@@ -1547,6 +1547,8 @@ mod tests {
             is_iconic: false,
             is_elevated: false,
             band: None,
+            style: 0,
+            ex_style: 0,
         };
         registry.register_window_from_info(&info);
         if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {

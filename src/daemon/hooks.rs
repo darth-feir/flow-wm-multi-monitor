@@ -205,7 +205,10 @@ impl FlowWM {
 
         if fresh_float {
             let idx = self.monitor_for_arrival(hwnd, arrival);
-            let float_rect = self.centered_float_rect_on(WindowId(hwnd), idx);
+            // An undecorated popup is where its app put it (ADR-0036).
+            let float_rect = self
+                .app_placed_rect(hwnd)
+                .unwrap_or_else(|| self.centered_float_rect_on(WindowId(hwnd), idx));
             // The new float has no previous rect, so it appears at its
             // place instead of gliding from where it was created
             // (`animation::first_placement`); the registry already holds its
@@ -229,6 +232,21 @@ impl FlowWM {
         // Report whether the window ended up tracked (classified) so the caller
         // retries only genuinely-not-ready windows (case 4).
         self.registry.is_tracked(hwnd)
+    }
+
+    /// Where a window untileable by shape floats when it arrives: its own
+    /// rect, the app's choice, when that lies on a screen; `None` for any
+    /// other window (ADR-0036).
+    fn app_placed_rect(&self, hwnd: isize) -> Option<crate::common::Rect> {
+        let untileable = self
+            .registry
+            .get_window(HWND(hwnd as *mut _))
+            .is_some_and(|w| w.untileable_shape);
+        if !untileable {
+            return None;
+        }
+        self.current_visible_rect(hwnd)
+            .filter(|r| self.monitor_index_for_rect_opt(*r).is_some())
     }
 
     /// Record the owning monitor of a window registered **minimized**: the
@@ -1461,6 +1479,8 @@ mod readd_tests {
             is_iconic: false,
             is_elevated: false,
             band: None,
+            style: 0,
+            ex_style: 0,
         };
         registry.register_window_from_info(&info);
         if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {

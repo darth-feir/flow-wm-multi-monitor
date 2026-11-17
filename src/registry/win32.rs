@@ -107,6 +107,10 @@ pub struct WindowInfo {
     /// when it could not be read. Above the UIAccess band it marks a shell
     /// surface flow never manages (ADR-0033).
     pub band: Option<u32>,
+    /// `GWL_STYLE` at arrival (0 when it could not be read).
+    pub style: u32,
+    /// `GWL_EXSTYLE` at arrival (0 when it could not be read).
+    pub ex_style: u32,
 }
 
 // ── String conversion helpers ──────────────────────────────────────
@@ -2124,6 +2128,7 @@ pub fn get_window_info(hwnd: HWND) -> Result<WindowInfo, String> {
     };
 
     let band = window_band(hwnd);
+    let (style, ex_style) = window_styles(hwnd);
 
     let pid = match get_window_thread_process_id(hwnd) {
         Ok(p) => p,
@@ -2141,6 +2146,8 @@ pub fn get_window_info(hwnd: HWND) -> Result<WindowInfo, String> {
                 is_iconic,
                 is_elevated: false,
                 band,
+                style,
+                ex_style,
             });
         }
     };
@@ -2162,7 +2169,22 @@ pub fn get_window_info(hwnd: HWND) -> Result<WindowInfo, String> {
         is_iconic,
         is_elevated,
         band,
+        style,
+        ex_style,
     })
+}
+
+/// `GWL_STYLE` and `GWL_EXSTYLE` of `hwnd`; 0 for a style that cannot be
+/// read, which the style gates take as "no bits" (fail-open, ADR-0036).
+#[must_use]
+pub fn window_styles(hwnd: HWND) -> (u32, u32) {
+    // SAFETY: plain reads; a stale handle returns 0.
+    unsafe {
+        (
+            GetWindowLongW(hwnd, GWL_STYLE) as u32,
+            GetWindowLongW(hwnd, GWL_EXSTYLE) as u32,
+        )
+    }
 }
 
 // ── Monitor queries ──────────────────────────────────────────────────

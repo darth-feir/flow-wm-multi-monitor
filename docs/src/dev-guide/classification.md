@@ -57,6 +57,10 @@ The four layers, from highest to lowest priority:
    system windows (taskbar, Chromium helper windows, dialogs).
 4. **`default_action`** — the unconditional fallback, now `Float`.
 
+One shape rule sits over the chain: a window **untileable by shape** (see
+[Undecorated Popups Float](#undecorated-popups-float)) is never tiled by
+layers 2-4; only a user rule tiles it.
+
 User rules outrank learned rules deliberately: if flow's learned behavior
 conflicts with the user's intent, the user's `flow-rules.toml` entry wins and
 the learned rule is never consulted for that app.
@@ -321,6 +325,67 @@ before `WTS_SESSION_LOCK` (measured) and go before `WTS_SESSION_UNLOCK`; the
 band (17), not the lock, leaves them alone. Disconnect and connect notifications are only
 logged. Why: ADR-0034.
 
+## Overlays Are Unmanaged
+
+A top-level window with `WS_EX_TRANSPARENT` (mouse input passes through it)
+or `WS_EX_NOACTIVATE` (it never becomes the foreground window) is an
+overlay: a screen-share border, a click-through indicator. The user can
+neither focus nor arrange it, so flow never manages it, whatever its other
+styles. `get_window_info` reads `GWL_STYLE` and `GWL_EXSTYLE` once at
+arrival (`registry::win32::window_styles`); `register_window_from_info`
+tests `classification::is_overlay` right after the shell-band gate and
+before the session lock and every rule. The window is registered
+`Ignored(Overlay)` (`flow query all`: `Ignored::Overlay`), with one info
+line, `window 0x.. (exe "class") is a click-through or no-activate overlay
+(ex-style 0x..); left unmanaged`. It is not a floating-layer member, never
+moved or bordered, and `set-window` refuses it. An unreadable style reads
+as 0: the rules decide (fail-open).
+
+An overlay that is also a tool window (`WS_EX_TOOLWINDOW` without
+`WS_EX_APPWINDOW`, like the Teams share border) is skipped earlier by the
+Alt+Tab creation gate and never registered; the overlay gate covers the
+ones that gate lets through. Why: ADR-0036
+(`docs/adr/0036-untileable-windows.md`).
+
+## Undecorated Popups Float
+
+A window is **untileable by shape** when its style is `WS_POPUP` with no
+sizing border (`WS_THICKFRAME`) and no title bar (not both bits of
+`WS_CAPTION`; a thin border or a dialog frame alone is no title bar):
+`classification::is_untileable_shape`. Such a popup was made at a size its
+app chose and offers the user no way to resize it (a share control bar, a
+toolbar strip). `WS_POPUP` is required, so a borderless main window built as
+an overlapped window (Alacritty with `decorations = "None"` keeps
+`WS_CAPTION | WS_THICKFRAME`) is not caught.
+
+`classification::shaped_verdict` runs the four layers as usual and then,
+for such a window, turns a `Tile` from a learned rule, a bundled rule or
+`default_action` into `Float`; a `Tile` from a user rule stands, and an
+`Ignore` or `Float` is untouched. The shape is read once at arrival and
+kept on the window (`Window::untileable_shape`), so the reclassification
+after an un-maximize uses it too. `flow query all` shows `untileable:
+"undecorated popup"`.
+
+- Overruled tile, info, once per window: `window 0x.. (exe "class") is an
+  undecorated popup without a sizing border (style 0x..); it floats (a
+  learned rule that tiles it does not apply)` (or `a bundled rule`,
+  `default_action`).
+- User rule, warn, once per rule per load of `flow-rules.toml`:
+  `flow-rules.toml rule N (exe = "...", class = "...") tiles window 0x..
+  (exe "class"), an undecorated popup without a sizing border; it is tiled
+  because the rule says so`. A tile that then keeps its own size is still
+  released by the placement check ([Floating Space](./floating-space.md#released-tiles-a-window-that-refuses-its-slot)).
+- A new float of this shape stays where its app put it, not centred on the
+  focused screen.
+- **Not learned.** `set-window` on such a window still acts, but records
+  nothing (`set-window: exe (class) is an undecorated popup; the decision is
+  not learned`): a learned rule is keyed on exe + class, which the app's
+  main window may share, so a `float` learned from the popup would float
+  the main window. Existing learned rules are not rewritten; they keep
+  tiling the windows of the class that have another shape.
+
+Why: ADR-0036.
+
 ## Windows That Stop Answering
 
 A window whose thread has stopped pumping messages for five seconds is
@@ -375,6 +440,8 @@ setting.
 | Elevation gate (ADR-0025) | `process_elevation` / `elevation_blocks` in `src/registry/win32.rs`, `register_window_from_info` in `src/registry/core.rs` |
 | Shell-band gate (ADR-0033, ADR-0034) | `window_band` in `src/registry/win32.rs`, `is_shell_band` in `src/registry/classification.rs`, `register_window_from_info` |
 | Session lock (ADR-0034) | `SessionSink` in `src/daemon/session.rs`, `report_session_lock` in `src/registry/hooks.rs`, `on_session_lock_change` in `src/daemon/hooks.rs` |
+| Overlay gate, untileable shape (ADR-0036) | `is_overlay` / `is_untileable_shape` / `shaped_verdict` in `src/registry/classification.rs`, `window_styles` in `src/registry/win32.rs`, `register_window_from_info` |
+| Placement acceptance check (ADR-0036) | `src/daemon/placement_check.rs` |
 | Not-responding windows (ADR-0035) | `is_hung` / `misses_message_within` in `src/registry/win32.rs`, `mark_hung` / `mark_responding` in `src/registry/core.rs`, `src/daemon/hung.rs` |
 
 ## Cross-References

@@ -603,3 +603,17 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   `AttachThreadInput` to a foreground that misses a 50 ms `WM_NULL` and runs
   on a thread the main loop abandons after 1 s (the request then answers
   with an error). `docs/adr/0035-windows-that-stop-answering.md`
+- **ADR-0036 — Windows that cannot be tiles: overlays, undecorated popups,
+  refused rects.** Measured on a Teams screen share: the share border is a
+  click-through, never-activating popup (`WS_EX_TRANSPARENT |
+  WS_EX_NOACTIVATE`), skipped only because it is also a tool window; the
+  control bar, an undecorated `WS_POPUP` without a sizing border, was tiled
+  by a rule learned from the main window of the same class and kept its
+  297x35 in a full column. Now an overlay is `Ignored::Overlay` beside the
+  band gate; a popup with no title bar and no sizing border floats unless
+  `flow-rules.toml` tiles it (learned and bundled rules and
+  `default_action` cannot; `set-window` learns nothing from it); and a tile
+  that still has exactly its own size, smaller than its slot by more than
+  32 px, once the batch has settled is released to the floating layer once
+  (`untileable: "refused its rect"`; a minimum-size clamp is never smaller
+  than asked and stays a tile). `docs/adr/0036-untileable-windows.md`

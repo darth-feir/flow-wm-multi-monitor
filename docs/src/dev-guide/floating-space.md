@@ -117,15 +117,16 @@ wired regardless of how it became a float:
 | Entry point | Trigger | Float rect |
 |-------------|---------|------------|
 | **`set-window float` / `cycle`** | explicit user toggle of a tiled window | centered on the monitor the window is on (`centered_float_rect`) |
-| **`on_window_created` (runtime)** | a new window the rule pipeline classifies as `Float` | centered on the monitor the arrival is seated on — the focused screen by default, ADR-0023 (`centered_float_rect_on`); it appears there without a glide from where it was created |
+| **`on_window_created` (runtime)** | a new window the rule pipeline classifies as `Float` | centered on the monitor the arrival is seated on — the focused screen by default, ADR-0023 (`centered_float_rect_on`); it appears there without a glide from where it was created. An undecorated popup without a sizing border (untileable by shape, ADR-0036) keeps the rect its app gave it when that lies on a screen (`app_placed_rect`) |
 | **startup scan** | a `Float`-classified window already open when the daemon launched | its **current on-screen position** (adopted in place, not re-centred; `populate_existing_floats`) |
 
 The same primitive also seats a float adopted from an ignored window
 (`adopt_ignored_as_float`, at its current rect), a float moved to another
 monitor (its rect translated into the target work area), a float-origin
 window leaving fullscreen, a float registered while minimized and then
-restored (`seat_float_if_unseated`) and a float recovered from
-`Ignored(Maximized|Fullscreen)` (`seat_recovered_float`, centred).
+restored (`seat_float_if_unseated`), a float recovered from
+`Ignored(Maximized|Fullscreen)` (`seat_recovered_float`, centred) and a
+tile the placement check released (below).
 
 The runtime path exists because classification runs at creation time: without
 it, a rule-classified float would land in the registry yet stay absent from
@@ -210,6 +211,36 @@ sequenceDiagram
 Key point: the window snaps from its floating rect into a tile slot.
 `last_focused_window` is set to the newly tiled window so the next
 insert will go to its right.
+
+### Released tiles: a window that refuses its slot
+
+A tile that does not take the size its slot commands is released to the
+floating layer by the placement acceptance check (`daemon::placement_check`,
+ADR-0036), without any command:
+
+1. Every submit path notes the windows it commanded (`record_submitted` →
+   `note_placements`). 500 ms after the last submit, with the animator
+   idle, the main loop (`maybe_check_placements`) reads each noted window
+   that is still an active tile back once (not a fullscreen column, not in
+   its app's own full screen, not dragged, visible, tiling on).
+2. `refused_its_rect(own, actual, expected)`: its window rect still has the
+   size flow met it at (`last_natural_size`, within 2 px) and is smaller
+   than the slot's window rect (`tile_geometry` of the last submitted
+   rect) by more than 32 px in width or height. A window clamped to its
+   minimum size is never smaller than asked, so it stays a tile.
+3. A window that is hung (`IsHungAppWindow`) or misses a 50 ms `WM_NULL` is
+   not judged; after it answers the rect is read once more.
+4. Release (`release_refused_tile`): `remove_window` from its strip, then
+   `register_float` at its current rect when that lies inside its screen's
+   work area (else centred there at its own size), one
+   `animate_workspaces_on` batch for the strip and the float, the registry's
+   slots synced, the border refreshed. `Window::refused_rect` is set:
+   `flow query all` shows `untileable: "refused its rect"`; info line
+   `window 0x.. (exe "class") kept its own size WxH for a WxH slot; released
+   to the floating layer (refused its rect)`.
+
+A float is never checked, so a release happens once and is never retried.
+`set-window tile` on it clears the flag; the next placement judges it again.
 
 ### Side-by-Side Comparison
 

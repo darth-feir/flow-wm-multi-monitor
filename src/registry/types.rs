@@ -277,6 +277,19 @@ pub struct Window {
     #[serde(default)]
     pub band: Option<u32>,
 
+    /// The window is untileable by shape at arrival (an undecorated popup
+    /// without a sizing border, `classification::is_untileable_shape`):
+    /// only a user rule tiles it, and `set-window` learns nothing from it.
+    /// ADR-0036.
+    #[serde(default)]
+    pub untileable_shape: bool,
+
+    /// The placement check released this window from the strip because it
+    /// kept its own size instead of its slot's. Cleared when it is tiled
+    /// again. ADR-0036.
+    #[serde(default)]
+    pub refused_rect: bool,
+
     /// The `WS_EX_TOPMOST` flag the window had **before** the daemon put it
     /// in the floating layer, meaningful only while [`on_top`](Self::on_top)
     /// is set. A window that was topmost on its own (some apps' "always on
@@ -350,6 +363,8 @@ impl Window {
             on_top: false,
             was_topmost: false,
             band: None,
+            untileable_shape: false,
+            refused_rect: false,
         }
     }
 }
@@ -544,8 +559,8 @@ pub enum FloatingState {
 ///
 /// `Elevated` wins over everything: no rule, maximize or fullscreen state
 /// can make flow manage a window it is not allowed to move. `ShellBand`
-/// comes next, also ahead of every rule (ADR-0033), then `SessionLocked`
-/// (ADR-0034).
+/// comes next, also ahead of every rule (ADR-0033), then `Overlay`
+/// (ADR-0036), then `SessionLocked` (ADR-0034).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IgnoredReason {
     /// Window is maximized (`WS_MAXIMIZE` style).
@@ -563,6 +578,11 @@ pub enum IgnoredReason {
     /// a shell surface, never managed whatever the rules say. Decided once
     /// at arrival (ADR-0033).
     ShellBand(u32),
+    /// The window is click-through (`WS_EX_TRANSPARENT`) or never
+    /// activated (`WS_EX_NOACTIVATE`): an overlay such as a screen-share
+    /// border, never managed whatever the rules say. Decided once at
+    /// arrival (ADR-0036).
+    Overlay,
     /// The window arrived while the session was locked: held unmanaged
     /// until the unlock, then dropped if hidden or classified afresh
     /// (ADR-0034).

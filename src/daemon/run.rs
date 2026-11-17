@@ -271,6 +271,10 @@ impl FlowWM {
             // a due deadline now rather than re-scheduling a 1 ms re-wake.
             self.maybe_fire_edge_scroll();
 
+            // Read back the tiles placed since the last check once their
+            // batch has settled (ADR-0036).
+            self.maybe_check_placements();
+
             // Display-topology changes (monitor plugged / unplugged, taskbar
             // moved): take the flag the window procedures set, re-arm the
             // settle timer, and reconcile the monitor list once it is due.
@@ -520,6 +524,12 @@ impl FlowWM {
                         self.config.focus.foreground_sync_interval_ms,
                     )
             });
+        // The placement check's deadline rides on the same slot: either one
+        // only needs the loop to wake by then.
+        let next_foreground_sync = match (next_foreground_sync, self.placement_check_due) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         // The drag's armed edge-scroll deadline (if a repeat is mid-flight).
         // `None` when no drag is active or no timer is armed.
         let edge_scroll_deadline = self

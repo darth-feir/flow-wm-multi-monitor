@@ -364,6 +364,12 @@ pub struct FlowWM {
     /// neighbour-teleport rule*.
     pub(super) submitted_rects: std::collections::HashMap<isize, crate::common::Rect>,
 
+    /// Windows a submit path commanded since the last placement check, and
+    /// when that check is due (`daemon::placement_check`, ADR-0036).
+    pub(super) placement_checks: std::collections::HashSet<isize>,
+    /// See [`placement_checks`](Self::placement_checks).
+    pub(super) placement_check_due: Option<std::time::Instant>,
+
     /// `true` while tiling is paused (`flow dispatch tiling off`, see
     /// `daemon::tiling`). The daemon then never moves a window: hook events
     /// only keep the registry consistent, drag / float-sync / edge-scroll

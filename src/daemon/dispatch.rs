@@ -1935,6 +1935,15 @@ impl FlowWM {
                 ),
             };
         }
+        // Click-through or never activated (ADR-0036): never managed.
+        if matches!(win.state, WindowState::Ignored(IgnoredReason::Overlay)) {
+            return SocketResponse::Error {
+                message: format!(
+                    "window {:#x} ({}) is a click-through or no-activate overlay; flow leaves it alone",
+                    focused.0, win.exe
+                ),
+            };
+        }
         // Held since it arrived during a lock (ADR-0034): the unlock
         // classifies it.
         if matches!(
@@ -1955,6 +1964,7 @@ impl FlowWM {
         // short strings is negligible. See (`docs/src/dev-guide/classification.md`).
         let exe = win.exe.clone();
         let class = win.class.clone();
+        let untileable_shape = win.untileable_shape;
 
         // 3. Resolve the effective action via the pure decision helper. This is
         //    the only non-trivial branching in the handler — extracting it
@@ -1997,8 +2007,19 @@ impl FlowWM {
         // 5. Record the user's explicit decision so the next window of the
         //    same app is auto-classified. See `record_learned_transition` for
         //    the idempotent save + pipeline-refresh logic.
+        // A window untileable by shape teaches nothing about its app: the
+        // rule would be keyed on exe + class, which its app's main window
+        // may share (ADR-0036).
         if matches!(response, SocketResponse::Ok) {
-            self.record_learned_transition(action, &exe, &class);
+            if untileable_shape {
+                if action_to_learned(action).is_some() {
+                    log::info!(
+                        "set-window: {exe} ({class}) is an undecorated popup; the decision is not learned"
+                    );
+                }
+            } else {
+                self.record_learned_transition(action, &exe, &class);
+            }
         }
 
         response
@@ -2284,6 +2305,10 @@ impl FlowWM {
     /// Registry state is set to `Tiling(Active { col, row })` via direct field
     /// write, with `col`/`row` sourced from the destination virtual layout.
     fn set_window_to_tile(&mut self, focused: WindowId) -> SocketResponse {
+        // Tiled again on request: the placement check judges it afresh.
+        if let Some(w) = self.registry.get_window_mut(HWND(focused.0 as *mut _)) {
+            w.refused_rect = false;
+        }
         // The rect it is being tiled from is its pre-tiling anchor (unless
         // an earlier tiling of this run already recorded one): `flow
         // dispatch tiling off` puts the window back there.
@@ -3381,6 +3406,27 @@ mod tests {
         }
     }
 
+    /// ADR-0036: a click-through or no-activate overlay is no `set-window`
+    /// target: refused, not adopted.
+    #[test]
+    fn set_window_on_an_overlay_is_refused() {
+        for mode in [WindowMode::Tile, WindowMode::Float, WindowMode::Cycle] {
+            let mut flow = flow_with_focused_state(WindowState::Ignored(IgnoredReason::Overlay));
+            match flow.dispatch_set_window(mode) {
+                SocketResponse::Error { message } => {
+                    assert!(message.contains("overlay"), "{message}")
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+            assert!(matches!(
+                flow.registry
+                    .get_window(HWND(TEST_HWND as *mut _))
+                    .map(|w| &w.state),
+                Some(WindowState::Ignored(IgnoredReason::Overlay))
+            ));
+        }
+    }
+
     /// A shell surface of the desktop band (the desktop, the taskbar) the
     /// registry holds as its focus is no `set-window` target: refused, not
     /// adopted, nothing learned (ADR-0030; the lock frames it was found
@@ -3432,6 +3478,8 @@ mod tests {
             is_iconic: false,
             is_elevated: false,
             band: None,
+            style: 0,
+            ex_style: 0,
         };
         registry.register_window_from_info(&info);
 
@@ -3806,6 +3854,8 @@ mod tests {
             is_iconic: false,
             is_elevated: false,
             band: None,
+            style: 0,
+            ex_style: 0,
         };
         registry.register_window_from_info(&info);
         if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {
@@ -4204,6 +4254,8 @@ mod tests {
                 is_iconic: false,
                 is_elevated: false,
                 band: None,
+                style: 0,
+                ex_style: 0,
             };
             flow.registry.register_window_from_info(&info);
         }
@@ -4314,6 +4366,8 @@ mod tests {
                 is_iconic: false,
                 is_elevated: false,
                 band: None,
+                style: 0,
+                ex_style: 0,
             };
             flow.registry.register_window_from_info(&info);
         }
@@ -4492,6 +4546,8 @@ mod tests {
             is_iconic: false,
             is_elevated: false,
             band: None,
+            style: 0,
+            ex_style: 0,
         };
         flow.registry.register_window_from_info(&info);
         if let Some(win) = flow.registry.get_window_mut(HWND(hwnd as *mut _)) {

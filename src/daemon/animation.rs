@@ -229,6 +229,8 @@ impl FlowWM {
         for &(hwnd, rect) in submitted {
             self.submitted_rects.insert(hwnd, rect);
         }
+        // Read back once the batch has settled (ADR-0036).
+        self.note_placements(submitted.iter().map(|&(hwnd, _)| hwnd));
     }
 
     /// Drop `hwnd`'s last-submitted rect: the window left the layout
@@ -1728,6 +1730,8 @@ mod tests {
                 is_iconic: false,
                 is_elevated: false,
                 band: None,
+                style: 0,
+                ex_style: 0,
             });
         }
         let info = laptop_under_external();
@@ -1890,6 +1894,8 @@ mod tests {
                 is_iconic: false,
                 is_elevated: false,
                 band: None,
+                style: 0,
+                ex_style: 0,
             });
         }
         let info = primary_with_left_neighbour();
@@ -2093,6 +2099,8 @@ mod tests {
                 is_iconic: false,
                 is_elevated: false,
                 band: None,
+                style: 0,
+                ex_style: 0,
             });
             // Fake handles classify as floats (no styles to read): make
             // them the tiles the seat sees.
@@ -2204,6 +2212,8 @@ mod float_geometry_tests {
             is_iconic: false,
             is_elevated: false,
             band: None,
+            style: 0,
+            ex_style: 0,
         };
         registry.register_window_from_info(&info);
         if let Some(w) = registry.get_window_mut(HWND(hwnd as *mut _)) {

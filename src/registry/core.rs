@@ -125,6 +125,11 @@ pub struct WindowRegistry {
     /// `WTS_SESSION_UNLOCK` since): a window that arrives meanwhile is
     /// registered `Ignored(SessionLocked)` (ADR-0034). Set by the daemon.
     session_locked: bool,
+
+    /// The user rules (index in `flow-rules.toml`, from 0) already named in
+    /// the warning that a rule tiles a window untileable by shape: logged
+    /// once per rule, cleared when the rules are reloaded (ADR-0036).
+    shape_warned_rules: std::collections::HashSet<usize>,
 }
 
 impl WindowRegistry {
@@ -146,6 +151,7 @@ impl WindowRegistry {
             ),
             adopt_maximized: false,
             session_locked: false,
+            shape_warned_rules: std::collections::HashSet::new(),
         }
     }
 
@@ -355,11 +361,13 @@ impl WindowRegistry {
             return;
         }
 
+        let untileable_shape = classification::is_untileable_shape(info.style);
         let candidate = classification::WindowCandidate {
             exe: info.exe.clone(),
             title: info.title.clone(),
             class: info.class.clone(),
             process_path: info.process_path.clone(),
+            untileable_shape,
         };
 
         // An elevated window is out of reach (UIPI): no rule, seat or move
@@ -382,6 +390,17 @@ impl WindowRegistry {
                 info.class
             );
             WindowState::Ignored(IgnoredReason::ShellBand(band))
+        } else if classification::is_overlay(info.ex_style) {
+            // Click-through or never activated: an overlay (a screen-share
+            // border), never managed whatever the rules say (ADR-0036).
+            log::info!(
+                "window {:#x} ({} {:?}) is a click-through or no-activate overlay (ex-style {:#x}); left unmanaged",
+                info.hwnd.0 as isize,
+                info.exe,
+                info.class,
+                info.ex_style
+            );
+            WindowState::Ignored(IgnoredReason::Overlay)
         } else if self.session_locked {
             // Nothing is placed or focused while the user cannot see the
             // desktop; the unlock classifies it afresh (ADR-0034).
@@ -393,6 +412,9 @@ impl WindowRegistry {
             );
             WindowState::Ignored(IgnoredReason::SessionLocked)
         } else {
+            if !info.is_maximized && !info.is_fullscreen {
+                self.log_shape_note(info, &candidate);
+            }
             classification::classify_with_state_pipeline(
                 &candidate,
                 info.is_maximized,
@@ -422,6 +444,7 @@ impl WindowRegistry {
             invisible_bounds,
         );
         window.band = info.band;
+        window.untileable_shape = untileable_shape;
         if info.is_iconic {
             window.geometry_from_placement = true;
             if matches!(
@@ -452,6 +475,41 @@ impl WindowRegistry {
             info.title,
             if info.is_iconic { " (minimized)" } else { "" },
         );
+    }
+
+    /// Log what the untileable-shape rule did to a window being registered
+    /// (ADR-0036): one info line when a learned rule, a bundled rule or
+    /// `default_action` would have tiled it and it floats instead; one warn
+    /// per user rule (per rules load) that tiles such a window anyway.
+    fn log_shape_note(
+        &mut self,
+        info: &win32::WindowInfo,
+        candidate: &classification::WindowCandidate,
+    ) {
+        match classification::shaped_verdict(candidate, &self.pipeline).1 {
+            classification::ShapeNote::Unchanged => {}
+            classification::ShapeNote::Floated(layer) => log::info!(
+                "window {:#x} ({} {:?}) is an undecorated popup without a sizing border (style {:#x}); it floats ({} that tiles it does not apply)",
+                info.hwnd.0 as isize,
+                info.exe,
+                info.class,
+                info.style,
+                layer.word()
+            ),
+            classification::ShapeNote::UserTiled(i) => {
+                if self.shape_warned_rules.insert(i) {
+                    log::warn!(
+                        "flow-rules.toml {} tiles window {:#x} ({} {:?}), an undecorated popup without a sizing border; it is tiled because the rule says so",
+                        self.pipeline
+                            .user_rule_label(i)
+                            .unwrap_or_else(|| format!("rule {}", i + 1)),
+                        info.hwnd.0 as isize,
+                        info.exe,
+                        info.class
+                    );
+                }
+            }
+        }
     }
 
     /// The Win32 pre-filters a window must pass before it is classified —
@@ -634,6 +692,7 @@ impl WindowRegistry {
                         title: w.title.clone(),
                         class: w.class.clone(),
                         process_path: w.process_path.to_string_lossy().into_owned(),
+                        untileable_shape: w.untileable_shape,
                     })
             })
             .unwrap_or_default()
@@ -666,6 +725,7 @@ impl WindowRegistry {
             title: String::new(),
             class: class.to_owned(),
             process_path: process_path.to_owned(),
+            untileable_shape: false,
         };
         self.pipeline.classify(&candidate) == crate::config::types::WindowAction::Ignore
     }
@@ -675,6 +735,7 @@ impl WindowRegistry {
     /// Used by hot-reload so edited `flow-rules.toml` rules take effect without
     /// a restart. See (`docs/src/dev-guide/config-and-persistence.md`).
     pub fn set_user_rules(&mut self, user_rules: WindowRulesConfig) {
+        self.shape_warned_rules.clear();
         self.pipeline.set_user_rules(user_rules);
     }
 
@@ -1027,6 +1088,7 @@ impl WindowRegistry {
                     "adopted_from_maximized": w.adopted_from_maximized,
                     "on_top": w.on_top,
                     "band": w.band,
+                    "untileable": untileable_json(w),
                 })
             })
             .collect();
@@ -1700,6 +1762,7 @@ impl WindowRegistry {
                         title: window.title.clone(),
                         class: window.class.clone(),
                         process_path: window.process_path.to_string_lossy().into_owned(),
+                        untileable_shape: window.untileable_shape,
                     };
                     !matches!(
                         classification::classify_with_state_pipeline(
@@ -1750,6 +1813,7 @@ impl WindowRegistry {
                     title: window.title.clone(),
                     class: window.class.clone(),
                     process_path: window.process_path.to_string_lossy().into_owned(),
+                    untileable_shape: window.untileable_shape,
                 };
                 classification::classify_with_state_pipeline(
                     &candidate,
@@ -1909,6 +1973,19 @@ fn hwnd_key(hwnd: HWND) -> isize {
     hwnd.0 as isize
 }
 
+/// Why `flow query all` reports `w` as untileable (ADR-0036): `"refused
+/// its rect"` once the placement check released it, `"undecorated popup"`
+/// for its shape, else `null`.
+fn untileable_json(w: &Window) -> serde_json::Value {
+    if w.refused_rect {
+        serde_json::json!("refused its rect")
+    } else if w.untileable_shape {
+        serde_json::json!("undecorated popup")
+    } else {
+        serde_json::Value::Null
+    }
+}
+
 /// Converts a `WindowState` to a JSON value for the query API.
 ///
 /// This produces a human-readable JSON representation of each state variant,
@@ -1954,6 +2031,9 @@ fn state_to_json(state: &WindowState) -> serde_json::Value {
         }
         WindowState::Ignored(IgnoredReason::ShellBand(_)) => {
             serde_json::json!("Ignored::ShellBand")
+        }
+        WindowState::Ignored(IgnoredReason::Overlay) => {
+            serde_json::json!("Ignored::Overlay")
         }
         WindowState::Ignored(IgnoredReason::SessionLocked) => {
             serde_json::json!("Ignored::SessionLocked")
@@ -2075,6 +2155,8 @@ mod tests {
             is_iconic: false,
             is_elevated: false,
             band: None,
+            style: 0,
+            ex_style: 0,
         };
         registry.register_window_from_info(&info);
         if let Some(w) = registry.get_window_mut(HWND(0x77 as *mut _)) {
@@ -2402,6 +2484,8 @@ mod tests {
             is_iconic: false,
             is_elevated: false,
             band: None,
+            style: 0,
+            ex_style: 0,
         };
 
         reg.register_window_from_info(&info);
@@ -2568,6 +2652,8 @@ mod tests {
             is_iconic: true,
             is_elevated: false,
             band: None,
+            style: 0,
+            ex_style: 0,
         }
     }
 
@@ -3062,6 +3148,8 @@ mod tests {
                 is_iconic: iconic,
                 is_elevated: true,
                 band: None,
+                style: 0,
+                ex_style: 0,
             };
             reg.register_window_from_info(&info);
             let w = reg.get_window(HWND(hwnd_val as *mut _)).unwrap();
@@ -3095,6 +3183,8 @@ mod tests {
             is_iconic: false,
             is_elevated: elevated,
             band,
+            style: 0,
+            ex_style: 0,
         }
     }
 
@@ -3158,6 +3248,99 @@ mod tests {
             .clone();
         assert_eq!(first["band"], 4);
         assert_eq!(first["state"], "Ignored::ShellBand");
+    }
+
+    /// ADR-0036: a click-through or never-activated window is
+    /// `Ignored(Overlay)` ahead of every rule (and after elevation and the
+    /// band); an undecorated popup without a sizing border floats although
+    /// a learned rule tiles its exe + class, and tiles by a user rule; a
+    /// resizable popup of the same class is tiled by the learned rule.
+    /// `flow query all` names both.
+    #[test]
+    fn overlays_are_ignored_and_untileable_popups_float() {
+        use crate::config::types::MatchRule;
+        use classification::{
+            WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT, WS_POPUP, WS_THICKFRAME,
+        };
+        let tile = |exe: &str, class: &str| WindowRule {
+            match_: MatchRule {
+                exe: Some(exe.into()),
+                class: Some(class.into()),
+                ..Default::default()
+            },
+            action: Some(WindowAction::Tile),
+            fullscreen: None,
+            initial_width_px: None,
+            override_persist: false,
+        };
+        let user = WindowRulesConfig {
+            default_action: WindowAction::Tile,
+            rules: vec![tile("chat.exe", "UserBar")],
+        };
+        let mut reg = WindowRegistry::new(&user, &WindowRulesConfig::default());
+        reg.set_learned_rules(vec![tile("chat.exe", "ChatView")]);
+        let info = |hwnd_val: isize, class: &str, style: u32, ex_style: u32| {
+            let mut i = banded_info(hwnd_val, Some(1), false);
+            i.exe = "chat.exe".to_owned();
+            i.class = class.to_owned();
+            i.style = style;
+            i.ex_style = ex_style;
+            i
+        };
+        let state = |reg: &WindowRegistry, hwnd_val: isize| {
+            reg.get_window(HWND(hwnd_val as *mut _))
+                .unwrap()
+                .state
+                .clone()
+        };
+        // The share border: caption, transparent, no-activate.
+        reg.register_window_from_info(&info(
+            5001,
+            "ScreenBorderWindow",
+            WS_POPUP | WS_CAPTION,
+            WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+        ));
+        assert!(matches!(
+            state(&reg, 5001),
+            WindowState::Ignored(IgnoredReason::Overlay)
+        ));
+        reg.register_window_from_info(&info(5002, "ChatView", 0, WS_EX_NOACTIVATE));
+        assert!(matches!(
+            state(&reg, 5002),
+            WindowState::Ignored(IgnoredReason::Overlay)
+        ));
+        let mut elevated = info(5003, "ChatView", 0, WS_EX_TRANSPARENT);
+        elevated.is_elevated = true;
+        reg.register_window_from_info(&elevated);
+        assert!(matches!(
+            state(&reg, 5003),
+            WindowState::Ignored(IgnoredReason::Elevated)
+        ));
+        // The control bar: popup, no caption, no sizing border.
+        reg.register_window_from_info(&info(5010, "ChatView", WS_POPUP, 0));
+        assert!(matches!(state(&reg, 5010), WindowState::Floating(_)));
+        // The same class, resizable: the learned rule tiles it.
+        reg.register_window_from_info(&info(5011, "ChatView", WS_POPUP | WS_THICKFRAME, 0));
+        assert!(matches!(state(&reg, 5011), WindowState::Tiling(_)));
+        // default_action = tile does not tile an untileable popup either.
+        reg.register_window_from_info(&info(5012, "Other", WS_POPUP, 0));
+        assert!(matches!(state(&reg, 5012), WindowState::Floating(_)));
+        // A user rule does.
+        reg.register_window_from_info(&info(5013, "UserBar", WS_POPUP, 0));
+        assert!(matches!(state(&reg, 5013), WindowState::Tiling(_)));
+        let q = reg.to_json_value(0);
+        let field = |hwnd_val: isize, key: &str| {
+            q["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|w| w["hwnd"] == hwnd_val)
+                .unwrap()[key]
+                .clone()
+        };
+        assert_eq!(field(5001, "state"), "Ignored::Overlay");
+        assert_eq!(field(5010, "untileable"), "undecorated popup");
+        assert_eq!(field(5011, "untileable"), serde_json::Value::Null);
     }
 
     /// ADR-0034: while the session is locked a desktop-band window is
@@ -3227,6 +3410,8 @@ mod tests {
             is_iconic: false,
             is_elevated: false,
             band: None,
+            style: 0,
+            ex_style: 0,
         };
 
         assert!(reg.is_empty());
@@ -3262,6 +3447,8 @@ mod tests {
             is_iconic: false,
             is_elevated: false,
             band: None,
+            style: 0,
+            ex_style: 0,
         };
 
         reg.register_window_from_info(&info);
@@ -3307,6 +3494,8 @@ mod tests {
             is_iconic: false,
             is_elevated: false,
             band: None,
+            style: 0,
+            ex_style: 0,
         };
 
         reg.register_window_from_info(&info);
@@ -4569,12 +4758,14 @@ mod tests {
             title: String::new(),
             class: String::new(),
             process_path: String::new(),
+            untileable_shape: false,
         };
         let other = WindowCandidate {
             exe: "other.exe".into(),
             title: String::new(),
             class: String::new(),
             process_path: String::new(),
+            untileable_shape: false,
         };
         // Guard: original rules are in effect.
         assert_eq!(reg.pipeline.classify(&pinned), WindowAction::Ignore);

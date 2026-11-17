@@ -949,6 +949,34 @@ user rules always outrank learned rules. For the full algorithm, see
 [Classification & Learned Rules](../dev-guide/classification.md) in the
 Developer Guide.
 
+Some windows are never placed in the strip by anything but your own rules
+(ADR-0036):
+
+- **Overlays** — a window that lets clicks through (`WS_EX_TRANSPARENT`) or
+  never takes focus (`WS_EX_NOACTIVATE`), such as a screen-share border, is
+  never managed, whatever any rule says (`flow query all`:
+  `Ignored::Overlay`).
+- **Undecorated popups** — a `WS_POPUP` window with no title bar and no
+  sizing border (a share control bar, a toolbar strip) floats, where its
+  app put it. A learned rule, a bundled rule or `default_action = "tile"`
+  cannot tile it, and `set-window` on it is not remembered (the learned
+  rule would also hit the app's main window, which often has the same
+  class). A rule in your `flow-rules.toml` that matches it with
+  `action = "tile"` still tiles it; the daemon then logs a warning once per
+  rule:
+
+  ```text
+  flow-rules.toml rule 3 (exe = "ms-teams.exe", class = "TeamsWebView") tiles window 0x.. (ms-teams.exe "TeamsWebView"), an undecorated popup without a sizing border; it is tiled because the rule says so
+  ```
+
+  Add a `title` or `title_regex` to the rule if it should only match the
+  main window.
+- **Windows that refuse their slot** — a tile that keeps its own size
+  instead of the size of its column is released to the floating layer half
+  a second after it was placed (`flow query all`: `untileable: "refused its
+  rect"`). A window held wider than its column by its own minimum size
+  stays a tile.
+
 ---
 
 ## Config directory resolution

@@ -907,6 +907,8 @@ mod tests {
             is_iconic: false,
             is_elevated: false,
             band: None,
+            style: 0,
+            ex_style: 0,
         }
     }
 

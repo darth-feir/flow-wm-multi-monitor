@@ -54,6 +54,10 @@ pub struct WindowCandidate {
     pub class: String,
     /// Full path to the executable.
     pub process_path: String,
+    /// The window's styles make it untileable by shape
+    /// ([`is_untileable_shape`]): a tile verdict from any layer but the
+    /// user's rules becomes a float (ADR-0036).
+    pub untileable_shape: bool,
 }
 
 // ── Window bands ────────────────────────────────────────────────────
@@ -75,6 +79,40 @@ pub const BAND_UIACCESS: u32 = 2;
 #[must_use]
 pub const fn is_shell_band(band: Option<u32>) -> bool {
     matches!(band, Some(b) if b > BAND_UIACCESS)
+}
+
+// ── Window styles (ADR-0036) ────────────────────────────────────────
+
+/// `WS_POPUP`.
+pub const WS_POPUP: u32 = 0x8000_0000;
+/// `WS_CAPTION` (`WS_BORDER | WS_DLGFRAME`): a title bar.
+pub const WS_CAPTION: u32 = 0x00C0_0000;
+/// `WS_THICKFRAME` (`WS_SIZEBOX`): a sizing border.
+pub const WS_THICKFRAME: u32 = 0x0004_0000;
+/// `WS_EX_TRANSPARENT`: mouse input passes through the window.
+pub const WS_EX_TRANSPARENT: u32 = 0x0000_0020;
+/// `WS_EX_NOACTIVATE`: the window never becomes the foreground window.
+pub const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+
+/// Whether a window's extended style marks it as an overlay flow never
+/// manages: click-through (`WS_EX_TRANSPARENT`) or never activated
+/// (`WS_EX_NOACTIVATE`). Such a window can be neither focused nor
+/// arranged by the user, whatever its other styles (ADR-0036). An
+/// unreadable style reads as 0: not an overlay (fail-open).
+#[must_use]
+pub const fn is_overlay(ex_style: u32) -> bool {
+    ex_style & (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE) != 0
+}
+
+/// Whether a window's style makes it **untileable by shape**: a
+/// `WS_POPUP` with no sizing border (`WS_THICKFRAME`) and no title bar
+/// (not both `WS_CAPTION` bits). Such a window was made at a size of its
+/// app's choosing and offers the user no way to resize it, so it floats
+/// unless a user rule says otherwise (ADR-0036). An unreadable style
+/// reads as 0: not untileable (fail-open).
+#[must_use]
+pub const fn is_untileable_shape(style: u32) -> bool {
+    style & WS_POPUP != 0 && style & WS_THICKFRAME == 0 && style & WS_CAPTION != WS_CAPTION
 }
 
 // ── matches_rule ────────────────────────────────────────────────────
@@ -495,35 +533,41 @@ impl ClassificationPipeline {
     /// [`classify_with_state_pipeline`].
     #[must_use]
     pub fn classify(&self, candidate: &WindowCandidate) -> WindowAction {
-        // 1. User rules (first match wins)
-        for compiled in &self.user_rules {
-            if let Some(action) = compiled.rule.action
-                && matches_compiled_rule(candidate, compiled)
-            {
-                return action;
-            }
-        }
+        self.verdict(candidate).0
+    }
 
-        // 2. Learned rules (first match wins)
-        for compiled in &self.learned_rules {
-            if let Some(action) = compiled.rule.action
-                && matches_compiled_rule(candidate, compiled)
-            {
-                return action;
-            }
+    /// [`classify`](Self::classify) and the layer whose rule decided it
+    /// (the index is the rule's position in its layer, from 0).
+    #[must_use]
+    pub fn verdict(&self, candidate: &WindowCandidate) -> (WindowAction, RuleLayer) {
+        let first = |rules: &[CompiledRule]| {
+            rules.iter().enumerate().find_map(|(i, compiled)| {
+                compiled
+                    .rule
+                    .action
+                    .filter(|_| matches_compiled_rule(candidate, compiled))
+                    .map(|action| (action, i))
+            })
+        };
+        if let Some((action, i)) = first(&self.user_rules) {
+            return (action, RuleLayer::User(i));
         }
-
-        // 3. Default rules (first match wins)
-        for compiled in &self.default_rules {
-            if let Some(action) = compiled.rule.action
-                && matches_compiled_rule(candidate, compiled)
-            {
-                return action;
-            }
+        if let Some((action, i)) = first(&self.learned_rules) {
+            return (action, RuleLayer::Learned(i));
         }
+        if let Some((action, i)) = first(&self.default_rules) {
+            return (action, RuleLayer::Default(i));
+        }
+        (self.default_action, RuleLayer::Fallback)
+    }
 
-        // 4. Fallback
-        self.default_action
+    /// `rule N (exe = "...", ...)` for the user rule at `index` (from 0),
+    /// as `flow config check` names rules; `None` past the end.
+    #[must_use]
+    pub fn user_rule_label(&self, index: usize) -> Option<String> {
+        self.user_rules
+            .get(index)
+            .map(|c| format!("rule {} ({})", index + 1, c.rule.match_.summary()))
     }
 
     /// How `set-window fullscreen` is realised for `candidate`: the
@@ -575,6 +619,66 @@ impl ClassificationPipeline {
     }
 }
 
+// ── Untileable by shape (ADR-0036) ────────────────────────────────────
+
+/// The layer of the classification pipeline whose rule decided a window
+/// ([`ClassificationPipeline::verdict`]); the index is the rule's position
+/// in its layer, from 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleLayer {
+    /// A rule of the user's `flow-rules.toml`.
+    User(usize),
+    /// A learned rule (`history-flow-rules.toml`).
+    Learned(usize),
+    /// A bundled default rule.
+    Default(usize),
+    /// No rule matched: `default_action`.
+    Fallback,
+}
+
+impl RuleLayer {
+    /// How the log names the layer.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::User(_) => "a flow-rules.toml rule",
+            Self::Learned(_) => "a learned rule",
+            Self::Default(_) => "a bundled rule",
+            Self::Fallback => "default_action",
+        }
+    }
+}
+
+/// What the untileable-shape rule did to a window's verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShapeNote {
+    /// Nothing: the window is not untileable by shape, or no layer tiled it.
+    Unchanged,
+    /// The layer named would have tiled it; it floats instead.
+    Floated(RuleLayer),
+    /// The user rule at this index (from 0) tiles it anyway.
+    UserTiled(usize),
+}
+
+/// The action for `candidate` after the untileable-shape rule: a `Tile`
+/// from a learned rule, a bundled rule or `default_action` becomes `Float`
+/// for a window untileable by shape; a user rule's `Tile` stands. With the
+/// note saying which happened (ADR-0036).
+#[must_use]
+pub fn shaped_verdict(
+    candidate: &WindowCandidate,
+    pipeline: &ClassificationPipeline,
+) -> (WindowAction, ShapeNote) {
+    let (action, layer) = pipeline.verdict(candidate);
+    if !candidate.untileable_shape || action != WindowAction::Tile {
+        return (action, ShapeNote::Unchanged);
+    }
+    match layer {
+        RuleLayer::User(i) => (action, ShapeNote::UserTiled(i)),
+        other => (WindowAction::Float, ShapeNote::Floated(other)),
+    }
+}
+
 // ── classify_with_state_pipeline ──────────────────────────────────────
 
 /// Classify a window using the full pipeline (OS overrides + multi-layer rules).
@@ -614,8 +718,7 @@ pub(super) fn classify_with_state_pipeline(
         return WindowState::Ignored(IgnoredReason::Fullscreen);
     }
 
-    let action = pipeline.classify(candidate);
-    action_to_state(action)
+    action_to_state(shaped_verdict(candidate, pipeline).0)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -637,8 +740,116 @@ mod tests {
     use crate::registry::types::IgnoredReason;
 
     /// Helper to build a [`WindowCandidate`] with minimal boilerplate.
+    /// ADR-0036: the style predicates, on the styles measured on the Teams
+    /// share windows (2026-11-16) and on ordinary windows.
+    #[test]
+    fn overlay_and_untileable_shape_predicates() {
+        // ScreenBorderWindow: POPUP+CAPTION, TOOLWINDOW+LAYERED+TRANSPARENT+NOACTIVATE+TOPMOST.
+        assert!(is_overlay(0x0800_0000 | 0x20 | 0x80 | 0x8_0000 | 0x8));
+        assert!(is_overlay(WS_EX_NOACTIVATE));
+        assert!(is_overlay(WS_EX_TRANSPARENT));
+        assert!(!is_overlay(0x8 | 0x8_0000 | 0x20_0000));
+        assert!(!is_overlay(0));
+        // The control bar: POPUP (+ TOPMOST, NOREDIRECTIONBITMAP).
+        assert!(is_untileable_shape(WS_POPUP | 0x1000_0000));
+        // A popup with only a thin border or only a dialog frame.
+        assert!(is_untileable_shape(WS_POPUP | 0x0080_0000));
+        assert!(is_untileable_shape(WS_POPUP | 0x0040_0000));
+        // Popups with a title bar or a sizing border, and overlapped windows
+        // (Alacritty undecorated keeps caption + thickframe, 0x16cf0000).
+        assert!(!is_untileable_shape(WS_POPUP | WS_CAPTION));
+        assert!(!is_untileable_shape(WS_POPUP | WS_THICKFRAME));
+        assert!(!is_untileable_shape(0x16cf_0000));
+        assert!(!is_untileable_shape(0x14cf_0000));
+        assert!(!is_untileable_shape(0));
+    }
+
+    /// ADR-0036: an untileable window's `Tile` from a learned rule, a
+    /// bundled rule or `default_action` becomes `Float`; a user rule's
+    /// stands; a `Float` or `Ignore` is untouched.
+    #[test]
+    fn shaped_verdict_floats_untileable_windows_unless_a_user_rule_tiles_them() {
+        let user = WindowRulesConfig {
+            default_action: WindowAction::Tile,
+            rules: vec![rule(
+                MatchRule {
+                    exe: Some("mine.exe".into()),
+                    ..Default::default()
+                },
+                WindowAction::Tile,
+            )],
+        };
+        let defaults = WindowRulesConfig {
+            default_action: WindowAction::Float,
+            rules: vec![rule(
+                MatchRule {
+                    exe: Some("bundled.exe".into()),
+                    ..Default::default()
+                },
+                WindowAction::Tile,
+            )],
+        };
+        let mut pipeline = ClassificationPipeline::new(user, defaults);
+        pipeline.set_learned_rules(vec![
+            rule(
+                MatchRule {
+                    exe: Some("learned.exe".into()),
+                    ..Default::default()
+                },
+                WindowAction::Tile,
+            ),
+            rule(
+                MatchRule {
+                    exe: Some("ignored.exe".into()),
+                    ..Default::default()
+                },
+                WindowAction::Ignore,
+            ),
+        ]);
+        let shaped = |exe: &str, untileable: bool| {
+            let mut c = candidate(exe, "T", "C", "");
+            c.untileable_shape = untileable;
+            shaped_verdict(&c, &pipeline)
+        };
+        assert_eq!(
+            shaped("learned.exe", true),
+            (
+                WindowAction::Float,
+                ShapeNote::Floated(RuleLayer::Learned(0))
+            )
+        );
+        assert_eq!(
+            shaped("bundled.exe", true),
+            (
+                WindowAction::Float,
+                ShapeNote::Floated(RuleLayer::Default(0))
+            )
+        );
+        assert_eq!(
+            shaped("other.exe", true),
+            (WindowAction::Float, ShapeNote::Floated(RuleLayer::Fallback))
+        );
+        assert_eq!(
+            shaped("mine.exe", true),
+            (WindowAction::Tile, ShapeNote::UserTiled(0))
+        );
+        assert_eq!(
+            shaped("ignored.exe", true),
+            (WindowAction::Ignore, ShapeNote::Unchanged)
+        );
+        assert_eq!(
+            shaped("learned.exe", false),
+            (WindowAction::Tile, ShapeNote::Unchanged)
+        );
+        assert_eq!(
+            pipeline.user_rule_label(0).as_deref(),
+            Some("rule 1 (exe = \"mine.exe\")")
+        );
+    }
+
     fn candidate(exe: &str, title: &str, class: &str, process_path: &str) -> WindowCandidate {
         WindowCandidate {
+            untileable_shape: false,
             exe: exe.to_owned(),
             title: title.to_owned(),
             class: class.to_owned(),

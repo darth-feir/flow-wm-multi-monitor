@@ -78,6 +78,7 @@ mod hung;
 mod loadout;
 mod new;
 mod piles;
+mod placement_check;
 mod pre_place;
 mod query;
 mod restore_seat;
