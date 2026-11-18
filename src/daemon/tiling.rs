@@ -351,7 +351,7 @@ impl FlowWM {
                 "tiling: submitting {} instant target(s) to put windows back",
                 targets.len()
             );
-            if let Err(e) = self.animator.animate(targets) {
+            if let Err(e) = self.animate_with_riders(targets) {
                 log::warn!("tiling: pause batch error: {e}");
             }
         }

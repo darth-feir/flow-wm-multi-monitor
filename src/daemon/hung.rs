@@ -64,6 +64,8 @@ impl FlowWM {
         if !self.registry.mark_hung(hwnd) {
             return;
         }
+        // Its riders stay where they are with it (ADR-0038).
+        self.note_anchor_hung(hwnd);
         if was_tile {
             self.remove_hung_tile(window);
             self.forget_submitted(hwnd);

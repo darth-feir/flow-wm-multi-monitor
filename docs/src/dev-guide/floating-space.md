@@ -722,24 +722,57 @@ Now an untracked, visible foreground whose owner chain (at most eight
 `GW_OWNER` hops, a cycle ends the walk, `anchor_of`) reaches a tracked
 window is a *rider* of that *anchor*. It is classed by the anchor (shell
 classes still win first; the live fullscreen check runs on the rider and on
-the anchor), and while the layer is raised it is held in the topmost band
-like a member: an entering rider always gets `HWND_TOPMOST`, so it lands
-above the members raised before it; on a raise flip the members go first,
-then the riders, owner first and the foreground window (member or rider) last; the periodic
-pass re-asserts a demoted rider. A drop seats the riders under the
-foreground first, then the members, and no window is ever seated under a
-window on its own owner chain (`seat_below` falls back to
-`HWND_NOTOPMOST`). Riders get no registry record, seat, border or learned
-rule; they live in `FlowWM::riders` (`anchor`, `on_top`, `was_topmost`,
-where `was_topmost` ignores a flag inherited from an owner the layer holds).
-They leave with the layer (drop, `tiling off`, option off) and on `flow
+the anchor). Riders get no registry record, seat, border or learned rule;
+they live in `FlowWM::riders` (`anchor`, `on_top`, `was_topmost`, `seated`,
+and the following state of `daemon::rider_follow`), noted with the layer
+off too, because their position follows the anchor either way.
+
+*Z-order: the owner group, not the whole layer (ADR-0038,
+`docs/adr/0038-riders-follow-their-anchor.md`).* `rider_seat` decides
+where the layer wants a rider; `rider_step` the one step that gets it there:
+
+| Layer on, anchor tracked, rider visible? | Raised and the owner group holds the foreground? | Seat | Step |
+|---|---|---|---|
+| no | — | `Released` | its own flag back (`Leave`), only if the layer held or seated it |
+| yes | yes: the layer's last non-shell foreground is the anchor, the rider, or a window whose owner chain reaches the anchor | `Topmost` | `HWND_TOPMOST` (entering, always raised so it lands above the members raised before it; demoted: re-asserted) |
+| yes | no: another tile, a float, a foreign window, a dropped layer | `AboveOwner` | when held: seated directly above its owner (`seat_plan`: under the window above the owner when that one is in the owner's band, else `HWND_TOPMOST` / `HWND_NOTOPMOST` for the top of the owner's band); when not held: seated once if it floats in the topmost band over a non-topmost owner (an app's own flag, like the SSMS 21 connect dialog), never again (no fight) |
+
+So whatever covers the anchor covers its riders, and ADR-0024's protection
+stays: while the group holds the foreground no float raised by the layer
+covers the rider (raise order: members first, then the riders owner first,
+the foreground last). A dropping layer seats the members first, then the
+riders above their owners (a release puts riders back first). Siblings
+keep their order (`rider_sync_order`: seats top-down, raises bottom-up, the
+foreground last). A rider seated
+over its own flag keeps `was_topmost` across the next entry, and `flow
+stop` gives the flag back. Windows itself hides the owned windows of a
+minimized owner and shows them on restore; a rider hidden while its anchor
+is minimized (by Windows, or still by the registry during the restore) or
+parked as not responding (Windows' ghost hides the hung windows) is kept. Riders leave on `tiling off`, option off and `flow
 stop` / fail-back (`release_top_layer`, riders first), and are forgotten
-when hidden or destroyed or when every pass finds them gone, hidden or with
-an untracked anchor. A modeless owned window (a Find dialog) that once had
-the foreground therefore stays above flow windows until it closes or a
-foreign app takes the foreground; owned windows that never take the
-foreground are left to Windows' own topmost propagation. Logged as `top
-layer: rider 0x.. (anchor 0x..) entered|left|forgotten`.
+when hidden (anchor not minimized) or destroyed, or when a pass finds them
+gone, hidden or with an untracked anchor. Owned windows that never take the
+foreground are left to Windows' own topmost propagation.
+
+*Position: the anchor's moves (ADR-0038).* Every daemon move of an anchor
+carries its riders by the same delta, size kept (`daemon::rider_follow`):
+an animator batch gets a target for each rider of an anchor in it
+(`animate_with_riders`: same easing, same `instant` flag; a batch that
+retargets one in flight starts from the last commanded pair), a teleport
+(workspace bystanders, the resize preview) moves them right after the
+anchor, a drag of the anchor (a keymap session or a native move of a tile
+or float) keeps their offset on every move and at the drop, and the
+shutdown rescue moves them with their rescued anchor. A rider or anchor
+that does not respond (`IsHungAppWindow`) or a hidden rider is left where
+it is.
+
+Logged: `top layer: rider 0x.. (anchor 0x..) entered (was_topmost=..)|left
+(restored to ..)|forgotten` at info; at debug `noted`, `raised again`,
+`seated above its owner 0x.. (under 0x..|top of the normal band|..)`,
+`hidden with its minimized or hung anchor 0x..; kept`, and `riders: 0x.. follows
+anchor 0x.. by (dx,dy) to (x,y)`, `... not moved: the anchor|the rider is
+not responding`, `riders: 0x.. stays where it is: its anchor 0x.. is not
+responding`.
 
 `flow ping` prints the state (`floating layer raised|dropped`) while the
 option and tiling are on; `flow query all` keeps reporting `on_top`, which is
@@ -774,12 +807,13 @@ ex-style only for a window that is wanted or held:
 | `flow stop`, fail-back, session end | `release_top_layer` in the shutdown rescue pass | leave, whatever the option says |
 | Destroyed | — | nothing (the record goes) |
 | An owned window of a flow window takes the foreground (rider) | `on_focus_changed` / `reassert_top_layer` → `decide_top_layer_with` notes it, `sync_top_layer` | enter (`HWND_TOPMOST`, after the members) |
-| A rider is hidden, destroyed, gone, or its anchor is no longer tracked | `on_window_hidden`, `on_window_destroyed`, the purge of every pass | leave (flag put back) and forgotten |
+| The foreground leaves a rider's owner group (another tile or float, a foreign window) or comes back to it | `evaluate_top_layer` syncs every rider when the decision stands; a flip applies to all | seated above its owner / enter (ADR-0038) |
+| A rider is hidden, destroyed, gone, or its anchor is no longer tracked | `on_window_hidden`, `on_window_destroyed`, the purge of every pass | leave (flag put back) and forgotten; kept while its anchor is minimized or hung |
 | A member Windows demoted (an app clearing the flag on activation) | `on_focus_changed` for the activated window (when the decision stands); `reassert_top_layer` from the main loop once per `[focus] foreground_sync_interval_ms`, over the held windows only | re-assert |
 
 The Win32 side (`is_topmost` / `set_topmost` / `insert_below` /
-`is_fullscreen_live` / `class_name` / `owner_of` / `is_visible`) is behind
-`TopmostProbe`; the tiling
+`is_fullscreen_live` / `class_name` / `owner_of` / `is_visible` /
+`window_above` / `is_minimized`) is behind `TopmostProbe`; the tiling
 on/off probe extends it, so the pause (`released_on_top`) and the resume
 (`raised_on_top`) are covered by the mock desktop, and `top_layer.rs`'s own
 mock scripts the foreground (an untracked game window, a taskbar, a tile

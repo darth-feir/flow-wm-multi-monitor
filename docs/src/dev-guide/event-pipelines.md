@@ -545,7 +545,7 @@ demoted it. See [Floating Space](./floating-space.md#the-floating-layer-floating
 |-----------|--------|
 | Not tracked | Attempt the full creation pipeline first (`register_if_untracked`): a window that registers is seated by it and then handled as below; the taskbar, menus and dialogs fail a gate and fall through (`set_focused` ignores them) |
 | Tracked `Ignored(Maximized\|Fullscreen)` window | Run the [State Change](#state-change-event_object_statechange) recovery first (an un-maximize whose `STATECHANGE` never arrived is picked up here); a window now tiling is seated, then handled as below |
-| Untracked, and its `GW_OWNER` chain reaches a tracked window (a modal dialog, an error box) | A floating-layer *rider*: classed by that anchor, held in the topmost band with the layer, never seated, bordered or learned (`decide_top_layer_with` in `daemon::top_layer`, ADR-0024) |
+| Untracked, and its `GW_OWNER` chain reaches a tracked window (a modal dialog, an error box) | A *rider*: classed by that anchor, held in the topmost band while its owner group holds the foreground and seated directly above its owner otherwise, moved with its anchor, never seated in a strip, bordered or learned (`decide_top_layer_with` in `daemon::top_layer`, `daemon::rider_follow`, ADR-0024, ADR-0038) |
 | Any tracked window | `registry.set_focused(hwnd)` + `layout.set_focus(WindowId)` if tiling |
 
 Focus changes do not produce an `AppliedLayout` — they only update internal focus

@@ -168,7 +168,7 @@ impl FlowWM {
                 targets.len(),
                 layouts.len()
             );
-            if let Err(e) = self.animator.animate(targets) {
+            if let Err(e) = self.animate_with_riders(targets) {
                 log::warn!("animation error: {e}");
             }
         }
@@ -209,7 +209,7 @@ impl FlowWM {
             "animate_layout: submitting {} targets to animator",
             targets.len()
         );
-        if let Err(e) = self.animator.animate(targets) {
+        if let Err(e) = self.animate_with_riders(targets) {
             log::warn!("animation error: {e}");
         }
     }
@@ -534,7 +534,7 @@ impl FlowWM {
             batches.len()
         );
 
-        if let Err(e) = self.animator.animate(targets) {
+        if let Err(e) = self.animate_with_riders(targets) {
             log::warn!("animate_workspaces error: {e}");
         }
     }
@@ -692,6 +692,8 @@ impl FlowWM {
         let border_overlap = self.config.borders.overlap as i32;
         let excluded_float = self.drag_state.as_ref().map(|d| d.dragged_hwnd());
         let mut submitted: Vec<(isize, Rect)> = Vec::new();
+        // Anchors teleported with riders, and where they were (ADR-0038).
+        let mut followed: Vec<(isize, (i32, i32))> = Vec::new();
         for (layout, y_offset) in batches {
             for entry in &layout.entries {
                 if Some(entry.window_id.0) == excluded_float {
@@ -726,6 +728,7 @@ impl FlowWM {
                 // Teleport is best-effort: a single failure must not abort
                 // the rest of the batch, it only keeps the window out of the
                 // submitted-rect record.
+                let rider_from = self.anchor_position_for_riders(entry.window_id.0);
                 if crate::registry::win32::set_window_rect(
                     entry.window_id.0,
                     window_rect.x,
@@ -734,6 +737,9 @@ impl FlowWM {
                     window_rect.height,
                 ) {
                     submitted.push((entry.window_id.0, visible));
+                    if let Some(from) = rider_from {
+                        followed.push((entry.window_id.0, from));
+                    }
                 }
 
                 // Teleport the border overlay to match. `set_geometry` calls
@@ -744,6 +750,9 @@ impl FlowWM {
                     border.set_geometry(border_rect);
                 }
             }
+        }
+        for (anchor, from) in followed {
+            self.follow_anchor_now(anchor, from);
         }
         self.record_submitted(&submitted);
     }
@@ -771,6 +780,7 @@ impl FlowWM {
         let border_thickness = self.config.borders.thickness as i32;
         let border_overlap = self.config.borders.overlap as i32;
         let mut submitted: Vec<(isize, Rect)> = Vec::new();
+        let mut followed: Vec<(isize, (i32, i32))> = Vec::new();
 
         // Active-drag exclusion filter — same intent as submit_animation's, so
         // the animator-free teleport also leaves the dragged window alone.
@@ -809,6 +819,7 @@ impl FlowWM {
             // follows the cursor with no tween lag. A successful move is the
             // window's new last-submitted rect (the preview never commits to
             // the registry, so this record is all the next batch has).
+            let rider_from = self.anchor_position_for_riders(entry.window_id.0);
             if crate::registry::win32::set_window_rect(
                 entry.window_id.0,
                 window_rect.x,
@@ -817,12 +828,18 @@ impl FlowWM {
                 window_rect.height,
             ) {
                 submitted.push((entry.window_id.0, entry.rect));
+                if let Some(from) = rider_from {
+                    followed.push((entry.window_id.0, from));
+                }
             }
 
             // Teleport the border overlay to match (option<&Window> is Copy).
             if let Some(border) = window.and_then(|w| w.border.as_ref()) {
                 border.set_geometry(entry.rect);
             }
+        }
+        for (anchor, from) in followed {
+            self.follow_anchor_now(anchor, from);
         }
         self.record_submitted(&submitted);
     }

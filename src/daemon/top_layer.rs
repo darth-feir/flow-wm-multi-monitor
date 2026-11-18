@@ -21,7 +21,11 @@
 //! box) that takes the foreground is a *rider*: classed by its anchor (the
 //! first tracked window on its `GW_OWNER` chain, [`anchor_of`]) and held in
 //! the topmost band with the layer, after the members ([`Rider`],
-//! ADR-0024, `docs/adr/0024-owned-windows-ride-the-floating-layer.md`).
+//! ADR-0024, `docs/adr/0024-owned-windows-ride-the-floating-layer.md`) —
+//! but only while its owner group holds the foreground; otherwise it is
+//! seated directly above its owner, so whatever covers the owner covers it
+//! ([`rider_seat`], [`rider_step`], ADR-0038). Its position follows the
+//! anchor (`daemon::rider_follow`).
 //!
 //! The Win32 questions are behind [`TopmostProbe`] so the transitions run
 //! against a mock in the unit tests; the tiling on/off probe extends it.
@@ -67,6 +71,24 @@ pub(super) trait TopmostProbe {
     fn band(&self, _hwnd: isize) -> Option<u32> {
         None
     }
+    /// The window directly above in the z-order
+    /// ([`registry_win32::window_above`]); `None` at the top, for a handle
+    /// that is gone, and from test probes that do not model the z-order.
+    fn window_above(&self, _hwnd: isize) -> Option<isize> {
+        None
+    }
+    /// `IsIconic` ([`registry_win32::is_iconic`]): Windows hides the owned
+    /// windows of a minimized owner, so a rider of a minimized anchor is
+    /// kept while it is hidden.
+    fn is_minimized(&self, _hwnd: isize) -> bool {
+        false
+    }
+    /// Every top-level window, topmost first ([`registry_win32::z_order`]);
+    /// read only when two or more riders are synced, to keep siblings in
+    /// their order. Empty from test probes that do not model it.
+    fn z_order(&self) -> Vec<isize> {
+        Vec::new()
+    }
 }
 
 /// The production [`TopmostProbe`]: plain Win32.
@@ -103,6 +125,18 @@ impl TopmostProbe for Win32Topmost {
 
     fn band(&self, hwnd: isize) -> Option<u32> {
         registry_win32::window_band(HWND(hwnd as *mut _))
+    }
+
+    fn window_above(&self, hwnd: isize) -> Option<isize> {
+        registry_win32::window_above(hwnd)
+    }
+
+    fn is_minimized(&self, hwnd: isize) -> bool {
+        registry_win32::is_iconic(HWND(hwnd as *mut _))
+    }
+
+    fn z_order(&self) -> Vec<isize> {
+        registry_win32::z_order()
     }
 }
 
@@ -194,9 +228,11 @@ fn owner_depth(hwnd: isize, owner_of: impl Fn(isize) -> Option<isize>) -> usize 
     depth
 }
 
-/// A rider (ADR-0024): an untracked window owned by a flow window that took
-/// the foreground. It gets no registry entry, seat, border or learned rule;
-/// the layer only holds it in the topmost band with the members.
+/// A rider (ADR-0024, ADR-0038): an untracked window owned by a flow
+/// window that took the foreground. It gets no registry entry, seat, border
+/// or learned rule; the layer holds it in the topmost band while its owner
+/// group holds the foreground and seats it above its owner otherwise, and
+/// it moves with its anchor (`daemon::rider_follow`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Rider {
     /// The first tracked window on its owner chain ([`anchor_of`]).
@@ -207,6 +243,151 @@ pub(super) struct Rider {
     /// its chain was held by the layer (a flag inherited from the daemon's
     /// own raise is not the window's).
     pub was_topmost: bool,
+    /// Seated above its owner by the layer since it last left the topmost
+    /// band ([`RiderStep::SeatAbove`]): a flag of its own was cleared then,
+    /// so the next entry keeps `was_topmost` and a release puts it back,
+    /// and no pass seats it again (an app that sets the flag again is not
+    /// fought).
+    pub seated: bool,
+    /// Where the last submit sent the anchor and the rider, for a submit
+    /// that retargets a batch still in flight (`daemon::rider_follow`).
+    pub follow: Option<super::rider_follow::Follow>,
+    /// The rider's offset from its anchor's top-left corner when a drag of
+    /// the anchor began; `None` outside a drag (`daemon::rider_follow`).
+    pub drag_offset: Option<(i32, i32)>,
+}
+
+impl Rider {
+    /// A rider of `anchor` the layer does not hold yet.
+    #[must_use]
+    pub(super) fn new(anchor: isize) -> Self {
+        Self {
+            anchor,
+            on_top: false,
+            was_topmost: false,
+            seated: false,
+            follow: None,
+            drag_offset: None,
+        }
+    }
+}
+
+/// Where the layer wants a rider (ADR-0038).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RiderSeat {
+    /// Out of the layer's hands: the option or tiling is off, the anchor is
+    /// no longer tracked, or the rider is not visible. The flag it had on
+    /// its own goes back.
+    Released,
+    /// In the topmost band: the layer is raised and the rider's owner group
+    /// (its anchor, the rider itself, or any window owned through the
+    /// anchor) holds the foreground, so no float raised by the layer covers
+    /// it (ADR-0024's protection).
+    Topmost,
+    /// Directly above its owner, in the owner's band: whatever covers the
+    /// owner covers the rider.
+    AboveOwner,
+}
+
+/// Pure decision rule (ADR-0038): where the layer wants a rider, from
+/// whether the layer is on (`[floating] always_on_top` and tiling on),
+/// whether its anchor is still tracked, whether the rider is visible,
+/// whether the layer is raised, and whether its owner group holds the
+/// foreground (the last non-shell foreground the layer decided on).
+#[must_use]
+pub(super) fn rider_seat(
+    layer_on: bool,
+    anchor_tracked: bool,
+    visible: bool,
+    raised: bool,
+    group_foreground: bool,
+) -> RiderSeat {
+    if !layer_on || !anchor_tracked || !visible {
+        RiderSeat::Released
+    } else if raised && group_foreground {
+        RiderSeat::Topmost
+    } else {
+        RiderSeat::AboveOwner
+    }
+}
+
+/// The one z-order step the layer applies to a rider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RiderStep {
+    /// `HWND_TOPMOST`: it enters the band (always raised, so it lands above
+    /// the members raised before it).
+    Enter,
+    /// Held, but Windows demoted it: `HWND_TOPMOST` again.
+    Reassert,
+    /// Out of the band, directly above its owner ([`seat_plan`]).
+    SeatAbove,
+    /// Released; `restore_to` is the flag to set when the current one
+    /// differs from its own.
+    Leave { restore_to: Option<bool> },
+}
+
+/// Pure step rule behind the rider sync (ADR-0038): given where the layer
+/// wants the rider (`seat`), whether the layer holds it in the band
+/// (`on_top`) or seated it (`seated`), whether it and its owner are topmost
+/// now, and the flag it had on its own, the step to apply — or `None`.
+/// A rider not held is seated only when it sits in the topmost band while
+/// its owner does not (it would float over everything), and only once.
+#[must_use]
+pub(super) fn rider_step(
+    seat: RiderSeat,
+    on_top: bool,
+    seated: bool,
+    topmost_now: bool,
+    owner_topmost: bool,
+    was_topmost: bool,
+) -> Option<RiderStep> {
+    match seat {
+        RiderSeat::Topmost if !on_top => Some(RiderStep::Enter),
+        RiderSeat::Topmost => (!topmost_now).then_some(RiderStep::Reassert),
+        RiderSeat::AboveOwner if on_top => Some(RiderStep::SeatAbove),
+        RiderSeat::AboveOwner => {
+            (!seated && topmost_now && !owner_topmost).then_some(RiderStep::SeatAbove)
+        }
+        RiderSeat::Released => (on_top || seated).then_some(RiderStep::Leave {
+            restore_to: (topmost_now != was_topmost).then_some(was_topmost),
+        }),
+    }
+}
+
+/// How a rider is seated directly above its owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SeatPlan {
+    /// It already sits directly above its owner, in the owner's band.
+    Nothing,
+    /// `SetWindowPos(rider, after)`: directly under the window above the
+    /// owner, which is in the owner's band (the one call also clears the
+    /// rider's topmost flag when that band is the normal one).
+    Under(isize),
+    /// `HWND_TOPMOST` / `HWND_NOTOPMOST`: the top of the owner's band — the
+    /// owner is the top of its band then, so that is directly above it.
+    BandTop(bool),
+}
+
+/// Pure: how to seat `rider` directly above its owner, from the window
+/// directly above the owner (`above`, `None` at the top of the z-order),
+/// whether that window, the owner and the rider are topmost, and whether
+/// `above` is owned by the rider (never seat a window under its own popup).
+#[must_use]
+pub(super) fn seat_plan(
+    rider: isize,
+    above: Option<isize>,
+    above_topmost: bool,
+    owner_topmost: bool,
+    rider_topmost: bool,
+    above_owned_by_rider: bool,
+) -> SeatPlan {
+    match above {
+        Some(x) if x == rider && rider_topmost == owner_topmost => SeatPlan::Nothing,
+        Some(x) if x != rider && above_topmost == owner_topmost && !above_owned_by_rider => {
+            SeatPlan::Under(x)
+        }
+        _ => SeatPlan::BandTop(owner_topmost),
+    }
 }
 
 /// Who the layer sees holding the foreground.
@@ -467,16 +648,20 @@ impl FlowWM {
         probe: &P,
     ) -> Option<bool> {
         if !self.config.floating.always_on_top || self.tiling_paused {
+            // Riders follow their anchor with the layer off too (ADR-0038):
+            // an untracked foreground is still checked for an anchor.
+            if fg.is_some_and(|h| h != 0 && !self.registry.is_tracked(h)) {
+                let (owner, anchor) = self.foreground_view_with(fg, probe);
+                self.note_rider_if(owner, fg, anchor, probe);
+            }
             return None;
         }
         let (owner, anchor) = self.foreground_view_with(fg, probe);
-        if owner == ForegroundOwner::Flow
-            && let (Some(hwnd), Some(anchor)) = (fg, anchor)
-            && probe.is_visible(hwnd)
-        {
-            self.note_rider(hwnd, anchor);
-        }
+        self.note_rider_if(owner, fg, anchor, probe);
         let raise = owner.raised()?;
+        // The owner group a rider is held topmost for (ADR-0038); a shell
+        // surface keeps the last one, as it keeps the decision.
+        self.layer_foreground = fg;
         self.top_layer_below = if raise { None } else { fg };
         if raise == self.top_layer_raised {
             return None;
@@ -504,7 +689,12 @@ impl FlowWM {
         fg: Option<isize>,
         probe: &P,
     ) -> Option<bool> {
-        let raise = self.decide_top_layer_with(fg, probe)?;
+        let Some(raise) = self.decide_top_layer_with(fg, probe) else {
+            // The decision stands, but the foreground may have moved into or
+            // out of a rider's owner group (ADR-0038).
+            self.sync_riders_with(probe);
+            return None;
+        };
         let summary = self.apply_all_top_layer_with(probe);
         log::debug!(
             "top layer: {}: {} entered, {} left, {} re-asserted",
@@ -534,33 +724,114 @@ impl FlowWM {
         if let Some(wanted) = self.layer_wanted_for(hwnd) {
             return self.apply_layer_step(hwnd, wanted, probe);
         }
-        let wanted = self.rider_wanted_with(hwnd, probe)?;
-        self.apply_rider_step(hwnd, wanted, probe)
+        let seat = self.rider_seat_with(hwnd, probe)?;
+        self.apply_rider_step(hwnd, seat, probe)
+    }
+
+    /// Sync every rider, owner first and the foreground last
+    /// ([`rider_order`](Self::rider_order)). A few windows at most.
+    fn sync_riders_with<P: TopmostProbe>(&mut self, probe: &P) {
+        if self.riders.is_empty() {
+            return;
+        }
+        for hwnd in self.rider_sync_order(probe) {
+            self.sync_top_layer_with(hwnd, probe);
+        }
+    }
+
+    /// The riders in the order a sync applies them (ADR-0038): first the
+    /// ones to be seated above their owner, owner first and top-down among
+    /// siblings (each lands directly above its owner, under the one seated
+    /// before it, so siblings keep their order); then the ones held
+    /// topmost, owner first and bottom-up among siblings (each raise lands
+    /// on top), the foreground last; the released ones last.
+    fn rider_sync_order<P: TopmostProbe>(&self, probe: &P) -> Vec<isize> {
+        let z = if self.riders.len() > 1 {
+            probe.z_order()
+        } else {
+            Vec::new()
+        };
+        let zpos = |h: isize| {
+            z.iter()
+                .position(|x| *x == h)
+                .map_or(z.len() as i64, |p| p as i64)
+        };
+        let mut keyed: Vec<((u8, bool, usize, i64), isize)> = self
+            .riders
+            .keys()
+            .map(|h| {
+                let depth = owner_depth(*h, |o| probe.owner_of(o));
+                let key = match self.rider_seat_with(*h, probe) {
+                    Some(RiderSeat::AboveOwner) => (0, false, depth, zpos(*h)),
+                    Some(RiderSeat::Topmost) => (1, Some(*h) == self.foreground, depth, -zpos(*h)),
+                    _ => (2, false, depth, 0),
+                };
+                (key, *h)
+            })
+            .collect();
+        keyed.sort_unstable();
+        keyed.into_iter().map(|(_, h)| h).collect()
+    }
+
+    /// Note the foreground `fg` as a rider of `anchor` when the layer
+    /// classed it as flow's by that anchor and it is visible.
+    fn note_rider_if<P: TopmostProbe>(
+        &mut self,
+        owner: ForegroundOwner,
+        fg: Option<isize>,
+        anchor: Option<isize>,
+        probe: &P,
+    ) {
+        if owner == ForegroundOwner::Flow
+            && let (Some(hwnd), Some(anchor)) = (fg, anchor)
+            && probe.is_visible(hwnd)
+        {
+            self.note_rider(hwnd, anchor);
+        }
     }
 
     /// Remember `hwnd` as a rider of `anchor` (the foreground is classed by
     /// it, ADR-0024). Keeps the flags of a rider already known.
     fn note_rider(&mut self, hwnd: isize, anchor: isize) {
-        let rider = self.riders.entry(hwnd).or_insert(Rider {
-            anchor,
-            on_top: false,
-            was_topmost: false,
+        let rider = self.riders.entry(hwnd).or_insert_with(|| {
+            log::debug!("top layer: rider {hwnd:#x} noted (anchor {anchor:#x})");
+            Rider::new(anchor)
         });
         rider.anchor = anchor;
     }
 
-    /// Whether the rider `hwnd` is wanted in the topmost band: the layer is
-    /// on and raised, its anchor is still tracked and it is visible. `None`
-    /// for a window that is not a rider.
-    fn rider_wanted_with<P: TopmostProbe>(&self, hwnd: isize, probe: &P) -> Option<bool> {
+    /// Whether the owner group of the rider `hwnd` (anchor `anchor`) holds
+    /// the foreground the layer last decided on: the anchor, the rider, or
+    /// a window whose owner chain reaches the anchor (another rider, a
+    /// message box owned by the rider).
+    fn group_holds_foreground<P: TopmostProbe>(
+        &self,
+        hwnd: isize,
+        anchor: isize,
+        probe: &P,
+    ) -> bool {
+        self.layer_foreground.is_some_and(|fg| {
+            fg == anchor || fg == hwnd || owned_by(fg, anchor, |h| probe.owner_of(h))
+        })
+    }
+
+    /// Where the layer wants the rider `hwnd` ([`rider_seat`] over the
+    /// daemon's state). `None` for a window that is not a rider.
+    fn rider_seat_with<P: TopmostProbe>(&self, hwnd: isize, probe: &P) -> Option<RiderSeat> {
         let rider = self.riders.get(&hwnd)?;
-        Some(
-            self.config.floating.always_on_top
-                && !self.tiling_paused
-                && self.top_layer_raised
-                && self.registry.is_tracked(rider.anchor)
-                && probe.is_visible(hwnd),
-        )
+        let layer_on = self.config.floating.always_on_top && !self.tiling_paused;
+        let tracked = self.registry.is_tracked(rider.anchor);
+        let visible = layer_on && tracked && probe.is_visible(hwnd);
+        let group = visible
+            && self.top_layer_raised
+            && self.group_holds_foreground(hwnd, rider.anchor, probe);
+        Some(rider_seat(
+            layer_on,
+            tracked,
+            visible,
+            self.top_layer_raised,
+            group,
+        ))
     }
 
     /// Whether a window on `hwnd`'s owner chain is held in the band by the
@@ -596,68 +867,132 @@ impl FlowWM {
             .filter(|after| !owned_by(*after, hwnd, |h| probe.owner_of(h)))
     }
 
-    /// [`apply_layer_step`](Self::apply_layer_step) for a rider: an entering
+    /// Apply [`rider_step`] to the rider `hwnd` for `seat`: an entering
     /// rider is always raised (`HWND_TOPMOST` puts it at the top of the
     /// band, above members raised before it, even when it inherited the
-    /// flag), and the flag it had on its own is the one put back.
+    /// flag); a rider whose owner group lost the foreground is seated
+    /// directly above its owner ([`seat_plan`]); a released one gets the
+    /// flag it had on its own back. Returns the step as a [`LayerStep`]
+    /// for the pass summaries (a seat counts as a leave).
     fn apply_rider_step<P: TopmostProbe>(
         &mut self,
         hwnd: isize,
-        wanted: bool,
+        seat: RiderSeat,
         probe: &P,
     ) -> Option<LayerStep> {
         let rider = *self.riders.get(&hwnd)?;
-        if !wanted && !rider.on_top {
+        if seat == RiderSeat::Released && !rider.on_top && !rider.seated {
             return None;
         }
         let topmost_now = probe.is_topmost(hwnd);
-        let step = if wanted && !rider.on_top {
-            LayerStep::Enter { raise: true }
-        } else {
-            layer_step(wanted, rider.on_top, topmost_now, rider.was_topmost)?
-        };
+        let owner = probe.owner_of(hwnd).filter(|o| *o != 0);
+        let owner_topmost =
+            seat == RiderSeat::AboveOwner && owner.is_some_and(|o| probe.is_topmost(o));
+        let step = rider_step(
+            seat,
+            rider.on_top,
+            rider.seated,
+            topmost_now,
+            owner_topmost,
+            rider.was_topmost,
+        )?;
         match step {
-            LayerStep::Enter { .. } => {
-                let was_topmost = topmost_now && !self.owner_held(hwnd, probe);
+            RiderStep::Enter => {
+                // Seated before, its own flag was cleared by the seat: keep
+                // what was remembered then.
+                let was_topmost = if rider.seated {
+                    rider.was_topmost
+                } else {
+                    topmost_now && !self.owner_held(hwnd, probe)
+                };
                 if !probe.set_topmost(hwnd, true) {
                     log::debug!("top layer: could not raise rider {hwnd:#x}");
                 }
                 if let Some(r) = self.riders.get_mut(&hwnd) {
                     r.on_top = true;
+                    r.seated = false;
                     r.was_topmost = was_topmost;
                 }
-                log::info!(
-                    "top layer: rider {hwnd:#x} (anchor {:#x}) entered (was_topmost={was_topmost})",
-                    rider.anchor
-                );
+                if rider.seated {
+                    log::debug!(
+                        "top layer: rider {hwnd:#x} (anchor {:#x}) raised again (its owner group holds the foreground)",
+                        rider.anchor
+                    );
+                } else {
+                    log::info!(
+                        "top layer: rider {hwnd:#x} (anchor {:#x}) entered (was_topmost={was_topmost})",
+                        rider.anchor
+                    );
+                }
+                Some(LayerStep::Enter { raise: true })
             }
-            LayerStep::Leave { restore_to } => {
-                if let Some(after) = self.seat_below(hwnd, restore_to, probe)
-                    && probe.insert_below(hwnd, after)
-                {
-                    log::debug!("top layer: rider {hwnd:#x} seated under {after:#x}");
-                } else if let Some(flag) = restore_to
+            RiderStep::Reassert => {
+                if !probe.set_topmost(hwnd, true) {
+                    log::debug!("top layer: could not re-assert rider {hwnd:#x}");
+                }
+                log::debug!("top layer: rider {hwnd:#x} re-asserted");
+                Some(LayerStep::Reassert)
+            }
+            RiderStep::SeatAbove => {
+                let owner = owner.unwrap_or(rider.anchor);
+                let owner_top = probe.is_topmost(owner);
+                let above = probe.window_above(owner);
+                let plan = seat_plan(
+                    hwnd,
+                    above,
+                    above.is_some_and(|a| probe.is_topmost(a)),
+                    owner_top,
+                    topmost_now,
+                    above.is_some_and(|a| owned_by(a, hwnd, |h| probe.owner_of(h))),
+                );
+                let (issued, how) = match plan {
+                    SeatPlan::Nothing => (true, "already there".to_owned()),
+                    SeatPlan::Under(after) => {
+                        (probe.insert_below(hwnd, after), format!("under {after:#x}"))
+                    }
+                    SeatPlan::BandTop(top) => (
+                        probe.set_topmost(hwnd, top),
+                        if top {
+                            "top of the topmost band".to_owned()
+                        } else {
+                            "top of the normal band".to_owned()
+                        },
+                    ),
+                };
+                if let Some(r) = self.riders.get_mut(&hwnd) {
+                    r.on_top = false;
+                    r.seated = true;
+                }
+                if issued {
+                    log::debug!(
+                        "top layer: rider {hwnd:#x} (anchor {:#x}) seated above its owner {owner:#x} ({how})",
+                        rider.anchor
+                    );
+                } else {
+                    log::debug!(
+                        "top layer: could not seat rider {hwnd:#x} above its owner {owner:#x} ({how})"
+                    );
+                }
+                Some(LayerStep::Leave { restore_to: None })
+            }
+            RiderStep::Leave { restore_to } => {
+                if let Some(flag) = restore_to
                     && !probe.set_topmost(hwnd, flag)
                 {
                     log::debug!("top layer: could not restore topmost={flag} on rider {hwnd:#x}");
                 }
                 if let Some(r) = self.riders.get_mut(&hwnd) {
                     r.on_top = false;
+                    r.seated = false;
                     r.was_topmost = false;
                 }
                 log::info!(
                     "top layer: rider {hwnd:#x} (anchor {:#x}) left (restored to {restore_to:?})",
                     rider.anchor
                 );
-            }
-            LayerStep::Reassert => {
-                if !probe.set_topmost(hwnd, true) {
-                    log::debug!("top layer: could not re-assert rider {hwnd:#x}");
-                }
-                log::debug!("top layer: rider {hwnd:#x} re-asserted");
+                Some(LayerStep::Leave { restore_to })
             }
         }
-        Some(step)
     }
 
     /// The riders in the order they are raised: owner first (an owned
@@ -688,7 +1023,7 @@ impl FlowWM {
             .iter()
             .filter(|(h, r)| {
                 probe.class_name(**h).is_none()
-                    || !probe.is_visible(**h)
+                    || (!probe.is_visible(**h) && !self.anchor_minimized(r.anchor, probe))
                     || !self.registry.is_tracked(r.anchor)
             })
             .map(|(h, _)| (Reverse(owner_depth(*h, |o| probe.owner_of(o))), *h))
@@ -698,7 +1033,7 @@ impl FlowWM {
         for (_, hwnd) in stale {
             if probe.class_name(hwnd).is_some()
                 && matches!(
-                    self.apply_rider_step(hwnd, false, probe),
+                    self.apply_rider_step(hwnd, RiderSeat::Released, probe),
                     Some(LayerStep::Leave { .. })
                 )
             {
@@ -712,6 +1047,23 @@ impl FlowWM {
             }
         }
         left
+    }
+
+    /// Whether `anchor` hides its riders for a while: minimized by Windows
+    /// (`IsIconic`) or still by the registry (on a restore Windows shows the
+    /// owned windows only after the owner, and the owner's foreground can
+    /// be handled first), or parked as not responding (Windows' ghost
+    /// stands in for the hung windows and hides them, ADR-0035).
+    fn anchor_minimized<P: TopmostProbe>(&self, anchor: isize, probe: &P) -> bool {
+        let Some(w) = self.registry.get_window(HWND(anchor as *mut _)) else {
+            return false;
+        };
+        probe.is_minimized(anchor)
+            || matches!(
+                w.state,
+                WindowState::Tiling(TilingState::Minimized | TilingState::Hung)
+                    | WindowState::Floating(FloatingState::Minimized | FloatingState::Hung)
+            )
     }
 
     /// A rider was hidden or destroyed: out of the band (when it is still
@@ -728,11 +1080,19 @@ impl FlowWM {
         destroyed: bool,
         probe: &P,
     ) {
-        if !self.riders.contains_key(&hwnd) {
+        let Some(anchor) = self.riders.get(&hwnd).map(|r| r.anchor) else {
             return;
-        }
+        };
         if !destroyed {
-            let _ = self.apply_rider_step(hwnd, false, probe);
+            let _ = self.apply_rider_step(hwnd, RiderSeat::Released, probe);
+            // Windows hides the owned windows of a minimized owner and shows
+            // them again with it: the rider is kept (ADR-0038).
+            if self.anchor_minimized(anchor, probe) {
+                log::debug!(
+                    "top layer: rider {hwnd:#x} hidden with its minimized or hung anchor {anchor:#x}; kept"
+                );
+                return;
+            }
         }
         if let Some(r) = self.riders.remove(&hwnd) {
             log::info!(
@@ -825,7 +1185,7 @@ impl FlowWM {
             ..LayerSummary::default()
         };
         let members: Vec<isize> = self.registry.windows().map(|w| w.hwnd.0 as isize).collect();
-        let riders = self.rider_order(probe);
+        let riders = self.rider_sync_order(probe);
         let lifting =
             self.config.floating.always_on_top && !self.tiling_paused && self.top_layer_raised;
         let order: Vec<isize> = if lifting {
@@ -837,7 +1197,12 @@ impl FlowWM {
                 .partition(|h| Some(*h) != fg);
             order.extend(last);
             order
+        } else if self.config.floating.always_on_top && !self.tiling_paused {
+            // Dropped: the members leave first, then the riders are seated
+            // above their owners, owner first (ADR-0038).
+            members.into_iter().chain(riders).collect()
         } else {
+            // Released: owned windows before their owners.
             riders.into_iter().rev().chain(members).collect()
         };
         for hwnd in order {
@@ -868,7 +1233,7 @@ impl FlowWM {
         // Riders first (owned windows before their owners), then members.
         for hwnd in self.rider_order(probe).into_iter().rev() {
             if matches!(
-                self.apply_rider_step(hwnd, false, probe),
+                self.apply_rider_step(hwnd, RiderSeat::Released, probe),
                 Some(LayerStep::Leave { .. })
             ) {
                 left += 1;
@@ -903,7 +1268,8 @@ impl FlowWM {
     /// Windows demoted. Walks only the windows the daemon holds in the
     /// layer; a member whose ex-style still says topmost costs one read.
     pub(super) fn reassert_top_layer(&mut self) {
-        if !self.config.floating.always_on_top || self.tiling_paused {
+        let layer_on = self.config.floating.always_on_top && !self.tiling_paused;
+        if !layer_on && self.riders.is_empty() {
             return;
         }
         let interval = Duration::from_millis(self.config.focus.foreground_sync_interval_ms);
@@ -913,6 +1279,12 @@ impl FlowWM {
         self.last_top_layer_reassert = Instant::now();
         // No z-order work while the session is locked (ADR-0034).
         if self.registry.session_locked() {
+            return;
+        }
+        if !layer_on {
+            // Riders are kept for following their anchor (ADR-0038); the
+            // stale ones still go.
+            self.purge_riders_with(&Win32Topmost);
             return;
         }
         let fg = registry_win32::get_foreground_window();
@@ -927,8 +1299,9 @@ impl FlowWM {
         probe: &P,
     ) {
         self.purge_riders_with(probe);
+        // A decision that stands syncs the riders itself (`evaluate`).
         if self.evaluate_top_layer_with(fg, probe).is_some() || !self.top_layer_raised {
-            // Just re-applied everywhere, or nothing is held while dropped.
+            // Just re-applied everywhere, or no member is held while dropped.
             return;
         }
         let held: Vec<isize> = self
@@ -940,11 +1313,8 @@ impl FlowWM {
         for hwnd in held {
             self.sync_top_layer_with(hwnd, probe);
         }
-        // Riders after the members: a demoted one is raised again, and a
-        // foreground rider whose own event was missed enters.
-        for hwnd in self.rider_order(probe) {
-            self.sync_top_layer_with(hwnd, probe);
-        }
+        // Riders after the members: a demoted one is raised again.
+        self.sync_riders_with(probe);
     }
 }
 
@@ -1078,6 +1448,11 @@ mod tests {
         owners: RefCell<HashMap<isize, isize>>,
         hidden: RefCell<HashSet<isize>>,
         bands: RefCell<HashMap<isize, u32>>,
+        /// `GW_HWNDPREV` answers: the window directly above a window.
+        above: RefCell<HashMap<isize, isize>>,
+        minimized: RefCell<HashSet<isize>>,
+        /// `EnumWindows` order, topmost first.
+        z: RefCell<Vec<isize>>,
     }
 
     impl MockTopmost {
@@ -1153,6 +1528,18 @@ mod tests {
 
         fn band(&self, hwnd: isize) -> Option<u32> {
             self.bands.borrow().get(&hwnd).copied()
+        }
+
+        fn window_above(&self, hwnd: isize) -> Option<isize> {
+            self.above.borrow().get(&hwnd).copied()
+        }
+
+        fn is_minimized(&self, hwnd: isize) -> bool {
+            self.minimized.borrow().contains(&hwnd)
+        }
+
+        fn z_order(&self) -> Vec<isize> {
+            self.z.borrow().clone()
         }
     }
 
@@ -1940,7 +2327,10 @@ mod tests {
         assert!(!probe.is_topmost(ERROR) && !probe.is_topmost(CONNECT));
         probe.calls.borrow_mut().clear();
         flow.note_foreground(ERROR);
-        assert_eq!(flow.evaluate_top_layer_with(Some(A), &probe), Some(true));
+        assert_eq!(
+            flow.evaluate_top_layer_with(Some(ERROR), &probe),
+            Some(true)
+        );
         let calls = probe.calls.borrow().clone();
         let pos = |h: isize| calls.iter().position(|c| *c == (h, true)).expect("raised");
         assert!(pos(F) < pos(CONNECT) && pos(I) < pos(CONNECT), "{calls:?}");
@@ -1963,7 +2353,10 @@ mod tests {
         assert_eq!(flow.evaluate_top_layer_with(Some(I), &probe), Some(true));
         let calls = probe.calls.borrow().clone();
         assert_eq!(calls.last(), Some(&(I, true)), "{calls:?}");
-        assert!(calls.contains(&(CONNECT, true)));
+        // The connect dialog belongs to F, not to I: it stays seated above
+        // F instead of being raised over I (ADR-0038).
+        assert!(!calls.contains(&(CONNECT, true)), "{calls:?}");
+        assert!(rider(&flow, CONNECT).is_some_and(|r| r.seated && !r.on_top));
     }
 
     #[test]
@@ -2013,17 +2406,26 @@ mod tests {
     }
 
     #[test]
-    fn a_drop_demotes_riders_first_and_never_seats_an_owner_under_its_popup() {
+    fn a_drop_seats_riders_above_their_owner_after_the_members_and_never_an_owner_under_its_popup()
+    {
         let mut flow = fixture();
         let probe = owned_desktop();
         flow.sync_all_top_layer_with(&probe);
         activate(&mut flow, CONNECT, &probe);
-        // A foreign window: the rider is seated before the members.
+        // A foreign window: the members are seated under it first, then the
+        // rider directly above its owner F (F is the top of the normal band
+        // in this desktop: HWND_NOTOPMOST).
+        probe.calls.borrow_mut().clear();
         assert_eq!(activate(&mut flow, G, &probe), Some(false));
         let below = probe.below.borrow().clone();
-        assert_eq!(below.first(), Some(&(CONNECT, G)), "{below:?}");
-        assert!(below.contains(&(F, G)) && below.contains(&(I, G)));
-        assert!(rider(&flow, CONNECT).is_some_and(|r| !r.on_top));
+        assert!(
+            below.contains(&(F, G)) && below.contains(&(I, G)),
+            "{below:?}"
+        );
+        assert!(!below.iter().any(|(h, _)| *h == CONNECT), "{below:?}");
+        assert!(probe.calls.borrow().contains(&(CONNECT, false)));
+        assert!(!probe.is_topmost(CONNECT));
+        assert!(rider(&flow, CONNECT).is_some_and(|r| !r.on_top && r.seated));
         // Back up; then F goes fullscreen by live geometry and its own
         // dialog takes the foreground: foreign, and F is not seated under
         // the window it owns (NOTOPMOST instead).
@@ -2107,9 +2509,8 @@ mod tests {
         flow.riders.insert(
             ERROR,
             Rider {
-                anchor: F,
                 on_top: true,
-                was_topmost: false,
+                ..Rider::new(F)
             },
         );
         flow.on_window_destroyed(ERROR);
@@ -2128,6 +2529,271 @@ mod tests {
         assert_eq!(summary.entered, 1);
         assert!(!on_top(&flow, I) && !probe.is_topmost(I));
         assert!(on_top(&flow, F));
+    }
+
+    // ── riders follow their anchor's z-order (ADR-0038) ───────────────
+
+    #[test]
+    fn the_seat_rule_holds_a_rider_topmost_only_for_its_owner_group() {
+        use RiderSeat::{AboveOwner, Released, Topmost};
+        // (layer_on, anchor_tracked, visible, raised, group_foreground)
+        assert_eq!(rider_seat(true, true, true, true, true), Topmost);
+        assert_eq!(rider_seat(true, true, true, true, false), AboveOwner);
+        assert_eq!(rider_seat(true, true, true, false, true), AboveOwner);
+        assert_eq!(rider_seat(true, true, true, false, false), AboveOwner);
+        assert_eq!(rider_seat(false, true, true, true, true), Released);
+        assert_eq!(rider_seat(true, false, true, true, true), Released);
+        assert_eq!(rider_seat(true, true, false, true, true), Released);
+    }
+
+    #[test]
+    fn the_step_rule_raises_seats_once_and_releases_with_the_own_flag() {
+        use RiderSeat::{AboveOwner, Released, Topmost};
+        // (seat, on_top, seated, topmost_now, owner_topmost, was_topmost)
+        assert_eq!(
+            rider_step(Topmost, false, true, false, false, true),
+            Some(RiderStep::Enter)
+        );
+        assert_eq!(
+            rider_step(Topmost, true, false, false, false, false),
+            Some(RiderStep::Reassert)
+        );
+        assert_eq!(rider_step(Topmost, true, false, true, false, false), None);
+        // Held, its group lost the foreground: seated whatever its flag.
+        assert_eq!(
+            rider_step(AboveOwner, true, false, true, false, false),
+            Some(RiderStep::SeatAbove)
+        );
+        assert_eq!(
+            rider_step(AboveOwner, true, false, true, true, false),
+            Some(RiderStep::SeatAbove)
+        );
+        // Not held: seated only when it floats over a non-topmost owner,
+        // and only once (an app that sets its flag again is not fought).
+        assert_eq!(
+            rider_step(AboveOwner, false, false, true, false, true),
+            Some(RiderStep::SeatAbove)
+        );
+        assert_eq!(rider_step(AboveOwner, false, true, true, false, true), None);
+        assert_eq!(rider_step(AboveOwner, false, false, true, true, true), None);
+        assert_eq!(
+            rider_step(AboveOwner, false, false, false, false, false),
+            None
+        );
+        // Released: the own flag back.
+        assert_eq!(
+            rider_step(Released, false, true, false, false, true),
+            Some(RiderStep::Leave {
+                restore_to: Some(true)
+            })
+        );
+        assert_eq!(
+            rider_step(Released, true, false, true, false, false),
+            Some(RiderStep::Leave {
+                restore_to: Some(false)
+            })
+        );
+        assert_eq!(rider_step(Released, false, false, true, false, true), None);
+    }
+
+    #[test]
+    fn the_seat_plan_goes_under_the_window_above_the_owner_in_the_owners_band() {
+        const R: isize = 0x40;
+        const X: isize = 0x41;
+        // (rider, above, above_topmost, owner_topmost, rider_topmost, above_owned_by_rider)
+        assert_eq!(
+            seat_plan(R, Some(X), false, false, true, false),
+            SeatPlan::Under(X)
+        );
+        assert_eq!(
+            seat_plan(R, Some(X), true, true, true, false),
+            SeatPlan::Under(X),
+            "a topmost owner: under the topmost window above it"
+        );
+        assert_eq!(
+            seat_plan(R, Some(X), true, false, true, false),
+            SeatPlan::BandTop(false),
+            "the owner tops the normal band"
+        );
+        assert_eq!(
+            seat_plan(R, None, false, false, true, false),
+            SeatPlan::BandTop(false)
+        );
+        assert_eq!(
+            seat_plan(R, Some(R), false, false, false, false),
+            SeatPlan::Nothing
+        );
+        assert_eq!(
+            seat_plan(R, Some(R), true, false, true, false),
+            SeatPlan::BandTop(false),
+            "directly above, but in the topmost band"
+        );
+        assert_eq!(
+            seat_plan(R, Some(X), false, false, true, true),
+            SeatPlan::BandTop(false),
+            "never under its own popup"
+        );
+    }
+
+    /// A non-flow window directly above A in the z-order.
+    const COVER: isize = 0x31;
+
+    #[test]
+    fn a_dialog_of_a_tile_is_seated_above_it_when_another_window_takes_the_foreground() {
+        let mut flow = fixture();
+        let probe = owned_desktop();
+        probe.above.borrow_mut().insert(A, COVER);
+        flow.sync_all_top_layer_with(&probe);
+        assert_eq!(activate(&mut flow, TILE_ERR, &probe), None);
+        assert!(probe.is_topmost(TILE_ERR));
+        // The float F takes the foreground: the layer stays raised, the
+        // dialog of A is seated directly above A, under COVER.
+        assert_eq!(activate(&mut flow, F, &probe), None);
+        assert!(probe.below.borrow().contains(&(TILE_ERR, COVER)));
+        assert!(!probe.is_topmost(TILE_ERR));
+        assert!(rider(&flow, TILE_ERR).is_some_and(|r| r.seated && !r.on_top));
+        // The periodic pass leaves it there.
+        probe.below.borrow_mut().clear();
+        flow.reassert_top_layer_with(Some(F), &probe);
+        assert!(probe.below.borrow().is_empty());
+        assert!(!probe.is_topmost(TILE_ERR));
+        // A takes the foreground (a click on it activates its dialog, or A
+        // itself for a modeless one): held topmost again.
+        assert_eq!(activate(&mut flow, A, &probe), None);
+        assert!(probe.is_topmost(TILE_ERR));
+        assert!(rider(&flow, TILE_ERR).is_some_and(|r| r.on_top && !r.seated));
+        // A foreign window: dropped, seated above A again.
+        assert_eq!(activate(&mut flow, G, &probe), Some(false));
+        assert!(!probe.is_topmost(TILE_ERR));
+        assert!(rider(&flow, TILE_ERR).is_some_and(|r| r.seated));
+    }
+
+    #[test]
+    fn a_dialog_topmost_on_its_own_is_seated_without_a_fight_and_gets_its_flag_back() {
+        let mut flow = fixture();
+        let probe = owned_desktop();
+        probe.topmost.borrow_mut().insert(TILE_ERR);
+        flow.sync_all_top_layer_with(&probe);
+        activate(&mut flow, TILE_ERR, &probe);
+        assert!(rider(&flow, TILE_ERR).is_some_and(|r| r.was_topmost));
+        activate(&mut flow, F, &probe);
+        assert!(
+            !probe.is_topmost(TILE_ERR),
+            "seated: the own flag is cleared"
+        );
+        // The app sets its flag again: not fought.
+        probe.topmost.borrow_mut().insert(TILE_ERR);
+        probe.calls.borrow_mut().clear();
+        flow.reassert_top_layer_with(Some(F), &probe);
+        activate(&mut flow, I, &probe);
+        assert!(!probe.calls.borrow().iter().any(|(h, _)| *h == TILE_ERR));
+        // Back in its group and out again, then the stop path: its own flag
+        // is remembered across the seat and put back.
+        probe.topmost.borrow_mut().remove(&TILE_ERR);
+        activate(&mut flow, TILE_ERR, &probe);
+        assert!(rider(&flow, TILE_ERR).is_some_and(|r| r.on_top && r.was_topmost));
+        activate(&mut flow, F, &probe);
+        assert!(!probe.is_topmost(TILE_ERR));
+        flow.release_top_layer_with(&probe);
+        assert!(probe.is_topmost(TILE_ERR));
+    }
+
+    #[test]
+    fn a_float_raised_by_the_layer_does_not_cover_the_dialog_of_the_foreground_anchor() {
+        let mut flow = fixture();
+        let probe = owned_desktop();
+        flow.sync_all_top_layer_with(&probe);
+        activate(&mut flow, TILE_ERR, &probe);
+        // A foreign window drops the layer, then the dialog takes the
+        // foreground back: the members are raised first, the dialog last.
+        assert_eq!(activate(&mut flow, G, &probe), Some(false));
+        probe.calls.borrow_mut().clear();
+        assert_eq!(activate(&mut flow, TILE_ERR, &probe), Some(true));
+        let calls = probe.calls.borrow().clone();
+        let pos = |h: isize| calls.iter().position(|c| *c == (h, true)).expect("raised");
+        assert!(
+            pos(F) < pos(TILE_ERR) && pos(I) < pos(TILE_ERR),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_riders_keep_their_order_when_seated_and_raised() {
+        // Two dialogs owned by the float F (the stage 31 R2 shape: a connect
+        // dialog and an error box, both owned by the main window); the
+        // error box is above the connect dialog.
+        const SIB: isize = 0x27;
+        let mut flow = fixture();
+        let probe = owned_desktop().with_owned(SIB, "#32770", F);
+        flow.sync_all_top_layer_with(&probe);
+        activate(&mut flow, CONNECT, &probe);
+        activate(&mut flow, SIB, &probe);
+        *probe.z.borrow_mut() = vec![SIB, CONNECT, F, I];
+        // A tile takes the foreground: both seated above F, the upper one
+        // first (each seat lands directly above F, under the one before).
+        probe.calls.borrow_mut().clear();
+        activate(&mut flow, A, &probe);
+        let calls = probe.calls.borrow().clone();
+        let pos = |h: isize| calls.iter().position(|c| c.0 == h).expect("seated");
+        assert!(pos(SIB) < pos(CONNECT), "{calls:?}");
+        // F (a member) takes the foreground: both raised, the lower one
+        // first, so the error box ends on top again.
+        probe.calls.borrow_mut().clear();
+        activate(&mut flow, F, &probe);
+        let calls = probe.calls.borrow().clone();
+        let pos = |h: isize| calls.iter().position(|c| *c == (h, true)).expect("raised");
+        assert!(pos(CONNECT) < pos(SIB), "{calls:?}");
+    }
+
+    #[test]
+    fn a_rider_of_a_minimized_anchor_is_kept_while_hidden() {
+        let mut flow = fixture();
+        let probe = owned_desktop();
+        flow.sync_all_top_layer_with(&probe);
+        activate(&mut flow, TILE_ERR, &probe);
+        // A minimized: Windows hides its dialog.
+        probe.minimized.borrow_mut().insert(A);
+        probe.hidden.borrow_mut().insert(TILE_ERR);
+        flow.forget_rider_with(TILE_ERR, false, &probe);
+        flow.reassert_top_layer_with(Some(G), &probe);
+        assert!(rider(&flow, TILE_ERR).is_some_and(|r| !r.on_top));
+        // Restoring: Windows has un-minimized A but not shown the dialog
+        // yet, and the registry still has A minimized: kept.
+        probe.minimized.borrow_mut().clear();
+        set_state(&mut flow, A, WindowState::Tiling(TilingState::Minimized));
+        flow.reassert_top_layer_with(Some(A), &probe);
+        assert!(rider(&flow, TILE_ERR).is_some());
+        set_state(&mut flow, A, tile());
+        // Restored: back, and raised when it takes the foreground.
+        probe.hidden.borrow_mut().clear();
+        activate(&mut flow, TILE_ERR, &probe);
+        assert!(probe.is_topmost(TILE_ERR));
+        // Its anchor parked as not responding: Windows' ghost hides the
+        // dialog; kept.
+        set_state(&mut flow, A, WindowState::Tiling(TilingState::Hung));
+        probe.hidden.borrow_mut().insert(TILE_ERR);
+        flow.forget_rider_with(TILE_ERR, false, &probe);
+        flow.reassert_top_layer_with(Some(G), &probe);
+        assert!(rider(&flow, TILE_ERR).is_some());
+        set_state(&mut flow, A, tile());
+        probe.hidden.borrow_mut().clear();
+        // Hidden while its anchor is not minimized: forgotten as before.
+        probe.hidden.borrow_mut().insert(TILE_ERR);
+        flow.forget_rider_with(TILE_ERR, false, &probe);
+        assert!(rider(&flow, TILE_ERR).is_none());
+    }
+
+    #[test]
+    fn riders_are_noted_with_the_layer_off_for_following_and_never_raised() {
+        let mut flow = fixture();
+        flow.config.floating.always_on_top = false;
+        let probe = owned_desktop();
+        assert_eq!(activate(&mut flow, TILE_ERR, &probe), None);
+        assert_eq!(rider(&flow, TILE_ERR).map(|r| r.anchor), Some(A));
+        assert!(probe.calls.borrow().is_empty() && probe.below.borrow().is_empty());
+        // A foreign window: nothing is noted for it.
+        activate(&mut flow, G, &probe);
+        assert_eq!(flow.riders.len(), 1);
     }
 
     #[test]

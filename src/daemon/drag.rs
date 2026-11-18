@@ -317,6 +317,8 @@ impl FlowWM {
                     dragged_hwnd: hwnd,
                 }));
                 set_dragged_hwnd(hwnd);
+                // Its riders ride the drag (ADR-0038).
+                self.riders_drag_begin(hwnd);
                 log::debug!("drag start: hwnd={hwnd} (float)");
                 return;
             }
@@ -341,6 +343,8 @@ impl FlowWM {
         }));
 
         set_dragged_hwnd(hwnd);
+        // Its riders ride the drag (ADR-0038).
+        self.riders_drag_begin(hwnd);
 
         // Recolor the border to focused to give visual feedback.
         let focused_style = style_for_state(&self.config.borders, BorderState::Focused);
@@ -388,6 +392,10 @@ impl FlowWM {
             Some(DragMode::Float(_)) => self.store_float_rect_with(probe, hwnd),
             // Still Classifying (no movement yet), or None — nothing to do.
             _ => {}
+        }
+        // The dragged window's riders keep their offset to it (ADR-0038).
+        if !self.riders.is_empty() {
+            self.riders_drag_move(hwnd);
         }
     }
 
@@ -930,6 +938,11 @@ impl FlowWM {
             let _ = t.edge_scroll.on_drag_end();
         }
         clear_dragged_hwnd();
+        // Its riders catch up with the drop point; the commit's layout
+        // submit moves them on with it (ADR-0038).
+        if !self.riders.is_empty() {
+            self.riders_drag_end(dragged_hwnd);
+        }
 
         // Destroyed-mid-drag guard: the window is already gone from the layout
         // and registry (on_window_destroyed handled it). Nothing to commit.

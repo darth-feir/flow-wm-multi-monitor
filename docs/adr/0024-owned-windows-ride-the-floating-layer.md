@@ -1,6 +1,9 @@
 # Owned windows of flow windows ride the floating layer
 
-**Status:** Accepted (stage 31, 2026-11-03). Amends
+**Status:** Accepted (stage 31, 2026-11-03); amended by
+[ADR-0038](0038-riders-follow-their-anchor.md) (stage 44, 2026-11-17),
+which supersedes "riders are never moved by the daemon" and the
+whole-layer z-order of riders (see *Amendment* at the end). Amends
 [ADR-0013](0013-floating-layer-follows-adr-0003.md): an untracked window
 owned by a flow window is no longer a "non-flow" foreground. Membership of
 the layer, the drop / raise rule for every other window and the shell
@@ -153,3 +156,30 @@ does not track.
   entering. The VM driver `test-stage31.ps1` (P0, R1–R10, Z) checks the real
   desktop; see `docs/src/dev-guide/floating-space.md` (*The floating layer*,
   *Riders*).
+
+## Amendment (stage 44, 2026-11-17): riders follow their anchor
+
+[ADR-0038](0038-riders-follow-their-anchor.md) changes two parts of the
+decision above; the rest (who is a rider, the classification, the raise
+order, the own-flag bookkeeping, release on stop) stands.
+
+- **Superseded: "Riders never get ... a seat" read as "riders are never
+  moved by the daemon".** Every daemon move of an anchor now moves its
+  riders by the same delta (same animator batch, teleports, drags, the
+  shutdown rescue), never while either window does not respond.
+- **Superseded: held topmost while the layer is raised.** A rider is held
+  topmost only while its owner group (the anchor, the rider, another window
+  owned through the anchor) holds the foreground; otherwise it is seated
+  directly above its owner, so whatever covers the owner covers it. A drop
+  no longer seats riders under the dropping foreground. The protection this
+  ADR was written for (no float raised by the layer covers a modal dialog of
+  the foreground app) is kept.
+- **Changed consequence:** a modeless owned window no longer stays above
+  every flow window until a foreign app takes the foreground; it sits above
+  its own window once another window has the focus.
+- **Changed:** riders are noted with the layer off too (for following), and
+  a rider hidden while its anchor is minimized is kept.
+- Closed by this stage: the SSMS 21 connect dialog (a topmost WPF window
+  owned by the tiled main window) staying behind when its window moved, and
+  staying topmost over other apps. Still open: resolving the keymap's focus
+  commands from a rider's anchor (*Not changed* above).

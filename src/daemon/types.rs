@@ -322,10 +322,17 @@ pub struct FlowWM {
     /// while raised.
     pub(super) top_layer_below: Option<isize>,
 
+    /// The non-shell foreground of the layer's last decision (raised or
+    /// dropped): a rider is held topmost only while this window belongs to
+    /// its owner group (ADR-0038). `None` until the first decision.
+    pub(super) layer_foreground: Option<isize>,
+
     /// The floating layer's riders: untracked windows owned by a flow
-    /// window (a modal dialog, an error box) that took the foreground, held
-    /// in the topmost band with the layer (ADR-0024,
-    /// [`Rider`](super::top_layer::Rider)). Keyed by the rider's handle.
+    /// window (a modal dialog, an error box) that took the foreground —
+    /// held topmost while their owner group holds the foreground, seated
+    /// above their owner otherwise, and moved with their anchor (ADR-0024,
+    /// ADR-0038, [`Rider`](super::top_layer::Rider)). Keyed by the rider's
+    /// handle.
     pub(super) riders: std::collections::HashMap<isize, super::top_layer::Rider>,
 
     /// When the pending display-topology change settles and

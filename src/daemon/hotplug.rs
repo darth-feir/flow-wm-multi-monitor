@@ -971,7 +971,7 @@ impl FlowWM {
                 targets.len(),
                 self.monitors.len()
             );
-            if let Err(e) = self.animator.animate(targets) {
+            if let Err(e) = self.animate_with_riders(targets) {
                 log::warn!("re-seat animation error: {e}");
             }
         }

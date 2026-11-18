@@ -487,7 +487,8 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   never seated, bordered or learned. No window is seated under its own
   popup. Explicitly ignored shell surfaces (Start, search) are no longer
   layer members. Amends ADR-0013 (fixes the SSMS error box hidden behind its
-  own window). `docs/adr/0024-owned-windows-ride-the-floating-layer.md`
+  own window); its z-order and "never moved" parts are superseded by
+  ADR-0038. `docs/adr/0024-owned-windows-ride-the-floating-layer.md`
 - **ADR-0025 — Elevated windows are unmanaged.** A window whose process runs
   elevated (or whose token cannot be read) while flowd does not is out of
   reach: UIPI refuses every move, z-order change and activation. It is
@@ -631,3 +632,16 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   visible tile. Refusals with an explanation are debug lines; the WARN is
   kept only when the removed window still holds the foreground.
   `docs/adr/0037-the-successor-push-follows-the-real-foreground.md`
+- **ADR-0038 — Riders follow their anchor.** The SSMS 21 connect dialog
+  (a topmost WPF window owned by the tiled main window) stayed where it was
+  when the strip scrolled, the window moved to the other screen or the
+  workspace changed, and stayed topmost over other apps. Now every daemon
+  move of an anchor (layout submit, teleport, drag, hotplug re-seat,
+  `tiling off`, the shutdown rescue) moves its riders by the same delta in
+  the same animator batch, size kept, never while either window is hung; a
+  rider is topmost only while its owner group holds the foreground and is
+  seated directly above its owner otherwise (`rider_seat` / `rider_step`),
+  so whatever covers the anchor covers it, once and without fighting an
+  app's own flag; riders of a minimized anchor are kept while Windows hides
+  them. Supersedes ADR-0024's "riders are never moved" and its whole-layer
+  z-order. `docs/adr/0038-riders-follow-their-anchor.md`

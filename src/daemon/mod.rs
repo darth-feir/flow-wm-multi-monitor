@@ -82,6 +82,7 @@ mod placement_check;
 mod pre_place;
 mod query;
 mod restore_seat;
+mod rider_follow;
 mod run;
 pub mod session;
 pub(crate) mod shutdown;

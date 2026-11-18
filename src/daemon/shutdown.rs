@@ -213,8 +213,12 @@ impl FlowWM {
         // Stop the worker first: a tween still in flight would otherwise
         // re-apply its interpolated rects over the rescued positions.
         let acknowledged = self.animator.cancel_and_wait();
+        // Riders follow their rescued anchors (ADR-0038): read now, the
+        // layer's release in the pass clears the rider table.
+        let riders = self.riders_snapshot();
         let rescued = self.rescue_stranded_windows_pass();
         if acknowledged {
+            Self::follow_rescued_anchors(&riders);
             return rescued;
         }
         // The worker was silent (wedged in a backend call, or dead). Give it
@@ -229,7 +233,9 @@ impl FlowWM {
                 "still silent"
             }
         );
-        rescued + self.rescue_stranded_windows_pass()
+        let rescued = rescued + self.rescue_stranded_windows_pass();
+        Self::follow_rescued_anchors(&riders);
+        rescued
     }
 
     /// One rescue pass over the current registry and monitor geometry.

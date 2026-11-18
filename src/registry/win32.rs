@@ -1578,6 +1578,23 @@ pub fn owner_of(hwnd_val: isize) -> Option<isize> {
     }
 }
 
+/// The window directly above `hwnd_val` in the z-order
+/// (`GetWindow(GW_HWNDPREV)`), visible or not; `None` at the top of the
+/// z-order, for a handle that is gone, or null. The floating layer seats a
+/// rider directly above its owner with it (`daemon::top_layer`, ADR-0038).
+#[must_use]
+pub fn window_above(hwnd_val: isize) -> Option<isize> {
+    use windows::Win32::UI::WindowsAndMessaging::{GW_HWNDPREV, GetWindow};
+    if hwnd_val == 0 {
+        return None;
+    }
+    // SAFETY: GetWindow on a stale handle fails cleanly (Err / null).
+    match unsafe { GetWindow(HWND(hwnd_val as *mut _), GW_HWNDPREV) } {
+        Ok(above) if !above.is_invalid() => Some(above.0 as isize),
+        _ => None,
+    }
+}
+
 /// Whether `hwnd_val` is fullscreen **on the desktop right now**: its
 /// window rect equals the full rect (`rcMonitor`) of the monitor it is on
 /// and its style has neither `WS_CAPTION` nor `WS_THICKFRAME`. A maximized
