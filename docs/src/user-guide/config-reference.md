@@ -554,6 +554,13 @@ window on the other screen; when it was the last tile of that screen the
 screen stays the active one and the focus goes to the desktop, so the next
 new window opens there.
 
+The neighbour is pushed only when no window you chose already holds the
+foreground: a new window of the same app, a window you clicked on the same
+screen, a dialog, a tool window or an administrator window flow does not
+manage keeps the focus. A neighbour that is minimized or hidden at that
+moment is skipped for the next visible tile. Why:
+`docs/adr/0037-the-successor-push-follows-the-real-foreground.md`.
+
 ### `[loadout]` — save/restore file
 
 | Field | Type | Default | Description |

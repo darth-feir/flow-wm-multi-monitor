@@ -686,6 +686,14 @@ pub fn push_foreground_window(hwnd_val: isize) -> ForegroundPush {
     set_foreground_window_impl(hwnd_val, false)
 }
 
+/// [`push_foreground_window`] that logs its own failures at `debug`: for a
+/// caller that reads the foreground after a refusal and reports the
+/// outcome itself (the removal pipeline's successor push, ADR-0037).
+#[must_use]
+pub fn push_foreground_window_quiet(hwnd_val: isize) -> ForegroundPush {
+    set_foreground_window_impl(hwnd_val, true)
+}
+
 /// `IsWindowVisible(hwnd) && !cloaked` — whether the user could see the
 /// window if it were on-screen. A hidden or DWM-cloaked window (a tray-
 /// hidden app, a window of another virtual desktop, an AutoHotkey GUI that

@@ -170,6 +170,12 @@ host the direct call in the no-foreground gap is refused by the foreground
 lock (no input reached flowd, error code 0), and Windows then activates the
 next window in z-order itself, which is the successor, so "focus lands on
 it a moment later". To be read from the host's debug log.
+*Resolved by ADR-0037 (stage 43):* the guest had no user input, so the
+foreground lock never applied; with a real key press before each action
+the pair is reproduced (a focused fullscreen column hiding itself: the
+direct push in the no-foreground gap is refused, error 0). The inference
+above holds for that gap; a second cause is a push past an untracked
+foreground the user chose.
 
 **The elevated target.** The host's denied `SetWindowPos` was for a
 `CredentialUIBroker.exe` window that the elevation gate (ADR-0025,

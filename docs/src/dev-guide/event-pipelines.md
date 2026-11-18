@@ -312,7 +312,9 @@ active monitor *and* the registry's focus — read before the removal — was
 nobody, the removed window or a tile of that strip. A window closing on a
 monitor the user is not working on, or on the active monitor while the user
 is in a float or a window elsewhere, must not drag the foreground over
-(review finding B6); then only the strip's bookkeeping changes.
+(review finding B6); then only the strip's bookkeeping changes. What holds the
+foreground then decides whether the push happens at all (below, *The push
+follows the real foreground*).
 
 ### Windows hands the focus to the other screen (stage 30)
 
@@ -350,6 +352,42 @@ acted there. Two pieces keep the focus on the screen the tile left:
   desktop or on an unmanaged window passes; every IPC command but the
   queries disarms it, so a deliberate `focus-monitor` right after a close is
   never fought.
+
+### The push follows the real foreground (stage 43)
+
+Before the successor is pushed, `push_successor` reads the foreground once
+and `successor_push_decision` (pure, unit-tested) decides
+(ADR-0037):
+
+- **Push** when no window holds the foreground, when the removed window
+  still does, when a shell surface does (shell class or shell band: Start,
+  search, a flyout, the taskbar, the desktop), when the foreground window is
+  not visible, or when it is a managed window of *another* screen that
+  Windows handed the focus to (its foreground event not handled yet, or the
+  removed window lost the foreground to it a moment ago): stage 30's case.
+- **Nothing to push** when the successor already holds it.
+- **Skip** otherwise: a window of the same screen, a float, a window flowd
+  does not track (a dialog, a tool window, an elevated window) or another
+  screen's window the user went to before the removal is the user's (or
+  the app's) choice. It is adopted: the registry focus names it, or, when
+  it is untracked, the registry focus that still named the removed window
+  is cleared. `set_focused` ignores untracked windows, so without this read
+  the removal took a stale registry focus for the user's and pushed past
+  the window they were in.
+
+A successor that is minimized, hidden or gone at that moment (its own
+event is still queued) is passed over for the nearest visible tile in the
+strip's successor order (`visible_successor`, `nearest_usable_successor`).
+
+The push is judged from the foreground read right after it. Measured in
+the VM with user input (the foreground lock applies only within
+`ForegroundLockTimeout` of the last input): when a focused window hides
+there is a moment with no foreground window at all, and the push in that
+gap is refused (error 0) because flowd did not receive the last input;
+Windows then activates the next window itself and the handoff above sends
+another screen's window back. That refusal, and one where another window
+took the foreground, are debug lines; only a refusal while the removed
+window itself still holds the foreground is a WARN.
 
 ### Landing on a monitor's active workspace
 

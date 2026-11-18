@@ -579,20 +579,184 @@ impl FlowWM {
             idx == self.active_monitor,
             focus_on_strip,
         ) || (held_focus && new_focus.is_some());
+        // A successor minimized or hidden this instant (its own event is
+        // still queued) is passed over for the next visible tile, and the
+        // push follows what Windows reports holds the foreground now
+        // (ADR-0037).
+        let new_focus = if refocus {
+            self.visible_successor(idx, window, new_focus)
+        } else {
+            new_focus
+        };
+        let mut handoff_successor = new_focus;
         if refocus && let Some(id) = new_focus {
-            let target = id.0;
-            if !registry_win32::set_foreground_window(target) {
-                log::warn!(
-                    "remove_from_layout_and_refocus: SetForegroundWindow failed for hwnd {target}"
-                );
+            let recent_loss = recent_loss_counts && self.lost_focus_just_now(window);
+            if let Some(adopted) = self.push_successor(idx, window, id, recent_loss) {
+                handoff_successor = Some(adopted);
             }
-            self.registry.set_focused(target);
         }
         if held_focus {
-            self.keep_focus_on_monitor(idx, new_focus);
+            self.keep_focus_on_monitor(idx, handoff_successor);
         }
 
         self.animate_layout_on(idx, &applied);
+    }
+
+    /// The strip's successor after `removed` left monitor `idx`, or, when
+    /// that window is minimized, hidden or gone right now, the nearest tile
+    /// that is not (same column first, then left, then right, as the strip
+    /// picks a successor); `None` when no tile of the strip is visible. The
+    /// strip's focus follows the replacement. ADR-0037.
+    fn visible_successor(
+        &mut self,
+        idx: usize,
+        removed: WindowId,
+        successor: Option<WindowId>,
+    ) -> Option<WindowId> {
+        let usable = |h: isize| {
+            registry_win32::is_window(h)
+                && registry_win32::is_visible_uncloaked(h)
+                && !registry_win32::is_iconic(HWND(h as *mut _))
+        };
+        let s = successor?;
+        if usable(s.0) {
+            return Some(s);
+        }
+        let layout = self.monitors[idx].active_scrolling().virtual_layout();
+        let cells: Vec<(usize, WindowId)> = layout
+            .columns
+            .iter()
+            .enumerate()
+            .flat_map(|(c, col)| col.rows.iter().map(move |r| (c, r.window_id)))
+            .filter(|&(_, id)| id != removed && id != s)
+            .collect();
+        let pick = nearest_usable_successor(layout.find_window(s).map(|(c, _)| c), &cells, |id| {
+            usable(id.0)
+        });
+        match pick {
+            Some(p) => {
+                log::debug!(
+                    "successor {:#x} is minimized or hidden; {:#x} on monitor {idx} takes its place",
+                    s.0,
+                    p.0
+                );
+                self.monitors[idx].active_scrolling_mut().set_focus(p);
+            }
+            None => log::debug!(
+                "successor {:#x} is minimized or hidden and no other tile of monitor {idx} is visible; nothing is pushed",
+                s.0
+            ),
+        }
+        pick
+    }
+
+    /// Push `successor` to the foreground after `removed` left monitor
+    /// `idx`, unless the foreground already belongs to a window the user
+    /// (or the app) chose: then that window is adopted as the focus and
+    /// nothing is pushed. Returns the adopted window when it is a tile or
+    /// float of monitor `idx` (the handoff's successor from then on).
+    /// `recent_loss`: the removed window lost the foreground to another
+    /// screen a moment ago (stage 30). ADR-0037.
+    fn push_successor(
+        &mut self,
+        idx: usize,
+        removed: WindowId,
+        successor: WindowId,
+        recent_loss: bool,
+    ) -> Option<WindowId> {
+        let fg = registry_win32::get_foreground_window();
+        let seen = fg.map(|h| ForegroundSeen {
+            hwnd: h,
+            shell: is_shell_foreground(h),
+            visible: registry_win32::is_visible_uncloaked(h),
+            monitor: self.monitor_index_containing(WindowId(h)),
+            already_focused: self.registry.focused() == Some(WindowId(h)),
+        });
+        let decision = successor_push_decision(removed, successor, idx, seen, recent_loss);
+        let s = successor.0;
+        match decision {
+            SuccessorPush::AlreadyThere => {
+                log::debug!("successor {s:#x} already holds the foreground");
+                self.registry.set_focused(s);
+                None
+            }
+            SuccessorPush::Skip => {
+                let h = fg.unwrap_or_default();
+                log::debug!(
+                    "successor push skipped: the foreground is already {h:#x} ({}) on monitor {}; {s:#x} not pushed",
+                    registry_win32::window_owner_description(h),
+                    self.monitor_word(h)
+                );
+                self.adopt_foreground(removed, h);
+                (self.monitor_index_containing(WindowId(h)) == Some(idx)).then_some(WindowId(h))
+            }
+            SuccessorPush::Push(why) => {
+                log::debug!("successor push: {s:#x} pushed ({})", why.word());
+                let outcome = registry_win32::push_foreground_window_quiet(s);
+                if outcome.is_focused() {
+                    self.registry.set_focused(s);
+                    return None;
+                }
+                let fg_now = registry_win32::get_foreground_window();
+                match fg_now {
+                    Some(h) if h != removed.0 && h != s => {
+                        log::debug!(
+                            "successor push refused ({outcome:?}): the foreground is {h:#x} ({}) on monitor {}; left there",
+                            registry_win32::window_owner_description(h),
+                            self.monitor_word(h)
+                        );
+                        if why == PushReason::Handoff {
+                            // The handoff sends that foreground back.
+                            self.registry.set_focused(s);
+                        } else {
+                            self.adopt_foreground(removed, h);
+                        }
+                    }
+                    Some(h) if h == s => self.registry.set_focused(s),
+                    None => {
+                        // Measured (ADR-0037): in the gap between the hide
+                        // and Windows activating the next window itself, the
+                        // foreground lock refuses flowd, which did not
+                        // receive the last input; the handoff keeps a
+                        // foreground Windows gives another screen here.
+                        log::debug!(
+                            "successor push refused ({outcome:?}): no window holds the foreground (the foreground lock); Windows activates the next window itself, the handoff keeps it on monitor {idx}"
+                        );
+                        self.registry.set_focused(s);
+                    }
+                    Some(now) => {
+                        let before = fg.unwrap_or_default();
+                        log::warn!(
+                            "remove_from_layout_and_refocus: successor push to {s:#x} refused ({outcome:?}); the foreground was {before:#x} ({}) when it started ({}) and is {now:#x} ({}) now",
+                            registry_win32::window_owner_description(before),
+                            why.word(),
+                            registry_win32::window_owner_description(now)
+                        );
+                        self.registry.set_focused(s);
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// The foreground `hwnd` is the user's focus now: the registry focus
+    /// names it when it is tracked; an untracked one only takes the focus
+    /// away from `removed`, which no longer holds it. ADR-0037.
+    fn adopt_foreground(&mut self, removed: WindowId, hwnd: isize) {
+        if self.registry.is_tracked(hwnd) {
+            self.registry.set_focused(hwnd);
+        } else if self.registry.focused() == Some(removed) {
+            self.drop_tracked_focus();
+        }
+    }
+
+    /// "N" for the monitor whose spaces hold `hwnd`, else the one Windows
+    /// reports for it, else "?", for log lines.
+    fn monitor_word(&self, hwnd: isize) -> String {
+        self.monitor_index_containing(WindowId(hwnd))
+            .or_else(|| self.monitor_index_for_hmonitor_of(hwnd))
+            .map_or_else(|| "?".to_owned(), |m| m.to_string())
     }
 
     /// Whether `window` lost the foreground within
@@ -1398,6 +1562,262 @@ pub(super) fn should_refocus_after_removal(
     new_focus != prev_focus
         && new_focus.is_some()
         && (held_focus || (on_active_monitor && focus_on_strip))
+}
+
+/// What Windows reports holds the foreground when the removal pipeline is
+/// about to push a successor (ADR-0037).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ForegroundSeen {
+    /// The foreground window.
+    pub(super) hwnd: isize,
+    /// A shell surface: a shell class (taskbar, desktop) or a shell band
+    /// (Start, search, flyouts, Alt+Tab, the lock screen).
+    pub(super) shell: bool,
+    /// Visible and not cloaked.
+    pub(super) visible: bool,
+    /// The monitor whose spaces hold it; `None` for a window flow does not
+    /// manage.
+    pub(super) monitor: Option<usize>,
+    /// The registry focus already names it: its foreground event was
+    /// handled before this removal.
+    pub(super) already_focused: bool,
+}
+
+/// Why the removal pipeline pushes the successor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PushReason {
+    /// No window holds the foreground.
+    NoForeground,
+    /// The removed window still holds it.
+    RemovedWindow,
+    /// A shell surface holds it; not the user's pick of a window.
+    Shell,
+    /// The foreground window is hidden or cloaked.
+    NotVisible,
+    /// Windows handed the focus of the removed window to a managed window
+    /// of another screen (stage 30): the push keeps it on this screen.
+    Handoff,
+}
+
+impl PushReason {
+    /// The phrase the log lines use.
+    #[must_use]
+    pub(super) const fn word(self) -> &'static str {
+        match self {
+            Self::NoForeground => "no foreground window",
+            Self::RemovedWindow => "the removed window still holds the foreground",
+            Self::Shell => "a shell surface holds the foreground",
+            Self::NotVisible => "the foreground window is not visible",
+            Self::Handoff => "Windows handed the foreground to another screen",
+        }
+    }
+}
+
+/// The removal pipeline's verdict on the successor push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SuccessorPush {
+    /// Push the successor.
+    Push(PushReason),
+    /// The successor already holds the foreground: nothing to push.
+    AlreadyThere,
+    /// Another window the user (or the app) chose holds the foreground:
+    /// it is adopted, nothing is pushed.
+    Skip,
+}
+
+/// Pure decision behind [`FlowWM::push_successor`]: whether the successor
+/// of `removed` on monitor `idx` is pushed, given what holds the foreground
+/// (`seen`, `None`: nothing). A window the user chose is a live visible
+/// window that is not the removed one and not a shell surface; a managed
+/// window of *another* screen counts only when its foreground was already
+/// handled before this removal and the removed window did not lose the
+/// foreground to it a moment ago (`recent_loss`): otherwise it is Windows
+/// handing the focus over (stage 30), and the push keeps it on this screen.
+/// ADR-0037.
+#[must_use]
+pub(super) fn successor_push_decision(
+    removed: WindowId,
+    successor: WindowId,
+    idx: usize,
+    seen: Option<ForegroundSeen>,
+    recent_loss: bool,
+) -> SuccessorPush {
+    let Some(fg) = seen else {
+        return SuccessorPush::Push(PushReason::NoForeground);
+    };
+    if fg.hwnd == removed.0 {
+        return SuccessorPush::Push(PushReason::RemovedWindow);
+    }
+    if fg.hwnd == successor.0 {
+        return SuccessorPush::AlreadyThere;
+    }
+    if fg.shell {
+        return SuccessorPush::Push(PushReason::Shell);
+    }
+    if !fg.visible {
+        return SuccessorPush::Push(PushReason::NotVisible);
+    }
+    if fg.monitor.is_some_and(|m| m != idx) && (!fg.already_focused || recent_loss) {
+        return SuccessorPush::Push(PushReason::Handoff);
+    }
+    SuccessorPush::Skip
+}
+
+/// Whether the foreground `hwnd` is a shell surface (a shell class or a
+/// shell band, [`top_layer::is_shell_surface`](super::top_layer::is_shell_surface)).
+fn is_shell_foreground(hwnd: isize) -> bool {
+    let h = HWND(hwnd as *mut _);
+    let class = registry_win32::get_class_name(h).unwrap_or_default();
+    super::top_layer::is_shell_surface(&class, registry_win32::window_band(h))
+}
+
+/// The nearest tile for which `usable` holds, the way the strip picks a
+/// successor: the other rows of `column` first, then the columns to its
+/// left (nearest first), then those to its right. `cells` are the strip's
+/// other tiles as `(column, window)` in column/row order; with no `column`
+/// the first usable cell wins.
+#[must_use]
+pub(super) fn nearest_usable_successor(
+    column: Option<usize>,
+    cells: &[(usize, WindowId)],
+    usable: impl Fn(WindowId) -> bool,
+) -> Option<WindowId> {
+    let Some(col) = column else {
+        return cells.iter().map(|&(_, id)| id).find(|&id| usable(id));
+    };
+    let rank = |c: usize| -> (u8, usize) {
+        if c == col {
+            (0, 0)
+        } else if c < col {
+            (1, col - c)
+        } else {
+            (2, c - col)
+        }
+    };
+    let mut ordered: Vec<(usize, WindowId)> = cells.to_vec();
+    ordered.sort_by_key(|&(c, _)| rank(c));
+    ordered.into_iter().map(|(_, id)| id).find(|&id| usable(id))
+}
+
+#[cfg(test)]
+mod successor_push_tests {
+    use super::{
+        ForegroundSeen, PushReason, SuccessorPush, nearest_usable_successor,
+        successor_push_decision,
+    };
+    use crate::common::WindowId;
+
+    const REMOVED: WindowId = WindowId(10);
+    const SUCC: WindowId = WindowId(20);
+
+    fn fg(hwnd: isize, monitor: Option<usize>, already_focused: bool) -> Option<ForegroundSeen> {
+        Some(ForegroundSeen {
+            hwnd,
+            shell: false,
+            visible: true,
+            monitor,
+            already_focused,
+        })
+    }
+
+    #[test]
+    fn no_foreground_or_the_removed_window_pushes() {
+        assert_eq!(
+            successor_push_decision(REMOVED, SUCC, 0, None, false),
+            SuccessorPush::Push(PushReason::NoForeground)
+        );
+        assert_eq!(
+            successor_push_decision(REMOVED, SUCC, 0, fg(10, Some(0), true), false),
+            SuccessorPush::Push(PushReason::RemovedWindow)
+        );
+    }
+
+    #[test]
+    fn the_successor_already_in_front_is_not_pushed() {
+        assert_eq!(
+            successor_push_decision(REMOVED, SUCC, 0, fg(20, Some(0), false), false),
+            SuccessorPush::AlreadyThere
+        );
+    }
+
+    #[test]
+    fn a_shell_surface_or_an_invisible_window_is_not_the_users_choice() {
+        let mut s = fg(30, None, false).unwrap();
+        s.shell = true;
+        assert_eq!(
+            successor_push_decision(REMOVED, SUCC, 0, Some(s), false),
+            SuccessorPush::Push(PushReason::Shell)
+        );
+        let mut v = fg(30, Some(0), false).unwrap();
+        v.visible = false;
+        assert_eq!(
+            successor_push_decision(REMOVED, SUCC, 0, Some(v), false),
+            SuccessorPush::Push(PushReason::NotVisible)
+        );
+    }
+
+    #[test]
+    fn a_window_of_the_same_screen_or_an_untracked_one_is_adopted() {
+        // A new window of the app on the same screen (the swap), handled or not.
+        assert_eq!(
+            successor_push_decision(REMOVED, SUCC, 0, fg(30, Some(0), false), false),
+            SuccessorPush::Skip
+        );
+        // A window flow does not manage (a tool window, an elevated one).
+        assert_eq!(
+            successor_push_decision(REMOVED, SUCC, 0, fg(30, None, false), true),
+            SuccessorPush::Skip
+        );
+    }
+
+    #[test]
+    fn another_screen_counts_only_when_the_user_went_there_first() {
+        // Its foreground was handled before the removal: the user's click.
+        assert_eq!(
+            successor_push_decision(REMOVED, SUCC, 0, fg(30, Some(1), true), false),
+            SuccessorPush::Skip
+        );
+        // Not handled yet, or lost to it a moment ago: Windows' handoff.
+        assert_eq!(
+            successor_push_decision(REMOVED, SUCC, 0, fg(30, Some(1), false), false),
+            SuccessorPush::Push(PushReason::Handoff)
+        );
+        assert_eq!(
+            successor_push_decision(REMOVED, SUCC, 0, fg(30, Some(1), true), true),
+            SuccessorPush::Push(PushReason::Handoff)
+        );
+    }
+
+    #[test]
+    fn nearest_usable_successor_follows_the_strip_order() {
+        let cells = [
+            (0, WindowId(1)),
+            (1, WindowId(2)),
+            (2, WindowId(3)),
+            (2, WindowId(4)),
+            (3, WindowId(5)),
+        ];
+        // Same column first.
+        assert_eq!(
+            nearest_usable_successor(Some(2), &cells, |_| true),
+            Some(WindowId(3))
+        );
+        // Then left, nearest first.
+        assert_eq!(
+            nearest_usable_successor(Some(2), &cells, |id| id.0 <= 2),
+            Some(WindowId(2))
+        );
+        // Then right.
+        assert_eq!(
+            nearest_usable_successor(Some(2), &cells, |id| id.0 == 5),
+            Some(WindowId(5))
+        );
+        assert_eq!(nearest_usable_successor(Some(2), &cells, |_| false), None);
+        assert_eq!(
+            nearest_usable_successor(None, &cells, |id| id.0 >= 4),
+            Some(WindowId(4))
+        );
+    }
 }
 
 #[cfg(test)]

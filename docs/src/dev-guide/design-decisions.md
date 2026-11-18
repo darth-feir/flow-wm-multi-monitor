@@ -617,3 +617,17 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   32 px, once the batch has settled is released to the floating layer once
   (`untileable: "refused its rect"`; a minimum-size clamp is never smaller
   than asked and stays a tile). `docs/adr/0036-untileable-windows.md`
+- **ADR-0037 — The successor push follows the real foreground.** The
+  host's refused-successor-push WARN pair, reproduced in the VM once the
+  guest had user input (the foreground lock): a focused window that hides
+  (a fullscreen column most of all) leaves a moment with no foreground
+  window, and the push in that gap is refused; and a tile hiding while the
+  user was in a window flowd does not track pushed past that window (the
+  registry focus still named the tile). Now the removal reads the
+  foreground once: none, the removed window, a shell surface or a window
+  Windows handed to another screen gets the push; the successor in front
+  needs none; any other window is the user's choice and is adopted, no
+  push. A minimized or hidden successor is passed over for the nearest
+  visible tile. Refusals with an explanation are debug lines; the WARN is
+  kept only when the removed window still holds the foreground.
+  `docs/adr/0037-the-successor-push-follows-the-real-foreground.md`
