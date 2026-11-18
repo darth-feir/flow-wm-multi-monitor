@@ -149,7 +149,8 @@ Key details:
   is at most 100 ms, ensuring retries happen even without new events.
 - **The wait is never infinite.** Its timeout is the soonest of: the 100 ms
   pending-creation retry, the float-tracking resume deadline, the next
-  foreground reconciliation (`[focus] foreground_sync_interval_ms`), a drag's
+  foreground reconciliation (`[focus] foreground_sync_interval_ms`; the
+  placement acceptance check's due time shares that slot, ADR-0036), a drag's
   edge-scroll repeat, the display-topology settle deadline, and the 1 s liveness
   tick (`LIVENESS_TICK_MS`) that checks the helper threads and the config files.
 - **IPC is one-shot.** The CLI connects, sends one command, reads the response,

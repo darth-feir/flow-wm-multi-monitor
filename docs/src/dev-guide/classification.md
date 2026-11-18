@@ -25,6 +25,22 @@ The rationale: on a scrolling-canvas tiler like flow, most application windows
 Tiling is most useful for a small set of "main" apps the user actively works
 in — and the user is the best judge of which apps those are.
 
+## Gates Before the Rules
+
+`register_window_from_info` (`src/registry/core.rs`) runs four gates before
+any rule, in this order; each is decided once at arrival and no rule,
+learned or explicit, overrides it:
+
+1. **Elevated** — `Ignored(Elevated)`, ADR-0025 ([below](#elevated-windows-are-unmanaged)).
+2. **Shell band** — `Ignored(ShellBand(n))`, ADR-0033 and ADR-0034
+   ([below](#shell-bands-are-unmanaged)).
+3. **Overlay** — `Ignored(Overlay)`, ADR-0036 ([below](#overlays-are-unmanaged)).
+4. **Session lock** — `Ignored(SessionLocked)` while the session is locked,
+   ADR-0034 ([below](#the-session-lock)).
+
+Only a window past all four reaches the maximized / fullscreen checks and
+the rule chain below, with the shape rule of ADR-0036 on top of it.
+
 ## The Four-Layer Priority Chain
 
 Every classification consults four layers in priority order. The first layer to

@@ -27,7 +27,7 @@ FlowWM is written by [CCpcalvin](https://github.com/CCpcalvin/flow-wm) (MIT). Up
 | **Borders** | The ring follows the window's own shape: a frameless window such as Alacritty without decorations gets a square ring. Windows that grow their frame late (SSMS, Visual Studio) are re-measured when placed, so there is no gap between app and ring. |
 | **Mouse** | Win + left-button drag moves a tile to a new slot, on any screen, with a drop preview. Win + mouse wheel mirrors the arrow chords: wheel alone moves focus, with Shift moves the column, with Ctrl changes screen, with Alt moves the column to the other screen. |
 | **Selection buffer** | An opt-in X11-style buffer (`[keymap] selection_buffer`): highlight text with the mouse, then middle-click to paste it, without touching the clipboard. Works in terminals, editors and browsers through UI Automation; Alacritty needs its copy-on-select option. |
-| **Key bindings are configuration** | Chords live in a `[binds]` table in `flow.toml`, in niri's spelling, laid over a built-in default table. The keymap registers whatever the daemon lists and re-reads it when the file is saved. |
+| **Key bindings are configuration** | Chords live in a `[binds]` table in `flow.toml`, in niri's spelling, laid over a built-in default table. The keymap registers whatever the daemon lists and re-reads it when the file is saved. A table with a mistake is set aside when the daemon starts: the built-in chords run, and `flow start` names each bad entry (from autostart, a Windows notification points at the log). |
 | **Fail-safe exit** | Every way the daemon can stop, including a crash, puts the desktop back the way Windows had it: borders gone, windows restored, nothing left parked off-screen. Tiling can be paused without stopping. |
 | **Hardening** | The IPC pipe has a real ACL, rejects remote clients and caps message size; the daemon trusts only its own user and only files it wrote; window titles are logged at debug level only and logs are pruned. The self-updater is gone: `flow update` only reports whether the repository has something newer than the commit the binaries were built from. |
 
@@ -78,7 +78,7 @@ target\release\flow.exe config init   # writes %USERPROFILE%\.config\flow\flow.t
 3. Merge `keymaps\win-niri\flow.toml.example` into your `flow.toml`. It carries the width presets, the stack rows, `layout` and `wrap_around`, `adopt_maximized`, `always_on_top`, `new_window_monitor`, and commented `[binds]`, `[keymap]` and `[startup]` examples.
 4. Install [AutoHotkey v2](https://www.autohotkey.com/), then `flow start --ahk`. For every login, `flow enable-autostart --ahk` writes one shortcut into your Startup folder. A shortcut to `flow-resident.ahk` in the Startup folder instead gives you `Win+Ctrl+T` as an on/off switch for the whole thing.
 
-`flow config check` reports every problem in both config files without applying anything; `flow query binds` shows the resolved chord table; `flow query all` shows what the daemon sees.
+`flow config check` reports every problem in both config files without applying anything; `flow query binds` shows the resolved chord table; `flow query all` shows what the daemon sees, including each window's `mode` (`hung` for a program that stopped responding), the z-order `band` it is drawn in and why it is `untileable`.
 
 Upstream's `cargo install flow-wm` and its bundled Alt-based `flow.ahk` install upstream FlowWM, not this fork.
 

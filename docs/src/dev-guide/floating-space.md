@@ -640,10 +640,9 @@ through `register_float` when it comes back; a float and a fullscreen window
 are both topmost and stack by whichever was activated last. Minimized /
 hidden floats are out until restored / shown; `Ignored(Maximized|Fullscreen)`
 windows are never touched, nor is an `Ignored(Elevated)` window (UIPI refuses
-the daemon's z-order changes; it is foreign to the layer, ADR-0025), and neither is a tracked window whose class is a
-shell surface (`SHELL_CLASSES`: the Start menu and search `CoreWindow`s the
-default rules ignore explicitly would otherwise get `HWND_TOPMOST` on every
-raise, ADR-0024). Untracked windows are never members; the ones owned by a
+the daemon's z-order changes; it is foreign to the layer, ADR-0025), and neither is a tracked shell surface
+(`is_shell_surface`: a class in `SHELL_CLASSES` or a shell band, ADR-0034;
+such a window would otherwise get `HWND_TOPMOST` on every raise, ADR-0024). Untracked windows are never members; the ones owned by a
 flow window ride with the layer instead (*Riders*, below).
 
 **The decision** (`classify_foreground`, pure; `FlowWM::decide_top_layer_with`
@@ -655,7 +654,7 @@ of three owners:
 | A registry window whose state is `Tiling(Active)`, `Floating(Active)` or `Ignored(ExplicitRule)` — a tile or a layer member — **and** not fullscreen by the live check | `Flow` | raised: members `HWND_TOPMOST` |
 | An untracked window owned by a flow window (its `GW_OWNER` chain reaches a tracked window, the *anchor*): classed by the anchor's state, and by the live fullscreen check on the window and the anchor | by its anchor | `Flow`: raised, and the window rides with the layer (*Riders*) |
 | Fullscreen by live geometry + style (tracked or not); an untracked window no tracked window owns; a registry window in any other `Ignored` state (`Maximized`, `Fullscreen`, `Elevated`) or a minimized / hidden state, and a rider whose anchor is in one of those states | `Foreign` | dropped: members seated directly under that window |
-| A shell surface (class in `SHELL_CLASSES`), no foreground, or a handle already gone | `Shell` | kept: the last decision stands |
+| A shell surface (class in `SHELL_CLASSES`, or a window in a shell band, ADR-0034), no foreground, or a handle already gone | `Shell` | kept: the last decision stands |
 
 *Fullscreen is read live, not from the stored state.* F11 in a browser, VS
 Code or a terminal resizes the window — `EVENT_OBJECT_LOCATIONCHANGE`, not a

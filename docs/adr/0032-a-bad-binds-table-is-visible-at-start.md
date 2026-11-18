@@ -85,6 +85,11 @@ placed the windows it found, so its own start does not overlap it. The VM
 case B (stage 38) opens a window while the toast is up and checks that it is
 seated and focused.
 
+> Corrected by [ADR-0033](0033-window-bands-and-foreground-pushes.md) (stage
+> 39): a toast does not hold the foreground; the VM reading above most
+> likely came from a build with a since-fixed `AttachThreadInput` bug, and
+> the keymap's `TrayTip` ban is no longer a hard rule.
+
 ## Consequences
 
 - Windows drops a balloon notice together with its icon: it is shown as a

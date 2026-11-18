@@ -346,10 +346,14 @@ Chromium hosts) rather than `exe` (which differs per application), so a single
 rule covers every Chromium-based app. Class matching is also race-free — the
 class is assigned at creation time, while the title may arrive milliseconds later.
 
-**Taskbar, search, and system UI.** Windows like `Shell_TrayWnd` (the taskbar),
-`Windows.UI.Core.CoreWindow` (Settings), and various system overlay windows are
-ignored by default rules. These windows are either always-on-top or interact with
-the shell in ways that conflict with tiling.
+**Taskbar and system UI.** Windows like `Shell_TrayWnd` and
+`Shell_SecondaryTrayWnd` (the taskbars), `Xaml_WindowedPopupClass` (the Win+X
+menu, the tray overflow, the snap layouts flyout) and a few system overlay
+windows are ignored by default rules. These windows are either always-on-top or
+interact with the shell in ways that conflict with tiling. Start, search, the
+flyouts, Alt+Tab and the lock screen have no rule: the shell-band gate leaves
+them alone ahead of every rule (ADR-0033, ADR-0034; see
+[Classification](./classification.md#shell-bands-are-unmanaged)).
 
 ## The `InvisibleBounds` Concept
 

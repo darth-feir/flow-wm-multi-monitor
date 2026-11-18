@@ -562,10 +562,11 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   the daemon does instead; `flow config check`, the daemon log and
   `flow query binds` (`set_aside`) use the same lines. With no console to
   read (autostart) it sends a notification-area toast after the daemon is
-  ready, and a failed start writes its cause to the log and sends one too:
-  no daemon runs then, so the toast's hold on the foreground, which keeps
-  `TrayTip` out of the keymap, disturbs nothing. Windows does not keep such
-  a toast in the notification center; the log is the record.
+  ready, and a failed start writes its cause to the log and sends one too.
+  (The ADR also argues that the toast's hold on the foreground disturbs
+  nothing because no daemon runs then; ADR-0033 found that a toast does not
+  hold the foreground at all.) Windows does not keep such a toast in the
+  notification center; the log is the record.
   `docs/adr/0032-a-bad-binds-table-is-visible-at-start.md`
 - **ADR-0033 — Window bands mark shell surfaces; a foreground push injects
   no input.** `GetWindowBand` (an undocumented user32 export, read
@@ -577,7 +578,9 @@ renumbered at merge time, the way ADR-0007 (cursor) already was once.
   line (nothing gets past it). A retry after an empty `SendInput` mouse event
   was tried and dropped: it never fired in the VM and injected input resets
   the idle timer, so `AttachThreadInput` stays the push path. A toast does not block focus
-  pushes, so the keymap's `TrayTip` ban is no longer a hard rule.
+  pushes, so the keymap's `TrayTip` ban is no longer a hard rule. Corrected
+  in part by ADR-0034 (the lock frames are band 17, not band 1; the class
+  and exe entries the band covers are gone).
   `docs/adr/0033-window-bands-and-foreground-pushes.md`
 - **ADR-0034 — Shell bands replace the shell lists; the session lock is a
   signal.** Measured with the real lock screen: the lock frames and LockApp

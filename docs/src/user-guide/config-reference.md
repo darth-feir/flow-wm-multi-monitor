@@ -585,7 +585,10 @@ The daemon writes one `logs/flowd-YYYY-MM-DD.log` per day under the config
 directory. At the default level the log records every window it manages by
 handle, executable and window class; **window titles are only logged at
 `debug` level** (`flow start --verbose`), since they name your documents and
-conversations. The saved loadout file records executables and handles,
+conversations. The level is not a config key: it is `info` unless
+`flow start --verbose` (`debug`) or `flow start --log-level <filter>` (a level
+such as `trace`, or a filter such as `flow_wm::registry=trace`) says
+otherwise, and `RUST_LOG` is read when neither flag is given. The saved loadout file records executables and handles,
 never titles.
 
 The keymap the daemon starts (`flow start --ahk`) can write its own trace
@@ -938,7 +941,14 @@ action = "ignore"
 
 ### How classification actually works (short version)
 
-When a new window appears, FlowWM checks, in order:
+When a new window appears, four gates come before any rule and cannot be
+overridden by one: a window running elevated while FlowWM is not
+(`Ignored::Elevated`), a shell surface in a z-order band above the apps'
+(`Ignored::ShellBand`: toasts, flyouts, Start, search, Alt+Tab, the lock
+screen), a click-through or no-activate overlay (`Ignored::Overlay`), and,
+while the session is locked, any new window (`Ignored::SessionLocked`, held
+until the unlock and then classified). A window past those gates is checked
+against the rules, in order:
 
 1. **User rules** — your `flow-rules.toml`, top-to-bottom, first match wins.
 2. **Learned rules** — machine-written to `history-flow-rules.toml`. Whenever

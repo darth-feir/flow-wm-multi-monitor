@@ -48,7 +48,10 @@ The full pipeline for a created window:
    thread.
 2. `on_window_created()` calls `registry.handle_created(hwnd)`, which runs the
    full classification pipeline: visibility check, title check, Alt-Tab visibility,
-   owner check, rule evaluation. Returns `Some(WindowId)` if the window is
+   owner check, then the gates that no rule overrides (elevated, shell band,
+   overlay, session lock; see
+   [Classification](./classification.md#gates-before-the-rules)), then rule
+   evaluation with the untileable-shape rule (ADR-0036). Returns `Some(WindowId)` if the window is
    classified as tiling; `None` otherwise (the handler then inspects the
    registry to distinguish a fresh float from ignored / not-ready).
 3. If tiling, `ScrollingSpace::insert_window()` places the new column
@@ -65,7 +68,12 @@ The full pipeline for a created window:
    previous rect, so it is placed at its slot instantly while the other
    columns tween (the first-placement rule, see
    [Animation](./animation.md#first-placement); ADR-0023, *Appearing in
-   place*).
+   place*). Every submit notes the tiles it commanded; 500 ms after the last
+   one the placement acceptance check reads them back and releases a tile
+   that kept its own size to the floating layer (ADR-0036, see
+   [Floating Space](./floating-space.md#released-tiles-a-window-that-refuses-its-slot)).
+   A batch that moves an anchor carries its riders by the same delta
+   (ADR-0038, [Floating Space](./floating-space.md#the-floating-layer-floating-always_on_top)).
 6. `reconcile_new_window_focus()` pushes the OS foreground to the new window,
    syncs the registry focus, and refreshes borders (see *Foreground on
    creation* below).
